@@ -1,0 +1,80 @@
+{
+  "name": "Alive",
+  "model": "",
+  "thinkingLevel": "",
+  "stateDir": ".alive",
+  "workspace": ".alive/workspace",
+  "soulFile": "SOUL.md",
+  "session": "continue",
+  "tools": {
+    "builtin": [
+      "read",
+      "write",
+      "edit",
+      "bash",
+      "grep",
+      "find",
+      "ls"
+    ],
+    "bash": true
+  },
+  "loop": {
+    "pollIntervalMs": 750,
+    "sleepAfterMs": 900000,
+    "runTimeoutMs": 240000,
+    "maxEventsPerIdle": 8,
+    "maxNudges": 3,
+    "maxNudgesPerRun": 5,
+    "interrupt": true
+  },
+  "budget": {
+    "maxDailyCostUsd": 0,
+    "maxWakesPerHour": 0
+  },
+  "chat": {
+    "console": true,
+    "http": {
+      "enabled": false,
+      "host": "127.0.0.1",
+      "port": 4321,
+      "token": ""
+    }
+  },
+  "modules": {
+    "telegram": {
+      "enabled": true,
+      "token": "",
+      "tokenEnv": "ALIVE_TELEGRAM_TOKEN",
+      "apiBase": "https://api.telegram.org",
+      "allowedChatIds": [],
+      "allowedUserIds": [],
+      "pollTimeoutSec": 25,
+      "allowedUpdates": [
+        "message",
+        "edited_message",
+        "channel_post",
+        "edited_channel_post",
+        "callback_query"
+      ],
+      "parseMode": "",
+      "linkPreview": true,
+      "typingIndicator": true,
+      "ackReaction": "",
+      "ingestEdits": true,
+      "historyLimitPerThread": 0,
+      "maxMessageChars": 4000
+    },
+    "grafana": {
+      "enabled": false,
+      "host": "127.0.0.1",
+      "port": 4322,
+      "path": "/grafana",
+      "token": "",
+      "firingPriority": "high",
+      "resolvedPriority": "low"
+    },
+    "external": []
+  },
+  "verbose": false,
+  "extensions": []
+}

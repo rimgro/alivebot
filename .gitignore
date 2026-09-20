@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# agent state
+.alive/
+
+# local overrides
+alive.config.local.json
+.env

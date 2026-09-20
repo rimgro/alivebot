@@ -1,0 +1,42 @@
+{
+  "name": "alive",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A long-lived agent runtime built on @earendil-works/pi-coding-agent: system prompt -> poll -> tool calls -> outbound messages as tool use -> poll",
+  "type": "module",
+  "bin": {
+    "alive": "./dist/index.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "init": "tsx src/index.ts init",
+    "run": "tsx src/index.ts run",
+    "status": "tsx src/index.ts status",
+    "modules": "tsx src/index.ts modules",
+    "history": "tsx src/index.ts history",
+    "telegram": "tsx src/index.ts telegram",
+    "smoke": "tsx src/dev/smoke.ts",
+    "test": "tsc -p tsconfig.json --noEmit && tsx src/dev/store-test.ts && tsx src/dev/idle-test.ts && tsx src/dev/runner-test.ts && tsx src/dev/modules-test.ts && tsx src/dev/daemon-test.ts",
+    "alive": "tsx src/index.ts",
+    "test:store": "tsx src/dev/store-test.ts",
+    "test:idle": "tsx src/dev/idle-test.ts",
+    "test:runner": "tsx src/dev/runner-test.ts",
+    "test:modules": "tsx src/dev/modules-test.ts",
+    "test:daemon": "tsx src/dev/daemon-test.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "^0.85.1",
+    "@earendil-works/pi-ai": "^0.85.1",
+    "@earendil-works/pi-coding-agent": "^0.85.1",
+    "typebox": "1.3.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.3",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3"
+  }
+}
