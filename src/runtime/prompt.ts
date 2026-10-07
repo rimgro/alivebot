@@ -4,10 +4,12 @@ import type { Reminder } from "../store/reminders.js";
 import type { RunRecord } from "../store/runs.js";
 import type { ThreadState } from "../store/threads.js";
 import { formatDuration, iso, localTime, truncate } from "../util.js";
+import { DEFAULT_CONTRACT } from "../config.js";
 
 export interface SystemPromptInput {
 	name: string;
 	soul: string;
+	contract?: string;
 	workspace: string;
 	stateDir: string;
 	runTimeoutMs: number;
@@ -25,6 +27,12 @@ export function buildSystemPrompt(input: SystemPromptInput): string {
 	return `You are ${input.name}.
 
 ${input.soul.trim()}
+
+# Your contract
+
+${input.contract?.trim() || DEFAULT_CONTRACT.trim()}
+
+Treat this contract as your role and working agreement. Learn the user's communication preferences through conversation; do not assume or inherit another agent's personal preferences.
 
 # How you exist
 
@@ -59,12 +67,18 @@ If you stay inside \`idle\` for a long time (about ${formatDuration(input.sleepA
 nothing arriving, the runtime offers you a **sleep**. Sleeping means:
 
 - Your conversation context is wiped. You wake up with only your system prompt,
-  your notes, your journal and your reminders.
-- Everything you want your future self to keep **must be written down first**.
+  summary.md, relevant database memories, notes, your journal and reminders.
+- Before sleep, call \`retain({ facts: [...], scopes: [...] })\` with the durable facts
+  you chose from this context. Then call \`sleep\` with the complete updated
+  \`summary_md\`. The runtime refuses to reset context until retain succeeds and
+  summary.md is replaced. Retained facts and embeddings are stored in local SQLite; revisions
+  preserve the old versions rather than deleting them. Use \`memory\` to search
+  facts or inspect their history.
 
-When \`idle\` returns a SLEEP notice, write what matters (decisions, open threads,
-promises, facts) and then call \`sleep({ summary })\`. The summary is written to
-your journal for you. If you are waiting on something important, do not sleep:
+When \`idle\` returns a SLEEP notice, select durable facts from your context and
+call \`retain({ facts, scopes })\`. Then pass the complete updated summary.md as
+\`summary_md\` to \`sleep({ summary, summary_md })\`; summary is also written to
+your journal. If you are waiting on something important, do not sleep:
 call \`idle({ important: true })\` instead and keep waiting.
 
 Nothing is lost while you are awake: reminders you scheduled still fire, messages
@@ -78,9 +92,10 @@ the conversation, never your memory of the world.
 - The **only** way to reach a human is the \`send_message\` tool.
 - If an event has \`expects_reply\`, you must either \`send_message\` to that thread
   or \`close_thread\` with a reason. Assistant text does not count as an answer.
-- Silence is a legitimate action. Do not send messages just to report that you woke up.
-- Messages should read like a person wrote them: short, concrete, no headings, no
-  process narration, no "as an AI".
+- Silence is a legitimate action for quick tasks or when nobody needs an update. Do not send messages just to report that you woke up.
+- For a substantial / multi-step request, send a brief start signal with \`send_message\` before doing the work, then send a progress update when you have a meaningful finding (or if blocked / delayed), and a concise outcome when done. Don't wait until completion to communicate. Skip this for quick tasks; don't send empty play-by-play or invent an ETA. These can be separate short messages, like a natural messenger conversation.
+- Messages should read like a person wrote them: short, concrete, usually lowercase in casual chat, no headings, no
+  process narration, no "as an AI". Preserve normal casing for names, acronyms, code, and commands.
 
 # The world outside
 
@@ -152,6 +167,8 @@ export interface AwakePromptInput {
 	notes: Record<string, string>;
 	reminders: Reminder[];
 	journalTail: string[];
+	summary: string;
+	relevantMemories: Array<{ text: string; scopes: string[]; validFrom: string }>;
 	recentRuns: RunRecord[];
 	policy: NotifyPolicyFile;
 	costTodayUsd: number;
@@ -188,6 +205,12 @@ function carriedOver(input: AwakePromptInput): string[] {
 	const noteKeys = Object.keys(input.notes);
 	if (noteKeys.length > 0) {
 		sections.push("Your notes:\n" + noteKeys.map((k) => `- ${k}: ${input.notes[k]}`).join("\n"));
+	}
+	if (input.summary.trim()) {
+		sections.push(`Long-term memory (summary.md — primary, always loaded):\n${input.summary.trim()}`);
+	}
+	if (input.relevantMemories.length > 0) {
+		sections.push(`Relevant fact memories (search the memory tool for more):\n${input.relevantMemories.map((fact) => `- (${fact.scopes.join(", ")}; since ${fact.validFrom}) ${fact.text}`).join("\n")}`);
 	}
 	if (input.journalTail.length > 0) {
 		sections.push(`Journal (tail):\n${input.journalTail.slice(-12).join("\n")}`);
@@ -331,17 +354,10 @@ export function renderSleepOffer(waitedMs: number): string {
 	return (
 		`SLEEP OFFER — you have been idle for ${formatDuration(waitedMs)} and nothing has happened.\n\n` +
 		`This is a good moment to sleep and free your context:\n` +
-		`1. Write anything your future self needs into the \`journal\` (and short state into \`note\`).\n` +
-		`2. Call \`sleep({ summary: "..." })\` — the summary is saved to your journal for you.\n\n` +
+		`1. Call \`retain({ facts: [...], scopes: [...] })\` with durable facts from this context (an empty list is OK).\n` +
+		`2. Update summary.md and call \`sleep({ summary: "episodic note", summary_md: "complete updated file" })\`.\n\n` +
 		`If you are waiting on something important and must not lose this context, call ` +
 		`\`idle({ reason: "...", important: true })\` to keep waiting awake.`
-	);
-}
-
-export function renderSleepForced(waitedMs: number): string {
-	return (
-		`SLEEP — you returned to idle after being offered sleep (idle for ${formatDuration(waitedMs)}). ` +
-		`Context is being reset now. Anything not written to your journal, notes or reminders will be forgotten.`
 	);
 }
 

@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { clearManagedBotRequest, configureAgentTelegram, createAgent, disableManagedAgent, enableManagedAgent, ensureAdminAgent, getAgentEnabled, listAgents, queueManagedBotRequest, restartManagedAgent, startManagedAgent, stopManagedAgent, updateManagedAgentProfile, validateAgentId } from "./agents.js";
 import type { AliveConfig, LoadedConfig } from "./config.js";
 import { loadConfig, writeDefaultConfig } from "./config.js";
 import { Logger } from "./log.js";
@@ -8,9 +9,13 @@ import { PolicyStore, type NotifyMode } from "./store/policy.js";
 import { ThreadStore } from "./store/threads.js";
 import { RunLog, readRuntimeState } from "./store/runs.js";
 import { HistoryStore, type HistoryDirection, type HistoryQuery } from "./store/history.js";
+import { Outbox } from "./store/outbox.js";
+import { listLocalMessages, operatorAgentThread, sendLocalAgentMessage } from "./runtime/agent-messaging.js";
+import { runAgentConsole } from "./tui/agent-console.js";
 import { describeModules } from "./events/loader.js";
 import { TelegramApi } from "./modules/telegram/client.js";
 import { resolveToken } from "./modules/telegram/module.js";
+import { TelegramAllowlistStore } from "./modules/telegram/state.js";
 import { AliveRuntime } from "./runtime/loop.js";
 import { snapshotRuntime, spawnBackground, stdoutLogPath, stopRuntime, waitForRuntime } from "./runtime/daemon.js";
 import { LOG_SOURCES, followFile, readLogTail, renderLogLine, resolveLogSource } from "./logs.js";
@@ -77,13 +82,18 @@ export async function main(argv: string[]): Promise<number> {
 		switch (command) {
 			case "init": {
 				const { configPath, soulPath } = writeDefaultConfig(cwd);
+				const admin = ensureAdminAgent(loadConfig({ cwd, configPath }));
 				process.stdout.write(`created ${path.relative(cwd, configPath) || configPath}\n`);
 				process.stdout.write(`created ${path.relative(cwd, soulPath) || soulPath}\n`);
+				process.stdout.write(`administrator agent: ${admin.id} (${admin.configPath})\n`);
 				process.stdout.write(`next: npm run run   (or: npm run dev -- run)\n`);
 				return 0;
 			}
 			case "run": {
 				return await runCommand(cwd, flags);
+			}
+			case "agents": {
+				return agentsCommand(cwd, flags, positionals);
 			}
 			case "stop": {
 				return await stopCommand(cwd, flags);
@@ -163,6 +173,10 @@ function makeLogger(config: LoadedConfig, quiet = true): Logger {
 
 async function runCommand(cwd: string, flags: Record<string, string | boolean>): Promise<number> {
 	const config = loadForCli(flags);
+	if (!config.config.enabled) {
+		process.stderr.write(`${term.red("agent is disabled:")} ${config.config.name}; enable it before starting\n`);
+		return 1;
+	}
 	// `--once` is a one-shot debug run, so it stays attached; everything else goes
 	// to the background and is managed with stop/restart/logs/status.
 	const once = flagBool(flags, "once");
@@ -332,6 +346,189 @@ async function logsCommand(cwd: string, flags: Record<string, string | boolean>)
 	return 0;
 }
 
+async function agentsCommand(cwd: string, flags: Record<string, string | boolean>, positionals: string[]): Promise<number> {
+	const base = loadForCli(flags);
+	const action = positionals[0] ?? "list";
+	if (action === "tui") {
+		await runAgentConsole({
+			listAgents: async () => listAgents(base).map((agent) => {
+				const loaded = loadConfig({ cwd, configPath: agent.configPath });
+				return {
+					id: agent.id,
+					name: loaded.config.name,
+					enabled: getAgentEnabled(agent),
+					running: snapshotRuntime(loaded.paths.stateDir)?.alive ?? false,
+				};
+			}),
+			listMessages: async (id) => {
+				const agent = findManagedAgent(base, id);
+				const loaded = loadConfig({ cwd, configPath: agent.configPath });
+				return HistoryStore.open(loaded.paths.stateDir).query({ module: "local", thread: operatorAgentThread(id), limit: 300, order: "asc" });
+			},
+			send: async (id, text) => {
+				await sendLocalAgentMessage({ config: base, outbox: new Outbox(base.paths.stateDir), to: id, text, runId: `tui-${Date.now()}`, senderId: "operator", senderName: "Operator" });
+			},
+			start: async (id) => { await startManagedAgent(base, id); },
+			stop: async (id) => { await stopManagedAgent(base, id); },
+		});
+		return 0;
+	}
+	if (action === "list") {
+		const agents = listAgents(base);
+		if (!agents.length) process.stdout.write("no agents; create one with: alive agents create <id>\n");
+		for (const agent of agents) {
+			const loaded = loadConfig({ cwd, configPath: agent.configPath });
+			const snapshot = snapshotRuntime(loaded.paths.stateDir);
+			const running = snapshot?.alive ? `running pid=${snapshot.pid}` : "stopped";
+			const enabled = getAgentEnabled(agent) ? "enabled" : "disabled";
+			process.stdout.write(`${agent.id.padEnd(20)} ${loaded.config.name}  ${enabled}  ${running}  workspace=${loaded.paths.workspaceDir}\n`);
+		}
+		return 0;
+	}
+	if (action === "send" || action === "message") {
+		const recipientId = positionals[1];
+		const text = positionals.slice(2).join(" ");
+		if (!recipientId || !text.trim()) throw new Error("usage: alive agents send <agent-id> <message text>");
+		const message = await sendLocalAgentMessage({
+			config: base,
+			outbox: new Outbox(base.paths.stateDir),
+			to: recipientId,
+			text,
+			runId: `cli-${Date.now()}`,
+			senderId: "operator",
+			senderName: flagString(flags, "from") ?? "Operator",
+		});
+		process.stdout.write(`message ${message.id} delivered to ${message.recipientAgentId} (thread ${message.thread})\n`);
+		return 0;
+	}
+	if (action === "inbox" || action === "read") {
+		const agent = findManagedAgent(base, positionals[1]);
+		const target = loadConfig({ cwd, configPath: agent.configPath });
+		const thread = flagString(flags, "thread");
+		const limit = Math.max(1, Math.min(Number(flagString(flags, "n") ?? 30) || 30, 1000));
+		const messages = listLocalMessages(target, limit, thread);
+		if (!messages.length) {
+			process.stdout.write(`no local messages for ${agent.id}\n`);
+			return 0;
+		}
+		for (const message of messages) {
+			process.stdout.write(`${new Date(message.ts).toISOString()} ${message.direction} ${message.author ?? message.authorId ?? "unknown"} [${message.thread}]: ${message.text}\n`);
+		}
+		return 0;
+	}
+	if (["enable", "disable", "edit", "permissions"].includes(action)) {
+		const id = positionals[1];
+		if (!id) throw new Error(`usage: alive agents ${action} <id>`);
+		const agent = findManagedAgent(base, id);
+		if (action === "enable") {
+			await enableManagedAgent(base, agent.id);
+			process.stdout.write(`enabled ${agent.id}; start it with: alive agents start ${agent.id}\n`);
+			return 0;
+		}
+		if (action === "disable") {
+			await disableManagedAgent(base, agent.id);
+			process.stdout.write(`disabled and stopped ${agent.id}\n`);
+			return 0;
+		}
+		const updates: { name?: string; role?: string; contract?: string; toolAllowlist?: string[]; management?: import("./config.js").AgentManagementPermissions } = {};
+		if (action === "edit") {
+			const name = flagString(flags, "name");
+			const role = flagString(flags, "role");
+			const contract = flagString(flags, "contract");
+			const contractFile = flagString(flags, "contract-file");
+			const tools = flagString(flags, "tools");
+			if (name !== undefined) updates.name = name;
+			if (role !== undefined) updates.role = role;
+			if (contract !== undefined && contractFile !== undefined) throw new Error("use only one of --contract or --contract-file");
+			if (contract !== undefined) updates.contract = contract;
+			if (contractFile !== undefined) updates.contract = (await import("node:fs")).readFileSync(path.resolve(cwd, contractFile), "utf8");
+			if (tools !== undefined) updates.toolAllowlist = tools.split(",").map((tool) => tool.trim()).filter(Boolean);
+		}
+		const permissionFile = flagString(flags, "permissions-file");
+		if (permissionFile) {
+			updates.management = JSON.parse((await import("node:fs")).readFileSync(path.resolve(cwd, permissionFile), "utf8"));
+		}
+		if (!Object.keys(updates).length) throw new Error(`usage: alive agents ${action} ${agent.id} --name NAME --role ROLE --contract TEXT --tools read,write ... --permissions-file JSON`);
+		await updateManagedAgentProfile(base, agent.id, updates);
+		process.stdout.write(`updated ${agent.id}; security-sensitive changes are active\n`);
+		return 0;
+	}
+	if (action === "create") {
+		const id = positionals[1];
+		if (!id) throw new Error("usage: alive agents create <id> [--name <name>]");
+		const agent = createAgent(base, id, flagString(flags, "name"));
+		process.stdout.write(`created agent ${agent.id}\nconfig: ${agent.configPath}\nworkspace: ${path.join(agent.directory, "workspace")}\nstart: alive agents start ${agent.id}\n`);
+		return 0;
+	}
+	if (action === "request-telegram") {
+		const agent = findManagedAgent(base, positionals[1]);
+		const chatValue = flagString(flags, "chat");
+		if (!chatValue || !/^-?\d+$/.test(chatValue)) throw new Error("usage: alive agents request-telegram <id> --chat <private-chat-id>");
+		const token = resolveToken(base.config.modules.telegram);
+		if (!token) throw new Error(`master bot token is missing; set modules.telegram.token or $${base.config.modules.telegram.tokenEnv}`);
+		const api = new TelegramApi({ token, apiBase: base.config.modules.telegram.apiBase });
+		const master = await api.getMe();
+		if (!master.can_manage_bots) throw new Error("master bot lacks can_manage_bots; enable bot management in the @BotFather Mini App first");
+		const chatId = Number(chatValue);
+		const requestId = Date.now() % 2_147_483_647;
+		const pending = { agentId: agent.id, chatId, requestedAt: Date.now() };
+		const pendingRoot = path.join(base.paths.modulesDir, "telegram");
+		queueManagedBotRequest(pendingRoot, pending);
+		try {
+			await api.sendMessage({
+				chat_id: chatId,
+				text: `Create a Telegram bot profile for agent “${agent.id}” and share it with me. Telegram will ask you to confirm.`,
+				reply_markup: {
+					keyboard: [[{ text: `Create bot for ${agent.id}`, request_managed_bot: { request_id: requestId, suggested_name: `${agent.id} agent` } }]],
+					resize_keyboard: true,
+					one_time_keyboard: true,
+				},
+			});
+		} catch (error) {
+			clearManagedBotRequest(pendingRoot, pending);
+			throw new Error(`failed to send managed-bot request: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		process.stdout.write(`Managed Bot creation request sent for ${agent.id}; approve it in Telegram. The master bot will attach its token when Telegram returns the created bot.\n`);
+		return 0;
+	}
+	if (action === "telegram") {
+		const agent = findManagedAgent(base, positionals[1]);
+		const tokenEnv = flagString(flags, "token-env");
+		if (!tokenEnv) throw new Error("usage: alive agents telegram <id> --token-env <ENV_NAME> (create the bot with @BotFather first)");
+		configureAgentTelegram(agent, tokenEnv);
+		process.stdout.write(`Telegram enabled for ${agent.id} using $${tokenEnv}; restart the agent to apply.\n`);
+		return 0;
+	}
+	if (action === "start" || action === "stop" || action === "restart" || action === "status") {
+		const agent = findManagedAgent(base, positionals[1]);
+		if (action === "start") {
+			const started = await startManagedAgent(base, agent.id);
+			process.stdout.write(`started ${agent.id} (pid ${started.pid})\n`);
+			return 0;
+		}
+		if (action === "stop") {
+			await stopManagedAgent(base, agent.id);
+			process.stdout.write(`stopped ${agent.id}\n`);
+			return 0;
+		}
+		if (action === "restart") {
+			const started = await restartManagedAgent(base, agent.id);
+			process.stdout.write(`restarted ${agent.id} (pid ${started.pid})\n`);
+			return 0;
+		}
+		return statusCommand(cwd, { ...flags, config: agent.configPath });
+	}
+	throw new Error(`unknown agents action: ${action} (use list, create, edit, permissions, enable, disable, send, inbox, start, stop, restart, status, telegram, request-telegram)`);
+}
+
+function findManagedAgent(base: LoadedConfig, idInput: string | undefined) {
+	if (!idInput) throw new Error("agent id is required");
+	const id = validateAgentId(idInput);
+	const agent = listAgents(base).find((item) => item.id === id);
+	if (!agent) throw new Error(`unknown agent: ${id}`);
+	return agent;
+}
+
 function sayCommand(cwd: string, flags: Record<string, string | boolean>, text: string): number {
 	const config = loadForCli(flags);
 	if (!text.trim()) throw new Error("usage: alive say <text> [--thread console] [--no-reply]");
@@ -427,7 +624,7 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 		process.stdout.write(
 			`${JSON.stringify(
 				{
-					config: config.config,
+					config: redactSecrets(config.config),
 					paths: config.paths,
 					runtime: runtime && running ? runtime : null,
 					staleRuntime: runtime && !running ? runtime : null,
@@ -481,6 +678,14 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 	line("workspace", config.paths.workspaceDir);
 	line("journal", config.paths.journalDir);
 	return 0;
+}
+
+function redactSecrets(config: AliveConfig): AliveConfig {
+	const safe = structuredClone(config);
+	safe.modules.telegram.token = safe.modules.telegram.token ? "[redacted]" : "";
+	safe.modules.grafana.token = safe.modules.grafana.token ? "[redacted]" : "";
+	safe.chat.http.token = safe.chat.http.token ? "[redacted]" : "";
+	return safe;
 }
 
 function runsCommand(_cwd: string, flags: Record<string, string | boolean>): number {
@@ -629,6 +834,31 @@ async function telegramCommand(
 	const sub = positionals[0] ?? "me";
 	const moduleConfig = config.config.modules.telegram;
 
+	if (sub === "whitelist") {
+		const allowlist = new TelegramAllowlistStore(path.join(config.paths.modulesDir, "telegram"));
+		const action = positionals[1] ?? "list";
+		const userId = positionals[2];
+		if (action === "list") {
+			const ids = [...new Set([...moduleConfig.allowedUserIds.map(String), ...allowlist.list()])];
+			process.stdout.write(ids.length ? `${ids.join("\n")}\n` : "Вайтлист пуст: сообщения обрабатываться не будут.\n");
+			return 0;
+		}
+		if ((action === "add" || action === "remove") && !userId) {
+			throw new Error(`usage: alive telegram whitelist ${action} <user-id>`);
+		}
+		if (action === "add") {
+			const added = allowlist.add(userId!);
+			process.stdout.write(added ? `Добавлен Telegram ID ${userId} в вайтлист\n` : `Telegram ID ${userId} уже в вайтлисте\n`);
+			return 0;
+		}
+		if (action === "remove") {
+			const removed = allowlist.remove(userId!);
+			process.stdout.write(removed ? `Удалён Telegram ID ${userId} из динамического вайтлиста\n` : `Telegram ID ${userId} не найден в динамическом вайтлисте\n`);
+			return 0;
+		}
+		throw new Error(`unknown whitelist action: ${action} (use list, add, remove)`);
+	}
+
 	if (sub === "chats") {
 		const history = HistoryStore.open(config.paths.stateDir);
 		const threads = history.threads({ module: "telegram" });
@@ -732,7 +962,18 @@ function printHelp(): void {
 usage:
   alive init                                  create alive.config.json + SOUL.md
   alive run [--foreground|--once] [--force] [--verbose]
-                                              start the agent in the background
+                                              start the default agent in the background
+  alive agents list | create <id> [--name name]
+  alive agents tui                            interactive local agent messenger
+                                              (↑/↓ select, Alt+S start, Alt+X stop, Esc quit)
+  alive agents start|stop|restart|enable|disable|status <id>
+  alive agents edit <id> [--name NAME] [--role ROLE] [--contract TEXT] [--tools read,write,...]
+  alive agents permissions <id> --permissions-file JSON
+  alive agents send <id> <message>          send a durable local message to an agent
+  alive agents inbox <id> [--thread ID]     list/read local messages for an agent
+  alive agents telegram <id> --token-env ENV
+  alive agents request-telegram <id> --chat ID
+                                              request a Managed Bot for an agent via Telegram 9.6
                                               (--foreground: stay attached, --once: one run)
   alive stop [--force] [--timeout 30s]        stop the running instance
                                               (--force: SIGKILL immediately)
@@ -754,6 +995,8 @@ usage:
   alive history [--thread t] [--search s] [--all] [-n 30] [--json]
                                               conversation history (no args = list threads)
   alive telegram me | chats | chat <id|@name> | send <id|@name> <text> | ping
+  alive telegram whitelist [list | add <user-id> | remove <user-id>]
+                                              manage Telegram user access without restart
   alive thoughts [-n 20]                      the agent's private monologue
 `);
 }

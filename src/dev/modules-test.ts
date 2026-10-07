@@ -428,6 +428,16 @@ section("telegram module end-to-end against a fake Bot API");
 								text: "are you there?",
 							},
 						},
+						{
+							update_id: 101,
+							message: {
+								message_id: 6,
+								date: 1_700_000_001,
+								chat: { id: 43, type: "private", first_name: "Bob" },
+								from: { id: 8, is_bot: false, first_name: "Bob" },
+								text: "unknown user message",
+							},
+						},
 					],
 				});
 			}
@@ -454,7 +464,7 @@ section("telegram module end-to-end against a fake Bot API");
 					tokenEnv: "ALIVE_TEST_TELEGRAM_TOKEN_UNSET",
 					apiBase: "https://api.telegram.org",
 					allowedChatIds: [],
-					allowedUserIds: [],
+					allowedUserIds: ["7"],
 					pollTimeoutSec: 0,
 					allowedUpdates: ["message"],
 					parseMode: "",
@@ -493,6 +503,8 @@ section("telegram module end-to-end against a fake Bot API");
 		check("an update became a durable event", pending.length === 1, pending.map((e) => e.title));
 		check("the event is a user message on the right thread", pending[0]?.kind === "user_message" && pending[0]?.thread === "telegram:42", pending[0]);
 		check("the event expects a reply", pending[0]?.expectsReply === true);
+		const denial = calls.find((call) => call.method === "sendMessage" && String(call.params.text).includes("Ваш Telegram ID: 8"));
+		check("unknown Telegram users get a whitelist request and are not processed", pending.length === 1 && denial !== undefined, { pending: pending.length, denial });
 		check("the event carries structured payload", (pending[0]?.payload as { messageId?: string })?.messageId === "5", pending[0]?.payload);
 
 		const records = history.query({ thread: "telegram:42" });

@@ -14,6 +14,7 @@ export interface TelegramUser {
 	username?: string;
 	language_code?: string;
 	is_premium?: boolean;
+	can_manage_bots?: boolean;
 }
 
 export type TelegramChatType = "private" | "group" | "supergroup" | "channel";
@@ -156,6 +157,7 @@ export interface TelegramMessage {
 	is_topic_message?: boolean;
 	via_bot?: TelegramUser;
 	web_app_data?: { data: string; button_text: string };
+	managed_bot_created?: { bot: TelegramUser };
 }
 
 export interface TelegramCallbackQuery {
@@ -173,6 +175,7 @@ export interface TelegramUpdate {
 	channel_post?: TelegramMessage;
 	edited_channel_post?: TelegramMessage;
 	callback_query?: TelegramCallbackQuery;
+	managed_bot?: { user: TelegramUser; bot: TelegramUser };
 	my_chat_member?: {
 		chat: TelegramChat;
 		from: TelegramUser;

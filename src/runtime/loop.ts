@@ -1,10 +1,11 @@
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import type { LoadedConfig } from "../config.js";
+import { resolveMemoryDatabasePath, type LoadedConfig } from "../config.js";
 import type { Logger } from "../log.js";
 import { EventStore } from "../store/events.js";
 import { HistoryStore } from "../store/history.js";
 import { Journal } from "../store/journal.js";
 import { NoteStore } from "../store/notes.js";
+import { MemoryStore } from "../store/memory.js";
 import { Outbox, type OutgoingMessage } from "../store/outbox.js";
 import { PolicyStore } from "../store/policy.js";
 import { ReminderStore } from "../store/reminders.js";
@@ -58,6 +59,7 @@ export class AliveRuntime {
 	private store!: EventStore;
 	private reminders!: ReminderStore;
 	private notes!: NoteStore;
+	private memory!: MemoryStore;
 	private journal!: Journal;
 	private threads!: ThreadStore;
 	private outbox!: Outbox;
@@ -101,6 +103,17 @@ export class AliveRuntime {
 		this.store = EventStore.open(paths.stateDir);
 		this.reminders = new ReminderStore(paths.stateDir);
 		this.notes = new NoteStore(paths.stateDir);
+		const memoryConfig = this.config.config.memory;
+		this.memory = new MemoryStore({
+			databasePath: resolveMemoryDatabasePath(this.config),
+			embeddingProvider: memoryConfig.embeddingProvider,
+			embeddingBaseUrl: memoryConfig.embeddingBaseUrl,
+			embeddingApiKey: process.env[memoryConfig.embeddingApiKeyEnv] ?? "",
+			embeddingModel: memoryConfig.embeddingModel,
+			embeddingDimensions: memoryConfig.embeddingDimensions,
+			revisionThreshold: memoryConfig.revisionThreshold,
+		});
+		await this.memory.init();
 		this.journal = new Journal(paths.stateDir);
 		this.threads = new ThreadStore(paths.stateDir);
 		this.outbox = new Outbox(paths.stateDir);
@@ -113,6 +126,7 @@ export class AliveRuntime {
 			store: this.store,
 			reminders: this.reminders,
 			notes: this.notes,
+			memory: this.memory,
 			journal: this.journal,
 			threads: this.threads,
 			outbox: this.outbox,
@@ -275,6 +289,7 @@ export class AliveRuntime {
 		}
 		await this.loopPromise?.catch(() => undefined);
 		await this.host?.stop().catch(() => undefined);
+		await this.memory?.close().catch(() => undefined);
 		session?.dispose();
 		this.statusKind = "stopped";
 		this.writeState(true);

@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
 import {
@@ -11,7 +12,7 @@ import {
 	SettingsManager,
 	type AgentSession,
 } from "@earendil-works/pi-coding-agent";
-import type { LoadedConfig } from "../config.js";
+import { DEFAULT_CONTRACT, type LoadedConfig } from "../config.js";
 import { defaultModelSpec } from "../config.js";
 import type { Logger } from "../log.js";
 import { ensureDir } from "../util.js";
@@ -75,6 +76,7 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 	const systemPrompt = buildSystemPrompt({
 		name: cfg.name,
 		soul,
+		contract: readContract(paths.contractPath),
 		workspace: paths.workspaceDir,
 		stateDir: paths.stateDir,
 		runTimeoutMs: cfg.loop.runTimeoutMs,
@@ -86,13 +88,19 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 		retry: { enabled: true, maxRetries: 3 },
 	});
 
+	const toolboxExtensionPath = path.join(
+		path.dirname(fileURLToPath(import.meta.url)),
+		`toolbox-extension${fileURLToPath(import.meta.url).endsWith(".ts") ? ".ts" : ".js"}`,
+	);
+	process.env.ALIVE_TOOLS_DIR = path.join(paths.stateDir, "tools");
+	process.env.ALIVE_TOOL_ALLOWLIST = JSON.stringify(cfg.tools.allowlist);
 	const resourceLoader = new DefaultResourceLoader({
 		cwd: paths.workspaceDir,
 		agentDir: paths.agentDir,
 		settingsManager,
 		noThemes: true,
 		systemPrompt,
-		additionalExtensionPaths: cfg.extensions,
+		additionalExtensionPaths: [...cfg.extensions, toolboxExtensionPath],
 	});
 	await resourceLoader.reload();
 	for (const error of resourceLoader.getExtensions().errors) {
@@ -100,9 +108,6 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 	}
 
 	const builtinTools = cfg.tools.builtin.filter((tool) => (tool === "bash" ? cfg.tools.bash : true));
-	// `createAliveTools` already appends module-contributed tools; their names must
-	// also be in the allow-list or pi will not activate them.
-	const tools = [...builtinTools, ...ALIVE_TOOL_NAMES, ...toolDeps.moduleTools.map((tool) => tool.name)];
 
 	const sessionManager =
 		cfg.session === "continue" && !options.forceNewSession
@@ -115,12 +120,24 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 		model,
 		thinkingLevel: (resolvedThinking || undefined) as ThinkingLevel | undefined,
 		modelRuntime,
-		tools,
 		customTools: createAliveTools(toolDeps),
 		resourceLoader,
 		sessionManager,
 		settingsManager,
 	});
+
+	// Extensions may register tools, but only names selected below become active.
+	// The same configured allowlist is enforced by the toolbox extension for tools
+	// created or loaded after this initial activation.
+	const persistedTools = readPersistedToolNames(path.join(paths.stateDir, "tools", "registry.json"));
+	session.setActiveToolsByName(selectAllowedTools({
+		allowlist: cfg.tools.allowlist,
+		builtins: builtinTools,
+		alive: [...ALIVE_TOOL_NAMES],
+		modules: toolDeps.moduleTools.map((tool) => tool.name),
+		custom: persistedTools,
+		toolRegistryAvailable: true,
+	}));
 
 	if (modelFallbackMessage) log.warn("model fallback", { message: modelFallbackMessage });
 	log.info("agent session ready", {
@@ -134,10 +151,48 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 	return { session, modelRuntime, model: model ?? session.model ?? undefined, modelFallbackMessage };
 }
 
+export function selectAllowedTools(input: {
+	allowlist: string[];
+	builtins: string[];
+	alive: string[];
+	modules: string[];
+	custom: string[];
+	toolRegistryAvailable?: boolean;
+}): string[] {
+	const allowed = new Set(input.allowlist);
+	const candidates = [
+		...input.builtins,
+		...input.alive,
+		...input.modules,
+		...input.custom,
+		...(input.toolRegistryAvailable ? ["tool_registry"] : []),
+	];
+	return [...new Set(candidates.filter((name) => allowed.has(name)))];
+}
+
+function readPersistedToolNames(file: string): string[] {
+	try {
+		const records = JSON.parse(fs.readFileSync(file, "utf8")) as Array<{ name?: unknown }>;
+		return Array.isArray(records)
+			? records.map((record) => record?.name).filter((name): name is string => typeof name === "string")
+			: [];
+	} catch {
+		return [];
+	}
+}
+
 export function readSoul(file: string): string {
 	try {
 		return fs.readFileSync(file, "utf8");
 	} catch {
 		return "";
+	}
+}
+
+export function readContract(file: string): string {
+	try {
+		return fs.readFileSync(file, "utf8");
+	} catch {
+		return DEFAULT_CONTRACT;
 	}
 }

@@ -1,6 +1,6 @@
 /**
  * Integration test for the continuous-cycle primitives: the blocking `idle`
- * tool, the sleep offer/refusal/force path, memory-on-sleep, and the
+ * tool, the sleep offer/refusal path, explicit fact retention, and the
  * notification policy. No model is involved — it exercises the tools exactly as
  * the agent would call them.
  *
@@ -15,6 +15,7 @@ import { Logger } from "../log.js";
 import { EventStore } from "../store/events.js";
 import { Journal } from "../store/journal.js";
 import { NoteStore } from "../store/notes.js";
+import { FakeMemoryStore } from "./fake-memory.js";
 import { Outbox } from "../store/outbox.js";
 import { PolicyStore } from "../store/policy.js";
 import { ReminderStore } from "../store/reminders.js";
@@ -50,11 +51,13 @@ const config = loadConfig({
 		},
 	},
 });
+config.config.memory.sharedScopes = ["project:alive"];
 const log = new Logger({ console: false, level: "error", scope: "idle-test" });
 
 const store = EventStore.open(config.paths.stateDir);
 const reminders = new ReminderStore(config.paths.stateDir);
 const notes = new NoteStore(config.paths.stateDir);
+const memory = new FakeMemoryStore();
 const journal = new Journal(config.paths.stateDir);
 const threads = new ThreadStore(config.paths.stateDir);
 const outbox = new Outbox(config.paths.stateDir);
@@ -67,6 +70,7 @@ const deps: ToolDeps = {
 	store,
 	reminders,
 	notes,
+	memory,
 	journal,
 	threads,
 	outbox,
@@ -87,6 +91,7 @@ const tool = (name: string): ToolDefinition => {
 };
 const idle = tool("idle");
 const sleepTool = tool("sleep");
+const retainTool = tool("retain");
 const notifications = tool("notifications");
 type Result = { content: Array<{ text: string }>; terminate?: boolean };
 const call = (def: ToolDefinition, params: unknown, signal?: AbortSignal): Promise<Result> =>
@@ -114,6 +119,7 @@ function makeRun(index: number): RunHandle {
 		sleepOffered: false,
 		sleepRequested: false,
 		sleepForced: false,
+		retainedThisRun: false,
 	};
 }
 const event = (text: string, thread = "console") =>
@@ -159,8 +165,8 @@ section("idle offers sleep after a long wait");
 	check("offer mentions sleep", /SLEEP OFFER/i.test(offer.content[0].text), offer.content[0].text);
 	check("run remembers the offer", run.sleepOffered === true);
 	const forced = await call(idle, { reason: "still waiting" });
-	check("returning to idle without pinning forces sleep", forced.terminate === true && run.sleepRequested === true);
-	check("forced sleep is marked", run.sleepForced === true);
+	check("sleep offer does not reset context without explicit retention", forced.terminate !== true && forced.content[0].text.includes("Call retain"));
+	check("run remains awake until explicit sleep", run.sleepRequested === false && run.sleepForced === false);
 	store.endRun();
 }
 
@@ -179,9 +185,19 @@ section("sleep writes memory and requests a context reset");
 {
 	run = makeRun(5);
 	store.beginRun(run.id);
-	const result = await call(sleepTool, { summary: "user asked about the deploy; PR #12 is green", note_key: "focus", note_value: "PR #12" });
+	let blockedSleep = false;
+	try {
+		await call(sleepTool, { summary: "not yet", summary_md: "# Should not be written" });
+	} catch {
+		blockedSleep = true;
+	}
+	check("sleep is blocked until facts are retained", blockedSleep && !run.sleepRequested);
+	const retained = await call(retainTool, { facts: ["PR #12 is green"], scopes: ["project:alive"] });
+	const result = await call(sleepTool, { summary: "checked deploy; PR #12 is green", summary_md: "# Long-term memory\n\n## Current\n- Project alive uses PR #12 for deployment checks", note_key: "focus", note_value: "PR #12" });
+	check("retain stored selected context facts", retained.content[0].text.includes("added") && memory.retained.length === 1);
 	check("sleep terminates the run", result.terminate === true && run.sleepRequested === true);
 	check("sleep summary is in the journal", journal.tail(20).some((line) => line.includes("PR #12 is green")), journal.tail(3));
+	check("summary.md updated before sleep", fs.readFileSync(config.paths.summaryPath, "utf8").includes("deployment checks"));
 	check("note written before sleep", notes.get("focus") === "PR #12", notes.all());
 	check("run recorded a journal entry", run.journalEntries >= 1);
 	store.endRun();

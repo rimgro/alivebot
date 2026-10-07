@@ -197,7 +197,30 @@ Telegram **не даёт ботам серверную историю**: `getUpd
 - `alive history` и инструмент `history`/`telegram` работают и когда рантайм не
   запущен — они читают файлы.
 
-## 6. Ограничения
+## 6. Telegram-профили для нескольких агентов
+
+Можно вручную подключить отдельного бота к агенту: создайте его через `@BotFather`,
+задайте уникальную переменную окружения и выполните:
+
+```bash
+alive agents telegram researcher --token-env RESEARCHER_TELEGRAM_TOKEN
+alive agents restart researcher
+```
+
+**Bot API 9.6 Managed Bots интегрированы в Alive.** Включите управление ботами для
+master-бота в Mini App @BotFather, запустите master-бота Alive и выполните:
+
+```bash
+alive agents create researcher
+alive agents request-telegram researcher --chat <ваш Telegram user ID>
+```
+
+Подтвердите запрос в личном чате с master-ботом. Alive обработает `managed_bot_created`,
+получит секрет методом `getManagedBotToken` и сохранит его в конфиге агента (права
+`0600`). Запустите профиль отдельным процессом: `alive agents start researcher`.
+Токен не публикуется в сообщениях или логах.
+
+## 7. Ограничения
 
 - Нет webhook-режима: используется long polling. Один процесс на токен
   (`getUpdates` конфликтует сам с собой).
@@ -209,7 +232,7 @@ Telegram **не даёт ботам серверную историю**: `getUpd
   деградирует в ошибку доставки, которую увидит агент.
 - Правка/удаление чужих сообщений невозможна (ограничение Telegram).
 
-## 7. Тесты
+## 8. Тесты
 
 ```bash
 npm run test:modules

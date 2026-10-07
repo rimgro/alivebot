@@ -16,6 +16,7 @@ import { Logger } from "../log.js";
 import { EventStore } from "../store/events.js";
 import { Journal } from "../store/journal.js";
 import { NoteStore } from "../store/notes.js";
+import { FakeMemoryStore } from "./fake-memory.js";
 import { Outbox } from "../store/outbox.js";
 import { PolicyStore } from "../store/policy.js";
 import { ReminderStore } from "../store/reminders.js";
@@ -53,10 +54,12 @@ const config = loadConfig({
 		},
 	},
 });
+config.config.memory.sharedScopes = ["user:alice", "project:alive"];
 const log = new Logger({ console: false, level: "error", scope: "runner-test" });
 const store = EventStore.open(config.paths.stateDir);
 const reminders = new ReminderStore(config.paths.stateDir);
 const notes = new NoteStore(config.paths.stateDir);
+const memory = new FakeMemoryStore();
 const journal = new Journal(config.paths.stateDir);
 const threads = new ThreadStore(config.paths.stateDir);
 const outbox = new Outbox(config.paths.stateDir);
@@ -70,6 +73,7 @@ const deps: ToolDeps = {
 	store,
 	reminders,
 	notes,
+	memory,
 	journal,
 	threads,
 	outbox,
@@ -85,6 +89,7 @@ const deps: ToolDeps = {
 const tools = createAliveTools(deps);
 const idle = tools.find((t) => t.name === "idle")!;
 const sleepTool = tools.find((t) => t.name === "sleep")!;
+const retainTool = tools.find((t) => t.name === "retain")!;
 type Result = { content: Array<{ text: string }>; terminate?: boolean };
 const call = (def: ToolDefinition, params: unknown): Promise<Result> =>
 	def.execute("call", params as never, undefined, undefined, {} as never) as Promise<Result>;
@@ -186,7 +191,8 @@ section("idle returns an event, then sleep resets the context");
 		const idled = await call(idle, { reason: "waiting for alice" });
 		session.emit({ type: "message_end", message: { role: "assistant", content: idled.content, stopReason: "endTurn" } });
 		await session.turn();
-		await call(sleepTool, { summary: "answered alice (test)" });
+		await call(retainTool, { facts: ["Alice asked about the project"], scopes: ["user:alice", "project:alive"] });
+		await call(sleepTool, { summary: "answered alice (test)", summary_md: "# Test summary\n" });
 		session.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "sleeping" }], stopReason: "endTurn" } });
 	};
 	const record = await runner.execute();
@@ -222,7 +228,8 @@ section("policy-approved notifications are steered into a working run");
 		store.append({ kind: "user_message", source: "test", priority: "normal", title: "quiet", text: "quiet from bob", thread: "bob", expectsReply: true });
 		session.emit({ type: "turn_end", toolResults: [], context: {} });
 		await new Promise((resolve) => setTimeout(resolve, 30));
-		await call(sleepTool, { summary: "steered test done" });
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "steered test done", summary_md: "# Test summary\n" });
 		session.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "sleeping" }], stopReason: "endTurn" } });
 	};
 	const record = await runner.execute();

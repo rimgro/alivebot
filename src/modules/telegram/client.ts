@@ -50,6 +50,7 @@ export interface SendMessageParams {
 	disable_notification?: boolean;
 	reply_to_message_id?: number;
 	allow_sending_without_reply?: boolean;
+	reply_markup?: unknown;
 }
 
 /**
@@ -158,6 +159,14 @@ export class TelegramApi {
 
 	getMe(): Promise<TelegramUser> {
 		return this.call<TelegramUser>("getMe");
+	}
+
+	getManagedBotToken(userId: number): Promise<string> {
+		return this.call<string>("getManagedBotToken", { user_id: userId });
+	}
+
+	replaceManagedBotToken(userId: number): Promise<string> {
+		return this.call<string>("replaceManagedBotToken", { user_id: userId });
 	}
 
 	deleteWebhook(params: { drop_pending_updates?: boolean } = {}): Promise<boolean> {

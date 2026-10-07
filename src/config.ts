@@ -67,7 +67,7 @@ export interface TelegramConfig {
 	apiBase: string;
 	/** Chat allowlist (chat ids). Empty = every chat the bot can see. */
 	allowedChatIds: string[];
-	/** User allowlist (user ids). Empty = every user. */
+	/** Initial user allowlist (user ids); runtime access is restricted to configured or dynamically added IDs. */
 	allowedUserIds: string[];
 	/** Long-poll timeout for getUpdates, in seconds. */
 	pollTimeoutSec: number;
@@ -124,6 +124,35 @@ export interface ToolsConfig {
 	builtin: string[];
 	/** Allow bash in the agent workspace. */
 	bash: boolean;
+	/** Unified allowlist for built-in, Alive, module, and custom tools. */
+	allowlist: string[];
+}
+
+/** Per-action authority to manage other persistent agents. Targets are explicit ids; '*' grants all current and future ids. */
+export interface AgentManagementPermissions {
+	create: boolean;
+	edit: boolean;
+	start: boolean;
+	stop: boolean;
+	enable: boolean;
+	configurePermissions: boolean;
+	targets: string[];
+	/** Tool names this profile may grant to profiles it creates or configures. */
+	grantableTools: string[];
+}
+
+export interface MemoryConfig {
+	/** Optional shared SQLite database for managed agents. Path is relative to the config file unless absolute. */
+	databasePath: string;
+	/** Cross-agent scopes each runtime may explicitly read or retain. Agent-private scopes are always implicit. */
+	sharedScopes: string[];
+	embeddingProvider: "openai" | "cloudflare";
+	embeddingBaseUrl: string;
+	embeddingApiKeyEnv: string;
+	embeddingModel: string;
+	embeddingDimensions: number;
+	/** Cosine similarity above which an active fact is revised, not duplicated. */
+	revisionThreshold: number;
 }
 
 export interface AliveConfig {
@@ -132,11 +161,18 @@ export interface AliveConfig {
 	model: string;
 	thinkingLevel: string;
 	stateDir: string;
+	/** Shared filesystem registry for persistent managed agents; empty uses stateDir/agents. */
+	agentsDirectory: string;
+	/** Disabled managed profiles cannot be started, even by another authorized agent. */
+	enabled: boolean;
+	/** Fine-grained authority this profile may exercise over managed agents. */
+	agentManagement: AgentManagementPermissions;
 	workspace: string;
 	soulFile: string;
 	/** "continue" keeps one evolving transcript across restarts; "new" starts a fresh session each start. */
 	session: "continue" | "new";
 	tools: ToolsConfig;
+	memory: MemoryConfig;
 	loop: LoopConfig;
 	budget: BudgetConfig;
 	chat: ChatConfig;
@@ -166,6 +202,8 @@ export interface Paths {
 	configPath: string;
 	logFile: string;
 	thoughtsFile: string;
+	summaryPath: string;
+	contractPath: string;
 }
 
 export interface LoadedConfig {
@@ -173,17 +211,49 @@ export interface LoadedConfig {
 	paths: Paths;
 }
 
+export function resolveMemoryDatabasePath(config: LoadedConfig): string {
+	const configured = config.config.memory.databasePath.trim();
+	return configured ? path.resolve(config.paths.rootDir, configured) : path.join(config.paths.stateDir, "memory.sqlite");
+}
+
 export const DEFAULT_CONFIG: AliveConfig = {
 	name: "Alive",
 	model: "",
 	thinkingLevel: "",
 	stateDir: ".alive",
+	agentsDirectory: "",
+	enabled: true,
+	agentManagement: {
+		create: false,
+		edit: false,
+		start: false,
+		stop: false,
+		enable: false,
+		configurePermissions: false,
+		targets: [],
+		grantableTools: [],
+	},
 	workspace: ".alive/workspace",
 	soulFile: "SOUL.md",
 	session: "continue",
 	tools: {
 		builtin: ["read", "write", "edit", "bash", "grep", "find", "ls"],
 		bash: true,
+		allowlist: [
+			"read", "write", "edit", "bash", "grep", "find", "ls",
+			"send_message", "message_agent", "idle", "sleep", "notifications", "remind", "list_reminders", "cancel_reminder",
+			"note", "retain", "memory", "journal", "history", "close_thread", "status",
+		],
+	},
+	memory: {
+		databasePath: "",
+		sharedScopes: [],
+		embeddingProvider: "openai",
+		embeddingBaseUrl: "https://api.openai.com/v1",
+		embeddingApiKeyEnv: "ALIVE_EMBEDDING_API_KEY",
+		embeddingModel: "text-embedding-3-small",
+		embeddingDimensions: 1536,
+		revisionThreshold: 0.82,
 	},
 	loop: {
 		pollIntervalMs: 750,
@@ -267,6 +337,8 @@ export function resolvePaths(rootDir: string, config: AliveConfig): Paths {
 		configPath: path.join(rootDir, "alive.config.json"),
 		logFile: path.join(stateDir, "logs", "alive.jsonl"),
 		thoughtsFile: path.join(stateDir, "logs", "thoughts.jsonl"),
+		summaryPath: path.join(rootDir, "summary.md"),
+		contractPath: path.join(rootDir, "CONTRACT.md"),
 	};
 }
 
@@ -357,6 +429,14 @@ export function writeDefaultConfig(rootDir: string): { configPath: string; soulP
 	if (!fs.existsSync(soulPath)) {
 		fs.writeFileSync(soulPath, DEFAULT_SOUL, "utf8");
 	}
+	const summaryPath = path.join(rootDir, "summary.md");
+	if (!fs.existsSync(summaryPath)) {
+		fs.writeFileSync(summaryPath, DEFAULT_SUMMARY, "utf8");
+	}
+	const contractPath = path.join(rootDir, "CONTRACT.md");
+	if (!fs.existsSync(contractPath)) {
+		fs.writeFileSync(contractPath, DEFAULT_CONTRACT, "utf8");
+	}
 	return { configPath, soulPath };
 }
 
@@ -375,6 +455,30 @@ export function defaultModelSpec(piAgentDir: string): string {
 	const thinking = settings.defaultThinkingLevel;
 	return thinking ? `${provider}/${model}:${thinking}` : `${provider}/${model}`;
 }
+
+export const DEFAULT_CONTRACT = `# Agent contract
+
+## Role and responsibilities
+Describe who this agent is, what work it owns, and what outcomes it should produce.
+
+## Boundaries
+Describe what this agent should not do and when it should ask the user or administrator.
+
+## Working relationship
+At first contact, ask the user how they prefer to communicate with you (language, tone, level of detail, and when to send updates). Record only the preferences they explicitly share here or in your private memory.
+
+## Knowledge sharing
+Keep knowledge private unless an explicitly shared scope is configured. Never copy another agent's private memories into your own.
+`;
+
+export const DEFAULT_SUMMARY = `# Долгосрочная память
+
+Компактная сводка, которая загружается в контекст при каждом пробуждении. Обновляй её перед сном, оставляя здесь только важнейший устойчивый контекст; подробные факты сохраняй инструментом retain в локальную SQLite-базу.
+
+## О пользователе
+
+## Предпочтения и договорённости
+`;
 
 export const DEFAULT_SOUL = `# Who you are
 

@@ -27,6 +27,38 @@ const EMPTY: TelegramState = { offset: 0, polls: 0, updates: 0, inbound: 0, outb
  * Writes are atomic because the runtime may also be read by the CLI while the
  * agent runs.
  */
+export class TelegramAllowlistStore {
+	private readonly file: string;
+
+	constructor(dir: string) {
+		this.file = path.join(dir, "allowlist.json");
+	}
+
+	list(): string[] {
+		const value = readJson<{ userIds?: unknown }>(this.file, {});
+		return Array.isArray(value.userIds) ? [...new Set(value.userIds.map(String).filter(isTelegramId))] : [];
+	}
+
+	add(userId: string): boolean {
+		if (!isTelegramId(userId)) throw new Error(`invalid Telegram user id: ${userId}`);
+		const ids = this.list();
+		if (ids.includes(userId)) return false;
+		writeJsonAtomic(this.file, { userIds: [...ids, userId] });
+		return true;
+	}
+
+	remove(userId: string): boolean {
+		const ids = this.list();
+		if (!ids.includes(userId)) return false;
+		writeJsonAtomic(this.file, { userIds: ids.filter((id) => id !== userId) });
+		return true;
+	}
+}
+
+function isTelegramId(value: string): boolean {
+	return /^\d+$/.test(value);
+}
+
 export class TelegramStateStore {
 	private readonly file: string;
 

@@ -6,6 +6,10 @@ export interface OutgoingMessage {
 	runId: string;
 	thread: string;
 	text: string;
+	/** Explicit recipient for local managed-agent routing; thread remains a conversation id. */
+	recipientAgentId?: string;
+	senderId?: string;
+	senderName?: string;
 	ts: number;
 	replyTo?: string;
 	delivered?: boolean;
@@ -37,7 +41,7 @@ export class Outbox {
 	}
 
 	async send(
-		input: { runId: string; thread: string; text: string; replyTo?: string },
+		input: { runId: string; thread: string; text: string; replyTo?: string; recipientAgentId?: string; senderId?: string; senderName?: string },
 		deliver: (message: OutgoingMessage) => Promise<void>,
 	): Promise<OutgoingMessage> {
 		const message: OutgoingMessage = {
@@ -45,6 +49,9 @@ export class Outbox {
 			runId: input.runId,
 			thread: input.thread,
 			text: input.text,
+			recipientAgentId: input.recipientAgentId,
+			senderId: input.senderId,
+			senderName: input.senderName,
 			ts: Date.now(),
 			replyTo: input.replyTo,
 		};

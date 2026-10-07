@@ -2,7 +2,7 @@
 
 Долгоживущий агент, который «живёт» непрерывно, отдельно от чатов, на базе
 [`@earendil-works/pi-coding-agent`](https://github.com/earendil-works/pi) в headless-режиме
-(без TUI, полностью управляется своим рантаймом).
+(рантайм управляет жизненным циклом самостоятельно; для оператора есть отдельный локальный TUI).
 
 ```
 обычный агент:  user prompt -> tool use + react -> result + answer -> конец
@@ -108,6 +108,22 @@ npx alive policy reset
 показывать вовсе). Побеждает более специфичное правило; seed-правило
 `priority=interrupt → interrupt` можно удалить.
 
+## Доступ Telegram
+
+Бот обрабатывает сообщения только от Telegram user ID из вайтлиста. По умолчанию
+вайтлист пустой и все сообщения блокируются; незнакомому отправителю бот сообщает его
+ID и команду для запроса доступа. Добавлять ID можно прямо при работающем боте:
+
+```bash
+alive telegram whitelist list
+alive telegram whitelist add 123456789
+alive telegram whitelist remove 123456789
+```
+
+Команда изменяет динамический вайтлист в `.alive/modules/telegram/allowlist.json`,
+изменение вступает в силу сразу. ID из `modules.telegram.allowedUserIds` в конфиге
+тоже разрешены.
+
 ## CLI
 
 | Команда | Что делает |
@@ -127,6 +143,7 @@ npx alive policy reset
 | `alive modules [--json]` | какие event-модули загружены и включены |
 | `alive history [--thread t] [--search s] [--all] [-n 30] [--json]` | история диалогов всех модулей |
 | `alive telegram me\|chats\|chat\|send` | проверка Telegram-бота без запуска агента |
+| `alive telegram whitelist [list\|add <user-id>\|remove <user-id>]` | управление доступом к боту без перезапуска |
 | `alive thoughts [-n 20]` | приватный монолог агента |
 
 `say`/`emit`/`remind` пишут прямо в файлы состояния, поэтому работают и когда рантайм
@@ -157,13 +174,43 @@ Stdout фонового процесса пишется в `.alive/logs/stdout.l
 
 ## Сон и память
 
-- `sleepAfterMs` (по умолчанию 15m) — сколько рантайм ждёт, прежде чем предложить сон.
-- В `idle` после этого приходит SLEEP OFFER с инструкцией.
-- `sleep({ summary })` пишет summary в `journal/` и сбрасывает контекст
-  (`rebuildSession`), поэтому следующий run начинается с чистого транскрипта, но с
-  notes, journal и reminders.
-- `idle({ important: true })` — отказ от сна: ожидание продолжается бесконечно.
-- Всё, что не записано до сна, теряется осознанно.
+- `summary.md` в корне проекта — компактная сводка, загружаемая при каждом пробуждении.
+  Перед сном модель передаёт её обновлённое полное содержимое в `sleep.summary_md`.
+- Факты и их embeddings хранятся в локальном файле `.alive/memory.sqlite` через встроенный
+  в Node.js SQLite — отдельный PostgreSQL/pgvector сервер и npm-пакет не нужны. Поиск
+  считает cosine similarity в приложении, поэтому для очень больших коллекций он будет
+  медленнее специализированного vector index.
+- Для генерации embeddings нужен доступ к выбранному API. Для Cloudflare Workers AI
+  укажите `embeddingProvider: "cloudflare"`, URL аккаунта в `embeddingBaseUrl`, модель
+  и размерность. Запрос отправляется на `{embeddingBaseUrl}/{embeddingModel}` с bearer-
+  токеном Cloudflare и телом `{ "text": ["..."] }`. Пример для аккаунта Alive:
+
+  ```json
+  "memory": {
+    "embeddingProvider": "cloudflare",
+    "embeddingBaseUrl": "https://api.cloudflare.com/client/v4/accounts/538af39cbb2e80678fffef9a9435e4fa/ai/run",
+    "embeddingApiKeyEnv": "CLOUDFLARE_API_TOKEN",
+    "embeddingModel": "@cf/qwen/qwen3-embedding-0.6b",
+    "embeddingDimensions": 1024
+  }
+  ```
+
+  Токен Cloudflare с доступом Workers AI задайте в `.env` в корне проекта:
+  `CLOUDFLARE_API_TOKEN=ваш_токен`. Файл `.env` автоматически загружается при запуске
+  и уже исключён из Git; не записывайте секрет в `alive.config.json`.
+- Перед сном модель обязана вызвать `retain({ facts: [...], scopes: [...] })`.
+  Fact strings выбирает сама из своего контекста; scopes вроде `user:alex` и
+  `project:alive` задаются на вызов. Для разных групп scope можно вызвать `retain`
+  несколько раз. Затем `sleep({ summary, summary_md })` сохраняет journal note,
+  обновляет сводку и сбрасывает контекст. Runtime не уснёт без успешного `retain`
+  и `summary_md`.
+- Похожие актуальные факты выше порога сходства связываются как версии: прежние
+  записи помечаются superseded, но физически не удаляются. `memory({action:"history"})`
+  показывает цепочку, а `memory({action:"search", query:"..."})` ищет по embedding.
+- `sleepAfterMs` (по умолчанию 15m) — после этого `idle` предлагает сон. Сон больше
+  не форсируется автоматически: модель может сохранить память или продолжить ожидание
+  через `idle({ important: true })`.
+- Всё, что не записано до сброса, теряется осознанно.
 
 ## Модули и Events API
 
@@ -199,6 +246,13 @@ Stdout фонового процесса пишется в `.alive/logs/stdout.l
 `history`, а человеку — командой `alive history`. Именно она переживает `sleep`:
 транскрипт агента сбрасывается, история — нет.
 
+Агент также может расширять набор возможностей через `tool_registry`: создавать
+Node.js-инструменты с собственными именами, устанавливать npm-пакеты, просматривать
+и удалять инструменты. Новые инструменты регистрируются в сессии сразу, без
+перезапуска Alive, и сохраняются в `.alive/tools/` для следующих запусков. Код
+инструмента исполняется с правами процесса Alive — устанавливать следует только
+доверенные пакеты и проверять создаваемый код.
+
 Старые транспорты (`console`, `http`) никуда не делись: они работают как
 наблюдательные taps и включаются по-прежнему через `chat`.
 
@@ -222,7 +276,10 @@ logs/thoughts.jsonl     приватный монолог (текст и thinkin
 sessions/               jsonl-сессии pi (контекст живёт здесь, пока агент не уснул)
 workspace/              рабочая директория агента для read/write/bash
 agent/                  изолированный pi agent dir (расширения, skills)
+tools/                  созданные агентом Node.js-инструменты и npm-зависимости
 ```
+
+Факты и история revisions хранятся локально в `.alive/memory.sqlite`.
 
 ## Конфиг цикла
 
@@ -241,5 +298,102 @@ agent/                  изолированный pi agent dir (расшире�
 Старые ключи (`heartbeatMs`, `wakeTimeoutMs`, `maxTurnsPerWake`, `maxEventsPerWake`)
 мигрируют на новые при загрузке. Лимит на число шагов (`maxTurnsPerRun`) убран
 совсем: run длится столько, сколько нужно агенту.
+
+## Несколько изолированных агентов
+
+```bash
+alive agents create researcher --name Researcher
+alive agents list
+alive agents start researcher
+alive agents status researcher
+alive agents stop researcher
+alive agents edit researcher --name "Research editor" --role "Own literature reviews" --tools read,grep,send_message
+alive agents enable researcher
+alive agents disable researcher # also stops the process
+```
+
+Каждому агенту выделены собственные config, `SOUL.md`, workspace, state,
+история, журналы и процесс. Файлы находятся в `.alive/agents/<id>/`; меняйте
+модель, список инструментов и инструкции в индивидуальном `alive.config.json`,
+`SOUL.md` и `CONTRACT.md`. Общая база памяти использует приватные scopes по умолчанию.
+
+При `alive init` создаётся агент `admin`. Он может создавать и редактировать
+профили, настраивать инструменты и permissions, а также запускать, останавливать,
+включать и выключать агентов. Обычные агенты по умолчанию не получают этих прав.
+Их можно делегировать через `manage_agents` только вместе с явным списком targets;
+право создавать агентов, менять инструменты и выдавать permissions — отдельные
+capabilities. `grantableTools` ограничивает инструменты, которые агент может
+передавать дальше. Попытка выдать право/цель/инструмент за пределами собственных
+полномочий отклоняется. Изменение инструмента или permissions у работающего агента
+останавливает и перезапускает его, чтобы отозванные инструменты не остались активны.
+`disable` сначала сохраняет флаг выключения, затем останавливает процесс; пока профиль
+выключен, `start` и обычный `run --config` отказывают.
+
+Для живого терминального мессенджера используйте:
+
+```bash
+alive agents tui
+```
+
+TUI показывает состояние `enabled/running`, историю выбранного агента, обновляет новые
+сообщения автоматически и отправляет их напрямую во входящий ящик выбранного агента.
+Управление: `↑`/`↓` выбрать агента, `Enter` отправить, `Ctrl+J` новая строка,
+`PageUp`/`PageDown` прокрутить историю, `Alt+S` запустить, `Alt+X` остановить,
+`Esc` или `Ctrl+C` выйти. Запуск доступен только включённому агенту.
+
+Для machine-readable списка прав используйте `alive agents status <id>`.
+Оператор может выдать набор прав через JSON-файл:
+
+```json
+{
+  "create": false,
+  "edit": true,
+  "start": true,
+  "stop": false,
+  "enable": false,
+  "configurePermissions": false,
+  "targets": ["researcher"],
+  "grantableTools": ["read", "grep"]
+}
+```
+
+```bash
+alive agents permissions analyst --permissions-file permissions.json
+```
+
+### Telegram-профиль агента
+
+Создайте отдельного бота через `@BotFather`, затем настройте переменную окружения
+с его токеном и подключите ее:
+
+```bash
+export RESEARCHER_TELEGRAM_TOKEN="..."
+alive agents telegram researcher --token-env RESEARCHER_TELEGRAM_TOKEN
+alive agents restart researcher
+```
+
+**Managed Bots (Bot API 9.6):** master-бот может запросить у пользователя создание
+саб-бота через `KeyboardButtonRequestManagedBot`. Пользователь подтверждает создание
+в Telegram; master-бот получает `managed_bot_created` и извлекает токен методом
+`getManagedBotToken`. Для этого управление ботами должно быть включено для master-бота
+через Mini App @BotFather. Настроить создание и привязку к агенту:
+
+```bash
+# master-бот Alive должен быть настроен и запущен; создайте агента
+alive agents create researcher
+# укажите Telegram ID владельца (личный чат с master-ботом)
+alive agents request-telegram researcher --chat 123456789
+```
+
+Подтвердите создание в личке master-бота. Он автоматически сохранит токен в
+конфиге агента с правами файла `0600`; затем запустите агента:
+
+```bash
+alive agents start researcher
+```
+
+Токен не выводится в чат или логи. Управляемый бот запускается отдельным процессом
+и использует собственный workspace/state агента. Альтернатива для обычных ботов —
+`alive agents telegram <id> --token-env ENV`.
 
 Подробности архитектуры, компромиссов и roadmap — в [ARCHITECTURE.md](./ARCHITECTURE.md).

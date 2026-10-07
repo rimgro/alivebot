@@ -18,6 +18,14 @@
     ],
     "bash": true
   },
+  "memory": {
+    "embeddingProvider": "cloudflare",
+    "embeddingBaseUrl": "https://api.cloudflare.com/client/v4/accounts/538af39cbb2e80678fffef9a9435e4fa/ai/run",
+    "embeddingApiKeyEnv": "CLOUDFLARE_API_TOKEN",
+    "embeddingModel": "@cf/qwen/qwen3-embedding-0.6b",
+    "embeddingDimensions": 1024,
+    "revisionThreshold": 0.82
+  },
   "loop": {
     "pollIntervalMs": 750,
     "sleepAfterMs": 900000,

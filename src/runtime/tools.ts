@@ -1,17 +1,38 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { Type } from "typebox";
 import { defineTool, type AgentToolResult, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { LoadedConfig } from "../config.js";
+import { loadConfig, type AgentManagementPermissions, type LoadedConfig } from "../config.js";
+import {
+	assertCanDelegate,
+	canCreateAgents,
+	canManageAgent,
+	createAgent,
+	disableManagedAgent,
+	findManagedAgent,
+	getAgentEnabled,
+	listAgents,
+	NO_AGENT_MANAGEMENT,
+	enableManagedAgent,
+	startManagedAgent,
+	stopManagedAgent,
+	updateManagedAgentProfile,
+} from "../agents.js";
 import { EventStore, type AliveEvent, type EventKind, type EventPriority } from "../store/events.js";
 import type { Journal } from "../store/journal.js";
 import type { HistoryQuery, HistoryRecord, HistoryStore } from "../store/history.js";
 import type { NoteStore } from "../store/notes.js";
+import type { MemoryService } from "../store/memory.js";
 import type { Outbox, OutgoingMessage } from "../store/outbox.js";
 import type { NotifyMode, PolicyStore } from "../store/policy.js";
 import type { ReminderStore } from "../store/reminders.js";
 import type { ThreadStore } from "../store/threads.js";
 import type { Logger } from "../log.js";
+import { canReadMemoryFact, retainedMemoryScopes, searchableMemoryScopes } from "./memory-access.js";
+import { recordOperatorAgentReply, sendLocalAgentMessage } from "./agent-messaging.js";
+import { snapshotRuntime } from "./daemon.js";
 import { formatDuration, iso, parseTimeSpec, parseTimestamp, sleep, truncate } from "../util.js";
-import { renderIdleEvents, renderSleepForced, renderSleepOffer } from "./prompt.js";
+import { renderIdleEvents, renderSleepOffer } from "./prompt.js"
 
 /**
  * Mutable per-run bookkeeping shared between the run runner and the tools.
@@ -49,6 +70,7 @@ export interface RunHandle {
 	sleepOfferedAfterMs?: number;
 	sleepRequested: boolean;
 	sleepForced: boolean;
+	retainedThisRun: boolean;
 	sleepSummary?: string;
 	lastStopReason?: string;
 	lastError?: string;
@@ -59,6 +81,7 @@ export interface ToolDeps {
 	store: EventStore;
 	reminders: ReminderStore;
 	notes: NoteStore;
+	memory: MemoryService;
 	journal: Journal;
 	threads: ThreadStore;
 	outbox: Outbox;
@@ -82,10 +105,15 @@ export const ALIVE_TOOL_NAMES = [
 	"list_reminders",
 	"cancel_reminder",
 	"note",
+	"retain",
+	"memory",
 	"journal",
 	"history",
 	"close_thread",
 	"status",
+	"create_agent",
+	"manage_agents",
+	"message_agent",
 ] as const;
 
 type ToolResult = AgentToolResult<Record<string, unknown>>;
@@ -96,6 +124,148 @@ function ok(text: string, details: Record<string, unknown> = {}, terminate = fal
 
 export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 	const log = deps.log.child("tools");
+
+	const createManagedAgent = defineTool({
+		name: "create_agent",
+		label: "Create persistent agent",
+		description: "Create a persistent managed agent profile with its own state, workspace, role contract, and explicitly selected least-privilege tools. This is agent provisioning, not one-off task dispatch. Only administrator profiles granted this tool may use it.",
+		parameters: Type.Object({
+			id: Type.String({ description: "Unique agent id: lowercase letters, digits, underscore or hyphen." }),
+			name: Type.String({ description: "Human-readable agent name." }),
+			role: Type.String({ description: "The role and work this persistent agent owns." }),
+			contract: Type.String({ description: "Its responsibilities, boundaries, collaboration expectations, and communication onboarding instructions." }),
+			tools: Type.Array(Type.String(), { description: "Exact tool names this agent may use; privileged tools are never inherited." }),
+			permissions: Type.Optional(Type.Unknown({ description: "Fine-grained permissions: create/edit/start/stop/enable/configurePermissions booleans, targets allowlist, and grantableTools allowlist." })),
+		}),
+		execute: async (_toolCallId, params): Promise<ToolResult> => {
+			requireRun(deps, "create_agent");
+			if (!canCreateAgents(deps.config)) throw new Error("agent creation is not authorized for this profile");
+			const permissions = (params.permissions ?? NO_AGENT_MANAGEMENT) as AgentManagementPermissions;
+			assertCanDelegate(deps.config, params.tools, permissions);
+			const agent = createAgent(deps.config, params.id, params.name, {
+				role: params.role,
+				contract: params.contract,
+				toolAllowlist: params.tools,
+				management: permissions,
+			});
+			return ok(`Created persistent agent ${agent.id}. Start it with: alive agents start ${agent.id}`, {
+				agentId: agent.id,
+				configPath: agent.configPath,
+				toolAllowlist: params.tools,
+			});
+		},
+	});
+
+	const manageAgents = defineTool({
+		name: "manage_agents",
+		label: "Manage persistent agents",
+		description: "Manage persistent agent profiles and lifecycles. Each action requires its matching agentManagement capability and the target must be in your target allowlist. Permission and tool grants cannot exceed your own authority.",
+		parameters: Type.Object({
+			action: Type.Union([Type.Literal("create"), Type.Literal("edit"), Type.Literal("start"), Type.Literal("stop"), Type.Literal("enable"), Type.Literal("disable"), Type.Literal("permissions"), Type.Literal("status")]),
+			id: Type.String(),
+			name: Type.Optional(Type.String()),
+			role: Type.Optional(Type.String()),
+			contract: Type.Optional(Type.String()),
+			tools: Type.Optional(Type.Array(Type.String())),
+			permissions: Type.Optional(Type.Unknown({ description: "Fine-grained permissions: action booleans, targets list, and grantableTools list." })),
+		}),
+		execute: async (_toolCallId, params): Promise<ToolResult> => {
+			requireRun(deps, "manage_agents");
+			const actorId = managedAgentIdForConfig(deps.config);
+			if (!actorId) throw new Error("only a managed agent profile may manage agents through this tool");
+			const action = params.action;
+			const capability = action === "create" ? "create" : action === "edit" ? "edit" :
+				action === "start" ? "start" : action === "stop" ? "stop" :
+				action === "enable" || action === "disable" ? "enable" :
+				action === "permissions" ? "configurePermissions" : undefined;
+			if (action === "create") {
+				if (!canCreateAgents(deps.config)) throw new Error("agent creation is not authorized for this profile");
+				if (!params.name?.trim() || !params.role?.trim() || !params.contract?.trim() || !params.tools) {
+					throw new Error("create requires name, role, contract, and tools");
+				}
+				const permissions = (params.permissions ?? NO_AGENT_MANAGEMENT) as AgentManagementPermissions;
+				assertCanDelegate(deps.config, params.tools, permissions);
+				const created = createAgent(deps.config, params.id, params.name, {
+					role: params.role, contract: params.contract, toolAllowlist: params.tools, management: permissions,
+				});
+				return ok(`Created persistent agent ${created.id}; it is ${getAgentEnabled(created) ? "enabled" : "disabled"} and stopped.`, { agentId: created.id, configPath: created.configPath });
+			}
+			const target = findManagedAgent(deps.config, params.id);
+			if (target.id === actorId) throw new Error("an agent cannot manage its own profile or lifecycle");
+			if (capability && !canManageAgent(deps.config, capability, target.id)) throw new Error(`not authorized to ${action} agent ${target.id}`);
+			if (action === "edit" && (params.permissions !== undefined || params.tools !== undefined) && !canManageAgent(deps.config, "configurePermissions", target.id)) {
+				throw new Error(`not authorized to configure tools or permissions for agent ${target.id}`);
+			}
+			if (action === "status") {
+				if (!deps.config.config.agentManagement.targets.includes("*") && !deps.config.config.agentManagement.targets.includes(target.id)) throw new Error(`agent ${target.id} is outside your target allowlist`);
+				const state = snapshotRuntime(loadManagedConfig(deps.config, target).paths.stateDir);
+				const enabled = getAgentEnabled(target);
+				const running = state?.alive ?? false;
+				return ok(`${target.id}: ${enabled ? "enabled" : "disabled"}, ${running ? `running pid=${state?.pid}` : "stopped"}`, { agentId: target.id, enabled, running, pid: running ? state?.pid : undefined });
+			}
+			if (action === "start") {
+				const started = await startManagedAgent(deps.config, target.id);
+				return ok(`Started ${target.id} (pid ${started.pid}).`, { agentId: target.id, pid: started.pid });
+			}
+			if (action === "stop") {
+				await stopManagedAgent(deps.config, target.id);
+				return ok(`Stopped ${target.id}.`, { agentId: target.id, enabled: getAgentEnabled(target) });
+			}
+			if (action === "disable") {
+				await disableManagedAgent(deps.config, target.id);
+				return ok(`Disabled and stopped ${target.id}. It cannot be restarted until enabled.`, { agentId: target.id, enabled: false });
+			}
+			if (action === "enable") {
+				await enableManagedAgent(deps.config, target.id);
+				return ok(`Enabled ${target.id}; it remains stopped until started.`, { agentId: target.id, enabled: true });
+			}
+			if (action === "edit" || action === "permissions") {
+				const updates: { name?: string; role?: string; contract?: string; toolAllowlist?: string[]; management?: AgentManagementPermissions } = {};
+				if (action === "edit") {
+					if (params.name !== undefined) updates.name = params.name;
+					if (params.role !== undefined) updates.role = params.role;
+					if (params.contract !== undefined) updates.contract = params.contract;
+					if (params.tools !== undefined) updates.toolAllowlist = params.tools;
+				}
+				if (params.permissions !== undefined) updates.management = params.permissions as AgentManagementPermissions;
+				if (updates.toolAllowlist === undefined && updates.management === undefined && updates.name === undefined && updates.role === undefined && updates.contract === undefined) throw new Error(`${action} requires at least one field to update`);
+				const current = loadManagedConfig(deps.config, target);
+				if (updates.management || updates.toolAllowlist) {
+					assertCanDelegate(deps.config, updates.toolAllowlist ?? current.config.tools.allowlist, updates.management ?? current.config.agentManagement);
+				}
+				await updateManagedAgentProfile(deps.config, target.id, updates);
+				return ok(`Updated ${target.id}; security-sensitive changes are active.`, { agentId: target.id, updated: Object.keys(updates) });
+			}
+			throw new Error(`unsupported agent action ${action}`);
+		},
+	});
+
+	const messageAgent = defineTool({
+		name: "message_agent",
+		label: "Message another agent",
+		description: "Send a durable local message to a managed agent. The recipient is the explicit agent id; thread ids only group conversations. Messages are recorded in the sender outbox and both agents' local history before the recipient inbox is woken on its next poll.",
+		parameters: Type.Object({
+			to: Type.String({ description: "Managed recipient agent id (not a thread id)." }),
+			text: Type.String({ description: "Message body." }),
+		}),
+		execute: async (_toolCallId, params): Promise<ToolResult> => {
+			const run = requireRun(deps, "message_agent");
+			const message = await sendLocalAgentMessage({
+				config: deps.config,
+				outbox: deps.outbox,
+				to: params.to,
+				text: params.text,
+				runId: run.id,
+			});
+			run.outbound.push({ thread: message.thread, text: message.text, delivered: true });
+			deps.threads.recordOutbound(message.thread, message.ts);
+			return ok(`Message ${message.id} delivered to managed agent ${message.recipientAgentId}.`, {
+				messageId: message.id,
+				recipientAgentId: message.recipientAgentId,
+				thread: message.thread,
+			});
+		},
+	});
 
 	const sendMessage = defineTool({
 		name: "send_message",
@@ -118,6 +288,12 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 				{ runId: run.id, thread, text: params.text, replyTo: params.reply_to },
 				deps.deliver,
 			);
+			recordOperatorAgentReply(deps.history, deps.config, thread, {
+				id: message.id,
+				text: params.text,
+				ts: message.ts,
+				replyTo: params.reply_to,
+			});
 			run.outbound.push({ thread, text: params.text, delivered: message.delivered ?? false });
 			deps.threads.recordOutbound(thread, message.ts);
 			log.info("outbound message", { thread, chars: params.text.length, messageId: message.id });
@@ -165,11 +341,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 			// Returning to idle after a sleep offer without pinning the wait is
 			// consent to sleep.
 			if (run.sleepOffered && !pinned) {
-				deps.journal.append("[sleep] forced after a long idle without a summary; context was reset");
-				run.journalEntries += 1;
-				run.sleepRequested = true;
-				run.sleepForced = true;
-				return ok(renderSleepForced(run.sleepOfferedAfterMs ?? 0), { sleeping: true, forced: true }, true);
+				return ok("Sleep is not automatic. Call retain with selected facts (or an empty list), then sleep with the updated summary_md. Use important=true to keep waiting.", { sleepOffered: true, needsExplicitSleep: true });
 			}
 
 			const startedAt = Date.now();
@@ -237,19 +409,26 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		name: "sleep",
 		label: "Sleep (reset context)",
 		description:
-			"End this run and reset your conversation context. Your summary is written to the journal first, so write down " +
-			"everything your future self needs. You will wake again when a message, reminder or notification arrives.",
+			"Reset your context only after calling retain with selected facts and passing the complete updated summary.md as summary_md. " +
+			"The runtime enforces this order; the optional summary is an episodic journal note.",
 		executionMode: "sequential",
 		parameters: Type.Object({
 			summary: Type.String({
-				description: "What your future self must know: decisions, open threads, promises, facts. Saved to the journal.",
+				description: "Short episodic sleep note for the journal (decisions, open threads, promises).",
+			}),
+			summary_md: Type.String({
+				description: "Complete replacement content for summary.md: concise, stable, current long-term memory.",
 			}),
 			note_key: Type.Optional(Type.String({ description: "Optional short note key to set before sleeping." })),
 			note_value: Type.Optional(Type.String({ description: "Value for note_key." })),
 		}),
 		execute: async (_toolCallId, params): Promise<ToolResult> => {
 			const run = requireRun(deps, "sleep");
+			if (!run.retainedThisRun) throw new Error("Call retain (with selected facts, or an empty list) before sleeping");
 			const summary = params.summary.trim();
+			const summaryMd = params.summary_md.trim();
+			if (!summaryMd) throw new Error("summary_md cannot be empty; pass the complete updated summary.md content");
+			writeTextAtomic(deps.config.paths.summaryPath, `${summaryMd}\n`);
 			if (summary) {
 				deps.journal.append(`[sleep] ${summary}`);
 				run.journalEntries += 1;
@@ -262,8 +441,8 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 			run.sleepRequested = true;
 			run.sleepForced = false;
 			run.sleepSummary = summary;
-			log.info("agent chose to sleep", { chars: summary.length });
-			return ok("Sleeping now. Context will be reset; journal, notes and reminders survive.", { sleeping: true }, true);
+			log.info("agent chose to sleep", { chars: summary.length, summaryChars: summaryMd.length });
+			return ok("Sleeping now. Facts retained and summary.md updated before context reset.", { sleeping: true }, true);
 		},
 	});
 
@@ -437,6 +616,47 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		},
 	});
 
+	const retain = defineTool({
+		name: "retain",
+		label: "Retain facts",
+		description: "Before sleep, retain durable facts selected from your own context. Facts are private to you by default. To share, name a scope explicitly configured in memory.sharedScopes; unapproved scopes are rejected. Related current facts are superseded into a dated revision chain; nothing is physically deleted. Call even with an empty facts list when there is nothing worth retaining.",
+		parameters: Type.Object({
+			facts: Type.Array(Type.String(), { description: "Durable facts; formulate updates as the current complete truth." }),
+			scopes: Type.Array(Type.String(), { description: "Optional explicitly allowlisted shared scopes; your private agent scope is always added automatically." }),
+		}),
+		execute: async (_toolCallId, params): Promise<ToolResult> => {
+			const run = requireRun(deps, "retain");
+			const scopes = retainedMemoryScopes(deps.config, params.scopes);
+			const results = await deps.memory.retain(params.facts, scopes);
+			run.retainedThisRun = true;
+			const lines = results.map(({ status, fact }) => `- ${status}: [${fact.id}] ${fact.text} (scopes: ${fact.scopes.join(", ")})`);
+			return ok(lines.length ? lines.join("\n") : "No facts stored. You may now update summary.md and sleep.", { results });
+		},
+	});
+
+	const memory = defineTool({
+		name: "memory",
+		label: "Search memory",
+		description: "Search your private facts by default or inspect a fact's immutable revision history. Cross-agent knowledge is visible only when you explicitly request a scope configured in memory.sharedScopes. Search before relying on long-term memory.",
+		parameters: Type.Object({
+			action: Type.Union([Type.Literal("search"), Type.Literal("history")]),
+			query: Type.Optional(Type.String()),
+			id: Type.Optional(Type.String()),
+			scopes: Type.Optional(Type.Array(Type.String(), { description: "Optional shared scopes to search; each must be listed in memory.sharedScopes. Omit to search only your private facts." })),
+			include_history: Type.Optional(Type.Boolean()),
+			limit: Type.Optional(Type.Number()),
+		}),
+		execute: async (_toolCallId, params): Promise<ToolResult> => {
+			const requestedScopes = params.scopes ?? [];
+			const visibleScopes = searchableMemoryScopes(deps.config, requestedScopes);
+			const facts = params.action === "history"
+				? (await deps.memory.history(required(params.id, "id"))).filter((fact) => canReadMemoryFact(deps.config, fact.scopes, requestedScopes))
+				: await deps.memory.search(required(params.query, "query"), params.limit ?? 6, visibleScopes, params.include_history ?? false);
+			const lines = facts.map((fact) => `- ${fact.active ? "CURRENT" : `superseded at ${fact.validTo ?? "unknown"}`} [${fact.id}] (${fact.scopes.join(", ")}; ${fact.validFrom}) ${fact.text}${fact.supersedes.length ? ` <- ${fact.supersedes.join(",")}` : ""}`);
+			return ok(lines.length ? lines.join("\n") : "No matching memories.", { facts });
+		},
+	});
+
 	const journal = defineTool({
 		name: "journal",
 		label: "Journal",
@@ -597,13 +817,39 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		remind,
 		listReminders,
 		cancelReminder,
+		createManagedAgent,
+		manageAgents,
+		messageAgent,
 		note,
+		retain,
+		memory,
 		journal,
 		history,
 		closeThread,
 		status,
 		...deps.moduleTools,
 	] as ToolDefinition[];
+}
+
+function managedAgentIdForConfig(config: LoadedConfig): string | undefined {
+	const configPath = path.resolve(config.paths.configPath);
+	return listAgents(config).find((agent) => path.resolve(agent.configPath) === configPath)?.id;
+}
+
+function loadManagedConfig(base: LoadedConfig, agent: { configPath: string }): LoadedConfig {
+	return loadConfig({ cwd: base.paths.rootDir, configPath: agent.configPath });
+}
+
+function required(value: string | undefined, name: string): string {
+	if (!value?.trim()) throw new Error(`\`${name}\` is required`);
+	return value;
+}
+
+function writeTextAtomic(file: string, value: string): void {
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+	fs.writeFileSync(temporary, value, "utf8");
+	fs.renameSync(temporary, file);
 }
 
 function requireRun(deps: ToolDeps, tool: string): RunHandle {

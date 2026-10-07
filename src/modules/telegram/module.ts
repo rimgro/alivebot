@@ -2,11 +2,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TelegramConfig } from "../../config.js";
+import { attachManagedBotToken, clearManagedBotRequest, findManagedBotRequest, validateAgentId, type ManagedAgent } from "../../agents.js";
 import type { AliveModule, ModuleContext } from "../../events/api.js";
 import type { OutgoingMessage } from "../../store/outbox.js";
 import { sleep } from "../../util.js";
 import { TelegramApi, TelegramApiError, type SendMessageParams } from "./client.js";
-import { TelegramStateStore, type TelegramState } from "./state.js";
+import { TelegramAllowlistStore, TelegramStateStore, type TelegramState } from "./state.js";
 import { chatLabel, isParseModeError, splitMessage } from "./text.js";
 import { createTelegramTools, type TelegramToolHost } from "./tools.js";
 import { formatThread, parseThread } from "./threads.js";
@@ -44,6 +45,7 @@ export class TelegramModule implements AliveModule {
 	private ctx?: ModuleContext;
 	private api?: TelegramApi;
 	private state?: TelegramStateStore;
+	private allowlist?: TelegramAllowlistStore;
 	private readonly abort = new AbortController();
 	private pollPromise?: Promise<void>;
 	private stopped = false;
@@ -93,7 +95,9 @@ export class TelegramModule implements AliveModule {
 			return;
 		}
 
-		this.state = new TelegramStateStore(ctx.moduleDir());
+		const moduleDir = ctx.moduleDir();
+		this.state = new TelegramStateStore(moduleDir);
+		this.allowlist = new TelegramAllowlistStore(moduleDir);
 		this.api = new TelegramApi({ token, apiBase: this.config.apiBase });
 
 		// Polling must never depend on the identity handshake: a single network blip
@@ -182,8 +186,8 @@ export class TelegramModule implements AliveModule {
 				});
 				let highest = current.offset - 1;
 				for (const update of updates) {
+					await this.handleUpdate(update);
 					highest = Math.max(highest, update.update_id);
-					this.handleUpdate(update);
 				}
 				state.patch({
 					offset: highest + 1,
@@ -247,7 +251,46 @@ export class TelegramModule implements AliveModule {
 		}
 	}
 
-	private handleUpdate(update: TelegramUpdate): void {
+	private async handleManagedBotCreated(update: TelegramUpdate): Promise<void> {
+		const ctx = this.ctx;
+		const api = this.api;
+		const messageUpdate = update.message;
+		const created = messageUpdate?.managed_bot_created?.bot;
+		if (!ctx || !api || !messageUpdate || !created || !created.is_bot) return;
+		// Managed-bot creation must be approved by the same private user who
+		// initiated the local request. Never accept a bot shared in a group.
+		if (messageUpdate.chat.type !== "private" || !messageUpdate.from || messageUpdate.chat.id !== messageUpdate.from.id) return;
+		const requestRoot = ctx.moduleDir();
+		const request = findManagedBotRequest(requestRoot, messageUpdate.chat.id);
+		if (!request) return;
+		if (Date.now() - request.requestedAt > 24 * 60 * 60 * 1000) {
+			clearManagedBotRequest(requestRoot, request);
+			await api.sendMessage({ chat_id: messageUpdate.chat.id, text: "That agent's bot request expired. Start a new request from the alive CLI." });
+			return;
+		}
+		const agentId = validateAgentId(request.agentId);
+		const agentDirectory = path.join(ctx.paths.stateDir, "agents", agentId);
+		const agent: ManagedAgent = {
+			id: agentId,
+			directory: agentDirectory,
+			configPath: path.join(agentDirectory, "alive.config.json"),
+		};
+		if (!fs.existsSync(agent.configPath)) throw new Error(`requested agent no longer exists: ${agentId}`);
+		const token = await api.getManagedBotToken(created.id);
+		attachManagedBotToken(agent, token, { id: created.id, username: created.username });
+		clearManagedBotRequest(requestRoot, request);
+		await api.sendMessage({
+			chat_id: messageUpdate.chat.id,
+			text: `Managed bot @${created.username ?? created.id} is now attached to agent “${agentId}”. Start it with: alive agents start ${agentId}`,
+		});
+		ctx.log.info("managed Telegram bot attached to agent", { agentId, botId: created.id, username: created.username });
+	}
+
+	private async handleUpdate(update: TelegramUpdate): Promise<void> {
+		if (update.message?.managed_bot_created) {
+			await this.handleManagedBotCreated(update);
+			return;
+		}
 		const ctx = this.ctx;
 		const api = this.api;
 		const state = this.state;
@@ -262,7 +305,17 @@ export class TelegramModule implements AliveModule {
 			void api.answerCallbackQuery({ callback_query_id: update.callback_query.id }).catch(() => undefined);
 		}
 		if (!this.allowed(inbound)) {
-			ctx.log.debug("telegram update ignored by allowlist", { chatId: inbound.chatId, author: inbound.author?.id });
+			ctx.log.debug("telegram update denied by allowlist", { chatId: inbound.chatId, author: inbound.author?.id });
+			if (inbound.author?.id) {
+				const text =
+					`⛔ Доступ не разрешён. Ваш Telegram ID: ${inbound.author.id}.\n` +
+					`Чтобы добавить себя в вайтлист, попросите владельца выполнить в консоли: alive telegram whitelist add ${inbound.author.id}`;
+				void api.sendMessage({
+					chat_id: inbound.chatId,
+					text,
+					message_thread_id: inbound.topicId !== undefined ? Number(inbound.topicId) : undefined,
+				}).catch((err) => ctx.log.warn("telegram deny message failed", { chatId: inbound.chatId, error: message(err) }));
+			}
 			return;
 		}
 
@@ -355,12 +408,12 @@ export class TelegramModule implements AliveModule {
 			const allowed = this.config.allowedChatIds.map(String);
 			if (!allowed.includes(inbound.chatId)) return false;
 		}
-		if (this.config.allowedUserIds.length > 0) {
-			if (!inbound.author) return false;
-			const allowed = this.config.allowedUserIds.map(String);
-			if (!allowed.includes(inbound.author.id)) return false;
-		}
-		return true;
+		if (!inbound.author) return false;
+		const allowed = new Set([
+			...this.config.allowedUserIds.map(String),
+			...(this.allowlist?.list() ?? []),
+		]);
+		return allowed.has(inbound.author.id);
 	}
 
 	// ------------------------------------------------------------------

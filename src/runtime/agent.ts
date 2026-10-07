@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { LoadedConfig } from "../config.js";
 import type { Logger } from "../log.js";
@@ -9,6 +10,7 @@ import type { PolicyStore } from "../store/policy.js";
 import type { RunLog, RunRecord, RunStopReason } from "../store/runs.js";
 import type { ThreadStore } from "../store/threads.js";
 import { renderAwakePrompt, renderInterruptPrompt, renderNudgePrompt } from "./prompt.js";
+import { privateMemoryScope } from "./memory-access.js";
 import type { RunHandle, ToolDeps } from "./tools.js";
 
 export interface AgentRunnerDeps {
@@ -78,7 +80,7 @@ export class AgentRunner {
 
 	/**
 	 * Replace the session with a fresh one. Called after a sleep: the transcript
-	 * is wiped, the durable memory (journal/notes/reminders) is not.
+	 * is wiped, while SQLite facts, summary.md, journal/notes/reminders survive.
 	 */
 	async rebuildSession(): Promise<void> {
 		try {
@@ -145,6 +147,7 @@ export class AgentRunner {
 			sleepOffered: false,
 			sleepRequested: false,
 			sleepForced: false,
+			retainedThisRun: false,
 		};
 		this.deps.setRun(run);
 		store.beginRun(run.id);
@@ -167,13 +170,12 @@ export class AgentRunner {
 
 		while (true) {
 			if (!first) this.trackEvents(run, this.claimDeliverable());
-			const prompt = first
-				? this.renderAwake(run, options.redeliveryRange)
-				: this.renderNudge(run, options.redeliveryRange);
-			first = false;
-			run.promptChars += prompt.length;
-
 			try {
+				const prompt = first
+					? await this.renderAwake(run, options.redeliveryRange)
+					: await this.renderNudge(run, options.redeliveryRange);
+				first = false;
+				run.promptChars += prompt.length;
 				await this.session.prompt(prompt, { expandPromptTemplates: false, source: "extension" });
 			} catch (err) {
 				error = err instanceof Error ? err.message : String(err);
@@ -323,20 +325,24 @@ export class AgentRunner {
 		}
 	}
 
-	private renderAwake(run: RunHandle, redeliveryRange: { fromSeq: number; toSeq: number } | undefined): string {
-		return renderAwakePrompt(this.promptInput(run, redeliveryRange));
+	private async renderAwake(run: RunHandle, redeliveryRange: { fromSeq: number; toSeq: number } | undefined): Promise<string> {
+		return renderAwakePrompt(await this.promptInput(run, redeliveryRange));
 	}
 
-	private renderNudge(run: RunHandle, redeliveryRange: { fromSeq: number; toSeq: number } | undefined): string {
-		return renderNudgePrompt({ ...this.promptInput(run, redeliveryRange), nudge: run.nudges });
+	private async renderNudge(run: RunHandle, redeliveryRange: { fromSeq: number; toSeq: number } | undefined): Promise<string> {
+		return renderNudgePrompt({ ...(await this.promptInput(run, redeliveryRange)), nudge: run.nudges });
 	}
 
-	private promptInput(run: RunHandle, redeliveryRange: { fromSeq: number; toSeq: number } | undefined) {
+	private async promptInput(run: RunHandle, redeliveryRange: { fromSeq: number; toSeq: number } | undefined) {
 		const { config, store, runs } = this.deps;
 		const inbound = new Set(run.events.filter((e) => e.thread).map((e) => e.thread as string));
 		const carried = this.deps.threads
 			.unsettled(config.config.loop.maxNudges)
 			.filter((thread) => !inbound.has(thread.thread));
+		const memoryQuery = run.events.map((event) => `${event.title} ${event.text}`).join(" ");
+		const relevantMemories = memoryQuery.trim()
+			? await this.deps.toolDeps.memory.search(memoryQuery, 6, [privateMemoryScope(this.deps.config)])
+			: [];
 		return {
 			runIndex: run.index,
 			runId: run.id,
@@ -350,6 +356,8 @@ export class AgentRunner {
 			notes: this.deps.toolDeps.notes.all(),
 			reminders: this.deps.toolDeps.reminders.list(),
 			journalTail: this.deps.toolDeps.journal.tail(40),
+			summary: readSummary(config.paths.summaryPath),
+			relevantMemories,
 			recentRuns: runs.list(3),
 			policy: this.deps.policy.load(),
 			costTodayUsd: runs.usageToday().cost,
@@ -515,6 +523,10 @@ function toolResultText(result: unknown): string {
 		)
 		.filter(Boolean)
 		.join("\n");
+}
+
+export function readSummary(file: string): string {
+	try { return fs.readFileSync(file, "utf8").trim(); } catch { return ""; }
 }
 
 export function describeRunRecord(record: RunRecord): string {

@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 import { main } from "./cli.js";
+import * as fs from "node:fs";
+
+// Load project-local secrets for foreground and daemon launches. Existing
+// process environment variables take precedence over values in .env.
+if (fs.existsSync(".env")) process.loadEnvFile(".env");
 
 // Never crash because a consumer closed the pipe (e.g. `alive status | head`).
 process.stdout.on("error", (err) => {
