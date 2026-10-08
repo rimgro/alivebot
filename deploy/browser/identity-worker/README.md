@@ -16,11 +16,13 @@ The configuration is saved to the gitignored `.alive/identity-worker/wrangler.js
 After the operator authorizes Cloudflare hosting, use official Wrangler 4.148.0:
 
 ```sh
-npx wrangler@4.148.0 login
+npx wrangler@4.148.0 login --scopes account:read workers_scripts:write
 npx wrangler@4.148.0 deploy --config .alive/identity-worker/wrangler.json
 node deploy/browser/identity-worker/configure.mjs --secret-stdin | npx wrangler@4.148.0 secret put PRIVATE_KEY_PKCS8 --config .alive/identity-worker/wrangler.json
 npm run browser -- doctor --online
 ```
+
+Wrangler also requests `offline_access` to refresh its authorization. Authorize these three permissions only after reviewing them; the older `workers:write` scope does not authorize the current script deployment API. Access can be revoked under Cloudflare **My Profile → Access Management → Connected Applications**.
 
 Run the secret command only as the shown pipeline; never print or paste its output into chat. Until the secret is installed, the directory returns 503. Local cryptographic tests use disposable keys and no Cloudflare account: `npm run test:browser:identity-worker`.
 
