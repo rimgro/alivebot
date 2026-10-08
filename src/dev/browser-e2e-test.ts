@@ -15,8 +15,11 @@ import { HistoryStore } from "../store/history.js";
 declare const document: { documentElement: { scrollWidth: number }; querySelector(selector: string): { naturalWidth: number; value: string } };
 declare const innerWidth: number;
 declare function requestAnimationFrame(callback: () => void): number;
+declare const sessionStorage: { getItem(key: string): string | null };
 
-// Runs only against local fixtures. No external CAPTCHA or website is contacted.
+// Uses local fixtures only. An explicitly configured relay can expose the control panel.
+// No external CAPTCHA or target website is contacted.
+const publicOrigin = process.env.ALIVE_BROWSER_E2E_PUBLIC_ORIGIN || "";
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-browser-e2e-"));
 const artifacts = path.join(root, "artifacts");
 fs.mkdirSync(artifacts);
@@ -49,7 +52,7 @@ const loaded = loadConfig({ cwd: root });
 const log = new Logger({ console: false, level: "error" });
 const store = EventStore.open(loaded.paths.stateDir);
 let nativeContext: BrowserContext;
-const browser = new BrowserModule({ port: 0, headless: true, minActionIntervalMs: 0 }, {
+const browser = new BrowserModule({ port: publicOrigin ? 4323 : 0, publicUrl: publicOrigin, headless: true, minActionIntervalMs: 0 }, {
 	launch: async (directory, options) => {
 		nativeContext = await chromium.launchPersistentContext(directory, options);
 		return nativeContext;
@@ -77,9 +80,33 @@ try {
 	const errors: string[] = [];
 	operator.on("pageerror", (error) => errors.push(error.message));
 	await operator.goto(link);
+	await operator.waitForURL((url) => !url.hash);
 	await operator.getByRole("status").filter({ hasText: "Подключено" }).waitFor();
 	await operator.waitForFunction(() => document.querySelector("#frame").naturalWidth > 0);
 	assert.equal(new URL(operator.url()).hash, "", "capability must be removed from the visible URL");
+	const savedSession = await operator.evaluate(() => sessionStorage.getItem("alive.browser.operator"));
+	assert.ok(savedSession && !savedSession.includes(new URL(link).hash.slice(1)), "Only the rotated credential and a link fingerprint may be retained in tab storage");
+	await operator.reload();
+	await operator.getByRole("status").filter({ hasText: "Подключено" }).waitFor();
+	await operator.waitForFunction(() => document.querySelector("#frame").naturalWidth > 0);
+	await operator.goto(link);
+	await operator.waitForURL((url) => !url.hash);
+	await operator.getByRole("status").filter({ hasText: "Подключено" }).waitFor();
+	await operator.waitForFunction(() => document.querySelector("#frame").naturalWidth > 0);
+	const outsider = await operatorBrowser.newPage();
+	await outsider.goto(link);
+	await outsider.getByRole("status").filter({ hasText: "Ссылка уже использована" }).waitFor();
+	assert.equal(await outsider.locator("#frame").evaluate((element) => (element as unknown as { naturalWidth: number }).naturalWidth), 0, "A new tab cannot reuse the activation link");
+	await outsider.close();
+	const renewed = await browser.command({ action: "handoff", renew: true });
+	await operator.goto(renewed.details.operatorUrl as string);
+	await operator.waitForFunction((old) => {
+		const current = sessionStorage.getItem("alive.browser.operator");
+		return !!current && current !== old;
+	}, savedSession);
+	await operator.getByRole("status").filter({ hasText: "Подключено" }).waitFor();
+	await operator.waitForFunction(() => document.querySelector("#frame").naturalWidth > 0);
+	assert.ok(await operator.evaluate(() => sessionStorage.getItem("alive.browser.operator")) !== savedSession, "A renewed link must replace the old tab credential");
 	assert.equal(await operator.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
 	await operator.getByRole("button", { name: "Приостановить изображение" }).click();
 	await operator.screenshot({ path: path.join(artifacts, "mobile.png"), fullPage: true });
@@ -128,6 +155,7 @@ try {
 	await native.locator("#challenge-form").waitFor({ state: "detached" });
 	await operator.getByRole("button", { name: "Готово — вернуть агенту" }).click();
 	await operator.getByRole("status").filter({ hasText: "Управление возвращено агенту" }).waitFor();
+	assert.equal(await operator.evaluate(() => sessionStorage.getItem("alive.browser.operator")), null, "Explicit resume must erase the saved operator credential");
 	assert.equal(browser.status().paused, false);
 	assert.deepEqual(errors, []);
 	await browser.command({ action: "close" });
@@ -148,7 +176,7 @@ try {
 	await browser.command({ action: "navigate", url: `${targetOrigin}/denied` });
 	assert.equal(browser.status().paused, true);
 	assert.match((await browser.command({ action: "navigate", url: `${targetOrigin}/` })).details.error as string, /paused/);
-	console.log(`Browser E2E passed: real Chrome, shared profile/cookies, 403 pause, same-session pointer/drag/text, mobile/desktop UI, explicit resume. Screenshots: ${artifacts}`);
+	console.log(`Browser E2E passed: real Chrome, shared profile/cookies, 403 pause, same-session pointer/drag/text, reload/reopen recovery, renewed credentials, consumed-link rejection, mobile/desktop UI, explicit resume. Screenshots: ${artifacts}`);
 } finally {
 	await operatorBrowser?.close();
 	await host.stop();
