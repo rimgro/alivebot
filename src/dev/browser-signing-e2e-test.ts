@@ -71,10 +71,12 @@ origin = `https://127.0.0.1:${port}`;
 frameOrigin = `https://localhost:${port}`;
 unapprovedOrigin = `https://127.0.0.1:${(unapproved.address() as { port: number }).port}`;
 let native: BrowserContext;
+const agentDriver = process.env.ALIVE_BROWSER_TEST_DRIVER === "playwright" ? "playwright" : "patchright";
+const agentChromium = agentDriver === "patchright" ? (await import("patchright")).chromium : chromium;
 const loaded = loadConfig({ cwd: root });
 const module = new BrowserModule({ port: 0, headless: true, minActionIntervalMs: 0, publicUrl: "https://identity.test", signing: { enabled: true, agentUrl: "https://identity.test", keyFileEnv: "ALIVE_TEST_BROWSER_KEY", origins: [origin, frameOrigin] } }, {
 	// Self-signed TLS is confined to local test fixtures; production verifies TLS.
-	launch: async (profile, options) => native = await chromium.launchPersistentContext(profile, { ...options, ignoreHTTPSErrors: true, args: ["--ignore-certificate-errors"] }),
+	launch: async (profile, options) => native = await agentChromium.launchPersistentContext(profile, { ...options, ignoreHTTPSErrors: true, args: ["--ignore-certificate-errors"] }) as unknown as BrowserContext,
 });
 const events = EventStore.open(loaded.paths.stateDir);
 const host = new ModuleHost({ config: loaded, log: new Logger({ console: true, level: "warn" }), transports: [], modules: [module], ingest: e => events.append(e), outbox: () => [], history: HistoryStore.open(loaded.paths.stateDir), runtimeStatus: () => ({}) });

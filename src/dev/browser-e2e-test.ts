@@ -10,6 +10,7 @@ import { Logger } from "../log.js";
 import { BrowserModule } from "../modules/browser/module.js";
 import { EventStore } from "../store/events.js";
 import { HistoryStore } from "../store/history.js";
+import { sleep } from "../util.js";
 
 // Minimal browser-global types keep the server project's Node-only tsconfig.
 declare const document: { documentElement: { scrollWidth: number }; querySelector(selector: string): { naturalWidth: number; value: string } };
@@ -28,7 +29,7 @@ let requestCookie = "";
 const fixture = http.createServer((req, res) => {
 	if (req.url === "/completed-widget") {
 		res.writeHead(200, { "content-type": "text/html" });
-		res.end('<iframe src="/recaptcha-anchor"></iframe><textarea name="g-recaptcha-response" hidden></textarea><button id="complete" onclick="document.querySelector(\'textarea\').value=\'local-human-completion\'">Complete local widget</button>'); return;
+		res.end('<textarea name="g-recaptcha-response" hidden></textarea><button id="complete" onclick="document.querySelector(\'textarea\').value=\'local-human-completion\'">Complete local widget</button><script>setTimeout(()=>{const frame=document.createElement("iframe");frame.src="/recaptcha-anchor";document.body.prepend(frame)},1500)</script>'); return;
 	}
 	if (req.url === "/denied") { res.writeHead(403); res.end("Access denied"); return; }
 	if (req.url === "/redirect") {
@@ -43,7 +44,7 @@ const fixture = http.createServer((req, res) => {
 <label>Тестовое поле <input id="target" value="initial"></label>
 <label>Тест перетаскивания <input id="drag" type="range" min="0" max="100" value="0"></label>
 ${req.url === "/challenge" ? '<div id="challenge-form"><p>Тестовая проверка присутствия человека</p><button id="solve" onclick="this.parentElement.remove()">Подтвердить вручную</button></div>' : ""}
-<p id="saved"></p><script>document.getElementById('saved').textContent='Сохранённый профиль: '+(localStorage.getItem('profile')||'новый');localStorage.setItem('profile','persistent');document.cookie='fixture=session; path=/';</script></html>`);
+<p id="saved"></p><script>document.getElementById('saved').textContent='Сохранённый профиль: '+(localStorage.getItem('profile')||'новый');localStorage.setItem('profile','persistent');document.cookie='fixture=session; path=/';document.getElementById('target').dataset.webdriver=String(navigator.webdriver);document.getElementById('target').dataset.keys='0';document.getElementById('target').onkeydown=()=>{const el=document.getElementById('target');el.dataset.keys=String(Number(el.dataset.keys)+1)};document.documentElement.dataset.moves='0';document.addEventListener('mousemove',()=>{const el=document.documentElement;el.dataset.moves=String(Number(el.dataset.moves)+1)});${req.url === "/interrupt" ? "document.getElementById('target').oninput=()=>{if(document.getElementById('target').value.startsWith('xx'))location.href='/denied'};" : ""}</script></html>`);
 });
 await new Promise<void>((resolve) => fixture.listen(0, "127.0.0.1", resolve));
 const address = fixture.address();
@@ -52,9 +53,11 @@ const loaded = loadConfig({ cwd: root });
 const log = new Logger({ console: false, level: "error" });
 const store = EventStore.open(loaded.paths.stateDir);
 let nativeContext: BrowserContext;
-const browser = new BrowserModule({ port: publicOrigin ? 4323 : 0, publicUrl: publicOrigin, headless: true, minActionIntervalMs: 0 }, {
+const agentDriver = process.env.ALIVE_BROWSER_TEST_DRIVER === "playwright" ? "playwright" : "patchright";
+const agentChromium = agentDriver === "patchright" ? (await import("patchright")).chromium : chromium;
+const browser = new BrowserModule({ port: publicOrigin ? 4323 : 0, publicUrl: publicOrigin, driver: agentDriver, viewport: { width: 900, height: 720 }, headless: true, minActionIntervalMs: 0 }, {
 	launch: async (directory, options) => {
-		nativeContext = await chromium.launchPersistentContext(directory, options);
+		nativeContext = await agentChromium.launchPersistentContext(directory, options) as unknown as BrowserContext;
 		return nativeContext;
 	},
 });
@@ -66,6 +69,9 @@ try {
 	await browser.command({ action: "fill", selector: "#target", text: "Agent input" });
 	const native = nativeContext!.pages()[0];
 	assert.equal(await native.locator("#target").inputValue(), "Agent input");
+	assert.ok(Number(await native.locator("#target").getAttribute("data-keys")) >= "Agent input".length, "Humanized typing must emit individual native keyboard events");
+	assert.ok(Number(await native.locator("html").getAttribute("data-moves")) >= 10, "Humanized clicks must move the native pointer along a path");
+	if (agentDriver === "patchright") assert.equal(await native.locator("#target").getAttribute("data-webdriver"), "false", "The page itself must observe Patchright's webdriver reduction");
 	const redirect = await browser.command({ action: "request", url: `${targetOrigin}/redirect` });
 	assert.equal(redirect.details.status, 302);
 	assert.equal(destinations, 0, "request must not follow redirects");
@@ -162,7 +168,9 @@ try {
 	await browser.command({ action: "navigate", url: `${targetOrigin}/` });
 	assert.match((await browser.command({ action: "read" })).details.text as string, /профиль: persistent/);
 	await browser.command({ action: "navigate", url: `${targetOrigin}/completed-widget` });
-	assert.equal(browser.status().paused, true, "An incomplete visible widget must pause the agent");
+	const challengeDeadline = Date.now() + 5000;
+	while (!browser.status().paused && Date.now() < challengeDeadline) await sleep(50);
+	assert.equal(browser.status().paused, true, "A widget rendered after navigation must pause the idle agent without another tool action");
 	const completedWidget = await browser.command({ action: "handoff" });
 	const widgetLink = new URL(completedWidget.details.operatorUrl as string);
 	const widgetClaim = await fetch(`${widgetLink.origin}/browser/claim`, { method: "POST", headers: { "content-type": "application/json", Authorization: `Bearer ${widgetLink.hash.slice(1)}` }, body: "{}" });
@@ -173,7 +181,11 @@ try {
 	const widgetResume = await fetch(`${widgetLink.origin}/browser/resume`, { method: "POST", headers: { "content-type": "application/json", Authorization: `Bearer ${widgetCredential}` }, body: "{}" });
 	assert.equal(widgetResume.status, 200, "Explicit resume must allow a provider-completed widget that stays visible");
 	assert.equal(browser.status().paused, false);
-	await browser.command({ action: "navigate", url: `${targetOrigin}/denied` });
+	await browser.command({ action: "navigate", url: `${targetOrigin}/interrupt` });
+	const typingStarted = Date.now();
+	const interrupted = await browser.command({ action: "fill", selector: "#target", text: "x".repeat(200) });
+	assert.match(interrupted.details.error as string, /Action stopped/);
+	assert.ok(Date.now() - typingStarted < 4000, "An HTTP denial during typing must cancel the remaining input promptly");
 	assert.equal(browser.status().paused, true);
 	assert.match((await browser.command({ action: "navigate", url: `${targetOrigin}/` })).details.error as string, /paused/);
 	console.log(`Browser E2E passed: real Chrome, shared profile/cookies, 403 pause, same-session pointer/drag/text, reload/reopen recovery, renewed credentials, consumed-link rejection, mobile/desktop UI, explicit resume. Screenshots: ${artifacts}`);

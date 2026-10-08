@@ -66,7 +66,7 @@ async function fixture(options: { notify?: (url: string, reason: string) => Prom
 			return { status: () => 302, headers: () => ({ location: "https://other.test/" }), text: async () => "Redirect", dispose: async () => {} };
 		} },
 	});
-	const module = new BrowserModule({ port: 0, minActionIntervalMs: 0, handoffTtlMs: options.ttl ?? 60_000 }, {
+	const module = new BrowserModule({ port: 0, minActionIntervalMs: 0, humanization: { enabled: false }, handoffTtlMs: options.ttl ?? 60_000 }, {
 		launch: (async () => context as unknown as BrowserContext) as BrowserType["launchPersistentContext"], notify: options.notify,
 	});
 	const loaded = loadConfig({ cwd: fs.mkdtempSync(path.join(root, "instance-")) });

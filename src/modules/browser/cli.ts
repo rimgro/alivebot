@@ -34,6 +34,17 @@ export function setupBrowser(loaded: LoadedConfig, flags: Flags): string {
 	const file = path.join(path.dirname(loaded.paths.configPath), "alive.config.local.json");
 	const local = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
 	const browser = { ...DEFAULT_BROWSER_CONFIG, ...loaded.config.modules.browser, enabled: true };
+	const driver = stringFlag(flags, "driver");
+	if (driver) {
+		if (driver !== "patchright" && driver !== "playwright") throw new Error("Use --driver patchright or playwright");
+		browser.driver = driver;
+	}
+	const channel = stringFlag(flags, "channel");
+	if (channel) {
+		if (channel !== "chrome" && channel !== "chromium") throw new Error("Use --channel chrome or chromium");
+		browser.channel = channel;
+	}
+	if (flags.humanization !== undefined) browser.humanization = { ...DEFAULT_BROWSER_CONFIG.humanization, ...browser.humanization, enabled: boolFlag(flags, "humanization") };
 	const publicUrl = stringFlag(flags, "public-url");
 	if (publicUrl) browser.publicUrl = httpsOrigin(publicUrl);
 	if (flags.headless !== undefined) browser.headless = boolFlag(flags, "headless");
@@ -72,7 +83,7 @@ export async function browserCommand(loaded: LoadedConfig, action: string, flags
 		case "doctor": return await doctor(loaded, boolFlag(flags, "online"));
 		case "pair": return await pair(loaded);
 		case "serve": return await serve(loaded, flags);
-		default: throw new Error("usage: alive browser setup [--public-url HTTPS_ORIGIN] [--headless] [--sign-origins HTTPS_ORIGIN,...] | doctor [--online] | pair | serve [--url HTTP_URL] [--local] [--tunnel] [--cloudflared PATH]");
+		default: throw new Error("usage: alive browser setup [--driver patchright|playwright] [--channel chrome|chromium] [--humanization true|false] [--public-url HTTPS_ORIGIN] [--headless] [--sign-origins HTTPS_ORIGIN,...] | doctor [--online] | pair | serve [--url HTTP_URL] [--local] [--tunnel] [--cloudflared PATH]");
 	}
 }
 
@@ -82,14 +93,16 @@ async function doctor(loaded: LoadedConfig, online: boolean): Promise<number> {
 	const token = resolveToken(telegram);
 	const operator = readBrowserOperator(loaded.paths.modulesDir);
 	const snapshot = snapshotRuntime(loaded.paths.stateDir);
-	const candidates = browser.channel === "chromium" ? [chromium.executablePath()] : process.platform === "darwin"
+	const engine = browser.driver === "patchright" ? (await import("patchright")).chromium : chromium;
+	const candidates = browser.channel === "chromium" ? [engine.executablePath()] : process.platform === "darwin"
 		? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
 		: process.platform === "win32" ? [path.join(process.env.PROGRAMFILES ?? "", "Google/Chrome/Application/chrome.exe"), path.join(process.env.LOCALAPPDATA ?? "", "Google/Chrome/Application/chrome.exe")]
 		: ["/opt/google/chrome/chrome", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"];
 	const installed = candidates.some(file => fs.existsSync(file));
+	if (!installed) process.stdout.write(`Install browser: npx ${browser.driver === "patchright" ? "patchright" : "playwright"} install ${browser.channel}\n`);
 	const chat = browser.notifyChatId || operator?.chatId;
 	const destinationAllowed = !!chat && (!telegram.allowedChatIds.length || telegram.allowedChatIds.map(String).includes(chat));
-	process.stdout.write(`Host: ${process.platform}; configuration: ${loaded.paths.configPath}\nRuntime: ${snapshot?.alive ? `running (pid ${snapshot.pid})` : "not running here"}\nBrowser: ${browser.enabled ? "enabled" : "disabled"}; ${browser.channel} ${installed ? "installed" : "not found"}\nPhone HTTPS address: ${browser.publicUrl || "not configured"}\nTelegram token: ${token ? "configured" : "missing"}\nOperator: ${chat ? `${chat}${destinationAllowed ? "" : " (denied by chat allowlist)"}` : "not paired"}\n`);
+	process.stdout.write(`Host: ${process.platform}/${process.arch}; configuration: ${loaded.paths.configPath}\nRuntime: ${snapshot?.alive ? `running (pid ${snapshot.pid})` : "not running here"}\nBrowser: ${browser.enabled ? "enabled" : "disabled"}; ${browser.driver}/${browser.channel} ${installed ? "installed" : "not found"}; humanization ${browser.humanization.enabled ? "enabled" : "disabled"}\nPhone HTTPS address: ${browser.publicUrl || "not configured"}\nTelegram token: ${token ? "configured" : "missing"}\nOperator: ${chat ? `${chat}${destinationAllowed ? "" : " (denied by chat allowlist)"}` : "not paired"}\n`);
 	if (browser.signing.enabled) {
 		const identity = new BrowserIdentity(browser.signing);
 		process.stdout.write(`Web Bot Auth: ${identity.agentUrl}; public key ID ${identity.keyId}\nRegistration: requires operator approval from Cloudflare; a local signature is not registration.\n`);
