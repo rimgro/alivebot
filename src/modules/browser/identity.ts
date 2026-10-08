@@ -33,13 +33,19 @@ export class BrowserIdentity {
 		this.keyId = createHash("sha256").update(JSON.stringify(this.publicJwk)).digest("base64url");
 	}
 
-	requestHeaders(value: string, now = Date.now()): Record<string, string> {
+	authorizes(value: string): boolean {
 		const url = new URL(value);
-		if (url.username || url.password || !this.origins.has(url.origin)) throw new Error("Origin is not authorized for signed requests");
+		return !url.username && !url.password && this.origins.has(url.origin);
+	}
+
+	requestHeaders(value: string, now = Date.now(), method = "GET"): Record<string, string> {
+		const url = new URL(value);
+		if (!this.authorizes(value)) throw new Error("Origin is not authorized for signed requests");
+		if (!/^[A-Z]+$/.test(method)) throw new Error("Invalid signed request method");
 		const agent = JSON.stringify(this.agentUrl);
 		const components = '("@authority" "@method" "@path" "@query" "signature-agent")';
 		const input = this.parameters(components, "web-bot-auth", now);
-		const base = `"@authority": ${url.host}\n"@method": GET\n"@path": ${url.pathname}\n"@query": ${url.search || "?"}\n"signature-agent": ${agent}\n"@signature-params": ${input}`;
+		const base = `"@authority": ${url.host}\n"@method": ${method}\n"@path": ${url.pathname}\n"@query": ${url.search || "?"}\n"signature-agent": ${agent}\n"@signature-params": ${input}`;
 		return { "Signature-Agent": agent, ...this.headers(input, base) };
 	}
 

@@ -15,7 +15,7 @@ export interface BrowserConfig {
 	port: number;
 	/** HTTPS origin of the reverse proxy; empty uses the local listener. */
 	publicUrl: string;
-	/** Explicit operator destination; empty disables Telegram notifications. */
+	/** Explicit operator destination; empty uses the privately paired operator. */
 	notifyChatId: string;
 	handoffTtlMs: number;
 	/** Minimum spacing between agent actions, for workload control. */

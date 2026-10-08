@@ -1,0 +1,13 @@
+# Set ALIVE_BROWSER_DOMAIN to a DNS name pointing at this server.
+# Caddy obtains and renews HTTPS certificates. Alive stays on loopback.
+{$ALIVE_BROWSER_DOMAIN} {
+	@browser path /browser /browser/* /.well-known/http-message-signatures-directory
+	handle @browser {
+		reverse_proxy 127.0.0.1:4323 {
+			header_up Host {host}
+		}
+	}
+	handle {
+		respond "Not found" 404
+	}
+}

@@ -41,7 +41,7 @@ class FakePage extends EventEmitter {
 	locator(selector: string) {
 		return {
 			innerText: async () => "Test page text",
-			count: async () => selector === "body" ? 1 : Number(this.challenge),
+			count: async () => selector === "body" ? 1 : selector.includes("#challenge-form") ? Number(this.challenge) : 0,
 			nth: () => ({ isVisible: async () => this.challenge }),
 			first: () => ({ click: async () => { this.inputs.push("agent-click"); }, fill: async (value: string) => { this.inputs.push(value); } }),
 		};

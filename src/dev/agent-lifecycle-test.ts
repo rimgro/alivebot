@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -104,6 +105,7 @@ try {
 	const stub = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>process.exit(0));setInterval(()=>{},1000)"], { stdio: "ignore" });
 	subprocesses.push(stub);
 	assert.ok(stub.pid);
+	const stubExited = once(stub, "exit");
 	await sleep(100);
 	let releaseStartup!: () => void;
 	let startupEntered!: () => void;
@@ -132,8 +134,8 @@ try {
 		await startPromise;
 		await disablePromise;
 		assert.equal(getAgentEnabled(listAgents(base).find((item) => item.id === "writer")!), false);
-		assert.equal(stub.exitCode, 0, "disable waits until the just-started process exits");
 		assert.equal(snapshotRuntime(writerConfig.paths.stateDir)?.alive, false, "disable does not return with a running process");
+		assert.equal((await stubExited)[0], 0, "the stopped process exits cleanly; the child notification may follow kernel exit");
 	} finally {
 		releaseStartup();
 		await startPromise.catch(() => undefined);

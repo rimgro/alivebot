@@ -23,6 +23,10 @@ fs.mkdirSync(artifacts);
 let destinations = 0;
 let requestCookie = "";
 const fixture = http.createServer((req, res) => {
+	if (req.url === "/completed-widget") {
+		res.writeHead(200, { "content-type": "text/html" });
+		res.end('<iframe src="/recaptcha-anchor"></iframe><textarea name="g-recaptcha-response" hidden></textarea><button id="complete" onclick="document.querySelector(\'textarea\').value=\'local-human-completion\'">Complete local widget</button>'); return;
+	}
 	if (req.url === "/denied") { res.writeHead(403); res.end("Access denied"); return; }
 	if (req.url === "/redirect") {
 		requestCookie = req.headers.cookie ?? "";
@@ -129,6 +133,18 @@ try {
 	await browser.command({ action: "close" });
 	await browser.command({ action: "navigate", url: `${targetOrigin}/` });
 	assert.match((await browser.command({ action: "read" })).details.text as string, /профиль: persistent/);
+	await browser.command({ action: "navigate", url: `${targetOrigin}/completed-widget` });
+	assert.equal(browser.status().paused, true, "An incomplete visible widget must pause the agent");
+	const completedWidget = await browser.command({ action: "handoff" });
+	const widgetLink = new URL(completedWidget.details.operatorUrl as string);
+	const widgetClaim = await fetch(`${widgetLink.origin}/browser/claim`, { method: "POST", headers: { "content-type": "application/json", Authorization: `Bearer ${widgetLink.hash.slice(1)}` }, body: "{}" });
+	const widgetCredential = (await widgetClaim.json() as { credential: string }).credential;
+	const widgetPage = nativeContext!.pages()[0];
+	await widgetPage.locator("#complete").click();
+	assert.equal(await widgetPage.locator("iframe").isVisible(), true);
+	const widgetResume = await fetch(`${widgetLink.origin}/browser/resume`, { method: "POST", headers: { "content-type": "application/json", Authorization: `Bearer ${widgetCredential}` }, body: "{}" });
+	assert.equal(widgetResume.status, 200, "Explicit resume must allow a provider-completed widget that stays visible");
+	assert.equal(browser.status().paused, false);
 	await browser.command({ action: "navigate", url: `${targetOrigin}/denied` });
 	assert.equal(browser.status().paused, true);
 	assert.match((await browser.command({ action: "navigate", url: `${targetOrigin}/` })).details.error as string, /paused/);
