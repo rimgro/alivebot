@@ -1,0 +1,10 @@
+{
+  "name": "alive-browser-identity",
+  "main": "../../../src/modules/browser/identity-worker.ts",
+  "compatibility_date": "2026-10-08",
+  "workers_dev": true,
+  "vars": {
+    "AGENT_ORIGIN": "https://alive-browser-identity.YOUR_SUBDOMAIN.workers.dev",
+    "PUBLIC_JWK": "{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"YOUR_PUBLIC_KEY\"}"
+  }
+}

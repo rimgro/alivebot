@@ -121,7 +121,7 @@ Configure:
 }
 ```
 
-The identity origin must match `publicUrl`. The listener serves a JWKS with public `crv`, `kty`, and `x` fields at `/.well-known/http-message-signatures-directory`, with the required directory response signatures. Private key material is never exported. Preserve the identity origin's `Host` header through the proxy. Register the bot and key directory using Cloudflare's Bot Submission Form, as documented above; registration is an operator step.
+By default the identity origin matches `publicUrl`. Set `--identity-url` during setup to host the signed directory separately, for example using the optional [identity Worker](deploy/browser/identity-worker/README.md) on a stable `workers.dev` HTTPS origin without buying a domain. The phone endpoint can then change independently. When the directory is hosted on Alive itself, the listener serves a JWKS with public `crv`, `kty`, and `x` fields at `/.well-known/http-message-signatures-directory`, with the required directory response signatures. The listener never exports private key material. The optional Worker requires an operator-authorized copy of the dedicated identity key in a Cloudflare secret. Preserve the identity origin's `Host` header through the proxy. Register the bot and key directory using Cloudflare's Bot Submission Form, as documented above; registration is an operator step.
 
 ```js
 browser({ action: "request", url: "https://authorized.example.com/resource" })
@@ -141,6 +141,7 @@ npm run test:browser
 npm run test:browser:e2e
 npm run test:browser:signing
 npm run test:browser:operator
+npm run test:browser:identity-worker
 npm run test:browser:cli
 npm test
 ```

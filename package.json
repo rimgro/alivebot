@@ -20,7 +20,7 @@
     "history": "tsx src/index.ts history",
     "telegram": "tsx src/index.ts telegram",
     "smoke": "tsx src/dev/smoke.ts",
-    "test": "tsc -p tsconfig.json --noEmit && tsx src/dev/onboarding-test.ts && tsx src/dev/agent-lifecycle-test.ts && tsx src/dev/agent-messaging-test.ts && tsx src/dev/agent-tui-test.ts && tsx src/dev/memory-test.ts && tsx src/dev/store-test.ts && tsx src/dev/idle-test.ts && tsx src/dev/runner-test.ts && tsx src/dev/modules-test.ts && tsx src/dev/daemon-test.ts && tsx src/dev/browser-test.ts && tsx src/dev/browser-operator-test.ts",
+    "test": "tsc -p tsconfig.json --noEmit && tsx src/dev/onboarding-test.ts && tsx src/dev/agent-lifecycle-test.ts && tsx src/dev/agent-messaging-test.ts && tsx src/dev/agent-tui-test.ts && tsx src/dev/memory-test.ts && tsx src/dev/store-test.ts && tsx src/dev/idle-test.ts && tsx src/dev/runner-test.ts && tsx src/dev/modules-test.ts && tsx src/dev/daemon-test.ts && tsx src/dev/browser-test.ts && tsx src/dev/browser-identity-worker-test.ts && tsx src/dev/browser-operator-test.ts",
     "alive": "tsx src/index.ts",
     "test:store": "tsx src/dev/store-test.ts",
     "test:memory": "tsx src/dev/memory-test.ts",
@@ -33,7 +33,8 @@
     "browser": "tsx src/index.ts browser",
     "test:browser:operator": "tsx src/dev/browser-operator-test.ts",
     "test:browser:signing": "tsx src/dev/browser-signing-e2e-test.ts",
-    "test:browser:cli": "tsx src/dev/browser-cli-e2e-test.ts"
+    "test:browser:cli": "tsx src/dev/browser-cli-e2e-test.ts",
+    "test:browser:identity-worker": "tsx src/dev/browser-identity-worker-test.ts"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "^0.85.1",

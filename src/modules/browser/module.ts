@@ -62,9 +62,6 @@ export class BrowserModule implements AliveModule {
 		this.validateConfig();
 		this.ctx = ctx;
 		this.identity = this.config.signing.enabled ? new BrowserIdentity(this.config.signing) : undefined;
-		if (this.identity && new URL(this.config.publicUrl || "https://invalid.local").origin !== this.identity.agentUrl) {
-			throw new Error("signing.agentUrl must match publicUrl so the signed directory is served on the identity origin");
-		}
 		this.notify = this.deps.notify;
 		if (!this.notify && (this.config.notifyChatId || readBrowserOperator(ctx.paths.modulesDir) || ctx.config.modules.telegram.enabled)) {
 			const telegram = ctx.config.modules.telegram;
@@ -142,7 +139,7 @@ export class BrowserModule implements AliveModule {
 
 	/** Used by standalone development tunnels before issuing any capability. */
 	setPublicOrigin(value: string): void {
-		if (this.handoff || this.identity) throw new Error("Cannot change the public origin during a handoff or signed identity session");
+		if (this.handoff || (this.identity && this.identity.agentUrl === this.publicOrigin)) throw new Error("Cannot change the public origin during a handoff or locally hosted identity session");
 		const url = new URL(value);
 		if (url.protocol !== "https:" || url.pathname !== "/" || url.username || url.password || url.search || url.hash) throw new Error("Use an HTTPS origin");
 		this.config.publicUrl = url.origin;

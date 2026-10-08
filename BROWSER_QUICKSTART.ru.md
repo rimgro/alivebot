@@ -77,3 +77,5 @@ npm run browser -- setup --public-url https://YOUR_BROWSER_DOMAIN --sign-origins
 CLI создаёт Ed25519-ключ с правами 0600, сохраняет путь к нему в `.env` и публикует подписанный каталог открытого ключа. Существующий ключ не заменяется. Затем владелец регистрирует каталог через Bot Submission Form в своём аккаунте Cloudflare: **Verification Method → Request Signature**, URL каталога — `https://YOUR_BROWSER_DOMAIN/.well-known/http-message-signatures-directory`.
 
 Подпись подтверждает личность агента. Решение о разрешении доступа остаётся за сайтом. Обход блокировок и скрытие автоматизации не входят в эту интеграцию. Подробности, ограничения и проверки описаны в [BROWSER.md](BROWSER.md).
+
+Для отдельного постоянного каталога ключа без покупки домена есть [Worker на workers.dev](deploy/browser/identity-worker/README.md). Его адрес задаётся через `--identity-url` и не меняется вместе со ссылкой на телефон. В текущей панели Cloudflare форма находится в **Application security → BotBase → Submission form**; [официальная ссылка](https://dash.cloudflare.com/?to=/:account/configurations/verified-bots) ведёт туда автоматически.

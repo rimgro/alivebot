@@ -54,7 +54,9 @@ try {
 	assert.equal(acceptBrowserPairing(loaded.paths.modulesDir, privateMessage(current.code), [])?.chatId, "777");
 
 	const setupWithIdentity = loadConfig({ cwd: root });
-	setupBrowser(setupWithIdentity, { "sign-origins": "https://permitted.test" });
+	setupBrowser(setupWithIdentity, { "identity-url": "https://identity.test", "sign-origins": "https://permitted.test" });
+	assert.equal(loadConfig({ cwd: root }).config.modules.browser!.signing.agentUrl, "https://identity.test");
+	assert.equal(loadConfig({ cwd: root }).config.modules.browser!.publicUrl, "https://phone.test", "An external directory must not replace the phone endpoint");
 	const keyFile = process.env.ALIVE_BROWSER_SIGNING_KEY_FILE!;
 	assert.equal(fs.statSync(keyFile).mode & 0o777, 0o600);
 	const originalKey = fs.readFileSync(keyFile, "utf8");

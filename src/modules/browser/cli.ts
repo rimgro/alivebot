@@ -47,10 +47,13 @@ export function setupBrowser(loaded: LoadedConfig, flags: Flags): string {
 	if (flags.humanization !== undefined) browser.humanization = { ...DEFAULT_BROWSER_CONFIG.humanization, ...browser.humanization, enabled: boolFlag(flags, "humanization") };
 	const publicUrl = stringFlag(flags, "public-url");
 	if (publicUrl) browser.publicUrl = httpsOrigin(publicUrl);
+	const identityUrl = stringFlag(flags, "identity-url");
+	if (identityUrl) browser.signing = { ...browser.signing, agentUrl: httpsOrigin(identityUrl) };
 	if (flags.headless !== undefined) browser.headless = boolFlag(flags, "headless");
 	const origins = stringFlag(flags, "sign-origins");
 	if (origins) {
-		if (!browser.publicUrl) throw new Error("Signing setup requires --public-url with the deployed identity origin");
+		const agentUrl = browser.signing.agentUrl || browser.publicUrl;
+		if (!agentUrl) throw new Error("Signing setup requires --identity-url or --public-url with the deployed identity origin");
 		const permitted = origins.split(",").map(httpsOrigin);
 		let keyFile = process.env[browser.signing.keyFileEnv];
 		if (!keyFile) {
@@ -65,10 +68,10 @@ export function setupBrowser(loaded: LoadedConfig, flags: Flags): string {
 			fs.chmodSync(envFile, 0o600);
 			process.env[browser.signing.keyFileEnv] = keyFile;
 		}
-		browser.signing = { ...browser.signing, enabled: true, agentUrl: browser.publicUrl, origins: permitted };
+		browser.signing = { ...browser.signing, enabled: true, agentUrl, origins: permitted };
 		new BrowserIdentity(browser.signing);
 	}
-	if (browser.signing.enabled && browser.signing.agentUrl !== browser.publicUrl) throw new Error("Changing a signed identity origin requires --sign-origins so agentUrl and publicUrl stay consistent");
+	if (identityUrl && !browser.signing.enabled) throw new Error("Use --sign-origins when configuring a new signed identity");
 	local.modules = { ...local.modules, browser: { ...local.modules?.browser, ...browser } };
 	local.tools = { ...local.tools, allowlist: [...new Set([...loaded.config.tools.allowlist, "browser"])] };
 	writePrivateJson(file, local);
@@ -83,7 +86,7 @@ export async function browserCommand(loaded: LoadedConfig, action: string, flags
 		case "doctor": return await doctor(loaded, boolFlag(flags, "online"));
 		case "pair": return await pair(loaded);
 		case "serve": return await serve(loaded, flags);
-		default: throw new Error("usage: alive browser setup [--driver patchright|playwright] [--channel chrome|chromium] [--humanization true|false] [--public-url HTTPS_ORIGIN] [--headless] [--sign-origins HTTPS_ORIGIN,...] | doctor [--online] | pair | serve [--url HTTP_URL] [--local] [--tunnel] [--cloudflared PATH]");
+		default: throw new Error("usage: alive browser setup [--driver patchright|playwright] [--channel chrome|chromium] [--humanization true|false] [--public-url HTTPS_ORIGIN] [--identity-url HTTPS_ORIGIN] [--headless] [--sign-origins HTTPS_ORIGIN,...] | doctor [--online] | pair | serve [--url HTTP_URL] [--local] [--tunnel] [--cloudflared PATH]");
 	}
 }
 
@@ -115,16 +118,18 @@ async function doctor(loaded: LoadedConfig, online: boolean): Promise<number> {
 		process.stdout.write(`Telegram reachable: @${bot.username ?? bot.id}\n`);
 	}
 	if (online && browser.publicUrl) {
-		const endpoint = browser.signing.enabled ? "/.well-known/http-message-signatures-directory" : "/browser";
-		const response = await fetch(`${browser.publicUrl}${endpoint}`, { redirect: "error", signal: AbortSignal.timeout(10_000) });
+		const response = await fetch(`${browser.publicUrl}/browser`, { redirect: "error", signal: AbortSignal.timeout(10_000) });
 		if (!response.ok) throw new Error(`Public browser endpoint returned HTTP ${response.status}`);
-		if (browser.signing.enabled) {
-			const identity = new BrowserIdentity(browser.signing);
-			const directory = await response.json() as { keys?: Array<{ x?: string }> };
-			const expected = JSON.parse(identity.directory().body) as { keys: Array<{ x: string }> };
-			if (directory.keys?.[0]?.x !== expected.keys[0].x || !response.headers.get("signature")) throw new Error("Public directory does not match the configured identity");
-		}
-		process.stdout.write("Public HTTPS endpoint reachable\n");
+		process.stdout.write("Public phone HTTPS endpoint reachable\n");
+	}
+	if (online && browser.signing.enabled) {
+		const identity = new BrowserIdentity(browser.signing);
+		const response = await fetch(`${identity.agentUrl}/.well-known/http-message-signatures-directory`, { redirect: "error", signal: AbortSignal.timeout(10_000) });
+		if (!response.ok) throw new Error(`Identity directory returned HTTP ${response.status}`);
+		const directory = await response.json() as { keys?: Array<{ x?: string }> };
+		const expected = JSON.parse(identity.directory().body) as { keys: Array<{ x: string }> };
+		if (directory.keys?.[0]?.x !== expected.keys[0].x || !response.headers.get("signature")) throw new Error("Public directory does not match the configured identity");
+		process.stdout.write("Public identity HTTPS directory reachable\n");
 	}
 	return browser.enabled && installed && token && destinationAllowed && browser.publicUrl ? 0 : 1;
 }
@@ -194,7 +199,7 @@ async function serve(loaded: LoadedConfig, flags: Flags): Promise<number> {
 	}
 	const browser = new BrowserModule({ ...DEFAULT_BROWSER_CONFIG, ...loaded.config.modules.browser, ...(flags.headless !== undefined ? { headless: boolFlag(flags, "headless") } : {}) });
 	const browserConfig = { ...DEFAULT_BROWSER_CONFIG, ...loaded.config.modules.browser };
-	if (boolFlag(flags, "tunnel") && (browserConfig.signing.enabled || !["127.0.0.1", "localhost", "::1"].includes(browserConfig.host) || browserConfig.port === 0)) throw new Error("Quick tunnels require a fixed loopback port and signing disabled. Web Bot Auth needs a stable HTTPS identity origin.");
+	if (boolFlag(flags, "tunnel") && ((browserConfig.signing.enabled && browserConfig.signing.agentUrl === browserConfig.publicUrl) || !["127.0.0.1", "localhost", "::1"].includes(browserConfig.host) || browserConfig.port === 0)) throw new Error("Quick tunnels require a fixed loopback port. Web Bot Auth needs a separately hosted stable HTTPS identity origin.");
 	const telegram = loaded.config.modules.telegram;
 	const host = hostFor(loaded, [browser, ...(telegram.enabled && resolveToken(telegram) ? [new TelegramModule(telegram)] : [])]);
 	let fixture: http.Server | undefined;
