@@ -1001,8 +1001,8 @@ usage:
   alive telegram me | chats | chat <id|@name> | send <id|@name> <text> | ping
   alive telegram whitelist [list | add <user-id> | remove <user-id>]
                                               manage Telegram user access without restart
-  alive browser setup [--public-url HTTPS_ORIGIN] [--headless] [--sign-origins ORIGIN,...]
-  alive browser doctor [--online] | pair | serve [--local] [--url URL]
+  alive browser setup [--cdp-env ENV_NAME] [--public-url HTTPS_ORIGIN] [--headless] [--sign-origins ORIGIN,...]
+  alive browser doctor [--online] | diagnose | pair | serve [--local] [--url URL]
                                               configure, diagnose and test phone handoff without an LLM
   alive thoughts [-n 20]                      the agent's private monologue
 `);

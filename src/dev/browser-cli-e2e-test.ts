@@ -30,6 +30,14 @@ try {
 	assert.match(command.output(), /not configured/);
 	assert.match(command.output(), /not paired/);
 	assert.match(command.output(), /Telegram token: missing/);
+	command = launch("setup", "--cdp-env", "ALIVE_CLI_TEST_CDP");
+	assert.equal((await once(command.child, "exit"))[0], 0, command.output());
+	assert.equal(JSON.parse(fs.readFileSync(path.join(root, "alive.config.local.json"), "utf8")).modules.browser.cdpEndpointEnv, "ALIVE_CLI_TEST_CDP");
+	command = launch("setup", "--cdp-env", "");
+	assert.equal((await once(command.child, "exit"))[0], 0, command.output());
+	command = launch("diagnose");
+	assert.equal((await once(command.child, "exit"))[0], 0, command.output());
+	assert.equal(JSON.parse(command.output()).canvas.passed, true);
 	const socket = net.createServer();
 	await new Promise<void>(resolve => socket.listen(0, "127.0.0.1", resolve));
 	const port = (socket.address() as { port: number }).port;
@@ -59,6 +67,9 @@ try {
 	const blocked = launch("serve", "--local", "--headless");
 	assert.equal((await once(blocked.child, "exit"))[0], 1);
 	assert.match(blocked.output(), /owns this state directory/);
+	const blockedDiagnosis = launch("diagnose");
+	assert.equal((await once(blockedDiagnosis.child, "exit"))[0], 1);
+	assert.match(blockedDiagnosis.output(), /owns this state directory/);
 	const exit = once(child, "exit");
 	child.kill("SIGTERM");
 	assert.equal((await exit)[0], 0);

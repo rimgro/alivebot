@@ -18,6 +18,8 @@ import { BrowserIdentity } from "./identity.js";
 import { BrowserModule } from "./module.js";
 import { cancelBrowserPairing, readBrowserOperator, requestBrowserPairing, writePrivateJson } from "./operator.js";
 import { startQuickTunnel, type QuickTunnel } from "./tunnel.js";
+import { resolveCdpEndpoint } from "./connection.js";
+import { diagnoseBrowser } from "./diagnostics.js";
 
 type Flags = Record<string, string | boolean>;
 const stringFlag = (flags: Flags, name: string) => typeof flags[name] === "string" ? flags[name] as string : undefined;
@@ -38,6 +40,11 @@ export function setupBrowser(loaded: LoadedConfig, flags: Flags): string {
 	if (driver) {
 		if (driver !== "patchright" && driver !== "playwright") throw new Error("Use --driver patchright or playwright");
 		browser.driver = driver;
+	}
+	const cdpEnv = stringFlag(flags, "cdp-env");
+	if (cdpEnv !== undefined) {
+		if (cdpEnv && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(cdpEnv)) throw new Error("Invalid --cdp-env variable name");
+		browser.cdpEndpointEnv = cdpEnv;
 	}
 	const channel = stringFlag(flags, "channel");
 	if (channel) {
@@ -84,9 +91,15 @@ export async function browserCommand(loaded: LoadedConfig, action: string, flags
 			process.stdout.write(`Browser enabled in ${setupBrowser(loaded, flags)}\nNext: alive browser doctor\n`);
 			return 0;
 		case "doctor": return await doctor(loaded, boolFlag(flags, "online"));
+		case "diagnose": {
+			runtimeAvailable(loaded);
+			const report = await diagnoseBrowser({ ...DEFAULT_BROWSER_CONFIG, ...loaded.config.modules.browser });
+			process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+			return report.canvas.passed ? 0 : 1;
+		}
 		case "pair": return await pair(loaded);
 		case "serve": return await serve(loaded, flags);
-		default: throw new Error("usage: alive browser setup [--driver patchright|playwright] [--channel chrome|chromium] [--humanization true|false] [--public-url HTTPS_ORIGIN] [--identity-url HTTPS_ORIGIN] [--headless] [--sign-origins HTTPS_ORIGIN,...] | doctor [--online] | pair | serve [--url HTTP_URL] [--local] [--tunnel] [--cloudflared PATH]");
+		default: throw new Error("usage: alive browser setup [--driver patchright|playwright] [--cdp-env ENV_NAME] [--channel chrome|chromium] [--humanization true|false] [--public-url HTTPS_ORIGIN] [--identity-url HTTPS_ORIGIN] [--headless] [--sign-origins HTTPS_ORIGIN,...] | doctor [--online] | diagnose | pair | serve [--url HTTP_URL] [--local] [--tunnel] [--cloudflared PATH]");
 	}
 }
 
@@ -97,15 +110,26 @@ async function doctor(loaded: LoadedConfig, online: boolean): Promise<number> {
 	const operator = readBrowserOperator(loaded.paths.modulesDir);
 	const snapshot = snapshotRuntime(loaded.paths.stateDir);
 	const engine = browser.driver === "patchright" ? (await import("patchright")).chromium : chromium;
+	const endpoint = resolveCdpEndpoint(browser);
 	const candidates = browser.channel === "chromium" ? [engine.executablePath()] : process.platform === "darwin"
 		? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
 		: process.platform === "win32" ? [path.join(process.env.PROGRAMFILES ?? "", "Google/Chrome/Application/chrome.exe"), path.join(process.env.LOCALAPPDATA ?? "", "Google/Chrome/Application/chrome.exe")]
 		: ["/opt/google/chrome/chrome", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"];
-	const installed = candidates.some(file => fs.existsSync(file));
+	let installed = endpoint ? true : candidates.some(file => fs.existsSync(file));
+	if (online && endpoint) {
+		try {
+			const connection = await engine.connectOverCDP(endpoint, { timeout: browser.actionTimeoutMs, noDefaults: true });
+			try {
+				installed = connection.contexts().length > 0;
+				if (!installed) throw new Error("The CDP browser has no default persistent context");
+			}
+			finally { await connection.close(); }
+		} catch { throw new Error("Cannot connect to the configured browser CDP endpoint"); }
+	}
 	if (!installed) process.stdout.write(`Install browser: npx ${browser.driver === "patchright" ? "patchright" : "playwright"} install ${browser.channel}\n`);
 	const chat = browser.notifyChatId || operator?.chatId;
 	const destinationAllowed = !!chat && (!telegram.allowedChatIds.length || telegram.allowedChatIds.map(String).includes(chat));
-	process.stdout.write(`Host: ${process.platform}/${process.arch}; configuration: ${loaded.paths.configPath}\nRuntime: ${snapshot?.alive ? `running (pid ${snapshot.pid})` : "not running here"}\nBrowser: ${browser.enabled ? "enabled" : "disabled"}; ${browser.driver}/${browser.channel} ${installed ? "installed" : "not found"}; humanization ${browser.humanization.enabled ? "enabled" : "disabled"}\nPhone HTTPS address: ${browser.publicUrl || "not configured"}\nTelegram token: ${token ? "configured" : "missing"}\nOperator: ${chat ? `${chat}${destinationAllowed ? "" : " (denied by chat allowlist)"}` : "not paired"}\n`);
+	process.stdout.write(`Host: ${process.platform}/${process.arch}; configuration: ${loaded.paths.configPath}\nRuntime: ${snapshot?.alive ? `running (pid ${snapshot.pid})` : "not running here"}\nBrowser: ${browser.enabled ? "enabled" : "disabled"}; ${browser.driver}/${endpoint ? `external CDP (${online ? "reachable" : "reachability unchecked"})` : `${browser.channel} ${installed ? "installed" : "not found"}`}; humanization ${browser.humanization.enabled ? "enabled" : "disabled"}\nPhone HTTPS address: ${browser.publicUrl || "not configured"}\nTelegram token: ${token ? "configured" : "missing"}\nOperator: ${chat ? `${chat}${destinationAllowed ? "" : " (denied by chat allowlist)"}` : "not paired"}\n`);
 	if (browser.signing.enabled) {
 		const identity = new BrowserIdentity(browser.signing);
 		process.stdout.write(`Web Bot Auth: ${identity.agentUrl}; public key ID ${identity.keyId}\nRegistration: requires operator approval from Cloudflare; a local signature is not registration.\n`);

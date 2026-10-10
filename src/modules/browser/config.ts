@@ -10,6 +10,8 @@ export interface BrowserSigningConfig {
 export interface BrowserConfig {
 	enabled: boolean;
 	driver: "patchright" | "playwright";
+	/** Empty launches Chrome; otherwise attach to the loopback CDP URL in this env var. */
+	cdpEndpointEnv: string;
 	channel: "chrome" | "chromium";
 	headless: boolean;
 	/** null preserves native window dimensions. */
@@ -44,6 +46,7 @@ export const DEFAULT_HUMANIZATION: HumanizationConfig = {
 export const DEFAULT_BROWSER_CONFIG: BrowserConfig = {
 	enabled: false,
 	driver: "patchright",
+	cdpEndpointEnv: "",
 	channel: process.platform === "linux" && process.arch === "arm64" ? "chromium" : "chrome",
 	headless: false,
 	viewport: null,

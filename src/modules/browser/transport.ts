@@ -15,7 +15,7 @@ export class BrowserSigningTransport {
 		if (!browser) throw new Error("Browser signing requires Chromium CDP");
 		const session = await browser.newBrowserCDPSession();
 		this.session = session;
-		session.on("close", () => this.close());
+		session.on("close", () => { void this.close(); });
 		session.on("Fetch.requestPaused", (event: { requestId: string; request: { url: string; method: string; headers: Record<string, string> } }) => {
 			void this.continueRequest(session, event).catch(async error => {
 				if (!this.closed) this.onError(error);
@@ -27,7 +27,14 @@ export class BrowserSigningTransport {
 		await session.send("Fetch.enable", { patterns: [{ urlPattern: "http://*", requestStage: "Request" }, { urlPattern: "https://*", requestStage: "Request" }] });
 	}
 
-	close(): void { this.closed = true; this.session = undefined; }
+	async close(): Promise<void> {
+		this.closed = true;
+		const session = this.session;
+		this.session = undefined;
+		if (!session) return;
+		await boundedCleanup(session.send("Fetch.disable"));
+		await boundedCleanup(session.detach());
+	}
 
 	private async continueRequest(session: CDPSession, event: { requestId: string; request: { url: string; method: string; headers: Record<string, string> } }): Promise<void> {
 		const { request } = event;
@@ -39,4 +46,11 @@ export class BrowserSigningTransport {
 		// identity headers outside the explicitly authorized HTTPS origins.
 		await session.send("Fetch.continueRequest", { requestId: event.requestId, headers });
 	}
+}
+
+async function boundedCleanup(operation: Promise<unknown>): Promise<void> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await Promise.race([operation.catch(() => {}), new Promise<void>(resolve => { timer = setTimeout(resolve, 2000); })]);
+	} finally { clearTimeout(timer); }
 }

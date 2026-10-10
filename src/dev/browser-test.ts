@@ -6,6 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { BrowserContext, BrowserType } from "playwright";
 import { loadConfig } from "../config.js";
+import { resolveCdpEndpoint } from "../modules/browser/connection.js";
 import type { ModuleContext } from "../events/api.js";
 import { ModuleHost } from "../events/host.js";
 import { loadModules, describeModules } from "../events/loader.js";
@@ -31,6 +32,7 @@ class FakePage extends EventEmitter {
 	url() { return this.address; }
 	isClosed() { return false; }
 	mainFrame() { return this; }
+	frames() { return [this]; }
 	viewportSize() { return { width: 900, height: 720 }; }
 	async title() { return "Test page"; }
 	async goto(url: string) {
@@ -84,6 +86,14 @@ function post(base: string, endpoint: string, credential: string, body: unknown 
 }
 
 try {
+	assert.equal(resolveCdpEndpoint({ cdpEndpointEnv: "" }), undefined);
+	assert.equal(resolveCdpEndpoint({ cdpEndpointEnv: "TEST_CDP" }, { TEST_CDP: "http://127.0.0.1:9222" }), "http://127.0.0.1:9222/");
+	assert.equal(resolveCdpEndpoint({ cdpEndpointEnv: "TEST_CDP" }, { TEST_CDP: "ws://[::1]:9222/devtools/browser/example" }), "ws://[::1]:9222/devtools/browser/example");
+	assert.throws(() => resolveCdpEndpoint({ cdpEndpointEnv: "TEST_CDP" }, {}), /Set TEST_CDP/);
+	assert.throws(() => resolveCdpEndpoint({ cdpEndpointEnv: "bad-name" }), /variable name/);
+	for (const value of ["http://example.com:9222", "ws://127.0.0.1:9222/?token=secret", "http://user:secret@localhost:9222", "file:///tmp/browser", "not a url"]) {
+		assert.throws(() => resolveCdpEndpoint({ cdpEndpointEnv: "TEST_CDP" }, { TEST_CDP: value }), error => error instanceof Error && !error.message.includes("secret"));
+	}
 	const { privateKey, publicKey } = generateKeyPairSync("ed25519");
 	const keyPath = path.join(root, "key.pem");
 	fs.writeFileSync(keyPath, privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600 });

@@ -12,6 +12,8 @@ Install project dependencies and Google Chrome. The default is `driver: "patchri
 
 For guided configuration, run `npm run browser -- setup`, then `npm run browser -- doctor`. Setup writes only the gitignored local override and preserves the current tool permissions. `doctor --online` also checks the Telegram identity and public HTTPS endpoint. See the [Russian quick start](BROWSER_QUICKSTART.ru.md) for the complete phone connection workflow.
 
+For an already running Fortress/Chromium browser, `setup --driver playwright --cdp-env ALIVE_BROWSER_CDP_URL` selects attachment to the loopback HTTP/WebSocket endpoint stored in that environment variable. Alive adopts its default context and current tabs without creating a profile or changing launch settings. Stopping/closing Alive disconnects its client and preserves the external browser; connection loss revokes phone credentials and pauses the agent. Use a dedicated browser and avoid other controllers acting during a handoff. `diagnose` tests native transparent Canvas behavior in a temporary blank tab/profile. See [Fortress integration and the native transparent pixel fix](deploy/browser/fortress/README.ru.md).
+
 Add this configuration to the gitignored `alive.config.local.json`:
 
 ```json
@@ -80,6 +82,8 @@ A one-second observer also detects known widgets rendered after navigation while
 ## Manual control from a phone
 
 1. The browser pauses and sends the configured operator a single-use link. A notification failure leaves the browser paused and is reported to the agent; another `handoff` retries delivery.
+
+   Visible editable password and `autocomplete="one-time-code"` inputs, including frames, also request private operator entry. Detection never reads their values. Agent reads and screenshots remain blocked during the handoff. The operator must finish or leave the private form before resuming. Nonstandard code-entry widgets may require explicit `handoff`.
 2. Opening the link exchanges its fragment token for a rotated operator credential. The visible URL is immediately cleared. The phone tab keeps the credential, expiry, and a SHA-256 fingerprint of the activation link in `sessionStorage` so refreshing or reopening that link in the same tab restores control. The server retains its authorization state only in memory. The original link cannot activate another tab, and frame/input endpoints require the rotated credential. Completion or an authorization/expiry error clears the saved credential; it is not stored in `localStorage` or cookies.
 3. The operator sees the same page with the same cookies and network session. JPEG frames update roughly every 700 ms plus capture/network time. This is a low-frame-rate live view, without audio. Clicks, pointer drags, scrolls, text insertion, and selected keyboard keys go to that page; verification frames are not copied into another origin.
 4. The operator clicks **Готово — вернуть агенту** to resume. Resume is refused while an incomplete known verification widget or HTTP denial remains, or a rate-limit cooldown has not elapsed. A completed reCAPTCHA, hCaptcha or Turnstile checkbox can remain visible; its provider response field is checked without exporting or modifying its value. Visible full-page challenge forms remain blocking.
@@ -127,7 +131,7 @@ By default the identity origin matches `publicUrl`. Set `--identity-url` during 
 browser({ action: "request", url: "https://authorized.example.com/resource" })
 ```
 
-`request` makes an HTTP GET through the browser context's HTTP client and shares its cookies. With signing enabled, it signs `@authority`, `@method`, `@path`, `@query`, and `signature-agent`; includes a fresh nonce, RFC 7638 JWK thumbprint, and 60-second expiry; and rejects origins outside the explicit signing allowlist. Redirects are returned without following them so identity headers cannot be carried to an unapproved destination. HTTP responses are returned as truncated text.
+`request` makes an HTTP GET through the context's separate Node HTTP client and shares its cookies. It does not use Chromium/Fortress's native TLS stack; use `navigate` for native browser network behavior. Results identify `networkClient: "node"`. With signing enabled, it signs `@authority`, `@method`, `@path`, `@query`, and `signature-agent`; includes a fresh nonce, RFC 7638 JWK thumbprint, and 60-second expiry; and rejects origins outside the explicit signing allowlist. Redirects are returned without following them so identity headers cannot be carried to an unapproved destination. HTTP responses are returned as truncated text.
 
 Browser HTTP/HTTPS traffic is also signed through browser-level Chromium CDP `Fetch` interception. Navigation, assets, POST, out-of-process iframes, dedicated/shared/service worker network requests and the initial request of popups retain native Chrome transport, cookies and request bodies. Every request and redirect hop receives a fresh signature only when its exact HTTPS origin is authorized. Identity headers are stripped outside that allowlist. The page can visit other origins normally without claiming the configured identity. Interception failures fail the affected request and pause agent actions. Service workers remain enabled.
 
@@ -139,6 +143,7 @@ Signatures identify the request method, authority, path, query and agent; they d
 npm run typecheck
 npm run test:browser
 npm run test:browser:e2e
+npm run test:browser:cdp
 npm run test:browser:signing
 npm run test:browser:operator
 npm run test:browser:identity-worker
@@ -149,5 +154,7 @@ npm test
 `test:browser` checks independent signature verification, forbidden signing origins, one-time capabilities, exclusive operator control, revocation, expiration, notification failures, and rate-limit handling with an injected browser. `test:browser:e2e` requires Chrome and launches isolated headless profiles against local fixtures. It verifies page-observed `navigator.webdriver`, native pointer/key events, cancellation during typing on HTTP 403, and actual browser cookies/storage persistence, a simulated verification handoff, pointer drag/text input, phone-tab reload/reopen recovery, rejection of consumed links in new tabs, replacement of saved credentials on renewal, explicit resume, and phone/desktop layouts; it retains screenshots in a temporary directory and removes the session profile. It does not contact third-party challenge providers. To verify an operator-approved external relay against these fixtures, forward it to `127.0.0.1:4323` and set `ALIVE_BROWSER_E2E_PUBLIC_ORIGIN` to its exact HTTPS origin when running this test; only the control panel and fixture frames are exposed.
 
 `test:browser:signing` independently verifies Ed25519 signatures observed by local HTTPS fixtures for native Chrome navigation, assets, redirects, POST bodies, cross-site frames, workers and popups, and checks that signatures never reach an unapproved redirect destination. Self-signed TLS exceptions apply only to its isolated test profile. `test:browser:operator` covers the complete pairing/allowlist/notification flow through a local test Bot API. `test:browser:cli` starts the actual standalone CLI with Chrome, authenticates the live image endpoint, checks single-instance protection and graceful cleanup, and exercises tunnel process handling without publishing a service. The core suite includes operator tests; real Chrome tests are separate opt-in commands. Set `ALIVE_BROWSER_TEST_DRIVER=playwright` to run both browser E2E commands against the compatibility driver.
+
+`test:browser:cdp` launches an external Chrome process and attaches through its actual CDP socket. It checks existing page/cookie/storage preservation, temporary Canvas diagnostics, detach without process termination or lingering Fetch interception, password/iframe code-entry pause, authenticated live frames and private operator input, explicit resume, and credential revocation on disconnection. Both drivers can run this suite with `ALIVE_BROWSER_TEST_DRIVER`. This tests the adapter boundary, not an installed Fortress release.
 
 Runtime process-state helpers support both Linux procfs and macOS `ps`, including stopped processes. The runner idle test now waits for a deliberately delayed event so its elapsed-time assertion measures actual idle time. The lifecycle test verifies kernel exit before awaiting Node's asynchronous child-exit notification.

@@ -30,6 +30,7 @@
     "test:daemon": "tsx src/dev/daemon-test.ts",
     "test:browser": "tsx src/dev/browser-test.ts",
     "test:browser:e2e": "tsx src/dev/browser-e2e-test.ts",
+    "test:browser:cdp": "tsx src/dev/browser-cdp-e2e-test.ts",
     "browser": "tsx src/index.ts browser",
     "test:browser:operator": "tsx src/dev/browser-operator-test.ts",
     "test:browser:signing": "tsx src/dev/browser-signing-e2e-test.ts",
