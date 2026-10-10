@@ -95,7 +95,7 @@ async function withTimeout<T>(promise: Promise<T>, ms: number, label: string): P
 section("process state helpers");
 {
 	check("our own pid is alive", isProcessAlive(process.pid));
-	check("our own state comes from /proc", (processState(process.pid) ?? "").length === 1, processState(process.pid));
+	check("our own state comes from the kernel", (processState(process.pid) ?? "").length === 1, processState(process.pid));
 	check("our own pid is not suspended", !isProcessSuspended(process.pid));
 	check("pid 0 is never alive", !isProcessAlive(0));
 	check("nonsense pid is never alive", !isProcessAlive(Number.NaN));

@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { readJson } from "./util.js";
+import { DEFAULT_BROWSER_CONFIG, type BrowserConfig } from "./modules/browser/config.js";
 
 export interface LoopConfig {
 	/**
@@ -116,6 +117,7 @@ export interface ExternalModuleConfig {
 export interface ModulesConfig {
 	telegram: TelegramConfig;
 	grafana: GrafanaConfig;
+	browser?: BrowserConfig;
 	/** Modules written by the user: `{ name, path, options }`. */
 	external: ExternalModuleConfig[];
 }
@@ -310,6 +312,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 			firingPriority: "high",
 			resolvedPriority: "low",
 		},
+		browser: DEFAULT_BROWSER_CONFIG,
 		external: [],
 	},
 	verbose: false,

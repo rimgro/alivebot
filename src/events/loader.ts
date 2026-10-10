@@ -39,6 +39,15 @@ export async function loadModules(config: LoadedConfig, log: Logger): Promise<Mo
 		}
 	}
 
+	if (cfg.modules.browser?.enabled) {
+		try {
+			const { BrowserModule } = await import("../modules/browser/module.js");
+			modules.push(new BrowserModule(cfg.modules.browser));
+		} catch (err) {
+			errors.push({ name: "browser", error: message(err) });
+		}
+	}
+
 	for (const spec of cfg.modules.external) {
 		if (spec.enabled === false) continue;
 		try {
@@ -113,6 +122,8 @@ export function describeModules(config: AliveConfig): ModuleDescription[] {
 		source: "builtin",
 		detail: grafana.enabled ? `http://${grafana.host}:${grafana.port}${grafana.path}` : undefined,
 	});
+	const browser = config.modules.browser;
+	out.push({ name: "browser", enabled: browser?.enabled ?? false, source: "builtin", detail: browser?.enabled ? `${browser.channel}, persistent profile` : undefined });
 	for (const spec of config.modules.external) {
 		out.push({
 			name: spec.name,

@@ -13,6 +13,7 @@ import { createTelegramTools, type TelegramToolHost } from "./tools.js";
 import { formatThread, parseThread } from "./threads.js";
 import type { TelegramChat, TelegramSentMessage, TelegramUpdate } from "./types.js";
 import { normalizeUpdate, type NormalizedInbound } from "./update.js";
+import { acceptBrowserPairing } from "../browser/operator.js";
 
 const DEFAULT_ALLOWED_UPDATES = ["message", "edited_message", "channel_post", "edited_channel_post", "callback_query"];
 
@@ -295,6 +296,15 @@ export class TelegramModule implements AliveModule {
 		const api = this.api;
 		const state = this.state;
 		if (!ctx || !api || !state) return;
+		if (update.message?.text?.match(/^\/browser_pair(?:@[A-Za-z0-9_]+)?(?:\s|$)/)) {
+			const operator = acceptBrowserPairing(ctx.paths.modulesDir, update.message, this.config.allowedChatIds);
+			if (operator) this.allowlist?.add(operator.userId);
+			await api.sendMessage({ chat_id: update.message.chat.id, text: operator
+				? "Телефон привязан. Alive будет отправлять помощь браузеру в этот личный чат."
+				: "Привязка не выполнена. Запустите alive browser pair и отправьте новую команду боту в личном чате. Настроенный список разрешённых чатов также должен допускать этот чат." });
+			// Pairing capabilities must never enter history, events or model context.
+			return;
+		}
 		const inbound = normalizeUpdate(update, {
 			botId: this.botId,
 			botUsername: this.botUsername,
