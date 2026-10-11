@@ -30,7 +30,7 @@ try {
 	fs.writeFileSync(local, JSON.stringify({ modules: { telegram: { allowedChatIds: ["777"] } }, tools: { bash: false }, name: "Preserved" }));
 	setupBrowser(loadConfig({ cwd: root }), { "public-url": "https://phone.test", headless: true });
 	let loaded = loadConfig({ cwd: root });
-	assert.deepEqual(loaded.config.tools.allowlist, ["read", "status", "browser"]);
+	assert.deepEqual(loaded.config.tools.allowlist, ["read", "status", "browser", "browser_share"]);
 	assert.equal(loaded.config.tools.bash, false);
 	assert.equal(loaded.config.name, "Preserved");
 	assert.equal(loaded.config.modules.browser!.headless, true);
@@ -67,7 +67,8 @@ try {
 
 	// Exercise Telegram polling -> private pairing -> dynamic allowlist -> handoff notification.
 	const incoming: TelegramUpdate[] = [];
-	const sent: Array<{ chat_id: string; text: string }> = [];
+	const sent: Array<{ chat_id: string; text: string; protect_content?: boolean; reply_markup?: { inline_keyboard: Array<Array<{ text: string; web_app: { url: string } }>> } }> = [];
+	let chatType = "private";
 	api = http.createServer((req, res) => {
 		let body = ""; req.on("data", chunk => { body += chunk; });
 		req.on("end", () => {
@@ -75,6 +76,7 @@ try {
 			const method = req.url!.split("/").at(-1);
 			let result: unknown = true;
 			if (method === "getMe") result = { id: 123, is_bot: true, first_name: "Fixture", username: "fixture_bot" };
+			if (method === "getChat") result = { id: Number(params.chat_id), type: chatType };
 			if (method === "sendMessage") { sent.push(params); result = { message_id: sent.length, date: 1, chat: { id: Number(params.chat_id), type: "private" }, text: params.text }; }
 			if (method === "getUpdates") result = incoming.splice(0);
 			const reply = () => { if (!res.destroyed) { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ ok: true, result })); } };
@@ -101,12 +103,26 @@ try {
 	assert.equal(readBrowserOperator(loaded.paths.modulesDir)?.chatId, "777");
 	assert.ok(new TelegramAllowlistStore(path.join(loaded.paths.modulesDir, "telegram")).list().includes("777"));
 	assert.equal(history.stats().messages, 0, "Pairing command must not enter history");
-	const handoff = await browser.command({ action: "handoff", reason: "Fixture human assistance" });
+	const share = host.contributedTools().find(tool => tool.name === "browser_share")!;
+	assert.ok(share, "The agent must have an explicit sharing tool");
+	const handoff = await share.execute("fixture-share", { reason: "Fixture human assistance" } as never, undefined, undefined, {} as never) as { details: Record<string, unknown> };
 	assert.equal(handoff.details.notificationFailed, false);
 	assert.equal(handoff.details.operatorUrl, undefined, "Telegram capability must not appear in model tool output");
 	assert.ok(sent.some(r => String(r.chat_id) === "777" && /https:\/\/phone.test\/browser#[A-Za-z0-9_-]{43}/.test(r.text)));
+	const notification = sent.find(r => r.reply_markup)!;
+	const button = notification.reply_markup!.inline_keyboard[0][0];
+	assert.equal(button.text, "Открыть браузер");
+	assert.match(button.web_app.url, /^https:\/\/phone.test\/browser#aliveKey=[A-Za-z0-9_-]{43}$/);
+	assert.equal(notification.protect_content, true);
+	assert.equal(JSON.stringify(handoff).includes(new URL(button.web_app.url).hash.slice(1)), false);
 	await browser.command({ action: "handoff" });
 	assert.equal(sent.filter(r => r.text.includes("/browser#")).length, 1);
+	chatType = "supergroup";
+	const groupDenied = await browser.command({ action: "handoff", renew: true });
+	assert.equal(groupDenied.details.notificationFailed, true);
+	assert.equal(sent.filter(r => r.reply_markup).length, 1, "No browser capability may be sent to a group");
+	chatType = "private";
+	assert.equal((await browser.command({ action: "handoff" })).details.notificationFailed, false);
 	const logs = fs.existsSync(loaded.paths.logFile) ? fs.readFileSync(loaded.paths.logFile, "utf8") : "";
 	assert.equal(logs.includes(requestForBot.code), false);
 	assert.equal(JSON.stringify(events.all()).includes(requestForBot.code), false);
@@ -114,7 +130,7 @@ try {
 
 	const abort = new AbortController(); abort.abort();
 	await assert.rejects(startQuickTunnel("http://127.0.0.1:4323", abort.signal, "/nonexistent/alive-test-cloudflared"), /cancelled|could not start/);
-	console.log("Operator tests passed: private one-time pairing, expiry, chat boundaries, Telegram integration, notification secrecy, existing permission/key preservation, missing tunnel executable.");
+	console.log("Operator tests passed: private one-time pairing, Mini App sharing tool/button, group rejection, delivery retries, notification secrecy, existing permission/key preservation, missing tunnel executable.");
 } finally {
 	await host?.stop();
 	api?.closeAllConnections();

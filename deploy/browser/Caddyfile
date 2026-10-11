@@ -5,6 +5,8 @@
 	handle @browser {
 		reverse_proxy 127.0.0.1:4323 {
 			header_up Host {host}
+			# Flush live frames without suppressing client disconnect cancellation.
+			flush_interval 100ms
 		}
 	}
 	handle {

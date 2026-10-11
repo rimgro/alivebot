@@ -1,6 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs";
 import * as http from "node:http";
+import { setTimeout as delay } from "node:timers/promises";
 import { Type } from "typebox";
 import { defineTool, type ToolDefinition, type AgentToolResult } from "@earendil-works/pi-coding-agent";
 import type { Browser, BrowserContext, Page, Response as BrowserResponse, BrowserType } from "playwright";
@@ -56,6 +57,7 @@ export class BrowserModule implements AliveModule {
 	private actionAbort?: AbortController;
 	private challengeMonitor?: ReturnType<typeof setInterval>;
 	private monitoringChallenge = false;
+	private streamResponse?: http.ServerResponse;
 
 	constructor(config: Omit<Partial<BrowserConfig>, "humanization"> & { humanization?: Partial<HumanizationConfig> }, private readonly deps: BrowserDependencies = {}) {
 		this.config = { ...DEFAULT_BROWSER_CONFIG, ...config, humanization: { ...DEFAULT_HUMANIZATION, ...config.humanization }, signing: { ...DEFAULT_BROWSER_CONFIG.signing, ...config.signing } };
@@ -79,10 +81,16 @@ export class BrowserModule implements AliveModule {
 				if (!chatId || (telegram.allowedChatIds.length && !telegram.allowedChatIds.map(String).includes(chatId))) throw new Error("Pair a permitted browser operator first");
 				if (!this.config.publicUrl) throw new Error("Configure publicUrl with a phone-accessible HTTPS origin before Telegram handoff");
 				const api = new TelegramApi({ token, apiBase: telegram.apiBase });
+				const chat = await api.call<{ type: string }>("getChat", { chat_id: chatId }, { signal: ctx.signal });
+				if (chat.type !== "private") throw new Error("Browser Mini App assistance requires a private operator chat");
+				const miniAppUrl = new URL(url);
+				miniAppUrl.hash = `aliveKey=${miniAppUrl.hash.slice(1)}`;
 				await api.call("sendMessage", {
 					chat_id: chatId,
-					text: `Alive: браузеру нужна помощь.\n${reason}\nОткрой ссылку, выполни действие и нажми «Готово — вернуть агенту».\n${url}`,
+					text: `Alive: браузеру нужна помощь.\n${reason}\nНажми «Открыть браузер», выполни действие в Mini App и нажми «Готово — вернуть агенту».\nЕсли Mini App недоступен, открой в браузере:\n${url}`,
 					disable_web_page_preview: true,
+					protect_content: true,
+					reply_markup: { inline_keyboard: [[{ text: "Открыть браузер", web_app: { url: miniAppUrl.href } }]] },
 				}, { signal: ctx.signal });
 			};
 		}
@@ -116,6 +124,7 @@ export class BrowserModule implements AliveModule {
 		clearInterval(this.challengeMonitor);
 		this.challengeMonitor = undefined;
 		this.actionAbort?.abort(new Error("Browser is stopped"));
+		this.endStream();
 		this.handoff = undefined;
 		const server = this.server;
 		this.server = undefined;
@@ -158,6 +167,11 @@ export class BrowserModule implements AliveModule {
 				key: Type.Optional(Type.String()), delta: Type.Optional(Type.Number()), reason: Type.Optional(Type.String({ maxLength: 300 })), renew: Type.Optional(Type.Boolean({ description: "Revoke an existing link and issue a new one only when the operator requests recovery." })),
 			}),
 			execute: async (_id, params, signal) => this.command(params, signal),
+		}), defineTool({
+			name: "browser_share", label: "Share browser",
+			description: "Pause this browser and send the configured private Telegram operator a Mini App button with a live stream and pointer/keyboard control of the same session. Use for permitted CAPTCHA, password, verification code or other manual assistance. The agent cannot read or act on the browser until the operator explicitly returns control. Repeated calls reuse the current session; renew only at the operator's request. With local-only configuration, returns a local control link instead.",
+			parameters: Type.Object({ reason: Type.String({ minLength: 1, maxLength: 300, description: "Briefly explain the manual action needed. Never include passwords or verification codes." }), renew: Type.Optional(Type.Boolean()) }),
+			execute: async (_id, params, signal) => this.command({ action: "handoff", ...params }, signal),
 		})];
 	}
 
@@ -264,6 +278,7 @@ export class BrowserModule implements AliveModule {
 			const disconnected = () => {
 				if (this.context !== context) return;
 				this.context = undefined; this.page = undefined; this.attachedBrowser = undefined;
+				this.endStream();
 				this.handoff = undefined;
 				void this.signingTransport?.close(); this.signingTransport = undefined;
 				this.actionAbort?.abort(new Error("Browser connection lost"));
@@ -280,6 +295,7 @@ export class BrowserModule implements AliveModule {
 	}
 
 	private async releaseBrowser(): Promise<void> {
+		this.endStream();
 		const context = this.context, attached = this.attachedBrowser, transport = this.signingTransport;
 		this.context = undefined; this.page = undefined; this.attachedBrowser = undefined;
 		this.signingTransport = undefined; this.handoff = undefined;
@@ -383,7 +399,7 @@ export class BrowserModule implements AliveModule {
 	private async beginHandoff(reason: string, renew = false): Promise<Record<string, unknown>> {
 		if (this.stopped) throw new Error("Browser is stopped");
 		this.pausedReason ||= reason;
-		if (renew) this.handoff = undefined;
+		if (renew) { this.endStream("Invalid access key"); this.handoff = undefined; }
 		if (this.handoff && this.handoff.expiresAt > Date.now()) {
 			await this.notifyOperator();
 			return this.handoffResult();
@@ -423,16 +439,19 @@ export class BrowserModule implements AliveModule {
 		}
 		if (req.method === "GET" && pathname === "/browser") {
 			const nonce = randomBytes(18).toString("base64");
-			res.setHeader("Content-Security-Policy", `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; img-src blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`);
+			res.removeHeader("X-Frame-Options");
+			res.setHeader("Content-Security-Policy", `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; img-src blob:; connect-src 'self'; frame-ancestors https://web.telegram.org; base-uri 'none'; form-action 'none'`);
 			res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
 			res.end(controlPage(nonce));
 			return;
 		}
 		if (req.method === "POST" && req.headers.origin && req.headers.origin !== this.publicOrigin) throw new HttpError(403, "Unexpected origin");
-		if (!["/browser/claim", "/browser/frame", "/browser/input", "/browser/resume"].includes(pathname)) throw new HttpError(404, "Not found");
-		if ((pathname === "/browser/frame" && req.method !== "GET") || (pathname !== "/browser/frame" && req.method !== "POST")) throw new HttpError(405, "Method not allowed");
+		if (!["/browser/claim", "/browser/frame", "/browser/stream", "/browser/input", "/browser/resume"].includes(pathname)) throw new HttpError(404, "Not found");
+		const getEndpoint = pathname === "/browser/frame" || pathname === "/browser/stream";
+		if (req.method !== (getEndpoint ? "GET" : "POST")) throw new HttpError(405, "Method not allowed");
 		if (req.method === "POST" && req.headers["content-type"] !== "application/json") throw new HttpError(415, "Use application/json");
 		this.authorize(req);
+		if (pathname === "/browser/stream") { await this.streamFrames(req, res); return; }
 		const body = req.method === "POST" ? await readBody(req) : {};
 		await this.enqueue(async () => {
 			if (res.destroyed) return;
@@ -462,12 +481,64 @@ export class BrowserModule implements AliveModule {
 					throw new HttpError(409, "Site still requires verification, private login entry, or denies access. Finish the permitted action before resuming.");
 				}
 				await this.page.mouse.up();
+				this.endStream();
 				this.handoff = undefined;
 				this.pausedReason = undefined;
 				this.ctx!.event({ title: "Browser control returned", text: "The operator explicitly returned browser control to the agent.", priority: "normal" });
 				this.json(res, 200, { resumed: true });
 			}
 		});
+	}
+
+	/** A bounded live JPEG stream; capture operations yield the queue to operator input. */
+	private async streamFrames(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+		await this.enqueue(async () => {
+			if (res.destroyed) throw new HttpError(410, "Stream receiver disconnected");
+			if (!this.authorize(req).claimed) throw new HttpError(401, "Claim the operator link first");
+			if (this.streamResponse && !this.streamResponse.destroyed) throw new HttpError(409, "A browser stream is already open");
+			if (!this.page || this.page.isClosed()) throw new HttpError(410, "Browser page closed");
+			this.streamResponse = res;
+		});
+		if (res.destroyed) { if (this.streamResponse === res) this.streamResponse = undefined; return; }
+		const abort = new AbortController();
+		res.once("close", () => abort.abort());
+		res.writeHead(200, { "Content-Type": "application/x-ndjson", "X-Accel-Buffering": "no" });
+		res.flushHeaders();
+		try {
+			while (!abort.signal.aborted && !res.destroyed && !res.writableEnded) {
+				const started = Date.now();
+				const frame = await this.enqueue(async () => {
+					if (abort.signal.aborted || res.writableEnded) return;
+					this.authorize(req);
+					if (this.stopped || !this.page || this.page.isClosed()) throw new HttpError(410, "Browser page closed");
+					const buffer = await this.page.screenshot({ type: "jpeg", quality: 70, scale: "css", timeout: 5000 });
+					this.authorize(req);
+					if (buffer.length > 4 * 1024 * 1024) throw new HttpError(413, "Browser frame is too large");
+					return buffer;
+				});
+				if (!frame || abort.signal.aborted || res.writableEnded) break;
+				if (!res.write(`${JSON.stringify({ frame: frame.toString("base64") })}\n`)) {
+					await new Promise<void>((resolve, reject) => {
+						const done = (error?: Error) => { clearTimeout(timer); res.off("drain", drained); res.off("close", closed); error ? reject(error) : resolve(); };
+						const drained = () => done(); const closed = () => done(new Error("Stream closed"));
+						const timer = setTimeout(() => done(new Error("Stream receiver is too slow")), 10_000);
+						res.once("drain", drained); res.once("close", closed);
+					});
+				}
+				await delay(Math.max(0, 200 - (Date.now() - started)), undefined, { signal: abort.signal });
+			}
+		} catch (error) {
+			if (!res.destroyed && !res.writableEnded) res.write(`${JSON.stringify({ error: error instanceof HttpError ? error.message : "Browser stream interrupted", status: error instanceof HttpError ? error.status : 503 })}\n`);
+		} finally {
+			res.end();
+			if (this.streamResponse === res) this.streamResponse = undefined;
+		}
+	}
+
+	private endStream(error = "No active handoff"): void {
+		const res = this.streamResponse;
+		this.streamResponse = undefined;
+		if (res && !res.destroyed && !res.writableEnded) res.end(`${JSON.stringify({ error, status: 401 })}\n`);
 	}
 
 	private authorize(req: http.IncomingMessage): Handoff {
@@ -489,6 +560,7 @@ export class BrowserModule implements AliveModule {
 			if (input.type === "down") await page.mouse.down();
 			if (input.type === "up") await page.mouse.up();
 		} else if (input.type === "text" && typeof input.text === "string" && input.text.length <= 4096) {
+			if (!await this.operatorCanType()) throw new HttpError(409, "Select an editable text field on the browser image first");
 			await page.keyboard.insertText(input.text);
 		} else if (input.type === "key" && typeof input.key === "string" && ["Tab", "Enter", "Backspace", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Space", "Delete"].includes(input.key)) {
 			await page.keyboard.press(input.key);
@@ -498,6 +570,22 @@ export class BrowserModule implements AliveModule {
 			if (Date.now() < this.retryAt) throw new HttpError(409, "Rate limit cooldown has not elapsed");
 			await page.reload({ waitUntil: "domcontentloaded" });
 		} else throw new HttpError(400, "Invalid browser input");
+	}
+
+	/** Inspect focus/editability only; never read the contents of private fields. */
+	private async operatorCanType(): Promise<boolean> {
+		for (const frame of this.page!.frames()) {
+			const fields = frame.locator('input:focus:not([type="button"],[type="submit"],[type="reset"],[type="checkbox"],[type="radio"],[type="range"],[type="file"],[type="hidden"]), textarea:focus, [contenteditable]:focus');
+			if (!await fields.count() || !await fields.first().isEditable()) continue;
+			let focused = true;
+			for (let child = frame; child.parentFrame(); child = child.parentFrame()!) {
+				const element = await child.frameElement();
+				try { if (!await element.evaluate(element => element.getRootNode().activeElement === element)) { focused = false; break; } }
+				finally { await element.dispose(); }
+			}
+			if (focused) return true;
+		}
+		return false;
 	}
 
 	private enqueue<T>(operation: () => Promise<T>): Promise<T> {

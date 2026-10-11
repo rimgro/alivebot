@@ -80,7 +80,7 @@ export function setupBrowser(loaded: LoadedConfig, flags: Flags): string {
 	}
 	if (identityUrl && !browser.signing.enabled) throw new Error("Use --sign-origins when configuring a new signed identity");
 	local.modules = { ...local.modules, browser: { ...local.modules?.browser, ...browser } };
-	local.tools = { ...local.tools, allowlist: [...new Set([...loaded.config.tools.allowlist, "browser"])] };
+	local.tools = { ...local.tools, allowlist: [...new Set([...loaded.config.tools.allowlist, "browser", "browser_share"])] };
 	writePrivateJson(file, local);
 	return file;
 }
@@ -232,7 +232,7 @@ async function serve(loaded: LoadedConfig, flags: Flags): Promise<number> {
 	if (!url) {
 		fixture = http.createServer((_req, res) => {
 			res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });
-			res.end('<!doctype html><html lang="ru"><meta charset="utf-8"><title>Alive: проверка ручного управления</title><style>body{padding:36px;font:20px system-ui;background:#fafaf6;color:#183623}input,button{font:inherit;padding:12px;margin:12px 0}label{display:block}</style><h1>Проверка связи с браузером</h1><p>Введите текст и нажмите кнопку. Это локальная демонстрация.</p><label>Текст <input id="text"></label><button onclick="document.querySelector(\'output\').textContent=document.querySelector(\'input\').value">Подтвердить</button><p><output></output></p></html>');
+			res.end('<!doctype html><html lang="ru"><meta charset="utf-8"><title>Alive: проверка ручного управления</title><style>body{padding:24px;font:20px system-ui;background:#fafaf6;color:#183623}input,button{box-sizing:border-box;font:inherit;padding:12px;margin:12px 0;max-width:100%}input{width:100%}label{display:block}output{display:block;color:#176143;font-weight:600}</style><h1>Проверка связи с браузером</h1><p>Введите тестовый текст и нажмите кнопку. Это локальная демонстрация.</p><label>Текст <input id="text"></label><button onclick="document.querySelector(\'output\').textContent=\'Подтверждено: \'+document.querySelector(\'input\').value;this.textContent=\'Подтверждено ✓\'">Подтвердить</button><p><output aria-live="polite"></output></p></html>');
 		});
 		await new Promise<void>(resolve => fixture!.listen(0, "127.0.0.1", resolve));
 		url = `http://127.0.0.1:${(fixture.address() as { port: number }).port}/`;

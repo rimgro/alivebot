@@ -17,6 +17,11 @@ declare const document: { documentElement: { scrollWidth: number }; querySelecto
 declare const innerWidth: number;
 declare function requestAnimationFrame(callback: () => void): number;
 declare const sessionStorage: { getItem(key: string): string | null };
+declare const window: {
+	Telegram: { WebApp: unknown };
+	telegramCalls: string[];
+	telegramEvents: Record<string, () => void>;
+};
 
 // Uses local fixtures only. An explicitly configured relay can expose the control panel.
 // No external CAPTCHA or target website is contacted.
@@ -82,19 +87,48 @@ try {
 	const link = assist.details.operatorUrl as string;
 	assert.ok(link.includes("/browser#"));
 	operatorBrowser = await chromium.launch({ channel: "chrome", headless: true });
-	const operator = await operatorBrowser.newPage({ viewport: { width: 375, height: 812 } });
+	const operator = await operatorBrowser.newPage({ viewport: { width: 375, height: 812 }, hasTouch: true, isMobile: true });
+	// Literal JavaScript avoids injecting tsx/esbuild helper references into Chrome.
+	await operator.addInitScript(`window.telegramCalls=[];window.telegramEvents={};window.Telegram={WebApp:{
+		ready:()=>window.telegramCalls.push('ready'),expand:()=>window.telegramCalls.push('expand'),
+		enableClosingConfirmation:()=>window.telegramCalls.push('confirm'),disableClosingConfirmation:()=>window.telegramCalls.push('returned'),
+		isVersionAtLeast:()=>true,disableVerticalSwipes:()=>window.telegramCalls.push('swipes-disabled'),
+		onEvent:(name,callback)=>{window.telegramEvents[name]=callback}
+	}}`);
 	const errors: string[] = [];
 	operator.on("pageerror", (error) => errors.push(error.message));
-	await operator.goto(link);
+	let streamRequests = 0;
+	operator.on("request", req => { if (new URL(req.url()).pathname === "/browser/stream") streamRequests++; });
+	const miniAppLink = new URL(link);
+	miniAppLink.hash = `aliveKey=${miniAppLink.hash.slice(1)}&tgWebAppVersion=8.0&tgWebAppPlatform=ios&tgWebAppData=${encodeURIComponent("user=fixture&auth_date=1&hash=untrusted-fixture")}`;
+	await operator.goto(miniAppLink.href);
 	await operator.waitForURL((url) => !url.hash);
 	await operator.getByRole("status").filter({ hasText: "Подключено" }).waitFor();
 	await operator.waitForFunction(() => document.querySelector("#frame").naturalWidth > 0);
+	assert.deepEqual(await operator.evaluate(() => window.telegramCalls), ["ready", "expand", "confirm", "swipes-disabled"]);
+	assert.equal(streamRequests, 1, "A Mini App starts a continuous authenticated stream");
+	const initialFrame = await operator.locator("#frame").getAttribute("src");
+	await operator.waitForFunction(old => (document.querySelector("#frame") as unknown as { src: string }).src !== old, initialFrame);
+	await native.locator("#target").evaluate("element => element.blur()");
+	await operator.getByLabel("Текст в выбранное поле браузера").fill("Retain unfocused input");
+	await operator.getByRole("button", { name: "Ввести текст", exact: true }).click();
+	await operator.locator("#input-status").filter({ hasText: "Сначала нажми текстовое поле" }).waitFor();
+	assert.equal(await operator.getByLabel("Текст в выбранное поле браузера").inputValue(), "Retain unfocused input", "Rejected input must remain available for retry");
+	assert.equal(await native.locator("#target").inputValue(), "initial", "Unfocused operator input must not silently disappear");
+	await operator.evaluate(() => window.telegramEvents.deactivated());
+	await sleep(300);
+	const hiddenFrame = await operator.locator("#frame").getAttribute("src");
+	await sleep(400);
+	assert.equal(await operator.locator("#frame").getAttribute("src"), hiddenFrame, "An inactive Mini App must stop capture and delivery");
+	await operator.evaluate(() => window.telegramEvents.activated());
+	await operator.waitForFunction(old => (document.querySelector("#frame") as unknown as { src: string }).src !== old, hiddenFrame);
 	assert.equal(new URL(operator.url()).hash, "", "capability must be removed from the visible URL");
 	const savedSession = await operator.evaluate(() => sessionStorage.getItem("alive.browser.operator"));
 	assert.ok(savedSession && !savedSession.includes(new URL(link).hash.slice(1)), "Only the rotated credential and a link fingerprint may be retained in tab storage");
 	await operator.reload();
 	await operator.getByRole("status").filter({ hasText: "Подключено" }).waitFor();
 	await operator.waitForFunction(() => document.querySelector("#frame").naturalWidth > 0);
+	assert.deepEqual(await operator.evaluate(() => window.telegramCalls), ["ready", "expand", "confirm", "swipes-disabled"], "Mini App reload recovers SDK behavior without the original fragment");
 	await operator.goto(link);
 	await operator.waitForURL((url) => !url.hash);
 	await operator.getByRole("status").filter({ hasText: "Подключено" }).waitFor();
@@ -137,10 +171,13 @@ try {
 		return { x: box.x + x * box.width / 900, y: box.y + y * box.height / 720 };
 	};
 	const focus = await point(field.x + field.width / 2, field.y + field.height / 2);
-	await operator.mouse.click(focus.x, focus.y);
+	await operator.touchscreen.tap(focus.x, focus.y);
+	await operator.locator("#pointer-status").filter({ hasText: "Нажатие передано браузеру" }).waitFor();
 	await operator.getByLabel("Текст в выбранное поле браузера").fill(" — ручной ввод");
 	await operator.getByRole("button", { name: "Ввести текст", exact: true }).click();
 	await native.waitForFunction(() => document.querySelector("#target").value.includes("ручной ввод"));
+	await operator.locator("#input-status").filter({ hasText: "Текст отправлен в выбранное поле" }).waitFor();
+	assert.equal(await operator.getByLabel("Текст в выбранное поле браузера").inputValue(), "", "Acknowledged input is cleared from the controller");
 	const blocked = await browser.command({ action: "fill", selector: "#target", text: "must not overwrite" });
 	assert.match(blocked.details.error as string, /paused/);
 	await operator.getByRole("button", { name: "Готово — вернуть агенту" }).click();
@@ -157,10 +194,12 @@ try {
 	const solve = await native.locator("#solve").boundingBox();
 	assert.ok(solve);
 	const click = await point(solve.x + solve.width / 2, solve.y + solve.height / 2);
-	await operator.mouse.click(click.x, click.y);
+	await operator.touchscreen.tap(click.x, click.y);
 	await native.locator("#challenge-form").waitFor({ state: "detached" });
+	await operator.locator("#pointer-status").filter({ hasText: "Нажатие передано браузеру" }).waitFor();
 	await operator.getByRole("button", { name: "Готово — вернуть агенту" }).click();
 	await operator.getByRole("status").filter({ hasText: "Управление возвращено агенту" }).waitFor();
+	assert.ok((await operator.evaluate(() => window.telegramCalls)).includes("returned"));
 	assert.equal(await operator.evaluate(() => sessionStorage.getItem("alive.browser.operator")), null, "Explicit resume must erase the saved operator credential");
 	assert.equal(browser.status().paused, false);
 	assert.deepEqual(errors, []);

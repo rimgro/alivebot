@@ -29,10 +29,13 @@ class FakePage extends EventEmitter {
 	responseHeaders: Record<string, string> = {};
 	inputs: unknown[] = [];
 	gotos = 0;
+	captures = 0;
+	textFocused = true;
 	url() { return this.address; }
 	isClosed() { return false; }
 	mainFrame() { return this; }
 	frames() { return [this]; }
+	parentFrame() { return null; }
 	viewportSize() { return { width: 900, height: 720 }; }
 	async title() { return "Test page"; }
 	async goto(url: string) {
@@ -43,12 +46,12 @@ class FakePage extends EventEmitter {
 	locator(selector: string) {
 		return {
 			innerText: async () => "Test page text",
-			count: async () => selector === "body" ? 1 : selector.includes("#challenge-form") ? Number(this.challenge) : 0,
+			count: async () => selector === "body" ? 1 : selector.includes("input:focus") ? Number(this.textFocused) : selector.includes("#challenge-form") ? Number(this.challenge) : 0,
 			nth: () => ({ isVisible: async () => this.challenge }),
-			first: () => ({ click: async () => { this.inputs.push("agent-click"); }, fill: async (value: string) => { this.inputs.push(value); } }),
+			first: () => ({ isEditable: async () => this.textFocused, click: async () => { this.inputs.push("agent-click"); }, fill: async (value: string) => { this.inputs.push(value); } }),
 		};
 	}
-	async screenshot() { return Buffer.from([0xff, 0xd8, 0xff, 0xd9]); }
+	async screenshot() { this.captures++; return Buffer.from([0xff, 0xd8, 0xff, 0xd9]); }
 	mouse = {
 		move: async (x: number, y: number) => { this.inputs.push({ x, y }); },
 		down: async () => { this.inputs.push("down"); }, up: async () => { this.inputs.push("up"); },
@@ -78,6 +81,7 @@ async function fixture(options: { notify?: (url: string, reason: string) => Prom
 	hosts.push(host);
 	await host.init();
 	assert.equal(host.contributedTools().filter((tool) => tool.name === "browser").length, 1);
+	assert.equal(host.contributedTools().filter((tool) => tool.name === "browser_share").length, 1);
 	return { module, page, requested, store };
 }
 
@@ -132,6 +136,8 @@ try {
 	assert.ok(!JSON.stringify(module.status()).includes(token));
 	assert.ok(!JSON.stringify(store.peekPending(100)).includes(token));
 	assert.equal((await fetch(`${origin}/browser/frame`)).status, 401);
+	assert.equal((await fetch(`${origin}/browser/stream`)).status, 401);
+	assert.equal((await fetch(`${origin}/browser/stream`, { headers: { Authorization: `Bearer ${token}` } })).status, 401, "Stream requires a claimed credential");
 	assert.equal((await post(origin, "claim", token, {}, "https://attacker.test")).status, 403);
 	const before = page.inputs.length;
 	const denied = await module.command({ action: "click", selector: "button" });
@@ -147,18 +153,35 @@ try {
 	assert.equal(frame.status, 200);
 	assert.equal(frame.headers.get("cache-control"), "no-store");
 	assert.equal(frame.headers.get("content-type"), "image/jpeg");
+	const stream = await fetch(`${origin}/browser/stream`, { headers: { Authorization: `Bearer ${credential}` } });
+	assert.equal(stream.status, 200);
+	assert.equal(stream.headers.get("content-type"), "application/x-ndjson");
+	assert.equal(stream.headers.get("x-accel-buffering"), "no");
+	assert.equal(stream.headers.get("cache-control"), "no-store");
+	const reader = stream.body!.getReader();
+	const firstFrame = JSON.parse(new TextDecoder().decode((await reader.read()).value).split("\n")[0]);
+	assert.equal(Buffer.from(firstFrame.frame, "base64").equals(await page.screenshot()), true);
+	assert.equal((await fetch(`${origin}/browser/stream`, { headers: { Authorization: `Bearer ${credential}` } })).status, 409, "Only one bounded stream may capture a session");
 	assert.equal((await post(origin, "input", credential, { type: "down", x: 901, y: 10 })).status, 400);
 	assert.equal((await post(origin, "input", credential, { type: "key", key: "F12" })).status, 400);
 	assert.equal((await post(origin, "input", credential, { type: "text", text: "x".repeat(4097) })).status, 400);
 	assert.equal((await post(origin, "input", credential, { type: "text", text: "x".repeat(20_000) })).status, 413);
 	const malformed = await fetch(`${origin}/browser/input`, { method: "POST", headers: { Authorization: `Bearer ${credential}`, "content-type": "application/json" }, body: "[1]" });
 	assert.equal(malformed.status, 400);
+	page.textFocused = false;
+	assert.equal((await post(origin, "input", credential, { type: "text", text: "must not disappear" })).status, 409);
+	assert.equal(page.inputs.includes("must not disappear"), false);
+	page.textFocused = true;
 	assert.equal((await post(origin, "input", credential, { type: "text", text: "Ручной ввод" })).status, 200);
 	assert.ok(page.inputs.includes("Ручной ввод"));
 	page.challenge = true;
 	assert.equal((await post(origin, "resume", credential)).status, 409);
 	page.challenge = false;
 	assert.equal((await post(origin, "resume", credential)).status, 200);
+	let ended = false;
+	while (!ended) { const chunk = await reader.read(); ended = chunk.done; }
+	reader.releaseLock();
+	assert.equal((await fetch(`${origin}/browser/stream`, { headers: { Authorization: `Bearer ${credential}` } })).status, 401, "Resume revokes streaming access");
 	assert.equal(module.status().paused, false);
 	assert.equal((await post(origin, "input", credential, { type: "text", text: "after resume" })).status, 401);
 
@@ -181,7 +204,10 @@ try {
 	await page.goto("https://authorized.test/okay");
 	assert.equal((await post(origin, "resume", credential2)).status, 409, "Retry-After must still apply after a successful navigation");
 	assert.equal((await post(origin, "input", credential2, { type: "reload" })).status, 409, "Operator reload also respects the cooldown");
+	const oldStream = await fetch(`${origin}/browser/stream`, { headers: { Authorization: `Bearer ${credential2}` } });
 	await module.command({ action: "handoff", renew: true });
+	await oldStream.text();
+	assert.equal((await fetch(`${origin}/browser/stream`, { headers: { Authorization: `Bearer ${credential2}` } })).status, 401, "Renewal revokes a running stream");
 	assert.equal((await post(origin, "input", credential2, { type: "key", key: "Tab" })).status, 401, "renewal revokes the previous controller");
 
 	let notifications = 0;
@@ -198,9 +224,24 @@ try {
 
 	const expires = await fixture({ ttl: 1000 });
 	const expiringLink = new URL((await expires.module.command({ action: "handoff" })).details.operatorUrl as string);
+	const expiringClaim = await post(expiringLink.origin, "claim", expiringLink.hash.slice(1));
+	const expiringCredential = (await expiringClaim.json() as { credential: string }).credential;
+	const expiringStream = await fetch(`${expiringLink.origin}/browser/stream`, { headers: { Authorization: `Bearer ${expiringCredential}` } });
+	assert.match(await expiringStream.text(), /Link expired/);
 	await new Promise((resolve) => setTimeout(resolve, 1100));
 	assert.equal((await post(expiringLink.origin, "claim", expiringLink.hash.slice(1))).status, 410);
 	assert.equal(expires.module.status().paused, true, "expiration must never auto-resume the agent");
+	const cancel = await fixture();
+	const cancelLink = new URL((await cancel.module.command({ action: "handoff" })).details.operatorUrl as string);
+	const cancelCredential = (await (await post(cancelLink.origin, "claim", cancelLink.hash.slice(1))).json() as { credential: string }).credential;
+	const cancelled = await fetch(`${cancelLink.origin}/browser/stream`, { headers: { Authorization: `Bearer ${cancelCredential}` } });
+	const cancelledReader = cancelled.body!.getReader();
+	await cancelledReader.read(); await cancelledReader.cancel();
+	await new Promise(resolve => setTimeout(resolve, 300));
+	const capturesAfterCancel = cancel.page.captures;
+	await new Promise(resolve => setTimeout(resolve, 300));
+	assert.equal(cancel.page.captures, capturesAfterCancel, "Disconnect must stop browser capture");
+	assert.equal(cancel.module.status().paused, true, "Closing the stream must not resume the agent");
 
 	const defaults = loadConfig({ cwd: root });
 	assert.equal(defaults.config.modules.browser?.enabled, false);

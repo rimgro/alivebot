@@ -35,7 +35,7 @@ const fixture = http.createServer((req, res) => {
 		res.end('<input id="code" autocomplete="one-time-code">'); return;
 	}
 	if (req.url === "/delayed") {
-		res.end('<title>Delayed login fixture</title><p>Waiting</p><script>setTimeout(()=>{const f=document.createElement("iframe");f.src="/otp";document.body.append(f)},1200)</script>'); return;
+		res.end('<title>Delayed login fixture</title><p>Waiting</p><button id="foreground">Continue</button><script>setTimeout(()=>{const f=document.createElement("iframe");f.src="/otp";document.body.append(f)},1200)</script>'); return;
 	}
 	res.end('<title>Existing CDP session</title><p id="ready">Session ready</p><input id="target">');
 });
@@ -99,6 +99,10 @@ try {
 	assert.equal(frame.status, 200);
 	assert.equal(frame.headers.get("content-type"), "image/jpeg");
 	assert.ok((await frame.arrayBuffer()).byteLength > 1000);
+	const live = await fetch(`${control.origin}/browser/stream`, { headers: { authorization: `Bearer ${control.credential}` } });
+	assert.equal(live.status, 200);
+	const liveReader = live.body!.getReader();
+	assert.match(new TextDecoder().decode((await liveReader.read()).value), /"frame":/);
 	await page.locator("#password").focus();
 	assert.equal((await post(control.origin, "input", control.credential, { type: "text", text: "local-fixture-password" })).status, 200);
 	assert.equal(await page.locator("#password").inputValue(), "local-fixture-password");
@@ -106,16 +110,27 @@ try {
 	await post(control.origin, "input", control.credential, { type: "key", key: "Enter" });
 	await page.waitForURL(url => url.origin === target && url.pathname === "/ready");
 	assert.equal((await post(control.origin, "resume", control.credential)).status, 200);
+	while (!(await liveReader.read()).done) { /* Discard fixture frames after explicit return. */ }
+	liveReader.releaseLock();
 	assert.equal(module.status().paused, false);
 	assert.equal((await post(control.origin, "input", control.credential, { type: "key", key: "Enter" })).status, 401);
 	await module.command({ action: "navigate", url: `${target}/delayed` });
 	assert.equal(module.status().paused, false);
 	await eventually(() => module.status().paused === true, "Idle observer must catch private code entry in a newly loaded iframe");
 	const interrupted = await claim(module);
+	const codeFrame = page.frameLocator("iframe");
+	await codeFrame.locator("#code").focus();
+	assert.equal((await post(interrupted.origin, "input", interrupted.credential, { type: "text", text: "123456" })).status, 200, "Active iframe text entry must pass the focus check");
+	assert.equal(await codeFrame.locator("#code").inputValue(), "123456");
+	await page.locator("#foreground").focus();
+	assert.equal((await post(interrupted.origin, "input", interrupted.credential, { type: "text", text: "must-not-disappear" })).status, 409, "An inactive iframe must not satisfy the text focus check");
+	assert.equal(await codeFrame.locator("#code").inputValue(), "123456");
+	const disconnectedStream = await fetch(`${interrupted.origin}/browser/stream`, { headers: { authorization: `Bearer ${interrupted.credential}` } });
 	child.kill("SIGTERM");
 	await eventually(() => module.status().open === false, "External browser shutdown must invalidate the attachment");
 	assert.equal(module.status().paused, true);
 	assert.equal(module.status().handoff, undefined, "Disconnect must revoke phone access");
+	assert.match(await disconnectedStream.text(), /No active handoff|Browser page closed/, "Disconnect must close a live CDP stream");
 	assert.equal((await post(interrupted.origin, "input", interrupted.credential, { type: "key", key: "Enter" })).status, 401);
 	assert.ok((await module.command({ action: "read" })).details.error, "Disconnect must not silently launch another browser");
 	assert.ok(!JSON.stringify(events.peekPending(100)).includes("local-fixture-password"), "Private input must not enter event history");
