@@ -60,6 +60,20 @@ try {
 	await reopened.init();
 	assert.equal((await reopened.search("query", 6, ["user:test"]))[0].id, revised[0].fact.id);
 	await reopened.close();
+
+	const beforeDisabled = requests.length;
+	const disabled = new MemoryStore({ ...config, enabled: false, embeddingApiKey: "" });
+	await disabled.init();
+	assert.deepEqual(await disabled.search("nonempty wake prompt", 6, ["user:test"]), []);
+	assert.deepEqual(await disabled.retain([], ["user:test"]), []);
+	await assert.rejects(disabled.retain(["must not silently disappear"], ["user:test"]), /No facts were stored/);
+	assert.equal(requests.length, beforeDisabled, "A disabled instance must never contact an embedding provider");
+	assert.equal((await disabled.history(revised[0].fact.id)).length, 2, "Disabling semantic search must preserve existing facts");
+	await disabled.close();
+	const enabledAgain = new MemoryStore(config);
+	await enabledAgain.init();
+	assert.equal((await enabledAgain.search("query", 6, ["user:test"]))[0].id, revised[0].fact.id);
+	await enabledAgain.close();
 	console.log("memory tests passed");
 } finally {
 	globalThis.fetch = originalFetch;

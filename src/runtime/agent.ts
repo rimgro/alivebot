@@ -340,7 +340,7 @@ export class AgentRunner {
 			.unsettled(config.config.loop.maxNudges)
 			.filter((thread) => !inbound.has(thread.thread));
 		const memoryQuery = run.events.map((event) => `${event.title} ${event.text}`).join(" ");
-		const relevantMemories = memoryQuery.trim()
+		const relevantMemories = config.config.memory.enabled !== false && memoryQuery.trim()
 			? await this.deps.toolDeps.memory.search(memoryQuery, 6, [privateMemoryScope(this.deps.config)])
 			: [];
 		return {

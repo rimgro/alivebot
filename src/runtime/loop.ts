@@ -105,6 +105,7 @@ export class AliveRuntime {
 		this.notes = new NoteStore(paths.stateDir);
 		const memoryConfig = this.config.config.memory;
 		this.memory = new MemoryStore({
+			enabled: memoryConfig.enabled,
 			databasePath: resolveMemoryDatabasePath(this.config),
 			embeddingProvider: memoryConfig.embeddingProvider,
 			embeddingBaseUrl: memoryConfig.embeddingBaseUrl,

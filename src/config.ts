@@ -144,6 +144,8 @@ export interface AgentManagementPermissions {
 }
 
 export interface MemoryConfig {
+	/** Disable embedding-backed facts for local instances without an embedding service. */
+	enabled?: boolean;
 	/** Optional shared SQLite database for managed agents. Path is relative to the config file unless absolute. */
 	databasePath: string;
 	/** Cross-agent scopes each runtime may explicitly read or retain. Agent-private scopes are always implicit. */
@@ -248,6 +250,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		],
 	},
 	memory: {
+		enabled: true,
 		databasePath: "",
 		sharedScopes: [],
 		embeddingProvider: "openai",

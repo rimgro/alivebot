@@ -12,7 +12,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { loadConfig } from "../config.js";
+import { DEFAULT_CONFIG, loadConfig } from "../config.js";
 import { Logger } from "../log.js";
 import { AliveRuntime } from "../runtime/loop.js";
 import { EventStore } from "../store/events.js";
@@ -23,6 +23,8 @@ const config = loadConfig({
 	cwd: root,
 	overrides: {
 		model: process.env.ALIVE_MODEL ?? "",
+		...(process.env.ALIVE_PI_AGENT_DIR ? { piAgentDir: process.env.ALIVE_PI_AGENT_DIR } : {}),
+		...(process.env.ALIVE_SMOKE_MEMORY_ENABLED === "false" ? { memory: { ...DEFAULT_CONFIG.memory, enabled: false } } : {}),
 		verbose: process.env.ALIVE_VERBOSE === "1",
 		chat: { console: false, http: { enabled: false, host: "127.0.0.1", port: 0, token: "" } },
 		loop: {
@@ -72,8 +74,10 @@ log.info("smoke result", {
 	stateDir: config.paths.stateDir,
 });
 
-if (messages.length === 0) {
-	log.error("FAIL: the agent produced no send_message output");
+const disabledMemoryFailed = process.env.ALIVE_SMOKE_MEMORY_ENABLED === "false" &&
+	(record?.stopReason !== "slept" || !messages.some(message => message.text === "pong") || !fs.existsSync(config.paths.summaryPath));
+if (messages.length === 0 || disabledMemoryFailed) {
+	log.error("FAIL: missing send_message output or incomplete disabled-memory sleep cycle");
 	process.exitCode = 1;
 } else {
 	for (const message of messages) {

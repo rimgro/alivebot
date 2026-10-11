@@ -442,7 +442,9 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 			run.sleepForced = false;
 			run.sleepSummary = summary;
 			log.info("agent chose to sleep", { chars: summary.length, summaryChars: summaryMd.length });
-			return ok("Sleeping now. Facts retained and summary.md updated before context reset.", { sleeping: true }, true);
+			return ok(deps.config.config.memory.enabled === false
+				? "Sleeping now. Semantic memory is disabled; journal and summary.md were saved before context reset."
+				: "Sleeping now. Facts retained and summary.md updated before context reset.", { sleeping: true }, true);
 		},
 	});
 
@@ -619,9 +621,11 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 	const retain = defineTool({
 		name: "retain",
 		label: "Retain facts",
-		description: "Before sleep, retain durable facts selected from your own context. Facts are private to you by default. To share, name a scope explicitly configured in memory.sharedScopes; unapproved scopes are rejected. Related current facts are superseded into a dated revision chain; nothing is physically deleted. Call even with an empty facts list when there is nothing worth retaining.",
+		description: deps.config.config.memory.enabled === false
+			? "Semantic memory is disabled for this instance. Before sleep, call retain with facts: [] and scopes: []; no facts are stored. Persist useful context in the journal and complete summary.md instead."
+			: "Before sleep, retain durable facts selected from your own context. Facts are private to you by default. To share, name a scope explicitly configured in memory.sharedScopes; unapproved scopes are rejected. Related current facts are superseded into a dated revision chain; nothing is physically deleted. Call even with an empty facts list when there is nothing worth retaining.",
 		parameters: Type.Object({
-			facts: Type.Array(Type.String(), { description: "Durable facts; formulate updates as the current complete truth." }),
+			facts: Type.Array(Type.String(), { description: "Durable facts; formulate updates as the current complete truth.", ...(deps.config.config.memory.enabled === false ? { maxItems: 0 } : {}) }),
 			scopes: Type.Array(Type.String(), { description: "Optional explicitly allowlisted shared scopes; your private agent scope is always added automatically." }),
 		}),
 		execute: async (_toolCallId, params): Promise<ToolResult> => {
@@ -828,7 +832,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		closeThread,
 		status,
 		...deps.moduleTools,
-	] as ToolDefinition[];
+	].filter(tool => deps.config.config.memory.enabled !== false || tool.name !== "memory") as ToolDefinition[];
 }
 
 function managedAgentIdForConfig(config: LoadedConfig): string | undefined {
