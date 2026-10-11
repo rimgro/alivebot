@@ -215,6 +215,18 @@ alive agents create researcher
 alive agents request-telegram researcher --chat <ваш Telegram user ID>
 ```
 
+Агент с инструментом `manage_agents` может отправить тот же запрос без shell:
+
+```json
+{ "action": "request-telegram", "id": "researcher", "chat": "123456789" }
+```
+
+Нужно право `agentManagement.configurePermissions` для целевого профиля (и его ID
+в `targets`). `chat` — положительный ID личного чата оператора, не группы.
+Оператор должен предварительно написать master-боту; master-бот Alive должен
+работать, чтобы принять подтверждение. Повторный запрос в тот же чат блокируется,
+пока предыдущий ожидает подтверждения.
+
 Подтвердите запрос в личном чате с master-ботом. Alive обработает `managed_bot_created`,
 получит секрет методом `getManagedBotToken` и сохранит его в конфиге агента (права
 `0600`). Запустите профиль отдельным процессом: `alive agents start researcher`.

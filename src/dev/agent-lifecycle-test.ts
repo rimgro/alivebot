@@ -14,6 +14,8 @@ import {
 	enableManagedAgent,
 	ensureAdminAgent,
 	getAgentEnabled,
+	findManagedBotRequest,
+	clearManagedBotRequest,
 	listAgents,
 	startManagedAgent,
 	stopManagedAgent,
@@ -84,10 +86,65 @@ try {
 		/not authorized to disable agent admin/,
 	);
 
+	await assert.rejects(
+		() => manageTool.execute("call", { action: "request-telegram", id: "admin", chat: "123" } as never, undefined, undefined, {} as never),
+		/not authorized to request-telegram agent admin/,
+	);
+
 	const nested = createAgent(adminConfig, "analyst", "Analyst", {
 		role: "Analyst", contract: "Analyze data.", toolAllowlist: ["read", "idle"],
 	});
 	assert.ok(listAgents(base).some((agent) => agent.id === nested.id), "agents spawned by managed agents remain visible to the owner CLI");
+
+	// Provisioning requires permission, a private chat, and explicit user approval.
+	const telegramConfig = structuredClone(adminConfig);
+	telegramConfig.config.modules.telegram.token = "test-secret";
+	telegramConfig.config.modules.telegram.tokenEnv = "";
+	const telegramManager = createAliveTools({
+		config: telegramConfig, moduleTools: [], log: new Logger({ console: false }),
+		getRun: () => ({ id: "test-run" } as never),
+	} as unknown as ToolDeps).find((tool) => tool.name === "manage_agents")!;
+	const requestBot = (chat?: string) => telegramManager.execute("call", { action: "request-telegram", id: "analyst", chat } as never, undefined, undefined, {} as never);
+	const requestRoot = path.join(telegramConfig.paths.modulesDir, "telegram");
+	const originalFetch = globalThis.fetch;
+	let canManageBots = true;
+	let failSend = false;
+	const sent: Record<string, any>[] = [];
+	globalThis.fetch = (async (input, init) => {
+		const method = String(input).split("/").pop();
+		if (method === "getMe") return new Response(JSON.stringify({ ok: true, result: { id: 42, is_bot: true, first_name: "Master", can_manage_bots: canManageBots } }));
+		assert.equal(method, "sendMessage");
+		if (failSend) throw new Error("transport URL with test-secret");
+		sent.push(JSON.parse(String(init?.body)));
+		return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }));
+	}) as typeof fetch;
+	try {
+		await assert.rejects(() => requestBot(), /requires.*chat ID/);
+		for (const chat of ["-100123", "0", "abc", "9007199254740992"]) {
+			await assert.rejects(() => requestBot(chat), /positive private Telegram chat ID/);
+		}
+		canManageBots = false;
+		await assert.rejects(() => requestBot("123"), /can_manage_bots/);
+		assert.equal(findManagedBotRequest(requestRoot, 123), undefined);
+		canManageBots = true;
+		await requestBot("123");
+		assert.equal(sent.length, 1);
+		assert.equal(sent[0].chat_id, 123);
+		assert.ok(sent[0].reply_markup.keyboard[0][0].request_managed_bot);
+		assert.equal(findManagedBotRequest(requestRoot, 123)?.agentId, "analyst");
+		await assert.rejects(() => requestBot("123"), /already pending/);
+		assert.equal(sent.length, 1, "duplicate requests are not sent");
+		clearManagedBotRequest(requestRoot, findManagedBotRequest(requestRoot, 123)!);
+		failSend = true;
+		await assert.rejects(() => requestBot("123"), (error: Error) => {
+			assert.match(error.message, /failed to send/);
+			assert.ok(!error.message.includes("test-secret"));
+			return true;
+		});
+		assert.equal(findManagedBotRequest(requestRoot, 123), undefined, "failed delivery clears the pending request");
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
 
 	assert.equal(getAgentEnabled(nested), true);
 	await disableManagedAgent(base, "analyst");
