@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 import { main } from "./cli.js";
 import * as fs from "node:fs";
+import { initializeSandboxRuntimeIdentity } from "./sandbox/runtime-identity.js";
+
+initializeSandboxRuntimeIdentity();
 
 // Load project-local secrets for foreground and daemon launches. Existing
 // process environment variables take precedence over values in .env.

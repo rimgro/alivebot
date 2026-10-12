@@ -128,6 +128,17 @@ export interface ToolsConfig {
 	allowlist: string[];
 }
 
+export interface SandboxConfig {
+	/** Execution boundary for this runtime. `host` preserves legacy behavior. */
+	backend: "host" | "microsandbox";
+	/** Linux OCI image with Node.js 22+; application dependencies are installed on first boot. */
+	image: string;
+	/** vCPU limit for a Microsandbox guest. */
+	cpus: number;
+	/** Guest memory limit in MiB. */
+	memoryMiB: number;
+}
+
 /** Per-action authority to manage other persistent agents. Targets are explicit ids; '*' grants all current and future ids. */
 export interface AgentManagementPermissions {
 	create: boolean;
@@ -172,6 +183,7 @@ export interface AliveConfig {
 	/** "continue" keeps one evolving transcript across restarts; "new" starts a fresh session each start. */
 	session: "continue" | "new";
 	tools: ToolsConfig;
+	sandbox: SandboxConfig;
 	memory: MemoryConfig;
 	loop: LoopConfig;
 	budget: BudgetConfig;
@@ -244,6 +256,12 @@ export const DEFAULT_CONFIG: AliveConfig = {
 			"send_message", "message_agent", "idle", "sleep", "notifications", "remind", "list_reminders", "cancel_reminder",
 			"note", "retain", "memory", "journal", "history", "close_thread", "status",
 		],
+	},
+	sandbox: {
+		backend: "host",
+		image: "node:22-bookworm-slim",
+		cpus: 1,
+		memoryMiB: 2048,
 	},
 	memory: {
 		databasePath: "",
@@ -378,10 +396,18 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	const localConfigPath = path.join(path.dirname(configPath), "alive.config.local.json");
 	const localConfig = fs.existsSync(localConfigPath) ? readJson<Partial<AliveConfig>>(localConfigPath, {}) : {};
 	const merged = deepMerge(deepMerge(deepMerge(DEFAULT_CONFIG, fileConfig), localConfig), options.overrides);
+	validateSandboxConfig(merged.sandbox);
 	migrateLoopConfig(merged.loop as unknown as Record<string, unknown>);
 	merged.piAgentDir = expandHome(merged.piAgentDir);
 	const paths = resolvePaths(path.dirname(configPath), merged);
 	return { config: merged, paths };
+}
+
+function validateSandboxConfig(value: SandboxConfig): void {
+	if (value.backend !== "host" && value.backend !== "microsandbox") throw new Error('sandbox.backend must be "host" or "microsandbox"');
+	if (typeof value.image !== "string" || !value.image.trim()) throw new Error("sandbox.image must be a non-empty OCI image reference");
+	if (!Number.isInteger(value.cpus) || value.cpus < 1) throw new Error("sandbox.cpus must be a positive integer");
+	if (!Number.isInteger(value.memoryMiB) || value.memoryMiB < 256) throw new Error("sandbox.memoryMiB must be an integer of at least 256");
 }
 
 /**

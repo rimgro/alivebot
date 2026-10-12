@@ -342,7 +342,23 @@ alive agents disable researcher # also stops the process
 Каждому агенту выделены собственные config, `SOUL.md`, workspace, state,
 история, журналы и процесс. Файлы находятся в `.alive/agents/<id>/`; меняйте
 модель, список инструментов и инструкции в индивидуальном `alive.config.json`,
-`SOUL.md` и `CONTRACT.md`. Общая база памяти использует приватные scopes по умолчанию.
+`SOUL.md` и `CONTRACT.md`. Managed-агенты используют отдельные базы памяти.
+
+Чтобы включить Microsandbox для одного managed-агента, создайте его и поменяйте
+`sandbox.backend` на `microsandbox` в `.alive/agents/<id>/alive.config.json`.
+Проектный runtime и остальные агенты остаются на host backend. Перед запуском
+выполните `npm run build`: host supervisor копирует собранный runtime в Linux VM.
+На первом старте VM нужен доступ к npm для установки runtime-зависимостей.
+`sandbox.cpus` и `sandbox.memoryMiB` задают лимиты CPU и памяти; публичный
+исходящий интернет открыт, входящие подключения запрещены.
+
+Текущий срез отказывает в запуске при включённых Telegram/Grafana host-модулях,
+external modules, extensions, OAuth-моделях и credential-полях в `models.json`.
+API key модели хранится в госте как placeholder и подставляется Microsandbox
+только на настроенный HTTPS endpoint провайдера. Защита ещё не включает
+подтверждение владельца для произвольных личных секретов, которые агент получил
+в контексте или прочитал на сайте; пока browser egress guard и approval flow не
+готовы, эта сборка не реализует такое требование.
 
 При `alive init` создаётся агент `admin`. Он может создавать и редактировать
 профили, настраивать инструменты и permissions, а также запускать, останавливать,

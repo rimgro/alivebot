@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { DEFAULT_CONTRACT, loadConfig, resolveMemoryDatabasePath, type AgentManagementPermissions, type LoadedConfig } from "./config.js";
+import { DEFAULT_CONTRACT, loadConfig, type AgentManagementPermissions, type LoadedConfig } from "./config.js";
 import { snapshotRuntime, spawnBackground, stopRuntime, waitForRuntime } from "./runtime/daemon.js";
 import { sleep } from "./util.js";
 
@@ -70,8 +70,9 @@ export function createAgent(base: LoadedConfig, idInput: string, name?: string, 
 	config.agentManagement = validateAgentManagementPermissions(options.management ?? NO_AGENT_MANAGEMENT);
 	config.workspace = path.join(directory, "workspace");
 	config.soulFile = soulPath;
-	// Managed agents may share the database, but memory tools enforce private scope by default.
-	config.memory.databasePath = resolveMemoryDatabasePath(base);
+	// Keep managed-agent memory inside its private state directory so a sandbox
+	// never needs to mount the shared host database or another agent's state.
+	config.memory.databasePath = path.join(config.stateDir, "memory.sqlite");
 	config.memory.sharedScopes = [];
 	config.tools.allowlist = allowedTools;
 	// Every agent needs its own bot identity. Keep Telegram off until explicitly configured.
@@ -287,9 +288,25 @@ async function startManagedAgentUnlocked(
 	const config = loadAgentConfig(base, agent);
 	const current = snapshotRuntime(config.paths.stateDir);
 	if (current?.alive) return { pid: current.pid, logFile: path.join(config.paths.logsDir, "stdout.log") };
-	const child = operations.spawn({ paths: config.paths, args: ["--config", agent.configPath] });
-	const started = await operations.wait(config.paths.stateDir, child.pid, { child: child.child });
-	if (!started) throw new Error(`agent ${agent.id} failed to start; see ${child.logFile}`);
+	const sandboxed = config.config.sandbox.backend === "microsandbox";
+	const child = operations.spawn({
+		paths: config.paths,
+		command: sandboxed ? ["sandbox-supervisor"] : undefined,
+		args: ["--config", agent.configPath],
+		env: sandboxed ? {
+			ALIVE_SANDBOX_MEMORY_SOURCE: config.config.memory.databasePath
+				? path.resolve(config.paths.rootDir, config.config.memory.databasePath)
+				: path.join(config.paths.stateDir, "memory.sqlite"),
+		} : undefined,
+	});
+	const started = await operations.wait(config.paths.stateDir, child.pid, {
+		child: child.child,
+		timeoutMs: sandboxed ? 5 * 60_000 : undefined,
+	});
+	if (!started) {
+		child.child.kill("SIGTERM");
+		throw new Error(`agent ${agent.id} failed to start; see ${child.logFile}`);
+	}
 	return { pid: child.pid, logFile: child.logFile };
 }
 

@@ -29,6 +29,7 @@ import { loadModules } from "../events/loader.js";
 import type { AliveModule } from "../events/api.js";
 import { term } from "../term.js";
 import { formatDuration, isProcessAlive, nextMidnight, oneLine, sleep } from "../util.js";
+import { sandboxRuntimeOwnerPid } from "../sandbox/runtime-identity.js";
 
 export interface AliveRuntimeOptions {
 	config: LoadedConfig;
@@ -439,7 +440,7 @@ export class AliveRuntime {
 		this.lastStateWriteAt = now;
 		const run = this.currentRun;
 		const state: RuntimeStateFile = {
-			pid: process.pid,
+			pid: sandboxRuntimeOwnerPid() ?? process.pid,
 			startedAt: this.startedAt,
 			lastTickAt: now,
 			status: this.effectiveStatus(),
@@ -500,6 +501,9 @@ export class AliveRuntime {
 		if (this.force) return;
 		const state = readRuntimeState(this.config.paths.stateDir);
 		if (!state || state.status === "stopped") return;
+		// In a VM, the owner PID belongs to the host-side supervisor. The guest
+		// must not compare it against a guest-namespace PID that may coincidentally match.
+		if (sandboxRuntimeOwnerPid() === state.pid) return;
 		if (state.pid === process.pid) return;
 		if (isProcessAlive(state.pid)) {
 			throw new Error(

@@ -18,6 +18,7 @@ import { requestAgentTelegram } from "./modules/telegram/managed-request.js";
 import { resolveToken } from "./modules/telegram/module.js";
 import { TelegramAllowlistStore } from "./modules/telegram/state.js";
 import { AliveRuntime } from "./runtime/loop.js";
+import { superviseInMicrosandbox } from "./sandbox/microsandbox.js";
 import { snapshotRuntime, spawnBackground, stdoutLogPath, stopRuntime, waitForRuntime } from "./runtime/daemon.js";
 import { LOG_SOURCES, followFile, readLogTail, renderLogLine, resolveLogSource } from "./logs.js";
 import { term } from "./term.js";
@@ -81,6 +82,12 @@ export async function main(argv: string[]): Promise<number> {
 
 	try {
 		switch (command) {
+			case "sandbox-supervisor": {
+				const config = loadForCli(flags);
+				if (config.config.sandbox.backend !== "microsandbox") throw new Error("sandbox-supervisor requires sandbox.backend=microsandbox");
+				await superviseInMicrosandbox(config);
+				return 0;
+			}
 			case "init": {
 				const { configPath, soulPath } = writeDefaultConfig(cwd);
 				const admin = ensureAdminAgent(loadConfig({ cwd, configPath }));
@@ -174,6 +181,10 @@ function makeLogger(config: LoadedConfig, quiet = true): Logger {
 
 async function runCommand(cwd: string, flags: Record<string, string | boolean>): Promise<number> {
 	const config = loadForCli(flags);
+	if (config.config.sandbox.backend === "microsandbox" && process.env.ALIVE_IN_MICROSANDBOX !== "1") {
+		process.stderr.write("sandbox.backend=microsandbox is supported for managed agents; use `alive agents start <id>`\n");
+		return 1;
+	}
 	if (!config.config.enabled) {
 		process.stderr.write(`${term.red("agent is disabled:")} ${config.config.name}; enable it before starting\n`);
 		return 1;
