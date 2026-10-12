@@ -106,6 +106,7 @@ interface AliveModule {
 | `registerTools(tools)` | добавить инструменты агенту (вызывать в `start()`) |
 | `contributeStatus(fn)` | добавить поля в `alive status` |
 | `runtimeStatus()` | текущий статус рантайма (pid, run, pending, …) |
+| `currentThreads?()` | доверенные треды текущих задач: новый пакет из `idle` заменяет список, прерывание активной задачи дополняет его; текст страницы или модели не задаёт этот список |
 | `moduleDir(...segments)` | приватная durable-папка `<stateDir>/modules/<name>` |
 
 ### Порядок жизненного цикла

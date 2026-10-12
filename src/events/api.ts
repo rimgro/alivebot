@@ -105,6 +105,8 @@ export interface ModuleContext {
 
 	/** Current runtime status (pid, run, pending events, …). */
 	runtimeStatus(): Record<string, unknown>;
+	/** Trusted event threads available to the active task, not page/model text. */
+	currentThreads?(): string[];
 
 	/** Module-private durable directory (`<stateDir>/modules/<name>`), created on demand. */
 	moduleDir(...segments: string[]): string;

@@ -41,8 +41,13 @@ export async function loadModules(config: LoadedConfig, log: Logger): Promise<Mo
 
 	if (cfg.modules.browser?.enabled) {
 		try {
-			const { BrowserModule } = await import("../modules/browser/module.js");
-			modules.push(new BrowserModule(cfg.modules.browser));
+			if (cfg.modules.telegram.enabled) {
+				const { BrowserRouter } = await import("../modules/browser/router.js");
+				modules.push(new BrowserRouter(cfg.modules.browser));
+			} else {
+				const { BrowserModule } = await import("../modules/browser/module.js");
+				modules.push(new BrowserModule(cfg.modules.browser));
+			}
 		} catch (err) {
 			errors.push({ name: "browser", error: message(err) });
 		}

@@ -1,5 +1,5 @@
 /** Control surface; Telegram launches optionally load the integrity-pinned official SDK. */
-export function controlPage(nonce: string): string {
+export function controlPage(nonce: string, controlPath = "/browser"): string {
 	return `<!doctype html>
 <html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Alive — управление браузером</title><style nonce="${nonce}">
@@ -23,6 +23,7 @@ button,input{font:inherit}button{min-height:48px;padding:10px 16px;border:1px so
 <p class="hint">Нажимай и перетаскивай элементы прямо на изображении. Мелкие элементы можно увеличить; кнопка «Перемещать изображение» включает перемещение вида вместо кликов. Перед вводом текста выбери поле. Агент приостановлен, пока ты не вернёшь управление.</p>
 </main><script nonce="${nonce}">
 const statusEl=document.getElementById('status'),frame=document.getElementById('frame'),viewer=document.getElementById('viewer');
+const controlPath=${JSON.stringify(controlPath)};
 let credential='',ended=false,paused=false,dragging=false,queue=Promise.resolve(),lastMove=0,streamAbort,telegram,telegramActive=true,useStream=true;
 let pointerId,pointerDown,gesture=0,markerTimer;const marker=document.getElementById('pointer-marker'),pointerStatus=document.getElementById('pointer-status');
 let liveSocket,liveReady=false,requestId=0,remoteWidth=0,remoteHeight=0,moveInFlight=false,pendingMove;
@@ -47,7 +48,7 @@ async function initializeTelegram(){
   telegram.onEvent('deactivated',()=>{telegramActive=false;stopStream()});
   telegram.onEvent('activated',()=>{telegramActive=true});
 }
-const storageKey='alive.browser.operator';
+const storageKey='alive.browser.operator'+(controlPath==='/browser'?'':':'+controlPath);
 function forget(){try{sessionStorage.removeItem(storageKey)}catch{}}
 function remember(expiresAt,fingerprint){try{sessionStorage.setItem(storageKey,JSON.stringify({credential,expiresAt,fingerprint}))}catch{}}
 function restore(fingerprint){try{const saved=JSON.parse(sessionStorage.getItem(storageKey)||'null');if(!saved||!(/^[A-Za-z0-9_-]{43}$/).test(saved.credential)||!Number.isFinite(saved.expiresAt)||saved.expiresAt<=Date.now()||(fingerprint&&saved.fingerprint!==fingerprint)){forget();return false}credential=saved.credential;return true}catch{forget();return false}}
@@ -56,7 +57,7 @@ function report(message,error=false){statusEl.textContent=message;statusEl.class
 function stopStream(){streamAbort?.abort();liveSocket?.close()}
 function disable(){document.querySelectorAll('button,input').forEach(e=>e.disabled=true)}
 function connectionError(status,message){if(status===401||status===410){ended=true;forget();disable();stopStream();telegram?.disableClosingConfirmation()}const errors={'Select an editable text field on the browser image first':'Сначала нажми текстовое поле на изображении браузера, затем повтори ввод.','Invalid access key':'Ссылка уже использована или заменена. Запроси новую ссылку у агента.','No active handoff':'Сессия управления завершена. Можно закрыть страницу.','Link expired. Request a new handoff.':'Срок ссылки истёк. Запроси новую ссылку у агента.'};return Error(errors[message]||message||'Ошибка подключения')}
-async function api(path,body,signal){const r=await fetch('/browser/'+path,{method:body===undefined?'GET':'POST',headers:{Authorization:'Bearer '+credential,...(body===undefined?{}:{'Content-Type':'application/json'})},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store',signal});if(!r.ok){const j=await r.json();throw connectionError(r.status,j.error)}return r}
+async function api(path,body,signal){const r=await fetch(controlPath+'/'+path,{method:body===undefined?'GET':'POST',headers:{Authorization:'Bearer '+credential,...(body===undefined?{}:{'Content-Type':'application/json'})},body:body===undefined?undefined:JSON.stringify(body),cache:'no-store',signal});if(!r.ok){const j=await r.json();throw connectionError(r.status,j.error)}return r}
 function liveInput(body,type='input'){return new Promise(resolve=>{if(!liveReady||liveSocket?.readyState!==WebSocket.OPEN){resolve({ok:false,error:'Соединение прервано · проверь результат нажатия'});return}const id=++requestId,timer=setTimeout(()=>{requests.delete(id);resolve({ok:false,error:'Нет подтверждения действия · проверь соединение и изображение'})},8000);requests.set(id,{resolve,timer});liveSocket.send(JSON.stringify({type,id,body}))})}
 function send(body){const action=liveReady?liveInput(body):queue.then(async()=>{if(ended)return {ok:false};await api('input',body);return {ok:true}});const outcome=action.catch(e=>({ok:false,error:e.message})).then(result=>{if(result.error)report(result.error,true);return result});queue=Promise.all([queue,outcome]).then(([,result])=>result);return outcome}
 function point(e){const r=frame.getBoundingClientRect(),width=remoteWidth||frame.naturalWidth,height=remoteHeight||frame.naturalHeight;return {x:Math.max(0,Math.min(width-1,(e.clientX-r.left)*width/r.width)),y:Math.max(0,Math.min(height-1,(e.clientY-r.top)*height/r.height))}}
@@ -76,7 +77,7 @@ async function showFrame(blob){if(ended||paused||document.hidden||!telegramActiv
 let latestFrame,rendering=false;
 function queueFrame(blob){latestFrame=blob;if(rendering)return;rendering=true;(async()=>{try{while(latestFrame){const next=latestFrame;latestFrame=undefined;await showFrame(next)}}finally{rendering=false}})()}
 async function live(){return new Promise((resolve,reject)=>{
-  const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/browser/live');liveSocket=ws;ws.binaryType='arraybuffer';let authenticated=false,pingTimer,lastPing=0;
+  const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+controlPath+'/live');liveSocket=ws;ws.binaryType='arraybuffer';let authenticated=false,pingTimer,lastPing=0;
   const timeout=setTimeout(()=>{ws.close();reject(Error('WebSocket недоступен'))},5000);
   ws.onopen=()=>ws.send(JSON.stringify({type:'auth',credential}));
   ws.onmessage=async event=>{try{if(typeof event.data==='string'){const packet=JSON.parse(event.data);

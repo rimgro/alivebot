@@ -312,6 +312,7 @@ export class AgentRunner {
 	}
 
 	private trackEvents(run: RunHandle, events: AliveEvent[]): void {
+		if (events.length) run.currentThreads = [...new Set([...(run.currentThreads ?? []), ...events.flatMap(event => event.thread ? [event.thread] : [])])];
 		const seen = new Set(run.events.map((event) => event.seq));
 		for (const event of events) {
 			if (!seen.has(event.seq)) {

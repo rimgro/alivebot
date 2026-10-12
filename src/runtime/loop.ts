@@ -173,6 +173,7 @@ export class AliveRuntime {
 			outbox: (limit) => this.outbox.list(limit),
 			history: this.history,
 			runtimeStatus: () => this.status(),
+			currentThreads: () => this.currentRun?.currentThreads ?? [],
 		});
 	}
 

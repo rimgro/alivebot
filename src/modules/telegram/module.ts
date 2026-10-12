@@ -300,7 +300,7 @@ export class TelegramModule implements AliveModule {
 			const operator = acceptBrowserPairing(ctx.paths.modulesDir, update.message, this.config.allowedChatIds);
 			if (operator) this.allowlist?.add(operator.userId);
 			await api.sendMessage({ chat_id: update.message.chat.id, text: operator
-				? "Телефон привязан. Alive будет отправлять помощь браузеру в этот личный чат."
+				? "Телефон привязан для локальных демонстраций. В обычном Alive помощь браузеру приходит в личный чат пользователя, который поставил задачу."
 				: "Привязка не выполнена. Запустите alive browser pair и отправьте новую команду боту в личном чате. Настроенный список разрешённых чатов также должен допускать этот чат." });
 			// Pairing capabilities must never enter history, events or model context.
 			return;

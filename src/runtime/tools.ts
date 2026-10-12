@@ -59,6 +59,8 @@ export interface RunHandle {
 	promptChars: number;
 	/** Threads that produced inbound messages during this run. */
 	inboundThreads: Set<string>;
+	/** Trusted routing scope; idle replaces it, active interrupts extend it. */
+	currentThreads?: string[];
 	/** True while the agent is blocked inside the idle tool. */
 	idling: boolean;
 	idleStartedAt?: number;
@@ -863,6 +865,7 @@ function requireRun(deps: ToolDeps, tool: string): RunHandle {
 }
 
 function recordEvents(run: RunHandle, events: AliveEvent[]): void {
+	if (events.length) run.currentThreads = [...new Set(events.flatMap(event => event.thread ? [event.thread] : []))];
 	const seen = new Set(run.events.map((event) => event.seq));
 	for (const event of events) {
 		if (seen.has(event.seq)) continue;
