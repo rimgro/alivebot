@@ -14,6 +14,8 @@ For guided configuration, run `npm run browser -- setup`, then `npm run browser 
 
 For an already running Fortress/Chromium browser, `setup --driver playwright --cdp-env ALIVE_BROWSER_CDP_URL` selects attachment to the loopback HTTP/WebSocket endpoint stored in that environment variable. Alive adopts its default context and current tabs without creating a profile or changing launch settings. Stopping/closing Alive disconnects its client and preserves the external browser; connection loss revokes phone credentials and pauses the agent. Use a dedicated browser and avoid other controllers acting during a handoff. `diagnose` tests native transparent Canvas behavior in a temporary blank tab/profile. See [Fortress integration and the native transparent pixel fix](deploy/browser/fortress/README.ru.md).
 
+The upstream Fortress `browser` tool remains the fallback when this module is disabled. Enabling the shared browser module replaces that fallback with its conversation-owned tool, so the agent has exactly one `browser` tool. The upstream Fortress launcher/search code is preserved. Use `npm run browser:agent -- open https://example.com` for its original argv CLI, and `npm run browser -- setup` for the controller setup CLI. Attach an explicitly configured Fortress endpoint when the controller must use that existing engine; it is not automatically substituted for managed per-user Chrome profiles.
+
 Add this configuration to the gitignored `alive.config.local.json`:
 
 ```json

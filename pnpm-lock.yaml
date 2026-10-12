@@ -17,12 +17,18 @@ importers:
       '@earendil-works/pi-coding-agent':
         specifier: ^0.85.1
         version: 0.85.1(ws@8.22.0)
+      agent-browser:
+        specifier: ^0.27.0
+        version: 0.27.3
       patchright:
         specifier: 1.63.0
         version: 1.63.0
       playwright:
         specifier: 1.63.0
         version: 1.63.0
+      tilion-fortress:
+        specifier: ^151.0.7910
+        version: 151.0.7910
       typebox:
         specifier: 1.3.7
         version: 1.3.7
@@ -656,6 +662,11 @@ packages:
     resolution: {integrity: sha512-MnA+YT8fwfJPgBx3m60MNqakm30XOkyIoH1y6huTQvC0PwZG7ki8NacLBcrPbNoo8vEZy7Jpuk7+jMO+CUovTQ==}
     engines: {node: '>= 14'}
 
+  agent-browser@0.27.3:
+    resolution: {integrity: sha512-isQ1xWoYOnfR8BigYRlYmkFOrqw71tKEmUEMmFJGStQFOyCrLSsKoOAZEu8TjPZdmjD1nPQ/hLLYlxTwdHnA0Q==}
+    engines: {node: '>=24.0.0', pnpm: '>=11.0.0'}
+    hasBin: true
+
   balanced-match@4.0.4:
     resolution: {integrity: sha512-BLrgEcRTwX2o6gGxGOCNyMvGSp35YofuYzw9h1IMTRmKqttAZZVU67bdb9Pr2vUHA8+j3i2tJfjO6C6+4myGTA==}
     engines: {node: 18 || 20 || >=22}
@@ -905,6 +916,11 @@ packages:
 
   standardwebhooks@1.1.1:
     resolution: {integrity: sha512-bCbX9ZEyFkWPsRz7Bl3NuQUJohmwGSev/yhr7vhaGPlc4AfIrspIRa6cPTBuI1ItmrTDJ4d/S2hCsfe4+vQGnQ==}
+
+  tilion-fortress@151.0.7910:
+    resolution: {integrity: sha512-knpOr/o3zfxDpMQSW+Yw+T+YJFaPkmPXSw3c5/bz/pU93eSsymxjQFj0veK8HFo9SAXsM78GTWZRpTKUDXh7Pw==}
+    engines: {node: '>=18'}
+    hasBin: true
 
   ts-algebra@2.0.0:
     resolution: {integrity: sha512-FPAhNPFMrkwz76P7cdjdmiShwMynZYN6SgOujD1urY4oNm80Ou9oMdmbR45LotcKOXoy7wSmHkRFE6Mxbrhefw==}
@@ -1560,6 +1576,8 @@ snapshots:
 
   agent-base@7.1.4: {}
 
+  agent-browser@0.27.3: {}
+
   balanced-match@4.0.4: {}
 
   base64-js@1.5.1: {}
@@ -1834,6 +1852,8 @@ snapshots:
     dependencies:
       '@stablelib/base64': 1.0.1
       fast-sha256: 1.3.0
+
+  tilion-fortress@151.0.7910: {}
 
   ts-algebra@2.0.0: {}
 

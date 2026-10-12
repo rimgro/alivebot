@@ -244,7 +244,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		builtin: ["read", "write", "edit", "bash", "grep", "find", "ls"],
 		bash: true,
 		allowlist: [
-			"read", "write", "edit", "bash", "grep", "find", "ls",
+			"read", "write", "edit", "bash", "grep", "find", "ls", "browser", "web_search",
 			"send_message", "message_agent", "idle", "sleep", "notifications", "remind", "list_reminders", "cancel_reminder",
 			"note", "retain", "memory", "journal", "history", "close_thread", "status",
 		],

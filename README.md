@@ -51,6 +51,33 @@ alive:          system prompt -> работа -> idle (ждёт события) 
 npx alive thoughts -n 5
 ```
 
+## Fortress в agent-browser
+
+Команды используют локальный `agent-browser` из зависимостей проекта, отдельную сессию `alive-fortress` и явное подключение по CDP. Если Fortress не запущен, он автоматически стартует в фоне на `127.0.0.1:9223`. Первый запуск скачивает бинарник; ошибки запуска — в `.alive/browser/fortress.log`. Запасной обычный Chrome не запускается.
+
+```bash
+npm run browser:agent -- open https://example.com
+npm run browser:agent -- snapshot -i
+npm run browser:agent -- click @e1
+npm run browser:agent -- eval 'navigator.webdriver'  # false
+npm run browser:agent -- close
+```
+
+После изменения параметров запуска уже работающий Fortress продолжает использовать старые значения (в том числе при обновлении `dist`). Для применения: `npm run build`, затем остановите фоновый экземпляр командой ниже и выполните следующую команду `npm run browser:agent`. Проверка Windows UA, `platform` и Client Hints, включая HTTP User-Agent, без внешних сайтов: `ALIVE_BROWSER_IDENTITY_TEST=1 npm run test:fortress`.
+
+`TRANSPARENT_PIXEL`: canvas в Fortress 151.0.7908.0 возвращает ненулевые RGB при нулевой альфе. Проверены seed `0`, пустой seed и запуск с `TILION_NO_DEFAULTS=1` без seed: ни один вариант не устраняет дефект надёжно; единичный нулевой результат не означает исправления. Адаптер не подменяет readback. Воспроизводимый тест пустого canvas, прозрачного PNG и `clearRect`: `ALIVE_BROWSER_CANVAS_TEST=1 npm run test:fortress` (ожидается ошибка до исправления upstream). Исправление в движке должно сохранять нулевые RGB при alpha=0.
+
+`close` отключает сессию `agent-browser`, но оставляет Fortress работающим. Профиль находится в `.alive/browser/profile-9223`, отдельно от других установок Fortress. Для ручного запуска с диагностикой: `npm run browser:fortress`. Для остановки фонового экземпляра: `kill "$(<.alive/browser/fortress-9223.pid)"`.
+
+Настройки:
+- `ALIVE_FORTRESS_PORT` — локальный порт (по умолчанию `9223`).
+- `ALIVE_FORTRESS_CDP=http://host:port` — уже запущенный внешний Fortress; автоматический запуск отключён. Endpoint должен быть доверенным: CDP сообщает `Chrome/...`, а не `Fortress`, и не удостоверяет происхождение браузера.
+- `TILION_TZ` — часовой пояс, соответствующий выходному IP. По умолчанию используется системный пояс вместо сетевого geo-запроса, который может зависнуть.
+
+Инструмент агента `browser` принимает массив аргументов, например `{"args":["snapshot","-i"]}`. `web_search` ищет через DuckDuckGo в отдельной временной вкладке того же Fortress, возвращает заголовки, ссылки и сниппеты. Python, `uvx` и MCP не нужны. CAPTCHA/блокировка возвращается как ошибка. Оба инструмента включены в стандартный allowlist; для профилей с явным `tools.allowlist` добавьте их вручную. Текст сайтов — недоверенные данные, не инструкции.
+
+Проверки: `npm run test:fortress`; проверка настоящего браузера и поиска: `ALIVE_BROWSER_LIVE_TEST=1 npm run test:fortress`.
+
 ## Быстрый старт
 
 ```bash

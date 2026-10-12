@@ -14,6 +14,7 @@ import { writePrivateJson } from "../modules/browser/operator.js";
 import { EventStore } from "../store/events.js";
 import { HistoryStore } from "../store/history.js";
 import { TelegramAllowlistStore } from "../modules/telegram/state.js";
+import { createAliveTools, type ToolDeps } from "../runtime/tools.js";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-browser-routing-"));
 const sent: Array<{ chat_id: string; reply_markup: { inline_keyboard: Array<Array<{ web_app: { url: string } }>> } }> = [];
@@ -63,6 +64,11 @@ function claim(url: string, telegramInitData?: string) {
 }
 try {
 	await host.init();
+	const allTools = createAliveTools({ config: loaded, moduleTools: host.contributedTools(), log: new Logger({ console: false }) } as ToolDeps);
+	assert.equal(allTools.filter(tool => tool.name === "browser").length, 1, "The shared browser must replace the Fortress fallback without a duplicate tool name");
+	assert.ok(JSON.stringify(allTools.find(tool => tool.name === "browser")!.parameters).includes('"action"'));
+	const fallback = createAliveTools({ config: loaded, moduleTools: [], log: new Logger({ console: false }) } as unknown as ToolDeps);
+	assert.ok(JSON.stringify(fallback.find(tool => tool.name === "browser")!.parameters).includes('"args"'), "Fortress remains available when the shared browser module is disabled");
 	const share = host.contributedTools().find(tool => tool.name === "browser_share")!;
 	const first = await share.execute("share-a", { reason: "First user" } as never, undefined, undefined, {} as never) as { details: Record<string, unknown> };
 	assert.deepEqual(first.details.notification, { thread: "telegram:111", messageId: 1 });
