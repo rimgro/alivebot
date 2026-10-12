@@ -14,6 +14,7 @@ import { controlPage } from "./page.js";
 import { BrowserSigningTransport } from "./transport.js";
 import { readBrowserOperator } from "./operator.js";
 import { resolveCdpEndpoint } from "./connection.js";
+import { BrowserLive } from "./live.js";
 
 type Result = AgentToolResult<Record<string, unknown>>;
 interface Command { action: string; url?: string; selector?: string; text?: string; key?: string; delta?: number; reason?: string; renew?: boolean }
@@ -58,6 +59,8 @@ export class BrowserModule implements AliveModule {
 	private challengeMonitor?: ReturnType<typeof setInterval>;
 	private monitoringChallenge = false;
 	private streamResponse?: http.ServerResponse;
+	private live?: BrowserLive;
+	private capturingFrame = false;
 
 	constructor(config: Omit<Partial<BrowserConfig>, "humanization"> & { humanization?: Partial<HumanizationConfig> }, private readonly deps: BrowserDependencies = {}) {
 		this.config = { ...DEFAULT_BROWSER_CONFIG, ...config, humanization: { ...DEFAULT_HUMANIZATION, ...config.humanization }, signing: { ...DEFAULT_BROWSER_CONFIG.signing, ...config.signing } };
@@ -103,6 +106,29 @@ export class BrowserModule implements AliveModule {
 		server.requestTimeout = 20_000;
 		server.headersTimeout = 10_000;
 		server.maxConnections = 32;
+		this.live = new BrowserLive(server, {
+			origin: () => this.publicOrigin,
+			authorize: (credential) => {
+				const handoff = this.authorizeCredential(credential);
+				if (!handoff.claimed) throw new HttpError(401, "Claim the operator link first");
+				return handoff;
+			},
+			page: () => this.page,
+			busy: () => !!this.streamResponse,
+			input: (body, credential) => this.enqueue(async () => {
+				this.authorizeCredential(credential);
+				if (!this.page || this.page.isClosed()) throw new HttpError(410, "Browser page closed");
+				await this.operatorInput(body);
+			}),
+			release: (credential) => this.enqueue(async () => {
+				this.authorizeCredential(credential);
+				if (this.page && !this.page.isClosed()) await this.page.mouse.up();
+			}),
+			resume: (credential) => this.enqueue(async () => {
+				this.authorizeCredential(credential);
+				await this.resumeOperator(true);
+			}),
+		});
 		await new Promise<void>((resolve, reject) => {
 			server.once("error", reject);
 			server.listen(this.config.port, this.config.host, resolve);
@@ -125,6 +151,7 @@ export class BrowserModule implements AliveModule {
 		this.challengeMonitor = undefined;
 		this.actionAbort?.abort(new Error("Browser is stopped"));
 		this.endStream();
+		this.live?.close(); this.live = undefined;
 		this.handoff = undefined;
 		const server = this.server;
 		this.server = undefined;
@@ -145,6 +172,7 @@ export class BrowserModule implements AliveModule {
 			lastHttpStatus: this.lastHttpStatus, retryAt: this.retryAt || undefined,
 			handoff: this.handoff ? { claimed: this.handoff.claimed, expiresAt: this.handoff.expiresAt } : undefined,
 			signing: this.identity ? { agentUrl: this.identity.agentUrl, keyId: this.identity.keyId } : { enabled: false },
+			live: this.live?.status(),
 		};
 	}
 
@@ -440,7 +468,8 @@ export class BrowserModule implements AliveModule {
 		if (req.method === "GET" && pathname === "/browser") {
 			const nonce = randomBytes(18).toString("base64");
 			res.removeHeader("X-Frame-Options");
-			res.setHeader("Content-Security-Policy", `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; img-src blob:; connect-src 'self'; frame-ancestors https://web.telegram.org; base-uri 'none'; form-action 'none'`);
+			const websocketOrigin = this.publicOrigin.replace(/^http/, "ws");
+			res.setHeader("Content-Security-Policy", `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; img-src blob:; connect-src 'self' ${websocketOrigin}; frame-ancestors https://web.telegram.org; base-uri 'none'; form-action 'none'`);
 			res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
 			res.end(controlPage(nonce));
 			return;
@@ -452,6 +481,10 @@ export class BrowserModule implements AliveModule {
 		if (req.method === "POST" && req.headers["content-type"] !== "application/json") throw new HttpError(415, "Use application/json");
 		this.authorize(req);
 		if (pathname === "/browser/stream") { await this.streamFrames(req, res); return; }
+		if (pathname === "/browser/frame") {
+			const buffer = await this.captureFrame(req);
+			res.writeHead(200, { "Content-Type": "image/jpeg" }); res.end(buffer); return;
+		}
 		const body = req.method === "POST" ? await readBody(req) : {};
 		await this.enqueue(async () => {
 			if (res.destroyed) return;
@@ -468,34 +501,48 @@ export class BrowserModule implements AliveModule {
 			}
 			if (!handoff.claimed) throw new HttpError(401, "Claim the operator link first");
 			if (!this.page || this.page.isClosed()) throw new HttpError(410, "Browser page closed");
-			if (pathname === "/browser/frame") {
-				const buffer = await this.page.screenshot({ type: "jpeg", quality: 70, scale: "css", timeout: 5000 });
-				res.writeHead(200, { "Content-Type": "image/jpeg" });
-				res.end(buffer);
-			} else if (pathname === "/browser/input") {
+			if (pathname === "/browser/input") {
 				await this.operatorInput(body);
 				this.json(res, 200, { ok: true });
 			} else {
-				if (Date.now() < this.retryAt) throw new HttpError(409, "Rate limit cooldown has not elapsed");
-				if (this.lastHttpStatus === 403 || this.lastHttpStatus === 429 || await this.assistanceReason()) {
-					throw new HttpError(409, "Site still requires verification, private login entry, or denies access. Finish the permitted action before resuming.");
-				}
-				await this.page.mouse.up();
-				this.endStream();
-				this.handoff = undefined;
-				this.pausedReason = undefined;
-				this.ctx!.event({ title: "Browser control returned", text: "The operator explicitly returned browser control to the agent.", priority: "normal" });
+				await this.resumeOperator();
 				this.json(res, 200, { resumed: true });
 			}
 		});
 	}
 
-	/** A bounded live JPEG stream; capture operations yield the queue to operator input. */
+	private async resumeOperator(keepLive = false): Promise<void> {
+		if (!this.page || this.page.isClosed()) throw new HttpError(410, "Browser page closed");
+		if (Date.now() < this.retryAt) throw new HttpError(409, "Rate limit cooldown has not elapsed");
+		if (this.lastHttpStatus === 403 || this.lastHttpStatus === 429 || await this.assistanceReason()) {
+			throw new HttpError(409, "Site still requires verification, private login entry, or denies access. Finish the permitted action before resuming.");
+		}
+		await this.page.mouse.up();
+		this.endStream("No active handoff", keepLive);
+		this.handoff = undefined; this.pausedReason = undefined;
+		this.ctx!.event({ title: "Browser control returned", text: "The operator explicitly returned browser control to the agent.", priority: "normal" });
+	}
+
+	private async captureFrame(req: http.IncomingMessage): Promise<Buffer> {
+		if (!this.authorize(req).claimed) throw new HttpError(401, "Claim the operator link first");
+		if (this.capturingFrame || this.live?.busy) throw new HttpError(409, "A browser frame is already being captured");
+		const page = this.page;
+		if (this.stopped || !page || page.isClosed()) throw new HttpError(410, "Browser page closed");
+		this.capturingFrame = true;
+		try {
+			const buffer = await page.screenshot({ type: "jpeg", quality: 60, scale: "css", timeout: 1500 });
+			this.authorize(req);
+			if (buffer.length > 4 * 1024 * 1024) throw new HttpError(413, "Browser frame is too large");
+			return buffer;
+		} finally { this.capturingFrame = false; }
+	}
+
+	/** Legacy transport. Capturing must never occupy the operator input queue. */
 	private async streamFrames(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
 		await this.enqueue(async () => {
 			if (res.destroyed) throw new HttpError(410, "Stream receiver disconnected");
 			if (!this.authorize(req).claimed) throw new HttpError(401, "Claim the operator link first");
-			if (this.streamResponse && !this.streamResponse.destroyed) throw new HttpError(409, "A browser stream is already open");
+			if (this.live?.busy || (this.streamResponse && !this.streamResponse.destroyed)) throw new HttpError(409, "A browser stream is already open");
 			if (!this.page || this.page.isClosed()) throw new HttpError(410, "Browser page closed");
 			this.streamResponse = res;
 		});
@@ -507,15 +554,7 @@ export class BrowserModule implements AliveModule {
 		try {
 			while (!abort.signal.aborted && !res.destroyed && !res.writableEnded) {
 				const started = Date.now();
-				const frame = await this.enqueue(async () => {
-					if (abort.signal.aborted || res.writableEnded) return;
-					this.authorize(req);
-					if (this.stopped || !this.page || this.page.isClosed()) throw new HttpError(410, "Browser page closed");
-					const buffer = await this.page.screenshot({ type: "jpeg", quality: 70, scale: "css", timeout: 5000 });
-					this.authorize(req);
-					if (buffer.length > 4 * 1024 * 1024) throw new HttpError(413, "Browser frame is too large");
-					return buffer;
-				});
+				const frame = await this.captureFrame(req);
 				if (!frame || abort.signal.aborted || res.writableEnded) break;
 				if (!res.write(`${JSON.stringify({ frame: frame.toString("base64") })}\n`)) {
 					await new Promise<void>((resolve, reject) => {
@@ -535,17 +574,21 @@ export class BrowserModule implements AliveModule {
 		}
 	}
 
-	private endStream(error = "No active handoff"): void {
+	private endStream(error = "No active handoff", keepLive = false): void {
+		if (!keepLive) this.live?.end(error);
 		const res = this.streamResponse;
 		this.streamResponse = undefined;
 		if (res && !res.destroyed && !res.writableEnded) res.end(`${JSON.stringify({ error, status: 401 })}\n`);
 	}
 
 	private authorize(req: http.IncomingMessage): Handoff {
+		return this.authorizeCredential(req.headers.authorization?.match(/^Bearer ([A-Za-z0-9_-]{43})$/)?.[1]);
+	}
+
+	private authorizeCredential(token?: string): Handoff {
 		if (!this.handoff) throw new HttpError(401, "No active handoff");
 		if (this.handoff.expiresAt <= Date.now()) throw new HttpError(410, "Link expired. Request a new handoff.");
-		const token = req.headers.authorization?.match(/^Bearer ([A-Za-z0-9_-]{43})$/)?.[1];
-		if (!token || !timingSafeEqual(digest(token), this.handoff.digest)) throw new HttpError(401, "Invalid access key");
+		if (!token || !/^[A-Za-z0-9_-]{43}$/.test(token) || !timingSafeEqual(digest(token), this.handoff.digest)) throw new HttpError(401, "Invalid access key");
 		return this.handoff;
 	}
 

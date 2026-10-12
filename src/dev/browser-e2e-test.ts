@@ -15,6 +15,7 @@ import { sleep } from "../util.js";
 // Minimal browser-global types keep the server project's Node-only tsconfig.
 declare const document: { documentElement: { scrollWidth: number }; querySelector(selector: string): { naturalWidth: number; value: string } };
 declare const innerWidth: number;
+declare const remoteWidth: number, remoteHeight: number;
 declare function requestAnimationFrame(callback: () => void): number;
 declare const sessionStorage: { getItem(key: string): string | null };
 declare const window: {
@@ -98,7 +99,10 @@ try {
 	const errors: string[] = [];
 	operator.on("pageerror", (error) => errors.push(error.message));
 	let streamRequests = 0;
-	operator.on("request", req => { if (new URL(req.url()).pathname === "/browser/stream") streamRequests++; });
+	let receivedFrames = 0;
+	let httpReturns = 0;
+	operator.on("request", request => { if (new URL(request.url()).pathname === "/browser/resume") httpReturns++; });
+	operator.on("websocket", socket => { if (new URL(socket.url()).pathname === "/browser/live") { streamRequests++; socket.on("framereceived", event => { if (typeof event.payload !== "string") receivedFrames++; }); } });
 	const miniAppLink = new URL(link);
 	miniAppLink.hash = `aliveKey=${miniAppLink.hash.slice(1)}&tgWebAppVersion=8.0&tgWebAppPlatform=ios&tgWebAppData=${encodeURIComponent("user=fixture&auth_date=1&hash=untrusted-fixture")}`;
 	await operator.goto(miniAppLink.href);
@@ -106,10 +110,13 @@ try {
 	await operator.getByRole("status").filter({ hasText: "Подключено" }).waitFor();
 	await operator.waitForFunction(() => document.querySelector("#frame").naturalWidth > 0);
 	assert.deepEqual(await operator.evaluate(() => window.telegramCalls), ["ready", "expand", "confirm", "swipes-disabled"]);
-	assert.equal(streamRequests, 1, "A Mini App starts a continuous authenticated stream");
+	assert.equal(streamRequests, 1, "A Mini App starts a continuous authenticated WebSocket");
 	const initialFrame = await operator.locator("#frame").getAttribute("src");
-	await operator.waitForFunction(old => (document.querySelector("#frame") as unknown as { src: string }).src !== old, initialFrame);
-	await native.locator("#target").evaluate("element => element.blur()");
+	await native.locator("h1").evaluate(element => { (element as unknown as { textContent: string }).textContent = "Screen update"; });
+	await operator.waitForFunction(old => (document.querySelector("#frame") as unknown as { src: string }).src !== old, initialFrame, { timeout: 5000 }).catch(async error => {
+		console.error({ stage: "visible-frame-update", receivedFrames, live: browser.status().live, status: await operator.locator("#status").textContent(), metrics: await operator.locator("#connection-metrics").textContent(), errors }); throw error;
+	});
+	await native.locator("#target").evaluate(element => (element as unknown as { blur(): void }).blur());
 	await operator.getByLabel("Текст в выбранное поле браузера").fill("Retain unfocused input");
 	await operator.getByRole("button", { name: "Ввести текст", exact: true }).click();
 	await operator.locator("#input-status").filter({ hasText: "Сначала нажми текстовое поле" }).waitFor();
@@ -168,7 +175,8 @@ try {
 	const point = async (x: number, y: number) => {
 		await operator.locator("#frame").scrollIntoViewIfNeeded();
 		const box = (await operator.locator("#frame").boundingBox())!;
-		return { x: box.x + x * box.width / 900, y: box.y + y * box.height / 720 };
+		const viewport = native.viewportSize()!;
+		return { x: box.x + x * box.width / viewport.width, y: box.y + y * box.height / viewport.height };
 	};
 	const focus = await point(field.x + field.width / 2, field.y + field.height / 2);
 	await operator.touchscreen.tap(focus.x, focus.y);
@@ -191,17 +199,25 @@ try {
 	await operator.mouse.move(last.x, last.y, { steps: 12 });
 	await operator.mouse.up();
 	await native.waitForFunction(() => Number(document.querySelector("#drag").value) > 80);
+	await native.setViewportSize({ width: 1760, height: 1120 });
+	await operator.waitForFunction(() => {
+		const image = document.querySelector("#frame") as unknown as { naturalWidth: number; naturalHeight: number };
+		return remoteWidth === 1760 && remoteHeight === 1120 && image.naturalWidth > 0 && image.naturalWidth <= 1100 && image.naturalHeight <= 900;
+	});
 	const solve = await native.locator("#solve").boundingBox();
 	assert.ok(solve);
 	const click = await point(solve.x + solve.width / 2, solve.y + solve.height / 2);
+	const inputStarted = Date.now();
 	await operator.touchscreen.tap(click.x, click.y);
 	await native.locator("#challenge-form").waitFor({ state: "detached" });
 	await operator.locator("#pointer-status").filter({ hasText: "Нажатие передано браузеру" }).waitFor();
+	console.log(`Live controller: downscaled 1760×1120 viewport, local tap and browser acknowledgement ${Date.now() - inputStarted}ms`);
 	await operator.getByRole("button", { name: "Готово — вернуть агенту" }).click();
 	await operator.getByRole("status").filter({ hasText: "Управление возвращено агенту" }).waitFor();
 	assert.ok((await operator.evaluate(() => window.telegramCalls)).includes("returned"));
 	assert.equal(await operator.evaluate(() => sessionStorage.getItem("alive.browser.operator")), null, "Explicit resume must erase the saved operator credential");
 	assert.equal(browser.status().paused, false);
+	assert.equal(httpReturns, 0, "Live control must return through the existing WebSocket without another HTTP round trip");
 	assert.deepEqual(errors, []);
 	await browser.command({ action: "close" });
 	await browser.command({ action: "navigate", url: `${targetOrigin}/` });
