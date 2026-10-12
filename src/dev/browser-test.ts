@@ -48,7 +48,7 @@ class FakePage extends EventEmitter {
 			innerText: async () => "Test page text",
 			count: async () => selector === "body" ? 1 : selector.includes("input:focus") ? Number(this.textFocused) : selector.includes("#challenge-form") ? Number(this.challenge) : 0,
 			nth: () => ({ isVisible: async () => this.challenge }),
-			first: () => ({ isEditable: async () => this.textFocused, click: async () => { this.inputs.push("agent-click"); }, fill: async (value: string) => { this.inputs.push(value); } }),
+			first: () => ({ innerText: async () => "Test page text", isEditable: async () => this.textFocused, click: async () => { this.inputs.push("agent-click"); }, fill: async (value: string) => { this.inputs.push(value); } }),
 		};
 	}
 	async screenshot() { this.captures++; return Buffer.from([0xff, 0xd8, 0xff, 0xd9]); }

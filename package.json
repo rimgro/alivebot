@@ -22,6 +22,7 @@
     "test:browser": "tsx src/dev/browser-test.ts",
     "test:browser:access": "tsx src/dev/browser-access-test.ts",
     "test:browser:access:e2e": "tsx src/dev/browser-access-e2e-test.ts",
+    "test:browser:content:e2e": "tsx src/dev/browser-content-e2e-test.ts",
     "test:browser:native:e2e": "tsx src/dev/browser-native-e2e-test.ts",
     "browser": "tsx src/index.ts browser",
     "telegram": "tsx src/index.ts telegram",
