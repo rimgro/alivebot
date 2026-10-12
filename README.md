@@ -355,7 +355,13 @@ alive agents disable researcher # also stops the process
 Текущий срез отказывает в запуске при включённых Telegram/Grafana host-модулях,
 external modules, extensions, OAuth-моделях и credential-полях в `models.json`.
 API key модели хранится в госте как placeholder и подставляется Microsandbox
-только на настроенный HTTPS endpoint провайдера. Защита ещё не включает
+только на настроенный HTTPS endpoint провайдера. HTTPS egress перехватывается
+Microsandbox с проверкой upstream TLS; QUIC отключён, а неподходящие секретные
+placeholders блокируются. Это защищает credentials, зарегистрированные через
+механизм placeholders, но не ищет произвольные личные значения в тексте запроса.
+Ключи передаются SDK через краткоживущие host environment references, чтобы не
+класть plaintext в сохранённую конфигурацию sandbox.
+Защита ещё не включает
 подтверждение владельца для произвольных личных секретов, которые агент получил
 в контексте или прочитал на сайте; пока browser egress guard и approval flow не
 готовы, эта сборка не реализует такое требование.

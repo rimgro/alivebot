@@ -3,8 +3,9 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { fileURLToPath } from "node:url";
 import { DatabaseSync, backup } from "node:sqlite";
-import { createHash } from "node:crypto";
-import { Sandbox, NetworkPolicy } from "microsandbox";
+import { createHash, randomUUID } from "node:crypto";
+import { Sandbox, NetworkPolicy, type Sandbox as SandboxHandle } from "microsandbox";
+import type { TlsBuilder } from "microsandbox/native";
 import { ModelRuntime, resolveCliModel } from "@earendil-works/pi-coding-agent";
 import { defaultModelSpec, type LoadedConfig } from "../config.js";
 import { privateMemoryScope, sharedMemoryScopes } from "../runtime/memory-access.js";
@@ -58,7 +59,12 @@ export async function superviseInMicrosandbox(config: LoadedConfig): Promise<voi
 		.workdir("/opt/alive")
 		.network((network) => {
 			network.policyFromBuilder(policy);
-			for (const secret of apiSecrets) network.secretEnv(secret.envVar, secret.value, secret.placeholder, secret.host);
+			// Inspect HTTPS egress so Microsandbox can enforce its host-bound
+			// placeholder rules. Block QUIC to prevent Chromium from taking the
+			// opaque UDP/443 path around TLS inspection, and fail closed if a
+			// placeholder appears outside its configured destination.
+			network.tls((tls: TlsBuilder) => tls.interceptedPorts([443]).blockQuic(true).verifyUpstream(true));
+			network.strict(true).secretViolationAction("block-and-log");
 			return network;
 		})
 		.patch((patch) => patch.copyDir(path.join(appRoot, "dist"), "/opt/alive/dist").copyFile(path.join(appRoot, "package.json"), "/opt/alive/package.json").copyFile(path.join(appRoot, "package-lock.json"), "/opt/alive/package-lock.json"))
@@ -70,6 +76,7 @@ export async function superviseInMicrosandbox(config: LoadedConfig): Promise<voi
 		.env("ALIVE_RUNTIME_PID", String(process.pid));
 	if (embeddingSecret) builder.env(embeddingSecret.envVar, embeddingSecret.placeholder);
 	let sandbox: Sandbox | undefined;
+	let cleanupSecretSources: () => void = () => {};
 	let stopping = false;
 	const stop = () => {
 		stopping = true;
@@ -79,6 +86,7 @@ export async function superviseInMicrosandbox(config: LoadedConfig): Promise<voi
 	process.once("SIGINT", stop);
 	try {
 		sandbox = await builder.create();
+		cleanupSecretSources = await installHostReferencedSecrets(sandbox, apiSecrets);
 		const install = await sandbox.exec("npm", ["ci", "--omit=dev", "--ignore-scripts"]);
 		if (!install.success) throw new Error(`guest dependency install failed: ${install.stderr()}`);
 		const run = await sandbox.execStream("node", ["/opt/alive/dist/index.js", "run", "--foreground", "--config", "/alive/config/alive.config.json"]);
@@ -95,7 +103,51 @@ export async function superviseInMicrosandbox(config: LoadedConfig): Promise<voi
 		process.removeListener("SIGTERM", stop);
 		process.removeListener("SIGINT", stop);
 		if (sandbox && !stopping) await sandbox.stop().catch(() => undefined);
+		cleanupSecretSources();
 		fs.rmSync(stage, { recursive: true, force: true });
+	}
+}
+
+/**
+ * Resolve credential bytes from a host environment reference scoped to the
+ * supervisor lifetime.
+ * Microsandbox persists the source reference, not the plaintext, in sandbox
+ * config. The variable is removed after the attached sandbox stops.
+ */
+async function installHostReferencedSecrets(sandbox: SandboxHandle, secrets: ApiSecret[]): Promise<() => void> {
+	const previous = new Map<string, string | undefined>();
+	const sourceNames = new Map<string, string>();
+	for (const secret of secrets) {
+		const sourceName = `ALIVE_MICROSANDBOX_SECRET_${secret.envVar.replace(/[^A-Za-z0-9_]/g, "_")}_${randomUUID().replaceAll("-", "").slice(0, 8).toUpperCase()}`;
+		previous.set(sourceName, process.env[sourceName]);
+		sourceNames.set(secret.envVar, sourceName);
+		process.env[sourceName] = secret.value;
+	}
+	try {
+		for (const secret of secrets) {
+			const sourceName = sourceNames.get(secret.envVar);
+			if (!sourceName) throw new Error(`missing host secret source for ${secret.envVar}`);
+			await sandbox.modify({
+				secrets: {
+					[secret.envVar]: {
+						env: sourceName,
+						placeholder: secret.placeholder,
+						allowedHosts: [secret.host],
+					},
+				},
+			});
+		}
+	} catch (error) {
+		cleanup();
+		throw error;
+	}
+	return cleanup;
+
+	function cleanup(): void {
+		for (const [name, value] of previous) {
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
 	}
 }
 
