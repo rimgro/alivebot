@@ -34,12 +34,16 @@ Add this configuration to the gitignored `alive.config.local.json`:
         "maxTypingDelayMs": 75
       },
       "headless": false,
+      "launchMode": "auto",
+      "nativeWarmupMs": 10000,
       "host": "127.0.0.1",
       "port": 4323,
       "publicUrl": "https://browser.example.com",
       "notifyChatId": "123456789",
       "handoffTtlMs": 600000,
       "minActionIntervalMs": 500,
+      "minNavigationIntervalMs": 2000,
+      "challengeWaitMs": 15000,
       "actionTimeoutMs": 15000
     }
   }
@@ -49,6 +53,20 @@ Add this configuration to the gitignored `alive.config.local.json`:
 Append `browser` and `browser_share` to the existing `tools.allowlist` without removing its other tools. Arrays replace the defaults during configuration merging. `alive status` shows the browser module; `alive modules` describes whether it is enabled. Chrome starts lazily on the first tool call. Standalone profiles live in `.alive/modules/browser/profile/`; routed Telegram profiles live in `.alive/modules/browser/sessions/<thread-hash>/profile/`. Both survive process restarts; managed agents use their own state directories and profiles. Do not point it at a personal Chrome profile or start multiple runtimes on the same state directory.
 
 For a local desktop trial, omit `publicUrl` and `notifyChatId`. The handoff tool returns a local link to open on the same computer.
+
+## Browser compatibility and access
+
+Use `alive browser setup --headless false --launch-mode native --native-warmup-ms 10000 --challenge-wait-ms 15000 --navigation-interval-ms 2000` for a desktop compatibility trial. This preserves the existing persistent profiles and notification configuration. Restart Alive to apply launch settings. `auto` selects native startup for headed Chrome and driver startup for headless/Chromium; `driver` retains `launchPersistentContext`. `doctor` reports the selected connection and policy; `diagnose` inspects an isolated blank page using the selected launch method for the actual version, User-Agent/headless marker, language, timezone, WebDriver and Canvas behavior. Stop Alive before running standalone diagnostics, especially with external CDP.
+
+Native startup launches the real browser with a dedicated profile, a nonzero loopback debugging port and minimal startup arguments. There is no fabricated User-Agent or JavaScript fingerprint injection. An unsigned initial target loads before the automation client attaches; its completed navigation is not repeated. Exact signing-approved origins instead start on a blank page, then navigate with signing already active. A private ownership record binds the local endpoint, browser WebSocket identity and process ID. Verified surviving owned processes can be adopted; an unverifiable live PID is never killed or silently attached. Cleanup closes only the owned browser and keeps its profile. Chrome's personal default profile is never used. Headed Linux requires a display; deployment on a future Debian phone still requires verification on that device.
+
+Known automatic checks are passively awaited for at most `challengeWaitMs`; no clicks or reloads are performed to complete them. Interactive reCAPTCHA, hCaptcha, Turnstile, SmartCaptcha and private password/OTP entry require the operator. A stuck automatic check escalates once to the existing controller. Explicit sharing sends the requested controller immediately and retains explicit human return. Finishing a manual widget never silently takes control away from the operator. The `access.state` result distinguishes `ready`, `checking`, `verification`, `private-entry`, `denied`, `rate-limited` and `disconnected`.
+
+The router shares a per-origin navigation budget across its private conversations. It spaces top-level agent navigations and API requests; it does not delay the browser's resource loading or human clicks. HTTP 429 respects observed `Retry-After`, with `X-Ratelimit-Retry` as a fallback. A native initial request completed before attachment has no captured response headers and uses the 60-second fallback. An explicit 403 or deny page pauses the task. Other HTTP errors, including 439/498, are reported as `http-error` with an unknown cause rather than successful access or a guessed CAPTCHA diagnosis. Native Chrome error/interstitial documents are also stopped. Do not repeatedly reload, rotate identities or switch accounts to retry a denial. A separate `request` API-client rejection returns `requestAccess` and does not send a controller for an unrelated browser page.
+
+An operator-provided native Chromium/Fortress binary can use the same managed per-conversation profile and controller: put its **absolute executable path** in the gitignored environment variable `ALIVE_BROWSER_EXECUTABLE`, then run `alive browser setup --executable-env ALIVE_BROWSER_EXECUTABLE --cdp-env ""`. Use the actual browser binary, not the SDK CLI. Run diagnostics and compatibility tests for that exact build. A requested missing or invalid executable fails instead of silently starting Chrome. Clear the override with `--executable-env ""`. External CDP remains supported separately; choose only one connection method. Docker images and arbitrary remote CDP URLs are not native executables.
+
+No browser configuration guarantees access to every site. Network problems, site policy and server-side restrictions remain separate causes. Web Bot Auth identifies a registered agent; the website controls its permissions. The current research and measurements are in [the access report](BROWSER_ACCESS_RESEARCH_2026-10-12.ru.md).
 
 For phone access, route an HTTPS origin to the loopback listener using your existing reverse proxy or private network. Forward `/browser`, `/browser/*`, and, when signing is enabled, `/.well-known/http-message-signatures-directory`. Preserve the public `Host` header. The origin must be accessible from the phone. `publicUrl` advertises that origin; it does not create a tunnel, DNS record, or certificate. Keep the listener inaccessible directly from the public network.
 
@@ -162,6 +180,9 @@ Signatures identify the request method, authority, path, query and agent; they d
 ```sh
 npm run typecheck
 npm run test:browser
+npm run test:browser:access
+npm run test:browser:access:e2e
+npm run test:browser:native:e2e
 npm run test:browser:e2e
 npm run test:browser:router
 npm run test:browser:router:e2e
@@ -180,5 +201,9 @@ npm test
 `test:browser:router` uses a local Bot API and two authorized private users to verify correct recipients despite a different global pairing, isolated profile paths and capabilities, rejection of ambiguous/out-of-scope routing, cancellation without notifications, and delivery failures/receipts. `test:browser:router:e2e` checks two real Chrome profiles with separate cookies and localStorage, a routed mobile WebSocket controller, input/return isolation and cancellation. These tests send no real Telegram messages.
 
 `test:browser:cdp` launches an external Chrome process and attaches through its actual CDP socket. It checks existing page/cookie/storage preservation, temporary Canvas diagnostics, detach without process termination or lingering Fetch interception, password/iframe code-entry pause, authenticated live frames and private operator input, explicit resume, and credential revocation on disconnection. Both drivers can run this suite with `ALIVE_BROWSER_TEST_DRIVER`. This tests the adapter boundary, not an installed Fortress release.
+
+`test:browser:access` checks shared origin pacing, cancellation, standard/WB retry headers and executable selection. `test:browser:access:e2e` runs local real-browser scenarios: automatic 403 challenge redirects, passive challenge forms, in-place completion, timeout escalation, private-entry pause, manual/SmartCaptcha completion and explicit return, HTTP 403/200 denial, 429, independent API-client errors and cancellation without notification. Set `ALIVE_BROWSER_TEST_HEADED=1` to verify ordinary Chrome windows; the diagnostics assertion verifies that the headless marker is absent. These are local fixtures, not certificates of access to Avito/Wildberries. The live stream falls back to bounded CSS-scale snapshots when native screencast geometry would crop a headed window; input remains independent of capture.
+
+`test:browser:native:e2e` checks real native process ownership/adoption, WebDriver state, persistent cookies/storage across restart, cleanup, refusal of a foreign PID and cancellation during warmup. Set `ALIVE_BROWSER_TEST_NATIVE_LAUNCH=1` for `test:browser:router:e2e` to exercise two real native launches with the complete Mini App workflow. The scaled frame must retain the requested viewport's proportions, and the bottom-edge completion button must actually work.
 
 Runtime process-state helpers support both Linux procfs and macOS `ps`, including stopped processes. The runner idle test now waits for a deliberately delayed event so its elapsed-time assertion measures actual idle time. The lifecycle test verifies kernel exit before awaiting Node's asynchronous child-exit notification.

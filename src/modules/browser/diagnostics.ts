@@ -3,7 +3,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Browser, BrowserContext, BrowserType, Page } from "playwright";
 import type { BrowserConfig } from "./config.js";
-import { resolveCdpEndpoint } from "./connection.js";
+import { resolveBrowserExecutable, resolveCdpEndpoint } from "./connection.js";
+import { chromeExecutable, launchNativeBrowser, type NativeBrowser } from "./native.js";
 
 export interface CanvasReport {
 	passed: boolean;
@@ -45,10 +46,12 @@ export async function checkCanvas(page: Page): Promise<CanvasReport> {
 }
 
 /** Uses a fresh temporary profile, or a temporary tab in the configured CDP browser. */
-export async function diagnoseBrowser(config: BrowserConfig): Promise<{ connection: string; version: string; canvas: CanvasReport }> {
+export async function diagnoseBrowser(config: BrowserConfig): Promise<{ connection: string; version: string; environment: { userAgent: string; webdriver: boolean; language: string; timezone: string; headlessMarker: boolean }; canvas: CanvasReport }> {
 	const engine = (config.driver === "patchright" ? (await import("patchright")).chromium : (await import("playwright")).chromium) as unknown as BrowserType;
 	const endpoint = resolveCdpEndpoint(config);
+	const executablePath = resolveBrowserExecutable(config);
 	let browser: Browser | undefined, context: BrowserContext | undefined, page: Page | undefined, directory: string | undefined;
+	let native: NativeBrowser | undefined;
 	try {
 		if (endpoint) {
 			try { browser = await engine.connectOverCDP(endpoint, { timeout: config.actionTimeoutMs, noDefaults: true }); }
@@ -57,7 +60,11 @@ export async function diagnoseBrowser(config: BrowserConfig): Promise<{ connecti
 			if (!context) throw new Error("The CDP browser has no default persistent context");
 		} else {
 			directory = fs.mkdtempSync(path.join(os.tmpdir(), "alive-browser-diagnose-"));
-			context = await engine.launchPersistentContext(directory, { channel: config.channel, headless: config.headless, viewport: null, acceptDownloads: false });
+			if (config.launchMode === "native" || (config.launchMode === "auto" && !config.headless && config.channel === "chrome")) {
+				native = await launchNativeBrowser({ executable: executablePath || (config.channel === "chrome" ? chromeExecutable() : engine.executablePath()), profile: directory, headless: config.headless, warmupMs: 0, timeoutMs: config.actionTimeoutMs, signal: AbortSignal.timeout(config.actionTimeoutMs) });
+				browser = await engine.connectOverCDP(native.endpoint, { timeout: config.actionTimeoutMs, noDefaults: true });
+				context = browser.contexts()[0];
+			} else context = await engine.launchPersistentContext(directory, { ...(executablePath ? { executablePath } : { channel: config.channel }), headless: config.headless, viewport: null, acceptDownloads: false });
 		}
 		page = await context.newPage();
 		page.setDefaultTimeout(config.actionTimeoutMs);
@@ -68,11 +75,13 @@ export async function diagnoseBrowser(config: BrowserConfig): Promise<{ connecti
 				timer = setTimeout(() => reject(new Error("Canvas diagnostics timed out")), config.actionTimeoutMs);
 			})]);
 		} finally { clearTimeout(timer); }
-		return { connection: endpoint ? "cdp" : "managed", version: context.browser()!.version(), canvas };
+		const environment = await page.evaluate(() => ({ userAgent: navigator.userAgent, webdriver: (navigator as unknown as { webdriver?: boolean }).webdriver === true, language: navigator.language, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, headlessMarker: /HeadlessChrome/i.test(navigator.userAgent) }));
+		return { connection: endpoint ? "cdp" : native ? "managed-native" : "managed", version: context.browser()!.version(), environment, canvas };
 	} finally {
 		await page?.close().catch(() => {});
 		if (browser) await browser.close();
 		else await context?.close();
+		await native?.close();
 		if (directory) fs.rmSync(directory, { recursive: true, force: true });
 	}
 }

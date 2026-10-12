@@ -41,10 +41,10 @@ let origin = "https://phone.test";
 new TelegramAllowlistStore(path.join(loaded.paths.modulesDir, "telegram")).add("222");
 writePrivateJson(path.join(loaded.paths.modulesDir, "browser", "operator.json"), { chatId: "999", userId: "999", pairedAt: Date.now() });
 const pages: Array<EventEmitter & Record<string, any>> = [];
-const router = new BrowserRouter({ port: 0, publicUrl: "https://phone.test", minActionIntervalMs: 0 }, {
+const router = new BrowserRouter({ port: 0, publicUrl: "https://phone.test", minActionIntervalMs: 0, minNavigationIntervalMs: 0 }, {
 	launch: async directory => {
 		profiles.push(directory);
-		const page = Object.assign(new EventEmitter(), { url: () => "https://fixture.test/", isClosed: () => false, frames: () => [page], locator: () => ({ count: async () => 0 }), mouse: { up: async () => {} }, screenshot: async () => Buffer.from([0xff, 0xd8, 0xff, 0xd9]) });
+		const page = Object.assign(new EventEmitter(), { title: async () => "Fixture", url: () => "https://fixture.test/", isClosed: () => false, frames: () => [page], locator: () => ({ count: async () => 0 }), mouse: { up: async () => {} }, screenshot: async () => Buffer.from([0xff, 0xd8, 0xff, 0xd9]) });
 		pages.push(page);
 		const context = Object.assign(new EventEmitter(), { pages: () => [page], setDefaultTimeout: () => {}, close: async () => context.emit("close") });
 		return context as unknown as BrowserContext;
@@ -141,13 +141,17 @@ try {
 	}
 	const expiring = new BrowserRouter({ port: 0, publicUrl: origin, handoffTtlMs: 1000 }, {
 		launch: async () => {
-			const page = Object.assign(new EventEmitter(), { url: () => "https://fixture.test/", isClosed: () => false, frames: () => [page], locator: (selector: string) => ({ count: async () => selector.includes("#challenge-form") ? 1 : 0, nth: () => ({ isVisible: async () => true }) }), mouse: { up: async () => {} } });
+			const page = Object.assign(new EventEmitter(), { title: async () => "Fixture", url: () => "https://fixture.test/", isClosed: () => false, frames: () => [page], locator: (selector: string) => ({ count: async () => selector.includes("#challenge-form") ? 1 : 0, nth: () => ({ isVisible: async () => true }) }), mouse: { up: async () => {} } });
 			const context = Object.assign(new EventEmitter(), { pages: () => [page], setDefaultTimeout: () => {}, close: async () => context.emit("close") });
 			return context as unknown as BrowserContext;
 		},
 	});
 	expiryHost = new ModuleHost({ config: loaded, log: new Logger({ console: false, level: "error" }), modules: [expiring], transports: [], ingest: input => events.append(input), outbox: () => [], history: HistoryStore.open(loaded.paths.stateDir), runtimeStatus: () => ({}), currentThreads: () => ["telegram:111"] });
-	await expiryHost.init(); await expiring.command({ action: "handoff", thread: "telegram:111" });
+	await expiryHost.init();
+	const expiringShare = await expiring.command({ action: "handoff", thread: "telegram:111" });
+	assert.equal(expiringShare.isError, undefined, "The expiry fixture must create a real handoff");
+	assert.equal(expiringShare.details.notificationSent, true);
+	assert.equal(expiringShare.details.paused, true, "Expiration must exercise assistance cleanup rather than viewer-only expiry");
 	const expiredPath = new URL(sent.at(-1)!.reply_markup.inline_keyboard[0][0].web_app.url).pathname, beforeExpiry = sent.length;
 	await new Promise(resolve => setTimeout(resolve, 1300));
 	assert.equal((expiring.status().sessions as unknown[]).length, 0, "Expired routed sessions must leave the pool");

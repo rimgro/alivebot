@@ -18,7 +18,7 @@ import { BrowserIdentity } from "./identity.js";
 import { BrowserModule } from "./module.js";
 import { cancelBrowserPairing, readBrowserOperator, requestBrowserPairing, writePrivateJson } from "./operator.js";
 import { startQuickTunnel, type QuickTunnel } from "./tunnel.js";
-import { resolveCdpEndpoint } from "./connection.js";
+import { resolveBrowserExecutable, resolveCdpEndpoint } from "./connection.js";
 import { diagnoseBrowser } from "./diagnostics.js";
 
 type Flags = Record<string, string | boolean>;
@@ -45,6 +45,29 @@ export function setupBrowser(loaded: LoadedConfig, flags: Flags): string {
 	if (cdpEnv !== undefined) {
 		if (cdpEnv && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(cdpEnv)) throw new Error("Invalid --cdp-env variable name");
 		browser.cdpEndpointEnv = cdpEnv;
+	}
+	const executableEnv = stringFlag(flags, "executable-env");
+	if (executableEnv !== undefined) {
+		if (executableEnv && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(executableEnv)) throw new Error("Invalid --executable-env variable name");
+		browser.executablePathEnv = executableEnv;
+	}
+	if (browser.cdpEndpointEnv && browser.executablePathEnv) throw new Error("Choose --executable-env or --cdp-env, not both");
+	const launchMode = stringFlag(flags, "launch-mode");
+	if (launchMode) {
+		if (!["auto", "driver", "native"].includes(launchMode)) throw new Error("Use --launch-mode auto, driver or native");
+		browser.launchMode = launchMode as typeof browser.launchMode;
+	}
+	const warmup = stringFlag(flags, "native-warmup-ms");
+	if (warmup !== undefined) {
+		if (!/^\d+$/.test(warmup) || Number(warmup) > 15_000) throw new Error("--native-warmup-ms must be an integer between 0 and 15000");
+		browser.nativeWarmupMs = Number(warmup);
+	}
+	for (const [flag, property] of [["challenge-wait-ms", "challengeWaitMs"], ["navigation-interval-ms", "minNavigationIntervalMs"]] as const) {
+		const value = stringFlag(flags, flag);
+		if (value !== undefined) {
+			if (!/^\d+$/.test(value) || Number(value) > 60_000) throw new Error(`--${flag} must be an integer between 0 and 60000`);
+			browser[property] = Number(value);
+		}
 	}
 	const channel = stringFlag(flags, "channel");
 	if (channel) {
@@ -99,7 +122,7 @@ export async function browserCommand(loaded: LoadedConfig, action: string, flags
 		}
 		case "pair": return await pair(loaded);
 		case "serve": return await serve(loaded, flags);
-		default: throw new Error("usage: alive browser setup [--driver patchright|playwright] [--cdp-env ENV_NAME] [--channel chrome|chromium] [--humanization true|false] [--public-url HTTPS_ORIGIN] [--identity-url HTTPS_ORIGIN] [--headless] [--sign-origins HTTPS_ORIGIN,...] | doctor [--online] | diagnose | pair | serve [--url HTTP_URL] [--local] [--tunnel] [--cloudflared PATH]");
+		default: throw new Error("usage: alive browser setup [--driver patchright|playwright] [--cdp-env ENV_NAME | --executable-env ENV_NAME] [--channel chrome|chromium] [--launch-mode auto|driver|native] [--native-warmup-ms 10000] [--humanization true|false] [--public-url HTTPS_ORIGIN] [--identity-url HTTPS_ORIGIN] [--headless true|false] [--challenge-wait-ms 15000] [--navigation-interval-ms 2000] [--sign-origins HTTPS_ORIGIN,...] | doctor [--online] | diagnose | pair | serve [--url HTTP_URL] [--local] [--tunnel] [--cloudflared PATH]");
 	}
 }
 
@@ -111,11 +134,12 @@ async function doctor(loaded: LoadedConfig, online: boolean): Promise<number> {
 	const snapshot = snapshotRuntime(loaded.paths.stateDir);
 	const engine = browser.driver === "patchright" ? (await import("patchright")).chromium : chromium;
 	const endpoint = resolveCdpEndpoint(browser);
+	const executablePath = resolveBrowserExecutable(browser);
 	const candidates = browser.channel === "chromium" ? [engine.executablePath()] : process.platform === "darwin"
 		? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
 		: process.platform === "win32" ? [path.join(process.env.PROGRAMFILES ?? "", "Google/Chrome/Application/chrome.exe"), path.join(process.env.LOCALAPPDATA ?? "", "Google/Chrome/Application/chrome.exe")]
 		: ["/opt/google/chrome/chrome", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"];
-	let installed = endpoint ? true : candidates.some(file => fs.existsSync(file));
+	let installed = endpoint || executablePath ? true : candidates.some(file => fs.existsSync(file));
 	if (online && endpoint) {
 		try {
 			const connection = await engine.connectOverCDP(endpoint, { timeout: browser.actionTimeoutMs, noDefaults: true });
@@ -127,6 +151,9 @@ async function doctor(loaded: LoadedConfig, online: boolean): Promise<number> {
 		} catch { throw new Error("Cannot connect to the configured browser CDP endpoint"); }
 	}
 	if (!installed) process.stdout.write(`Install browser: npx ${browser.driver === "patchright" ? "patchright" : "playwright"} install ${browser.channel}\n`);
+	process.stdout.write(`Access policy: ${endpoint ? "external engine (inspect actual binary)" : executablePath ? "managed custom Chromium executable" : `${browser.channel}; ${browser.headless ? "headless" : "headed"}`}; automatic check wait ${browser.challengeWaitMs} ms; per-origin navigation interval ${browser.minNavigationIntervalMs} ms\n`);
+	process.stdout.write(`Launch mode: ${browser.launchMode}; native unsigned initial-navigation warmup ${browser.nativeWarmupMs} ms\n`);
+	if (!endpoint && browser.headless && browser.driver === "patchright") process.stdout.write("Compatibility note: Patchright recommends headed Chrome with a persistent profile. Headless Chrome may expose HeadlessChrome in its user agent.\n");
 	const chat = browser.notifyChatId || operator?.chatId;
 	const destinationAllowed = !!chat && (!telegram.allowedChatIds.length || telegram.allowedChatIds.map(String).includes(chat));
 	process.stdout.write(`Host: ${process.platform}/${process.arch}; configuration: ${loaded.paths.configPath}\nRuntime: ${snapshot?.alive ? `running (pid ${snapshot.pid})` : "not running here"}\nBrowser: ${browser.enabled ? "enabled" : "disabled"}; ${browser.driver}/${endpoint ? `external CDP (${online ? "reachable" : "reachability unchecked"})` : `${browser.channel} ${installed ? "installed" : "not found"}`}; humanization ${browser.humanization.enabled ? "enabled" : "disabled"}\nPhone HTTPS address: ${browser.publicUrl || "not configured"}\nTelegram token: ${token ? "configured" : "missing"}\nOperator: ${chat ? `${chat}${destinationAllowed ? "" : " (denied by chat allowlist)"}` : "not paired"}\n`);

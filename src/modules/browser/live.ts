@@ -61,6 +61,7 @@ export class BrowserLive {
 		let latest: { data: Buffer; width: number; height: number } | undefined;
 		let stopped = false, capturing = false, generation = 0, mode = "screencast";
 		let forcedSnapshots = false;
+		let geometrySnapshots = false;
 		let fallbackTimer: NodeJS.Timeout | undefined;
 		let seedTimer: NodeJS.Timeout | undefined;
 		const authTimer = setTimeout(() => socket.close(1008), 5000);
@@ -82,8 +83,9 @@ export class BrowserLive {
 			detach(); const current = generation; sourcePage = page; capturing = true;
 			forcedSnapshots = !!this.deps.snapshotMode?.();
 			try {
-				if (forcedSnapshots) throw new Error("Viewport requires logical snapshots");
+				if (forcedSnapshots || geometrySnapshots) throw new Error("Viewport requires logical snapshots");
 				await page.bringToFront();
+				const captureViewport = page.viewportSize() ?? await page.evaluate(() => ({ width: (globalThis as unknown as { innerWidth: number }).innerWidth, height: (globalThis as unknown as { innerHeight: number }).innerHeight }));
 				const session = await page.context().newCDPSession(page);
 				if (stopped || current !== generation) { await session.detach(); return; }
 				cdp = session;
@@ -91,7 +93,13 @@ export class BrowserLive {
 					void session.send("Page.screencastFrameAck", { sessionId: event.sessionId }).catch(() => {});
 					if (stopped || current !== generation) return;
 					this.counters.captured++;
-					const viewport = page.viewportSize() ?? { width: event.metadata.deviceWidth, height: event.metadata.deviceHeight };
+					const viewport = page.viewportSize() ?? captureViewport;
+					const surface = event.metadata;
+					// Headed Chromium can crop a window beyond the physical display while
+					// retaining a larger emulated layout. Never send that as the full page.
+					if (surface.deviceWidth > 0 && surface.deviceHeight > 0 && Math.abs((surface.deviceWidth / surface.deviceHeight) / (viewport.width / viewport.height) - 1) > .01) {
+						geometrySnapshots = true; latest = undefined; void capture(page); return;
+					}
 					const data = Buffer.from(event.data, "base64");
 					if (data.length <= 4 * 1024 * 1024) latest = { data, ...viewport };
 				});

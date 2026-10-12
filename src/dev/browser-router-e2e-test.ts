@@ -9,6 +9,7 @@ import { loadConfig } from "../config.js";
 import { ModuleHost } from "../events/host.js";
 import { Logger } from "../log.js";
 import { BrowserRouter } from "../modules/browser/router.js";
+import type { BrowserModule } from "../modules/browser/module.js";
 import { DEFAULT_HUMANIZATION } from "../modules/browser/config.js";
 import { EventStore } from "../store/events.js";
 import { HistoryStore } from "../store/history.js";
@@ -33,8 +34,9 @@ const driver = process.env.ALIVE_BROWSER_TEST_DRIVER === "playwright" ? "playwri
 const engine = driver === "patchright" ? (await import("patchright")).chromium : chromium;
 const nativeViewport = process.env.ALIVE_BROWSER_TEST_NATIVE_VIEWPORT === "1";
 const forceCompatibility = process.env.ALIVE_BROWSER_TEST_VIEWPORT_FALLBACK === "1";
-const router = new BrowserRouter({ port: 0, viewport: nativeViewport ? null : { width: 900, height: 720 }, driver, headless: process.env.ALIVE_BROWSER_TEST_HEADED !== "1", minActionIntervalMs: 0, humanization: { ...DEFAULT_HUMANIZATION, enabled: false } }, {
-	launch: async (directory, options) => {
+const nativeLaunch = process.env.ALIVE_BROWSER_TEST_NATIVE_LAUNCH === "1";
+const router = new BrowserRouter({ port: 0, viewport: nativeViewport || nativeLaunch ? null : { width: 900, height: 720 }, driver, launchMode: nativeLaunch ? "native" : "driver", nativeWarmupMs: 400, headless: nativeLaunch ? false : process.env.ALIVE_BROWSER_TEST_HEADED !== "1", minActionIntervalMs: 0, minNavigationIntervalMs: 0, humanization: { ...DEFAULT_HUMANIZATION, enabled: false } }, {
+	...(nativeLaunch ? {} : { launch: async (directory: string, options: Parameters<typeof engine.launchPersistentContext>[1]) => {
 		const context = await engine.launchPersistentContext(directory, options) as unknown as BrowserContext;
 		if (forceCompatibility) {
 			const connect = context.newCDPSession.bind(context);
@@ -45,7 +47,7 @@ const router = new BrowserRouter({ port: 0, viewport: nativeViewport ? null : { 
 			};
 		}
 		contexts.push(context); return context;
-	},
+	} }),
 	notify: async url => { const id = new URL(url).pathname.split("/").at(-1); const thread = ["telegram:111", "telegram:222"].find(value => createHash("sha256").update(value).digest("hex").slice(0, 24) === id)!; links.push({ thread, url }); return { thread, messageId: links.length }; },
 });
 const events = EventStore.open(loaded.paths.stateDir);
@@ -66,6 +68,15 @@ try {
 	assert.deepEqual(links.map(value => value.thread), ["telegram:111"]);
 	scope = ["telegram:222"];
 	await router.command({ action: "navigate", url: `${target}/?owner=222` });
+	if (nativeLaunch) {
+		const sessions = (router as unknown as { sessions: Map<string, { browser: BrowserModule }> }).sessions;
+		for (const thread of ["telegram:111", "telegram:222"]) {
+			const browser = sessions.get(thread)!.browser;
+			contexts.push((browser as unknown as { context: BrowserContext }).context);
+			assert.equal(browser.status().launchMode, "native");
+			assert.equal(await contexts.at(-1)!.pages()[0].evaluate("navigator.webdriver"), false);
+		}
+	}
 	assert.deepEqual(links.map(value => value.thread), ["telegram:111", "telegram:222"]);
 	assert.equal((await contexts[0].cookies(target)).find(cookie => cookie.name === "fixture_owner")?.value, "111");
 	assert.equal((await contexts[1].cookies(target)).find(cookie => cookie.name === "fixture_owner")?.value, "222");
@@ -92,7 +103,7 @@ try {
 	const errors: string[] = []; phone.on("pageerror", error => errors.push(error.message));
 	const recoveredLink = new URL(links[0].url); recoveredLink.hash = `aliveKey=${recoveredLink.hash.slice(1)}&tgWebAppData=${encodeURIComponent(initData)}&tgWebAppVersion=8.0`;
 	await phone.goto(recoveredLink.href);
-	await phone.waitForFunction(() => document.querySelector("#frame").naturalWidth === 500 && (document.querySelector("#frame") as unknown as { naturalHeight: number }).naturalHeight === 812, undefined, { timeout: 8000 }).catch(async error => {
+	await phone.waitForFunction(() => { const image = document.querySelector("#frame") as unknown as { naturalWidth: number; naturalHeight: number }; return image.naturalWidth > 0 && Math.abs(image.naturalWidth / image.naturalHeight - 500 / 812) < .003; }, undefined, { timeout: 8000 }).catch(async error => {
 		console.error({ stage: "recovered-mobile-frame", status: await phone.locator("#status").textContent(), frame: await phone.locator("#frame").evaluate(element => ({ width: (element as unknown as { naturalWidth: number }).naturalWidth, height: (element as unknown as { naturalHeight: number }).naturalHeight })), viewport: contexts[0].pages()[0].viewportSize(), actual: await contexts[0].pages()[0].evaluate("({width:innerWidth,height:innerHeight,outerWidth,outerHeight,devicePixelRatio})"), errors }); throw error;
 	});
 	const wrongContext = await operator.newContext(); const wrongPhone = await wrongContext.newPage();
@@ -160,7 +171,7 @@ try {
 	assert.equal((await router.command({ action: "status" })).details.handoff, undefined);
 	await router.command({ action: "close" });
 	assert.equal(links.length, before);
-	console.log(`Browser routing E2E passed (${driver}): isolated profiles, closure/reopen, authenticated recovery without storage, cross-account denial, mobile fit/fullscreen, same-owner input/return and agent revocation`);
+	console.log(`Browser routing E2E passed (${driver}, ${nativeLaunch ? "native launch" : "driver launch"}): isolated profiles, closure/reopen, authenticated recovery without storage, cross-account denial, mobile fit/fullscreen, same-owner input/return and agent revocation`);
 } finally {
 	await operator?.close(); await host.stop(); fixture.closeAllConnections(); await new Promise<void>(resolve => fixture.close(() => resolve())); fs.rmSync(root, { recursive: true, force: true });
 }
