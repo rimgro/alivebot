@@ -18,8 +18,8 @@ importers:
         specifier: ^0.85.1
         version: 0.85.1(ws@8.22.0)
       agent-browser:
-        specifier: ^0.27.0
-        version: 0.27.3
+        specifier: 0.27.0
+        version: 0.27.0
       patchright:
         specifier: 1.63.0
         version: 1.63.0
@@ -662,9 +662,8 @@ packages:
     resolution: {integrity: sha512-MnA+YT8fwfJPgBx3m60MNqakm30XOkyIoH1y6huTQvC0PwZG7ki8NacLBcrPbNoo8vEZy7Jpuk7+jMO+CUovTQ==}
     engines: {node: '>= 14'}
 
-  agent-browser@0.27.3:
-    resolution: {integrity: sha512-isQ1xWoYOnfR8BigYRlYmkFOrqw71tKEmUEMmFJGStQFOyCrLSsKoOAZEu8TjPZdmjD1nPQ/hLLYlxTwdHnA0Q==}
-    engines: {node: '>=24.0.0', pnpm: '>=11.0.0'}
+  agent-browser@0.27.0:
+    resolution: {integrity: sha512-mmHzVsYFVA6nshNNGJzg83aVMgKpf4h98ytY3pvtJB1Cot0ZyA2bfnkbSngGD56Azkj+GlhVH6qx9DfKOVE0yg==}
     hasBin: true
 
   balanced-match@4.0.4:
@@ -1576,7 +1575,7 @@ snapshots:
 
   agent-base@7.1.4: {}
 
-  agent-browser@0.27.3: {}
+  agent-browser@0.27.0: {}
 
   balanced-match@4.0.4: {}
 
