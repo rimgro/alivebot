@@ -89,7 +89,7 @@ try {
 	incoming.push({ update_id: 1, message: privateMessage(requestForBot.code) });
 	loaded = loadConfig({ cwd: root, overrides: { modules: { ...loaded.config.modules, telegram: { ...loaded.config.modules.telegram, enabled: true, token: "fixture-only", tokenEnv: "TEST_OPERATOR_TOKEN", apiBase: `http://127.0.0.1:${(api.address() as { port: number }).port}`, allowedUserIds: [], allowedChatIds: ["777"] } } } });
 	const page = new EventEmitter();
-	Object.assign(page, { mouse: { up: async () => {} }, url: () => "about:blank", isClosed: () => false });
+	Object.assign(page, { mouse: { up: async () => {} }, url: () => "https://fixture.test/", isClosed: () => false });
 	const context = new EventEmitter();
 	Object.assign(context, { pages: () => [page], setDefaultTimeout: () => {}, close: async () => context.emit("close") });
 	const browser = new BrowserModule({ port: 0, publicUrl: "https://phone.test", minActionIntervalMs: 0 }, { launch: async () => context as unknown as BrowserContext });

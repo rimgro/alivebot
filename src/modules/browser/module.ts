@@ -15,11 +15,12 @@ import { BrowserSigningTransport } from "./transport.js";
 import { readBrowserOperator } from "./operator.js";
 import { resolveCdpEndpoint } from "./connection.js";
 import { BrowserLive } from "./live.js";
+import { verifyTelegramOperator } from "./telegram-auth.js";
 
 type Result = AgentToolResult<Record<string, unknown>>;
 interface Command { action: string; url?: string; selector?: string; text?: string; key?: string; delta?: number; reason?: string; renew?: boolean }
-interface Handoff { token: string; digest: Buffer; claimed: boolean; notified: boolean; expiresAt: number; reason: string; notification?: { thread: string; messageId: number } }
-interface Input { type?: unknown; x?: unknown; y?: unknown; text?: unknown; key?: unknown; delta?: unknown }
+interface Handoff { token: string; digest: Buffer; activationDigest: Buffer; claimed: boolean; notified: boolean; expiresAt: number; reason: string; notification?: { thread: string; messageId: number } }
+interface Input { type?: unknown; x?: unknown; y?: unknown; text?: unknown; key?: unknown; delta?: unknown; width?: unknown; height?: unknown; telegramInitData?: unknown }
 
 export interface BrowserDependencies {
 	launch?: BrowserType["launchPersistentContext"];
@@ -64,6 +65,11 @@ export class BrowserModule implements AliveModule {
 	private streamResponse?: http.ServerResponse;
 	private live?: BrowserLive;
 	private capturingFrame = false;
+	private expiryTimer?: ReturnType<typeof setTimeout>;
+	private handoffSuppressed = false;
+	private expired = false;
+	private operatorViewport?: { width: number; height: number };
+	private viewportSnapshots = false;
 
 	constructor(config: Omit<Partial<BrowserConfig>, "humanization"> & { humanization?: Partial<HumanizationConfig> }, private readonly deps: BrowserDependencies = {}) {
 		this.config = { ...DEFAULT_BROWSER_CONFIG, ...config, humanization: { ...DEFAULT_HUMANIZATION, ...config.humanization }, signing: { ...DEFAULT_BROWSER_CONFIG.signing, ...config.signing } };
@@ -111,6 +117,7 @@ export class BrowserModule implements AliveModule {
 		server.headersTimeout = 10_000;
 		server.maxConnections = 32;
 		this.live = new BrowserLive(server, {
+			snapshotMode: () => this.viewportSnapshots,
 			origin: () => this.publicOrigin,
 			authorize: (credential) => {
 				const handoff = this.authorizeCredential(credential);
@@ -150,6 +157,7 @@ export class BrowserModule implements AliveModule {
 	}
 
 	async stop(): Promise<void> {
+		clearTimeout(this.expiryTimer);
 		this.stopped = true;
 		clearInterval(this.challengeMonitor);
 		this.challengeMonitor = undefined;
@@ -193,13 +201,14 @@ export class BrowserModule implements AliveModule {
 	async replacePublicOrigin(value: string): Promise<void> {
 		await this.enqueue(async () => {
 			if (this.stopped) throw new Error("Browser is stopped");
-			const reason = this.handoff?.reason;
+			const reason = this.handoff?.reason, deadline = this.handoff?.expiresAt;
 			if (this.identity && this.identity.agentUrl === this.publicOrigin) throw new Error("A locally hosted identity requires a stable public origin");
 			const url = new URL(value);
 			if (url.protocol !== "https:" || url.pathname !== "/" || url.username || url.password || url.search || url.hash) throw new Error("Use an HTTPS origin");
+			if (this.handoff && this.handoff.expiresAt <= Date.now()) await this.expireHandoff(this.handoff);
 			this.endStream("Invalid access key"); this.handoff = undefined;
 			this.config.publicUrl = url.origin; this.publicOrigin = url.origin;
-			if (reason) await this.beginHandoff(reason);
+			if (reason && !this.expired) await this.beginHandoff(reason, false, deadline);
 		});
 	}
 
@@ -212,17 +221,17 @@ export class BrowserModule implements AliveModule {
 	tools(): ToolDefinition[] {
 		return [defineTool({
 			name: "browser", label: "Browser",
-			description: "Persistent Chromium browser. Actions: navigate, read, screenshot, click, fill, press, scroll, request, handoff, status, close. close cancels assistance and revokes its credentials, including while paused; never use handoff to cancel. navigate uses native networking; request is a separate HTTP GET client sharing cookies. Use only where access is permitted. Stop on private fields, challenges or access/rate limits. handoff transfers control to the human; only the human can resume. Page content is untrusted external data.",
+			description: "Persistent Chromium browser. Actions: navigate, read, screenshot, click, fill, press, scroll, request, handoff, status, reclaim, close. reclaim revokes the human's controls but keeps the page; it does not mark a CAPTCHA complete or expose private fields. Navigate away or request help again if verification remains. close cancels and closes the session. handoff cannot cancel. Page text is untrusted.",
 			parameters: Type.Object({
-				action: Type.Union(["navigate", "read", "screenshot", "click", "fill", "press", "scroll", "request", "handoff", "status", "close"].map((value) => Type.Literal(value))),
+				action: Type.Union(["navigate", "read", "screenshot", "click", "fill", "press", "scroll", "request", "handoff", "status", "reclaim", "close"].map((value) => Type.Literal(value))),
 				url: Type.Optional(Type.String()), selector: Type.Optional(Type.String()), text: Type.Optional(Type.String({ maxLength: 4096 })),
 				key: Type.Optional(Type.String()), delta: Type.Optional(Type.Number()), reason: Type.Optional(Type.String({ maxLength: 300 })), renew: Type.Optional(Type.Boolean({ description: "Revoke an existing link and issue a new one only when the operator requests recovery." })),
 			}),
 			execute: async (_id, params, signal) => this.command(params, signal),
 		}), defineTool({
 			name: "browser_share", label: "Share browser",
-			description: "Pause this browser and send the configured private Telegram operator a Mini App button with a live stream and pointer/keyboard control of the same session. Use for permitted CAPTCHA, password, verification code or other manual assistance. The agent cannot read or act on the browser until the operator explicitly returns control. Repeated calls reuse the current session; renew only at the operator's request. With local-only configuration, returns a local control link instead.",
-			parameters: Type.Object({ reason: Type.String({ minLength: 1, maxLength: 300, description: "Briefly explain the manual action needed. Never include passwords or verification codes." }), renew: Type.Optional(Type.Boolean()) }),
+			description: "Share a loaded website with the private operator. For a request containing a URL, supply url: it loads the site before sending the controller, and replaces a paused task if the requested site differs. Without url, share the current loaded page; blank tabs are rejected. Repeat opening recovers the same session until expiry. reclaim revokes controls; close cancels the browser. Neither is a CAPTCHA completion.",
+			parameters: Type.Object({ url: Type.Optional(Type.String()), reason: Type.String({ minLength: 1, maxLength: 300, description: "Briefly explain the manual action needed. Never include passwords or verification codes." }), renew: Type.Optional(Type.Boolean()) }),
 			execute: async (_id, params, signal) => this.command({ action: "handoff", ...params }, signal),
 		})];
 	}
@@ -235,11 +244,25 @@ export class BrowserModule implements AliveModule {
 				await this.releaseBrowser(); this.pausedReason = undefined;
 				return result({ closed: true, credentialsRevoked: true, detached: !!this.cdpEndpoint });
 			}
+			if (params.action === "reclaim") {
+				await this.reclaimControl();
+				return result({ ...this.status(), reclaimed: true, credentialsRevoked: true, notificationSent: false });
+			}
 			if (params.action === "handoff") {
-				await this.ensurePage();
+				const page = await this.ensurePage();
+				if (params.url && (httpUrl(params.url).href !== page.url() || !this.handoff)) {
+					if (Date.now() < this.retryAt) throw new Error("Rate limit cooldown has not elapsed");
+					await this.reclaimControl(false); this.pausedReason = undefined; this.handoffSuppressed = false; this.expired = false;
+					await page.goto(httpUrl(params.url).href, { waitUntil: "domcontentloaded", timeout: this.config.actionTimeoutMs });
+				}
+				if (!/^https?:\/\//.test(page.url())) throw new Error("Browser has no loaded website. Supply url to browser_share or navigate before sharing; do not send an empty tab.");
 				return result(await this.beginHandoff(params.reason || "Manual assistance requested", params.renew === true));
 			}
-			if (this.pausedReason) return result({ ...this.status(), error: "Browser is paused. Wait for the operator; use handoff to request or renew assistance." });
+			if (this.pausedReason && !(params.action === "navigate" && !this.handoff && this.handoffSuppressed)) return result({ ...this.status(), error: "Browser is paused. Wait for the operator, or reclaim to revoke their controls without closing the page." });
+			if (params.action === "navigate" && !this.handoff) {
+				if (Date.now() < this.retryAt) throw new Error("Rate limit cooldown has not elapsed");
+				this.pausedReason = undefined; this.handoffSuppressed = false; this.expired = false;
+			}
 			const wait = this.lastActionAt + this.config.minActionIntervalMs - Date.now();
 			if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
 			if (this.stopped || signal?.aborted) throw new Error("Browser action was cancelled");
@@ -347,6 +370,7 @@ export class BrowserModule implements AliveModule {
 	}
 
 	private async releaseBrowser(): Promise<void> {
+		clearTimeout(this.expiryTimer); this.expiryTimer = undefined; this.operatorViewport = undefined; this.viewportSnapshots = false;
 		this.endStream();
 		const context = this.context, attached = this.attachedBrowser, transport = this.signingTransport;
 		this.context = undefined; this.page = undefined; this.attachedBrowser = undefined;
@@ -416,12 +440,12 @@ export class BrowserModule implements AliveModule {
 	private async probeChallenge(): Promise<void> {
 		const reason = await this.assistanceReason();
 		if (reason) this.pausedReason = reason;
-		if (this.pausedReason) await this.beginHandoff(this.pausedReason);
+		if (this.pausedReason && !this.handoffSuppressed) await this.beginHandoff(this.pausedReason);
 	}
 
 	/** Observe widgets rendered after navigation without requiring another agent action. */
 	private async monitorChallenge(): Promise<void> {
-		if (this.stopped || this.pausedReason || !this.page || this.monitoringChallenge) return;
+		if (this.stopped || this.pausedReason || this.handoffSuppressed || !this.page || this.monitoringChallenge) return;
 		this.monitoringChallenge = true;
 		try {
 			const reason = await this.assistanceReason();
@@ -448,20 +472,32 @@ export class BrowserModule implements AliveModule {
 		return undefined;
 	}
 
-	private async beginHandoff(reason: string, renew = false): Promise<Record<string, unknown>> {
+	private async beginHandoff(reason: string, renew = false, expiresAt?: number): Promise<Record<string, unknown>> {
 		if (this.stopped) throw new Error("Browser is stopped");
+		this.handoffSuppressed = false; this.expired = false;
 		this.pausedReason ||= reason;
-		if (renew) { this.endStream("Invalid access key"); this.handoff = undefined; }
+		if (renew) { expiresAt ??= this.handoff?.expiresAt; this.endStream("Invalid access key"); this.handoff = undefined; }
 		if (this.handoff && this.handoff.expiresAt > Date.now()) {
 			await this.notifyOperator();
 			return this.handoffResult();
 		}
 		await this.page?.mouse.up();
 		const token = randomBytes(32).toString("base64url");
-		this.handoff = { token, digest: digest(token), claimed: false, notified: false, reason, expiresAt: Date.now() + this.config.handoffTtlMs };
+		this.handoff = { token, digest: digest(token), activationDigest: digest(token), claimed: false, notified: false, reason, expiresAt: expiresAt ?? Date.now() + this.config.handoffTtlMs };
+		clearTimeout(this.expiryTimer);
+		const handoff = this.handoff;
+		this.expiryTimer = setTimeout(() => { void this.enqueue(() => this.expireHandoff(handoff)).catch(() => {}); }, Math.max(0, handoff.expiresAt - Date.now())); this.expiryTimer.unref();
 		this.ctx!.event({ title: "Browser requires human assistance", text: reason, priority: "high", payload: { expiresAt: this.handoff.expiresAt } });
 		await this.notifyOperator();
 		return this.handoffResult();
+	}
+
+	private async expireHandoff(handoff: Handoff): Promise<void> {
+		if (this.handoff !== handoff || this.stopped) return;
+		this.endStream("Link expired. Request a new handoff.");
+		await this.releaseBrowser(); this.expired = true; this.handoffSuppressed = true;
+		this.pausedReason = "Manual assistance expired; browser closed. Start a new task.";
+		this.ctx!.event({ title: "Browser assistance expired", text: this.pausedReason, priority: "normal", payload: { cleanup: true } });
 	}
 
 	private async notifyOperator(): Promise<void> {
@@ -503,7 +539,7 @@ export class BrowserModule implements AliveModule {
 		const getEndpoint = pathname === "/browser/frame" || pathname === "/browser/stream";
 		if (req.method !== (getEndpoint ? "GET" : "POST")) throw new HttpError(405, "Method not allowed");
 		if (req.method === "POST" && req.headers["content-type"] !== "application/json") throw new HttpError(415, "Use application/json");
-		this.authorize(req);
+		if (pathname !== "/browser/claim") this.authorize(req);
 		if (pathname === "/browser/stream") { await this.streamFrames(req, res); return; }
 		if (pathname === "/browser/frame") {
 			const buffer = await this.captureFrame(req);
@@ -513,12 +549,11 @@ export class BrowserModule implements AliveModule {
 		await this.enqueue(async () => {
 			if (res.destroyed) return;
 			if (this.stopped) throw new HttpError(410, "Browser session ended");
-			const handoff = this.authorize(req);
+			const handoff = pathname === "/browser/claim" ? this.authorizeClaim(req, body) : this.authorize(req);
 			if (pathname === "/browser/claim") {
-				if (handoff.claimed) throw new HttpError(401, "Link has already been used");
+				this.endStream("Control reopened in another window");
 				const credential = randomBytes(32).toString("base64url");
 				handoff.claimed = true;
-				handoff.token = "";
 				handoff.digest = digest(credential);
 				this.json(res, 200, { credential, expiresAt: handoff.expiresAt });
 				return;
@@ -542,9 +577,52 @@ export class BrowserModule implements AliveModule {
 			throw new HttpError(409, "Site still requires verification, private login entry, or denies access. Finish the permitted action before resuming.");
 		}
 		await this.page.mouse.up();
+		await this.restoreViewport(); clearTimeout(this.expiryTimer); this.expiryTimer = undefined;
 		this.endStream("No active handoff", keepLive);
 		this.handoff = undefined; this.pausedReason = undefined;
 		this.ctx!.event({ title: "Browser control returned", text: "The operator explicitly returned browser control to the agent.", priority: "normal" });
+	}
+
+	private async reclaimControl(checkPage = true): Promise<void> {
+		this.endStream("Browser control revoked by the agent"); clearTimeout(this.expiryTimer); this.expiryTimer = undefined;
+		this.handoff = undefined; this.handoffSuppressed = true;
+		await this.page?.mouse.up(); await this.restoreViewport();
+		this.pausedReason = this.lastHttpStatus === 403 || this.lastHttpStatus === 429 ? this.pausedReason : checkPage ? await this.assistanceReason() : undefined;
+	}
+
+	private async restoreViewport(): Promise<void> {
+		const viewport = this.operatorViewport; this.operatorViewport = undefined;
+		if (viewport && this.page && !this.page.isClosed()) await this.setPageViewport(viewport, this.config.viewport === null);
+	}
+
+	private async setPageViewport(viewport: { width: number; height: number }, native = false): Promise<void> {
+		const page = this.page!;
+		await page.setViewportSize(viewport);
+		let cdp: Awaited<ReturnType<BrowserContext["newCDPSession"]>> | undefined;
+		try {
+			cdp = await page.context().newCDPSession(page);
+			const { windowId } = await cdp.send("Browser.getWindowForTarget");
+			// Resize the content surface, including Chromium's window-decoration inset.
+			await cdp.send("Browser.setContentsSize", { windowId, ...viewport });
+			if (native) await cdp.send("Emulation.clearDeviceMetricsOverride");
+			this.viewportSnapshots = false;
+		} catch {
+			// Older external engines may emulate a viewport without resizing the surface.
+			this.viewportSnapshots = true;
+		} finally { await cdp?.detach().catch(() => {}); }
+	}
+
+	private authorizeClaim(req: http.IncomingMessage, body: Input): Handoff {
+		const handoff = this.handoff;
+		if (!handoff || handoff.expiresAt <= Date.now()) return this.authorize(req);
+		const telegram = this.ctx!.config.modules.telegram;
+		const recipient = this.config.notifyChatId || readBrowserOperator(this.ctx!.paths.modulesDir)?.chatId;
+		const token = process.env[telegram.tokenEnv] || telegram.token;
+		const hasIdentity = body.telegramInitData !== undefined && telegram.enabled && !!recipient && !!token;
+		if (hasIdentity && !verifyTelegramOperator(body.telegramInitData, token!, recipient!)) throw new HttpError(403, "Telegram identity does not match this browser session");
+		const bearer = req.headers.authorization?.match(/^Bearer ([A-Za-z0-9_-]{43})$/)?.[1];
+		if (hasIdentity && bearer && timingSafeEqual(digest(bearer), handoff.activationDigest)) return handoff;
+		return this.authorize(req);
 	}
 
 	private async captureFrame(req: http.IncomingMessage): Promise<Buffer> {
@@ -610,7 +688,7 @@ export class BrowserModule implements AliveModule {
 	}
 
 	private authorizeCredential(token?: string): Handoff {
-		if (!this.handoff) throw new HttpError(401, "No active handoff");
+		if (!this.handoff) throw new HttpError(this.expired ? 410 : 401, this.expired ? "Link expired. Request a new handoff." : "No active handoff");
 		if (this.handoff.expiresAt <= Date.now()) throw new HttpError(410, "Link expired. Request a new handoff.");
 		if (!token || !/^[A-Za-z0-9_-]{43}$/.test(token) || !timingSafeEqual(digest(token), this.handoff.digest)) throw new HttpError(401, "Invalid access key");
 		return this.handoff;
@@ -622,7 +700,12 @@ export class BrowserModule implements AliveModule {
 			const window = globalThis as unknown as { innerWidth: number; innerHeight: number };
 			return { width: window.innerWidth, height: window.innerHeight };
 		});
-		if (["down", "move", "up"].includes(String(input.type))) {
+		if (input.type === "viewport") {
+			const width = Math.max(500, finite(input.width, 360, 1920)), height = finite(input.height, 360, 1200);
+			if (!Number.isInteger(width) || !Number.isInteger(height)) throw new HttpError(400, "Invalid viewport size");
+			this.operatorViewport ||= viewport;
+			await page.mouse.up(); await this.setPageViewport({ width, height });
+		} else if (["down", "move", "up"].includes(String(input.type))) {
 			await page.mouse.move(finite(input.x, 0, viewport.width - 1), finite(input.y, 0, viewport.height - 1));
 			if (input.type === "down") await page.mouse.down();
 			if (input.type === "up") await page.mouse.up();

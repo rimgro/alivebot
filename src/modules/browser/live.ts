@@ -4,6 +4,7 @@ import type { CDPSession, Page } from "playwright";
 import { WebSocket, WebSocketServer } from "ws";
 
 interface LiveDependencies {
+	snapshotMode?(): boolean;
 	origin(): string;
 	authorize(credential: string): { expiresAt: number };
 	page(): Page | undefined;
@@ -57,7 +58,9 @@ export class BrowserLive {
 		let sourcePage: Page | undefined, cdp: CDPSession | undefined;
 		let latest: { data: Buffer; width: number; height: number } | undefined;
 		let stopped = false, capturing = false, generation = 0, mode = "screencast";
+		let forcedSnapshots = false;
 		let fallbackTimer: NodeJS.Timeout | undefined;
+		let seedTimer: NodeJS.Timeout | undefined;
 		const authTimer = setTimeout(() => socket.close(1008), 5000);
 		const reply = (body: unknown) => { if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(body)); };
 		const fail = (error: unknown, id?: number) => {
@@ -68,13 +71,16 @@ export class BrowserLive {
 		const detach = () => {
 			generation++; latest = undefined;
 			clearTimeout(fallbackTimer); fallbackTimer = undefined;
+			clearTimeout(seedTimer); seedTimer = undefined;
 			const session = cdp; cdp = undefined;
 			if (session) void session.send("Page.stopScreencast").catch(() => {}).finally(() => session.detach().catch(() => {}));
 		};
 		const stop = () => { if (stopped) return; stopped = true; clearTimeout(authTimer); clearInterval(tick); detach(); };
 		const capture = async (page: Page) => {
 			detach(); const current = generation; sourcePage = page; capturing = true;
+			forcedSnapshots = !!this.deps.snapshotMode?.();
 			try {
+				if (forcedSnapshots) throw new Error("Viewport requires logical snapshots");
 				await page.bringToFront();
 				const session = await page.context().newCDPSession(page);
 				if (stopped || current !== generation) { await session.detach(); return; }
@@ -89,6 +95,17 @@ export class BrowserLive {
 				});
 				await session.send("Page.startScreencast", { format: "jpeg", quality: 60, maxWidth: 1100, maxHeight: 900, everyNthFrame: 1 });
 				mode = "screencast";
+				// An unchanged/background Chromium surface may emit no initial frame.
+				seedTimer = setTimeout(() => { void (async () => {
+					if (stopped || current !== generation || sent || latest) return;
+					try {
+						this.deps.authorize(credential);
+						const viewport = page.viewportSize() ?? await page.evaluate(() => ({ width: (globalThis as unknown as { innerWidth: number }).innerWidth, height: (globalThis as unknown as { innerHeight: number }).innerHeight }));
+						const data = await page.screenshot({ type: "jpeg", quality: 60, scale: "css", timeout: 1500 });
+						this.deps.authorize(credential);
+						if (!stopped && current === generation && !sent && !latest && data.length <= 4 * 1024 * 1024) { this.counters.captured++; latest = { data, ...viewport }; }
+					} catch { /* The controller reconnects after a transient capture error. */ }
+				})(); }, 800); seedTimer.unref();
 			} catch {
 				if (stopped || current !== generation) return;
 				const session = cdp; cdp = undefined; await session?.detach().catch(() => {});
@@ -113,7 +130,7 @@ export class BrowserLive {
 				this.deps.authorize(credential);
 				const page = this.deps.page();
 				if (!page || page.isClosed()) throw { status: 410, message: "Browser page closed" };
-				if (page !== sourcePage && !capturing) void capture(page);
+				if ((page !== sourcePage || forcedSnapshots !== !!this.deps.snapshotMode?.()) && !capturing) void capture(page);
 				if (outstanding && Date.now() - sentAt > 10_000) throw { status: 503, message: "Stream receiver is too slow" };
 				if (!latest || outstanding || socket.bufferedAmount > 256 * 1024) return;
 				const frame = latest; latest = undefined; outstanding = ++sent; sentAt = Date.now();

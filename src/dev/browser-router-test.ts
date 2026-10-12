@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { createHmac } from "node:crypto";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
@@ -38,7 +39,7 @@ const pages: Array<EventEmitter & Record<string, any>> = [];
 const router = new BrowserRouter({ port: 0, publicUrl: "https://phone.test", minActionIntervalMs: 0 }, {
 	launch: async directory => {
 		profiles.push(directory);
-		const page = Object.assign(new EventEmitter(), { url: () => "about:blank", isClosed: () => false, mouse: { up: async () => {} }, screenshot: async () => Buffer.from([0xff, 0xd8, 0xff, 0xd9]) });
+		const page = Object.assign(new EventEmitter(), { url: () => "https://fixture.test/", isClosed: () => false, mouse: { up: async () => {} }, screenshot: async () => Buffer.from([0xff, 0xd8, 0xff, 0xd9]) });
 		pages.push(page);
 		const context = Object.assign(new EventEmitter(), { pages: () => [page], setDefaultTimeout: () => {}, close: async () => context.emit("close") });
 		return context as unknown as BrowserContext;
@@ -46,8 +47,15 @@ const router = new BrowserRouter({ port: 0, publicUrl: "https://phone.test", min
 });
 const events = EventStore.open(loaded.paths.stateDir);
 const host = new ModuleHost({ config: loaded, log: new Logger({ console: false, level: "error" }), modules: [router], transports: [], ingest: input => events.append(input), outbox: () => [], history: HistoryStore.open(loaded.paths.stateDir), runtimeStatus: () => ({}), currentThreads: () => scope });
-function claim(url: string) {
-	const link = new URL(url); return fetch(router.localEndpoint() + link.pathname + "/claim", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json", Authorization: `Bearer ${new URLSearchParams(link.hash.slice(1)).get("aliveKey")}` }, body: "{}" });
+let expiryHost: ModuleHost | undefined;
+function identity(user: number, date = Math.floor(Date.now() / 1000)) {
+	const fields = new URLSearchParams({ auth_date: String(date), query_id: "fixture", user: JSON.stringify({ id: user, first_name: "Fixture" }) });
+	const check = [...fields].sort(([a], [b]) => a.localeCompare(b)).map(([key, value]) => `${key}=${value}`).join("\n");
+	fields.set("hash", createHmac("sha256", createHmac("sha256", "WebAppData").update("fixture-only").digest()).update(check).digest("hex"));
+	return fields.toString();
+}
+function claim(url: string, telegramInitData?: string) {
+	const link = new URL(url); return fetch(router.localEndpoint() + link.pathname + "/claim", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json", Authorization: `Bearer ${new URLSearchParams(link.hash.slice(1)).get("aliveKey")}` }, body: JSON.stringify(telegramInitData === undefined ? {} : { telegramInitData }) });
 }
 try {
 	await host.init();
@@ -69,6 +77,18 @@ try {
 	assert.equal(new Set(profiles).size, 2, "Users must own separate persistent profiles");
 	const firstClaim = await claim(firstUrl); assert.equal(firstClaim.status, 200);
 	const firstCredential = (await firstClaim.json() as { credential: string }).credential;
+	assert.equal((await claim(firstUrl)).status, 401, "The original activation key alone remains single-use");
+	assert.equal((await claim(firstUrl, identity(222))).status, 403, "Another Telegram account cannot reopen a user's controller");
+	assert.equal((await claim(firstUrl, identity(111, Math.floor(Date.now() / 1000) - 601))).status, 403, "Stale signed launch data is rejected");
+	assert.equal((await claim(firstUrl, identity(111).replace("Fixture", "Tampered"))).status, 403, "Changing signed identity fields invalidates recovery");
+	assert.equal((await claim(firstUrl, identity(111) + "&auth_date=1")).status, 403, "Duplicate signed fields are rejected");
+	const restored = await claim(firstUrl, identity(111)); assert.equal(restored.status, 200, "The same verified owner can reopen without browser storage");
+	const restoredCredential = (await restored.json() as { credential: string }).credential;
+	assert.notEqual(restoredCredential, firstCredential);
+	const firstPath = new URL(firstUrl).pathname;
+	assert.equal((await fetch(router.localEndpoint() + firstPath + "/frame", { headers: { Authorization: `Bearer ${firstCredential}` } })).status, 401, "Reopening revokes the previous window's credential");
+	const reopened = await fetch(router.localEndpoint() + firstPath + "/claim", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json", Authorization: `Bearer ${restoredCredential}` }, body: "{}" });
+	assert.equal(reopened.status, 200, "A saved rotated credential can recover a regular browser window");
 	const secondPath = new URL(secondUrl).pathname;
 	assert.equal((await fetch(router.localEndpoint() + secondPath + "/frame", { headers: { Authorization: `Bearer ${firstCredential}` } })).status, 401, "One user's credential must not access another browser");
 	scope = ["telegram:111", "telegram:222"];
@@ -90,9 +110,11 @@ try {
 	assert.equal(JSON.stringify(retry).includes("aliveKey"), false);
 	const previousLink = sent[2].reply_markup.inline_keyboard[0][0].web_app.url;
 	const profileCount = profiles.length;
+	const deadline = (retry.details.handoff as { expiresAt: number }).expiresAt;
 	origin = "https://phone2.test";
 	writePrivateJson(path.join(root, "alive.config.local.json"), { modules: { browser: { publicUrl: origin } } });
-	await router.command({ action: "status", thread: "telegram:111" });
+	const rotated = await router.command({ action: "status", thread: "telegram:111" });
+	assert.equal((rotated.details.handoff as { expiresAt: number }).expiresAt, deadline, "Relay rotation must not indefinitely extend abandoned assistance");
 	assert.equal(profiles.length, profileCount, "Relay rotation must preserve browser contexts");
 	assert.equal((await claim(previousLink)).status, 401, "Relay rotation revokes previous activation keys");
 	assert.deepEqual(sent.slice(3).map(message => String(message.chat_id)).sort(), ["111", "222"], "Active controls must be renewed to their own recipients");
@@ -101,7 +123,24 @@ try {
 		assert.equal(new URL(link).origin, origin);
 		assert.equal((await claim(link)).status, 200);
 	}
-	console.log("browser-router: private recipients, isolated profiles/credentials, trusted routing, receipts, cancellation, failed delivery and live relay rotation passed");
+	const expiring = new BrowserRouter({ port: 0, publicUrl: origin, handoffTtlMs: 1000 }, {
+		launch: async () => {
+			const page = Object.assign(new EventEmitter(), { url: () => "https://fixture.test/", isClosed: () => false, mouse: { up: async () => {} } });
+			const context = Object.assign(new EventEmitter(), { pages: () => [page], setDefaultTimeout: () => {}, close: async () => context.emit("close") });
+			return context as unknown as BrowserContext;
+		},
+	});
+	expiryHost = new ModuleHost({ config: loaded, log: new Logger({ console: false, level: "error" }), modules: [expiring], transports: [], ingest: input => events.append(input), outbox: () => [], history: HistoryStore.open(loaded.paths.stateDir), runtimeStatus: () => ({}), currentThreads: () => ["telegram:111"] });
+	await expiryHost.init(); await expiring.command({ action: "handoff", thread: "telegram:111" });
+	const expiredPath = new URL(sent.at(-1)!.reply_markup.inline_keyboard[0][0].web_app.url).pathname, beforeExpiry = sent.length;
+	await new Promise(resolve => setTimeout(resolve, 1300));
+	assert.equal((expiring.status().sessions as unknown[]).length, 0, "Expired routed sessions must leave the pool");
+	assert.equal((await fetch(expiring.localEndpoint() + expiredPath + "/frame")).status, 410);
+	const endedPage = await fetch(expiring.localEndpoint() + expiredPath);
+	assert.match(endedPage.headers.get("content-type") || "", /text\/html/);
+	assert.match(await endedPage.text(), /frame-wait/, "Reopening an expired button must show the controller's ended state, not raw JSON");
+	assert.equal(sent.length, beforeExpiry, "Expiration must send no replacement button");
+	console.log("browser-router: isolated recipients, owner-authenticated reopening, tamper/stale/cross-user rejection, revocation, cancellation, relay rotation and expiry cleanup passed");
 } finally {
-	await host.stop(); api.closeAllConnections(); await new Promise<void>(resolve => api.close(() => resolve())); fs.rmSync(root, { recursive: true, force: true });
+	await expiryHost?.stop(); await host.stop(); api.closeAllConnections(); await new Promise<void>(resolve => api.close(() => resolve())); fs.rmSync(root, { recursive: true, force: true });
 }

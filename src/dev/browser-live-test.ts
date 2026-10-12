@@ -95,6 +95,15 @@ try {
 	await until(() => compatible.socket.readyState === WebSocket.CLOSED, "Expired credentials close the viewer");
 	assert.ok(releaseCount >= 2, "Disconnects release the native pointer");
 	expiresAt = Date.now() + 60_000; fallback = false;
+	finishSnapshot = undefined;
+	const seeded = open(); await until(() => seeded.socket.readyState === WebSocket.OPEN, "Unchanged surface socket opened");
+	packet(seeded.socket, { type: "auth", credential });
+	await until(() => !!finishSnapshot, "A surface without CDP frames must seed a bounded screenshot");
+	packet(seeded.socket, { type: "input", id: 5, body: { type: "key", key: "Tab" } });
+	await until(() => has(seeded.messages, "ack"), "Initial screenshot capture must not block native input");
+	finishSnapshot!(Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+	await until(() => seeded.messages.some(m => m.binary), "The unchanged surface must show an initial frame");
+	seeded.socket.close(); await until(() => seeded.socket.readyState === WebSocket.CLOSED, "Seed viewer closed");
 	const returned = open(); await until(() => returned.socket.readyState === WebSocket.OPEN, "Return socket opened");
 	packet(returned.socket, { type: "auth", credential });
 	await until(() => has(returned.messages, "authenticated"), "Return socket authenticated");

@@ -62,6 +62,7 @@ class FakePage extends EventEmitter {
 
 async function fixture(options: { notify?: (url: string, reason: string) => Promise<void>; ttl?: number } = {}) {
 	const page = new FakePage();
+	page.address = "https://fixture.test/";
 	const requested: Array<{ url: string; options: unknown }> = [];
 	const context = new EventEmitter() as EventEmitter & Record<string, unknown>;
 	Object.assign(context, {
@@ -231,6 +232,27 @@ try {
 	await new Promise((resolve) => setTimeout(resolve, 1100));
 	assert.equal((await post(expiringLink.origin, "claim", expiringLink.hash.slice(1))).status, 410);
 	assert.equal(expires.module.status().paused, true, "expiration must never auto-resume the agent");
+	assert.equal(expires.module.status().open, false, "Expired assistance must release the browser context");
+	assert.equal(expires.module.status().handoff, undefined, "Expired assistance must erase its capability");
+	const empty = await fixture(); empty.page.address = "about:blank";
+	await assert.rejects(() => empty.module.command({ action: "handoff" }), /no loaded website/);
+	const prepared = await empty.module.command({ action: "handoff", url: "https://fixture.test/loaded", reason: "Load before sharing" });
+	assert.equal(prepared.details.url, "https://fixture.test/loaded");
+	assert.equal(empty.page.gotos, 1, "Sharing a requested URL must navigate before handing off");
+	const preparedLink = new URL(prepared.details.operatorUrl as string);
+	const preparedClaim = await post(preparedLink.origin, "claim", preparedLink.hash.slice(1));
+	const preparedCredential = (await preparedClaim.json() as { credential: string }).credential;
+	empty.page.challenge = true;
+	const reclaimed = await empty.module.command({ action: "reclaim" });
+	assert.equal(reclaimed.details.reclaimed, true);
+	assert.equal(empty.module.status().open, true, "Reclaim must preserve the page and context");
+	assert.equal(reclaimed.details.paused, true, "Reclaim must not claim that an incomplete CAPTCHA passed");
+	assert.equal((await post(preparedLink.origin, "input", preparedCredential, { type: "key", key: "Enter" })).status, 401);
+	await new Promise(resolve => setTimeout(resolve, 1100));
+	assert.equal(empty.module.status().handoff, undefined, "A revoked CAPTCHA must not automatically create another pult");
+	empty.page.challenge = false;
+	await empty.module.command({ action: "navigate", url: "https://fixture.test/next" });
+	assert.equal(empty.module.status().paused, false, "After reclaim the agent may abandon the old page and navigate away");
 	const cancel = await fixture();
 	const cancelLink = new URL((await cancel.module.command({ action: "handoff" })).details.operatorUrl as string);
 	const cancelCredential = (await (await post(cancelLink.origin, "claim", cancelLink.hash.slice(1))).json() as { credential: string }).credential;
