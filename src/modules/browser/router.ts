@@ -5,6 +5,7 @@ import type { Duplex } from "node:stream";
 import { Type } from "typebox";
 import { defineTool, type AgentToolResult, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { AliveModule, ModuleContext } from "../../events/api.js";
+import { loadConfig } from "../../config.js";
 import { readJson } from "../../util.js";
 import { TelegramAllowlistStore } from "../telegram/state.js";
 import { DEFAULT_BROWSER_CONFIG, type BrowserConfig } from "./config.js";
@@ -29,6 +30,9 @@ export class BrowserRouter implements AliveModule {
 	private stopped = true;
 	private origin = "";
 	private identity?: BrowserIdentity;
+	private originMonitor?: ReturnType<typeof setInterval>;
+	private refresh?: Promise<void>;
+	private watchOrigin = false;
 
 	constructor(config: Partial<BrowserConfig>, private readonly dependencies: BrowserDependencies = {}) {
 		this.config = { ...DEFAULT_BROWSER_CONFIG, ...config };
@@ -49,12 +53,17 @@ export class BrowserRouter implements AliveModule {
 		await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(this.config.port, this.config.host, resolve); });
 		this.server = server; this.origin = this.config.publicUrl || `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 		this.stopped = false;
+		const configuredOrigin = this.configuredOrigin();
+		this.watchOrigin = !!this.config.publicUrl && !!configuredOrigin && new URL(configuredOrigin).origin === this.origin;
+		if (this.watchOrigin) { this.originMonitor = setInterval(() => { void this.refreshOrigin().catch(() => ctx.log.warn("browser relay origin update failed")); }, 1000); this.originMonitor.unref(); }
 		ctx.contributeStatus(() => this.status());
 		ctx.log.info("conversation browser router ready", { origin: this.origin });
 	}
 
 	async stop(): Promise<void> {
 		this.stopped = true;
+		if (this.originMonitor) clearInterval(this.originMonitor); this.originMonitor = undefined;
+		await this.refresh?.catch(() => {});
 		await this.serial.catch(() => {});
 		await Promise.all([...this.sessions.values()].map(session => session.browser.stop())); this.sessions.clear();
 		for (const socket of this.upgraded) socket.destroy(); this.upgraded.clear();
@@ -89,6 +98,7 @@ export class BrowserRouter implements AliveModule {
 	async command(params: Command, signal?: AbortSignal): Promise<Result> {
 		try {
 			if (this.stopped || signal?.aborted) throw new Error("Browser router is stopped or action was cancelled");
+			await this.refreshOrigin();
 			const thread = this.resolveThread(params.thread);
 			if (params.action === "close") {
 				const close = this.serial.then(async () => {
@@ -105,6 +115,28 @@ export class BrowserRouter implements AliveModule {
 			const message = error instanceof Error ? error.message : "Browser routing failed";
 			return { content: [{ type: "text", text: message }], details: { error: message, notificationSent: false }, isError: true };
 		}
+	}
+
+	private configuredOrigin(): string {
+		return loadConfig({ cwd: this.ctx!.paths.rootDir, configPath: this.ctx!.paths.configPath }).config.modules.browser?.publicUrl || "";
+	}
+
+	private async refreshOrigin(): Promise<void> {
+		if (!this.watchOrigin || this.stopped) return;
+		if (this.refresh) return this.refresh;
+		const configured = this.configuredOrigin();
+		if (!configured || configured === this.origin) return;
+		const url = new URL(configured);
+		if (url.protocol !== "https:" || url.pathname !== "/" || url.username || url.password || url.search || url.hash) throw new Error("Use an exact HTTPS browser origin");
+		if (url.origin === this.origin) return;
+		if (this.identity?.agentUrl === this.origin) throw new Error("A locally hosted identity requires a stable public origin");
+		const update = this.serial.then(async () => {
+			await Promise.all([...this.sessions.values()].map(session => session.browser.replacePublicOrigin(url.origin)));
+			this.config.publicUrl = url.origin; this.origin = url.origin;
+			this.ctx!.log.info("browser relay origin updated; old control keys revoked", { origin: this.origin });
+		});
+		this.serial = update.catch(() => {}); this.refresh = update;
+		try { await update; } finally { this.refresh = undefined; }
 	}
 
 	private resolveThread(explicit?: string): string {

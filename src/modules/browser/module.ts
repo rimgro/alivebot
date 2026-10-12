@@ -189,6 +189,20 @@ export class BrowserModule implements AliveModule {
 		this.publicOrigin = url.origin;
 	}
 
+	/** Refresh a locally configured relay without losing the conversation's page. */
+	async replacePublicOrigin(value: string): Promise<void> {
+		await this.enqueue(async () => {
+			if (this.stopped) throw new Error("Browser is stopped");
+			const reason = this.handoff?.reason;
+			if (this.identity && this.identity.agentUrl === this.publicOrigin) throw new Error("A locally hosted identity requires a stable public origin");
+			const url = new URL(value);
+			if (url.protocol !== "https:" || url.pathname !== "/" || url.username || url.password || url.search || url.hash) throw new Error("Use an HTTPS origin");
+			this.endStream("Invalid access key"); this.handoff = undefined;
+			this.config.publicUrl = url.origin; this.publicOrigin = url.origin;
+			if (reason) await this.beginHandoff(reason);
+		});
+	}
+
 	localEndpoint(): string {
 		const address = this.server?.address();
 		if (!address || typeof address === "string") throw new Error("Browser listener is not running");

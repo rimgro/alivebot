@@ -30,6 +30,8 @@ const api = http.createServer((request, response) => {
 await new Promise<void>(resolve => api.listen(0, "127.0.0.1", resolve));
 const initial = loadConfig({ cwd: root });
 const loaded = loadConfig({ cwd: root, overrides: { modules: { ...initial.config.modules, telegram: { ...initial.config.modules.telegram, enabled: true, token: "fixture-only", tokenEnv: "UNSET_FIXTURE_ROUTER_TOKEN", apiBase: `http://127.0.0.1:${(api.address() as { port: number }).port}`, allowedUserIds: ["111"], allowedChatIds: [] } } } });
+writePrivateJson(path.join(root, "alive.config.local.json"), { modules: { browser: { publicUrl: "https://phone.test" } } });
+let origin = "https://phone.test";
 new TelegramAllowlistStore(path.join(loaded.paths.modulesDir, "telegram")).add("222");
 writePrivateJson(path.join(loaded.paths.modulesDir, "browser", "operator.json"), { chatId: "999", userId: "999", pairedAt: Date.now() });
 const pages: Array<EventEmitter & Record<string, any>> = [];
@@ -45,7 +47,7 @@ const router = new BrowserRouter({ port: 0, publicUrl: "https://phone.test", min
 const events = EventStore.open(loaded.paths.stateDir);
 const host = new ModuleHost({ config: loaded, log: new Logger({ console: false, level: "error" }), modules: [router], transports: [], ingest: input => events.append(input), outbox: () => [], history: HistoryStore.open(loaded.paths.stateDir), runtimeStatus: () => ({}), currentThreads: () => scope });
 function claim(url: string) {
-	const link = new URL(url); return fetch(router.localEndpoint() + link.pathname + "/claim", { method: "POST", headers: { Origin: "https://phone.test", "Content-Type": "application/json", Authorization: `Bearer ${new URLSearchParams(link.hash.slice(1)).get("aliveKey")}` }, body: "{}" });
+	const link = new URL(url); return fetch(router.localEndpoint() + link.pathname + "/claim", { method: "POST", headers: { Origin: origin, "Content-Type": "application/json", Authorization: `Bearer ${new URLSearchParams(link.hash.slice(1)).get("aliveKey")}` }, body: "{}" });
 }
 try {
 	await host.init();
@@ -86,7 +88,20 @@ try {
 	assert.equal(String(sent[2].chat_id), "111");
 	assert.equal(JSON.stringify(events.all()).includes("aliveKey"), false);
 	assert.equal(JSON.stringify(retry).includes("aliveKey"), false);
-	console.log("browser-router: two private recipients, isolated profiles/paths/credentials, trusted thread routing, receipt, cancellation and failed-delivery reporting passed");
+	const previousLink = sent[2].reply_markup.inline_keyboard[0][0].web_app.url;
+	const profileCount = profiles.length;
+	origin = "https://phone2.test";
+	writePrivateJson(path.join(root, "alive.config.local.json"), { modules: { browser: { publicUrl: origin } } });
+	await router.command({ action: "status", thread: "telegram:111" });
+	assert.equal(profiles.length, profileCount, "Relay rotation must preserve browser contexts");
+	assert.equal((await claim(previousLink)).status, 401, "Relay rotation revokes previous activation keys");
+	assert.deepEqual(sent.slice(3).map(message => String(message.chat_id)).sort(), ["111", "222"], "Active controls must be renewed to their own recipients");
+	for (const message of sent.slice(3)) {
+		const link = message.reply_markup.inline_keyboard[0][0].web_app.url;
+		assert.equal(new URL(link).origin, origin);
+		assert.equal((await claim(link)).status, 200);
+	}
+	console.log("browser-router: private recipients, isolated profiles/credentials, trusted routing, receipts, cancellation, failed delivery and live relay rotation passed");
 } finally {
 	await host.stop(); api.closeAllConnections(); await new Promise<void>(resolve => api.close(() => resolve())); fs.rmSync(root, { recursive: true, force: true });
 }
