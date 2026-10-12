@@ -89,7 +89,7 @@ try {
 	incoming.push({ update_id: 1, message: privateMessage(requestForBot.code) });
 	loaded = loadConfig({ cwd: root, overrides: { modules: { ...loaded.config.modules, telegram: { ...loaded.config.modules.telegram, enabled: true, token: "fixture-only", tokenEnv: "TEST_OPERATOR_TOKEN", apiBase: `http://127.0.0.1:${(api.address() as { port: number }).port}`, allowedUserIds: [], allowedChatIds: ["777"] } } } });
 	const page = new EventEmitter();
-	Object.assign(page, { mouse: { up: async () => {} }, url: () => "https://fixture.test/", isClosed: () => false });
+	Object.assign(page, { mouse: { up: async () => {} }, frames: () => [], locator: () => ({ count: async () => 0 }), url: () => "https://fixture.test/", isClosed: () => false });
 	const context = new EventEmitter();
 	Object.assign(context, { pages: () => [page], setDefaultTimeout: () => {}, close: async () => context.emit("close") });
 	const browser = new BrowserModule({ port: 0, publicUrl: "https://phone.test", minActionIntervalMs: 0 }, { launch: async () => context as unknown as BrowserContext });
@@ -108,7 +108,7 @@ try {
 	const handoff = await share.execute("fixture-share", { reason: "Fixture human assistance" } as never, undefined, undefined, {} as never) as { details: Record<string, unknown> };
 	assert.equal(handoff.details.notificationFailed, false);
 	assert.equal(handoff.details.operatorUrl, undefined, "Telegram capability must not appear in model tool output");
-	assert.ok(sent.some(r => String(r.chat_id) === "777" && /https:\/\/phone.test\/browser#[A-Za-z0-9_-]{43}/.test(r.text)));
+	assert.ok(sent.some(r => String(r.chat_id) === "777" && r.reply_markup));
 	const notification = sent.find(r => r.reply_markup)!;
 	const button = notification.reply_markup!.inline_keyboard[0][0];
 	assert.equal(button.text, "Открыть браузер");
@@ -116,7 +116,7 @@ try {
 	assert.equal(notification.protect_content, true);
 	assert.equal(JSON.stringify(handoff).includes(new URL(button.web_app.url).hash.slice(1)), false);
 	await browser.command({ action: "handoff" });
-	assert.equal(sent.filter(r => r.text.includes("/browser#")).length, 1);
+	assert.equal(sent.filter(r => r.reply_markup).length, 1);
 	chatType = "supergroup";
 	const groupDenied = await browser.command({ action: "handoff", renew: true });
 	assert.equal(groupDenied.details.notificationFailed, true);

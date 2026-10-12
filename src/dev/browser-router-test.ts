@@ -17,14 +17,18 @@ import { TelegramAllowlistStore } from "../modules/telegram/state.js";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-browser-routing-"));
 const sent: Array<{ chat_id: string; reply_markup: { inline_keyboard: Array<Array<{ web_app: { url: string } }>> } }> = [];
+const edited: Array<{ chat_id: string; message_id: number; text: string; reply_markup: { inline_keyboard: Array<Array<{ web_app: { url: string } }>> } }> = [];
 const profiles: string[] = [];
 let failDelivery = false, scope = ["telegram:111"];
+let editFailure: "" | "limited" | "missing" = "";
 const api = http.createServer((request, response) => {
 	let body = ""; request.on("data", part => body += part); request.on("end", () => {
 		const params = JSON.parse(body); const method = request.url!.split("/").at(-1);
 		if (method === "sendMessage" && failDelivery) { response.writeHead(500); response.end(JSON.stringify({ ok: false, description: "Fixture delivery failure" })); return; }
+		if (method === "editMessageText" && editFailure) { const missing = editFailure === "missing"; response.writeHead(missing ? 400 : 429); response.end(JSON.stringify({ ok: false, error_code: missing ? 400 : 429, description: missing ? "Bad Request: message to edit not found" : "Too Many Requests" })); return; }
 		let result: unknown = { id: Number(params.chat_id), type: "private" };
 		if (method === "sendMessage") { sent.push(params); result = { message_id: sent.length, chat: { id: Number(params.chat_id), type: "private" } }; }
+		if (method === "editMessageText") { edited.push(params); result = { message_id: params.message_id }; }
 		response.writeHead(200, { "Content-Type": "application/json" }); response.end(JSON.stringify({ ok: true, result }));
 	});
 });
@@ -39,7 +43,7 @@ const pages: Array<EventEmitter & Record<string, any>> = [];
 const router = new BrowserRouter({ port: 0, publicUrl: "https://phone.test", minActionIntervalMs: 0 }, {
 	launch: async directory => {
 		profiles.push(directory);
-		const page = Object.assign(new EventEmitter(), { url: () => "https://fixture.test/", isClosed: () => false, mouse: { up: async () => {} }, screenshot: async () => Buffer.from([0xff, 0xd8, 0xff, 0xd9]) });
+		const page = Object.assign(new EventEmitter(), { url: () => "https://fixture.test/", isClosed: () => false, frames: () => [page], locator: () => ({ count: async () => 0 }), mouse: { up: async () => {} }, screenshot: async () => Buffer.from([0xff, 0xd8, 0xff, 0xd9]) });
 		pages.push(page);
 		const context = Object.assign(new EventEmitter(), { pages: () => [page], setDefaultTimeout: () => {}, close: async () => context.emit("close") });
 		return context as unknown as BrowserContext;
@@ -64,6 +68,8 @@ try {
 	assert.deepEqual(first.details.notification, { thread: "telegram:111", messageId: 1 });
 	assert.equal(first.details.notificationSent, true); assert.equal(first.details.operatorUrl, undefined);
 	assert.equal(String(sent[0].chat_id), "111", "Global paired operator must never replace the task owner");
+	assert.ok(!JSON.stringify((sent[0] as unknown as { text: string }).text).includes("https://"), "Controller URLs belong in buttons, not the message body");
+	assert.ok((sent[0] as unknown as { text: string }).text.length < 130, "The controller card must remain concise");
 	const firstUrl = sent[0].reply_markup.inline_keyboard[0][0].web_app.url;
 	assert.match(firstUrl, /\/browser\/s\/[a-f0-9]{24}#aliveKey=/);
 	assert.equal((await router.command({ action: "handoff", thread: "telegram:222" })).isError, true, "A user cannot select another conversation outside its trusted batch");
@@ -110,6 +116,7 @@ try {
 	assert.equal(JSON.stringify(retry).includes("aliveKey"), false);
 	const previousLink = sent[2].reply_markup.inline_keyboard[0][0].web_app.url;
 	const profileCount = profiles.length;
+	const beforeRotations = edited.length, beforeEvents = events.all().length;
 	const deadline = (retry.details.handoff as { expiresAt: number }).expiresAt;
 	origin = "https://phone2.test";
 	writePrivateJson(path.join(root, "alive.config.local.json"), { modules: { browser: { publicUrl: origin } } });
@@ -117,15 +124,18 @@ try {
 	assert.equal((rotated.details.handoff as { expiresAt: number }).expiresAt, deadline, "Relay rotation must not indefinitely extend abandoned assistance");
 	assert.equal(profiles.length, profileCount, "Relay rotation must preserve browser contexts");
 	assert.equal((await claim(previousLink)).status, 401, "Relay rotation revokes previous activation keys");
-	assert.deepEqual(sent.slice(3).map(message => String(message.chat_id)).sort(), ["111", "222"], "Active controls must be renewed to their own recipients");
-	for (const message of sent.slice(3)) {
+	assert.equal(sent.length, 3, "Relay rotation must edit existing cards instead of sending duplicates");
+	const rotations = edited.slice(beforeRotations);
+	assert.deepEqual(rotations.map(message => String(message.chat_id)).sort(), ["111", "222"], "Each card must be edited only in its owner's chat");
+	assert.equal(events.all().length, beforeEvents, "Relay renewal must not wake the agent with duplicate assistance events");
+	for (const message of rotations) {
 		const link = message.reply_markup.inline_keyboard[0][0].web_app.url;
 		assert.equal(new URL(link).origin, origin);
 		assert.equal((await claim(link)).status, 200);
 	}
 	const expiring = new BrowserRouter({ port: 0, publicUrl: origin, handoffTtlMs: 1000 }, {
 		launch: async () => {
-			const page = Object.assign(new EventEmitter(), { url: () => "https://fixture.test/", isClosed: () => false, mouse: { up: async () => {} } });
+			const page = Object.assign(new EventEmitter(), { url: () => "https://fixture.test/", isClosed: () => false, frames: () => [page], locator: (selector: string) => ({ count: async () => selector.includes("#challenge-form") ? 1 : 0, nth: () => ({ isVisible: async () => true }) }), mouse: { up: async () => {} } });
 			const context = Object.assign(new EventEmitter(), { pages: () => [page], setDefaultTimeout: () => {}, close: async () => context.emit("close") });
 			return context as unknown as BrowserContext;
 		},
@@ -140,6 +150,18 @@ try {
 	assert.match(endedPage.headers.get("content-type") || "", /text\/html/);
 	assert.match(await endedPage.text(), /frame-wait/, "Reopening an expired button must show the controller's ended state, not raw JSON");
 	assert.equal(sent.length, beforeExpiry, "Expiration must send no replacement button");
+	assert.equal(edited.at(-1)!.reply_markup.inline_keyboard.length, 0, "Expired cards must remove their controls");
+	const beforeFailure = sent.length;
+	editFailure = "limited";
+	assert.equal((await router.command({ action: "handoff", thread: "telegram:111", renew: true })).details.notificationFailed, true);
+	assert.equal(sent.length, beforeFailure, "A rate-limited edit must not create a duplicate message");
+	editFailure = "";
+	assert.equal((await router.command({ action: "handoff", thread: "telegram:111" })).details.notificationSent, true);
+	assert.equal(sent.length, beforeFailure, "Retry delivery by editing the same card");
+	editFailure = "missing";
+	assert.equal((await router.command({ action: "handoff", thread: "telegram:111", renew: true })).details.notificationSent, true);
+	assert.equal(sent.length, beforeFailure + 1, "A deleted card can be replaced for its owner");
+	assert.equal(String(sent.at(-1)!.chat_id), "111"); editFailure = "";
 	console.log("browser-router: isolated recipients, owner-authenticated reopening, tamper/stale/cross-user rejection, revocation, cancellation, relay rotation and expiry cleanup passed");
 } finally {
 	await expiryHost?.stop(); await host.stop(); api.closeAllConnections(); await new Promise<void>(resolve => api.close(() => resolve())); fs.rmSync(root, { recursive: true, force: true });

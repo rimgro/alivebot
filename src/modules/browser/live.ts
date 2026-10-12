@@ -5,6 +5,7 @@ import { WebSocket, WebSocketServer } from "ws";
 
 interface LiveDependencies {
 	snapshotMode?(): boolean;
+	state?(): { paused: boolean };
 	origin(): string;
 	authorize(credential: string): { expiresAt: number };
 	page(): Page | undefined;
@@ -14,7 +15,7 @@ interface LiveDependencies {
 	busy(): boolean;
 }
 
-/** One acknowledged frame in flight and one replaceable latest frame. */
+/** Three frames in flight and one replaceable latest frame; cumulative display ACKs. */
 export class BrowserLive {
 	private readonly server = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024, perMessageDeflate: false });
 	private active?: WebSocket;
@@ -54,7 +55,8 @@ export class BrowserLive {
 	}
 
 	private connect(socket: WebSocket): void {
-		let credential = "", queued = 0, sent = 0, outstanding = 0, sentAt = 0;
+		let credential = "", queued = 0, sent = 0, previousState = "";
+		const outstanding = new Map<number, number>();
 		let sourcePage: Page | undefined, cdp: CDPSession | undefined;
 		let latest: { data: Buffer; width: number; height: number } | undefined;
 		let stopped = false, capturing = false, generation = 0, mode = "screencast";
@@ -128,19 +130,22 @@ export class BrowserLive {
 			if (!credential || stopped || socket.readyState !== WebSocket.OPEN) return;
 			try {
 				this.deps.authorize(credential);
+				const state = JSON.stringify(this.deps.state?.() ?? { paused: true });
+				if (state !== previousState) { previousState = state; reply({ type: "state", ...JSON.parse(state) }); }
 				const page = this.deps.page();
 				if (!page || page.isClosed()) throw { status: 410, message: "Browser page closed" };
 				if ((page !== sourcePage || forcedSnapshots !== !!this.deps.snapshotMode?.()) && !capturing) void capture(page);
-				if (outstanding && Date.now() - sentAt > 10_000) throw { status: 503, message: "Stream receiver is too slow" };
-				if (!latest || outstanding || socket.bufferedAmount > 256 * 1024) return;
-				const frame = latest; latest = undefined; outstanding = ++sent; sentAt = Date.now();
+				const oldest = outstanding.values().next().value;
+				if (oldest !== undefined && Date.now() - oldest > 10_000) throw { status: 503, message: "Stream receiver is too slow" };
+				if (!latest || outstanding.size >= 3 || socket.bufferedAmount > 256 * 1024) return;
+				const frame = latest; latest = undefined; outstanding.set(++sent, Date.now());
 				this.counters.sent++;
 				const header = Buffer.alloc(16);
-				header.writeUInt32BE(0x414c4956, 0); header.writeUInt32BE(outstanding, 4);
+				header.writeUInt32BE(0x414c4956, 0); header.writeUInt32BE(sent, 4);
 				header.writeUInt32BE(Math.round(frame.width), 8); header.writeUInt32BE(Math.round(frame.height), 12);
 				socket.send(Buffer.concat([header, frame.data]), { binary: true }, (error) => { if (error) socket.terminate(); });
 			} catch (error) { fail(error); }
-		}, 50);
+		}, 40);
 		socket.on("error", () => socket.terminate());
 		socket.on("close", () => {
 			stop();
@@ -157,10 +162,15 @@ export class BrowserLive {
 					this.deps.authorize(packet.credential);
 					if (this.active || this.deps.busy()) throw { status: 409, message: "A browser stream is already open" };
 					credential = packet.credential; this.active = socket; this.endCapture = stop; clearTimeout(authTimer); this.counters = { captured: 0, sent: 0, acknowledged: 0 };
-					reply({ type: "authenticated" }); return;
+					reply({ type: "authenticated", ...this.deps.state?.() }); return;
 				}
 				this.deps.authorize(credential);
-				if (packet.type === "frame_ack") { if (outstanding && packet.id === outstanding) { outstanding = 0; this.counters.acknowledged++; } return; }
+				if (packet.type === "frame_ack") {
+					if (typeof packet.id === "number" && outstanding.has(packet.id)) {
+						for (const id of outstanding.keys()) if (id <= packet.id) { outstanding.delete(id); this.counters.acknowledged++; }
+					}
+					return;
+				}
 				if (packet.type === "ping") { reply({ type: "pong", id: packet.id }); return; }
 				if (packet.type === "resume" && Number.isSafeInteger(packet.id) && queued < 32) {
 					queued++;

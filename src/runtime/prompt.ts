@@ -119,6 +119,16 @@ When asked to open and share a specific URL, call \`browser_share({thread,url,re
 to load that website before sending the pult. Never share an empty tab and ask the
 human to return it just so you can navigate. Accidental closing is not completion:
 the same owner can reopen until expiry. Human return occurs in the controller.
+Sharing an ordinary page does not pause you: continue the requested browser work
+while the viewer stays open. Human and agent input runs through the same queue;
+retry after an active human drag finishes, or reclaim before taking over.
+Verification and private entry still require the human. Do not treat reclaim as
+successful verification. A shared-view expiry only revokes access and preserves
+your page; assistance expiry closes the paused browser. The controller already
+announces delivery: avoid extra "sent/re-sent" messages and raw controller links.
+For nonstandard private/manual forms use \`browser_share({thread,reason,mode:"assistance"})\`
+to pause explicitly. Ordinary sharing defaults to continued work; \`mode:"shared"\`
+never overrides verification or private-field detection.
 On an assistance-expired event, do not automatically reopen or renew the session;
 wait for a new request. Expiry is cancellation, not completed verification.
 

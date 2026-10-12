@@ -16,6 +16,7 @@ import { sleep } from "../util.js";
 declare const document: { documentElement: { scrollWidth: number }; querySelector(selector: string): { naturalWidth: number; value: string } };
 declare const innerWidth: number;
 declare const remoteWidth: number, remoteHeight: number;
+declare const liveReady: boolean;
 declare function requestAnimationFrame(callback: () => void): number;
 declare const sessionStorage: { getItem(key: string): string | null };
 declare const window: {
@@ -107,7 +108,7 @@ try {
 	miniAppLink.hash = `aliveKey=${miniAppLink.hash.slice(1)}&tgWebAppVersion=8.0&tgWebAppPlatform=ios&tgWebAppData=${encodeURIComponent("user=fixture&auth_date=1&hash=untrusted-fixture")}`;
 	await operator.goto(miniAppLink.href);
 	await operator.waitForURL((url) => !url.hash);
-	await operator.getByRole("status").filter({ hasText: "Подключено" }).waitFor();
+	await operator.locator("#agent-state").filter({ hasText: "Агент ждёт тебя" }).waitFor();
 	await operator.waitForFunction(() => document.querySelector("#frame").naturalWidth > 0);
 	assert.deepEqual(await operator.evaluate(() => window.telegramCalls), ["ready", "expand", "confirm", "swipes-disabled"]);
 	assert.equal(streamRequests, 1, "A Mini App starts a continuous authenticated WebSocket");
@@ -133,12 +134,12 @@ try {
 	const savedSession = await operator.evaluate(() => sessionStorage.getItem("alive.browser.operator"));
 	assert.ok(savedSession && !savedSession.includes(new URL(link).hash.slice(1)), "Only the rotated credential and a link fingerprint may be retained in tab storage");
 	await operator.reload();
-	await operator.getByRole("status").filter({ hasText: "Подключено" }).waitFor();
+	await operator.locator("#agent-state").filter({ hasText: "Агент ждёт тебя" }).waitFor();
 	await operator.waitForFunction(() => document.querySelector("#frame").naturalWidth > 0);
 	assert.deepEqual(await operator.evaluate(() => window.telegramCalls), ["ready", "expand", "confirm", "swipes-disabled"], "Mini App reload recovers SDK behavior without the original fragment");
 	await operator.goto(link);
 	await operator.waitForURL((url) => !url.hash);
-	await operator.getByRole("status").filter({ hasText: "Подключено" }).waitFor();
+	await operator.locator("#agent-state").filter({ hasText: "Агент ждёт тебя" }).waitFor();
 	await operator.waitForFunction(() => document.querySelector("#frame").naturalWidth > 0);
 	const outsider = await operatorBrowser.newPage();
 	await outsider.goto(link);
@@ -151,10 +152,11 @@ try {
 		const current = sessionStorage.getItem("alive.browser.operator");
 		return !!current && current !== old;
 	}, savedSession);
-	await operator.getByRole("status").filter({ hasText: "Подключено" }).waitFor();
+	await operator.locator("#agent-state").filter({ hasText: "Агент ждёт тебя" }).waitFor();
 	await operator.waitForFunction(() => document.querySelector("#frame").naturalWidth > 0);
 	assert.ok(await operator.evaluate(() => sessionStorage.getItem("alive.browser.operator")) !== savedSession, "A renewed link must replace the old tab credential");
 	assert.equal(await operator.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+	await operator.getByText("Ещё", { exact: true }).click();
 	await operator.getByRole("button", { name: "Приостановить изображение" }).click();
 	await operator.screenshot({ path: path.join(artifacts, "mobile.png"), fullPage: true });
 	await operator.setViewportSize({ width: 1366, height: 1400 });
@@ -169,6 +171,7 @@ try {
 	assert.equal(await operator.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
 	await operator.getByRole("button", { name: "По ширине", exact: true }).click();
 	await operator.getByRole("button", { name: "Продолжить изображение", exact: true }).click();
+	await operator.getByText("Ещё", { exact: true }).click();
 	const field = await native.locator("#target").boundingBox();
 	const frame = await operator.locator("#frame").boundingBox();
 	assert.ok(field && frame);
@@ -184,12 +187,13 @@ try {
 	await operator.getByLabel("Текст в выбранное поле браузера").fill(" — ручной ввод");
 	await operator.getByRole("button", { name: "Ввести текст", exact: true }).click();
 	await native.waitForFunction(() => document.querySelector("#target").value.includes("ручной ввод"));
-	await operator.locator("#input-status").filter({ hasText: "Текст отправлен в выбранное поле" }).waitFor();
+	await operator.locator("#input-status").filter({ hasText: "Текст введён" }).waitFor();
 	assert.equal(await operator.getByLabel("Текст в выбранное поле браузера").inputValue(), "", "Acknowledged input is cleared from the controller");
 	const blocked = await browser.command({ action: "fill", selector: "#target", text: "must not overwrite" });
 	assert.match(blocked.details.error as string, /paused/);
+	await operator.waitForFunction(() => liveReady);
 	await operator.getByRole("button", { name: "Готово — вернуть агенту" }).click();
-	await operator.getByRole("status").filter({ hasText: "Site still requires verification" }).waitFor();
+	await operator.getByRole("status").filter({ hasText: "Страница ещё ждёт проверку" }).waitFor();
 	const control = await native.locator("#drag").boundingBox();
 	assert.ok(control);
 	const first = await point(control.x + 10, control.y + control.height / 2);
@@ -212,6 +216,7 @@ try {
 	await native.locator("#challenge-form").waitFor({ state: "detached" });
 	await operator.locator("#pointer-status").filter({ hasText: "Нажатие передано браузеру" }).waitFor();
 	console.log(`Live controller: downscaled 1760×1120 viewport, local tap and browser acknowledgement ${Date.now() - inputStarted}ms`);
+	await operator.waitForFunction(() => liveReady);
 	await operator.getByRole("button", { name: "Готово — вернуть агенту" }).click();
 	await operator.getByRole("status").filter({ hasText: "Управление возвращено агенту" }).waitFor();
 	assert.ok((await operator.evaluate(() => window.telegramCalls)).includes("returned"));

@@ -141,9 +141,15 @@ try {
 	assert.equal((await fetch(`${origin}/browser/stream`, { headers: { Authorization: `Bearer ${token}` } })).status, 401, "Stream requires a claimed credential");
 	assert.equal((await post(origin, "claim", token, {}, "https://attacker.test")).status, 403);
 	const before = page.inputs.length;
+	const sharedClick = await module.command({ action: "click", selector: "button" });
+	assert.equal(sharedClick.details.paused, false, "Sharing an ordinary page must not pause agent work");
+	assert.equal(page.inputs.length, before + 1, "The agent may interact while the controller is shared");
+	page.challenge = true;
+	assert.equal((await module.command({ action: "handoff", mode: "shared" })).details.paused, true, "Shared mode cannot override verification detection");
 	const denied = await module.command({ action: "click", selector: "button" });
-	assert.equal(page.inputs.length, before, "agent cannot act while the human owns the page");
+	assert.equal(page.inputs.length, before + 1, "Verification still stops automated input");
 	assert.match(denied.details.error as string, /paused/);
+	page.challenge = false;
 	const claim = await post(origin, "claim", token);
 	assert.equal(claim.status, 200);
 	const credential = (await claim.json() as { credential: string }).credential;
@@ -185,6 +191,9 @@ try {
 	assert.equal((await fetch(`${origin}/browser/stream`, { headers: { Authorization: `Bearer ${credential}` } })).status, 401, "Resume revokes streaming access");
 	assert.equal(module.status().paused, false);
 	assert.equal((await post(origin, "input", credential, { type: "text", text: "after resume" })).status, 401);
+	page.challenge = true; await new Promise(resolve => setTimeout(resolve, 1100));
+	assert.equal(module.status().handoff, undefined, "An idle completed session must not send help again when a provider token expires");
+	assert.equal(module.status().paused, false); page.challenge = false;
 
 	page.statusCode = 403;
 	await module.command({ action: "navigate", url: "https://authorized.test/denied" });
@@ -224,6 +233,7 @@ try {
 	assert.ok(!JSON.stringify(notified.store.peekPending(100)).includes(new URL(notifiedLink).hash.slice(1)));
 
 	const expires = await fixture({ ttl: 1000 });
+	expires.page.challenge = true;
 	const expiringLink = new URL((await expires.module.command({ action: "handoff" })).details.operatorUrl as string);
 	const expiringClaim = await post(expiringLink.origin, "claim", expiringLink.hash.slice(1));
 	const expiringCredential = (await expiringClaim.json() as { credential: string }).credential;
@@ -234,6 +244,17 @@ try {
 	assert.equal(expires.module.status().paused, true, "expiration must never auto-resume the agent");
 	assert.equal(expires.module.status().open, false, "Expired assistance must release the browser context");
 	assert.equal(expires.module.status().handoff, undefined, "Expired assistance must erase its capability");
+	const sharedExpiry = await fixture({ ttl: 1000 });
+	const sharedLease = await sharedExpiry.module.command({ action: "handoff" });
+	assert.equal(sharedLease.details.paused, false);
+	await new Promise(resolve => setTimeout(resolve, 1200));
+	assert.equal(sharedExpiry.module.status().open, true, "A viewer's expiry must not cancel the agent's ongoing work");
+	assert.equal(sharedExpiry.module.status().handoff, undefined);
+	assert.equal(sharedExpiry.module.status().paused, false);
+	assert.equal((await sharedExpiry.module.command({ action: "read" })).details.text, "Test page text");
+	const manual = await fixture();
+	assert.equal((await manual.module.command({ action: "handoff", mode: "assistance", reason: "Private entry in a nonstandard form" })).details.paused, true);
+	assert.match((await manual.module.command({ action: "read" })).details.error as string, /paused/, "Explicit manual mode must block reads even for an unrecognized widget");
 	const empty = await fixture(); empty.page.address = "about:blank";
 	await assert.rejects(() => empty.module.command({ action: "handoff" }), /no loaded website/);
 	const prepared = await empty.module.command({ action: "handoff", url: "https://fixture.test/loaded", reason: "Load before sharing" });
@@ -242,6 +263,11 @@ try {
 	const preparedLink = new URL(prepared.details.operatorUrl as string);
 	const preparedClaim = await post(preparedLink.origin, "claim", preparedLink.hash.slice(1));
 	const preparedCredential = (await preparedClaim.json() as { credential: string }).credential;
+	assert.equal((await empty.module.command({ action: "read" })).details.text, "Test page text", "Claiming a normal shared page must not lock agent reads");
+	await post(preparedLink.origin, "input", preparedCredential, { type: "down", x: 20, y: 20 });
+	assert.match((await empty.module.command({ action: "click", selector: "button" })).details.error as string, /gesture/);
+	await post(preparedLink.origin, "input", preparedCredential, { type: "up", x: 20, y: 20 });
+	assert.equal((await empty.module.command({ action: "click", selector: "button" })).details.error, undefined, "Agent input resumes after the human gesture finishes");
 	empty.page.challenge = true;
 	const reclaimed = await empty.module.command({ action: "reclaim" });
 	assert.equal(reclaimed.details.reclaimed, true);
@@ -254,6 +280,7 @@ try {
 	await empty.module.command({ action: "navigate", url: "https://fixture.test/next" });
 	assert.equal(empty.module.status().paused, false, "After reclaim the agent may abandon the old page and navigate away");
 	const cancel = await fixture();
+	cancel.page.challenge = true;
 	const cancelLink = new URL((await cancel.module.command({ action: "handoff" })).details.operatorUrl as string);
 	const cancelCredential = (await (await post(cancelLink.origin, "claim", cancelLink.hash.slice(1))).json() as { credential: string }).credential;
 	const cancelled = await fetch(`${cancelLink.origin}/browser/stream`, { headers: { Authorization: `Bearer ${cancelCredential}` } });

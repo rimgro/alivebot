@@ -64,8 +64,12 @@ try {
 	assert.equal(first.readUInt32BE(0), 0x414c4956);
 	assert.equal(first.readUInt32BE(8), 1760); assert.equal(first.readUInt32BE(12), 1120);
 	assert.equal(first[18], 1);
-	cdp.frame(2); cdp.frame(3); await sleep(130);
-	assert.equal(messages.filter(m => m.binary).length, 1, "A slow viewer can have only one frame in flight");
+	cdp.frame(2); await until(() => messages.filter(m => m.binary).length === 2, "Second pipelined frame");
+	cdp.frame(3); await until(() => messages.filter(m => m.binary).length === 3, "Third pipelined frame");
+	cdp.frame(4); cdp.frame(5); await sleep(130);
+	assert.equal(messages.filter(m => m.binary).length, 3, "A slow viewer has at most three frames in flight");
+	packet(socket, { type: "frame_ack", id: 9999 }); await sleep(80);
+	assert.equal(messages.filter(m => m.binary).length, 3, "Future ACKs must not free frame credits");
 	const began = Date.now();
 	packet(socket, { type: "input", id: 1, body: { type: "down", x: 10, y: 20 } });
 	packet(socket, { type: "input", id: 2, body: { type: "up", x: 10, y: 20 } });
@@ -73,8 +77,20 @@ try {
 	assert.deepEqual(inputs.map(x => (x as { type: string }).type), ["down", "up"]);
 	assert.ok(Date.now() - began < 500, "A stalled screen must not stall input");
 	packet(socket, { type: "frame_ack", id: first.readUInt32BE(4) });
-	await until(() => messages.filter(m => m.binary).length === 2, "Next frame received");
-	assert.equal(messages.filter(m => m.binary)[1].data[18], 3, "Only the latest frame survives backpressure");
+	await until(() => messages.filter(m => m.binary).length === 4, "Next frame received");
+	assert.equal(messages.filter(m => m.binary)[3].data[18], 5, "Only the latest frame survives backpressure");
+	packet(socket, { type: "frame_ack", id: messages.filter(m => m.binary)[3].data.readUInt32BE(4) });
+	await sleep(30);
+	const beforeBenchmark = messages.filter(m => m.binary).length;
+	const timers: ReturnType<typeof setTimeout>[] = [];
+	const delayedAck = (data: Buffer, binary: boolean) => { if (binary) timers.push(setTimeout(() => { if (socket.readyState === WebSocket.OPEN) packet(socket, { type: "frame_ack", id: data.readUInt32BE(4) }); }, 240)); };
+	socket.on("message", delayedAck);
+	let value = 10;
+	const frames = setInterval(() => cdp.frame(value++), 20);
+	await sleep(1800); clearInterval(frames); socket.off("message", delayedAck); for (const timer of timers) clearTimeout(timer);
+	const delivered = messages.filter(m => m.binary).length - beforeBenchmark;
+	assert.ok(delivered >= 16, `240ms ACK delay must not force stop-and-wait frame delivery: ${delivered} frames`);
+	console.log(`browser-live latency fixture: ${delivered} frames in 1.8s with 240ms display-ACK delay; bounded to three in flight`);
 	const duplicate = open(); await until(() => duplicate.socket.readyState === WebSocket.OPEN, "Second socket opened");
 	packet(duplicate.socket, { type: "auth", credential });
 	await until(() => duplicate.socket.readyState === WebSocket.CLOSED, "Duplicate viewer rejected");
@@ -112,7 +128,7 @@ try {
 	assert.ok(returned.messages.some(m => !m.binary && JSON.parse(m.data.toString()).id === 4 && JSON.parse(m.data.toString()).ok === true), "Return must be acknowledged before closing");
 	assert.equal(has(returned.messages, "error"), false, "Successful return must not look like lost authorization");
 	assert.equal(credential, "returned");
-	console.log("browser-live: binary frames, latest-frame backpressure, independent input, origin/auth/revocation and slow-capture fallback passed");
+	console.log("browser-live: bounded frame pipeline, cumulative ACKs, independent input, origin/auth/revocation and slow-capture fallback passed");
 } finally {
 	live.close(); for (const socket of sockets) socket.terminate();
 	finishSnapshot?.(Buffer.from([0xff, 0xd8, 0xff, 0xd9]));

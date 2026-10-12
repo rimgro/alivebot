@@ -18,8 +18,9 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-browser-router-e2e-"))
 const fixture = http.createServer((request, response) => {
 	if (request.url === "/favicon.ico") { response.writeHead(204); response.end(); return; }
 	const owner = new URL(request.url!, "http://fixture").searchParams.get("owner") || "none";
+	const shared = new URL(request.url!, "http://fixture").searchParams.get("mode") === "shared";
 	response.writeHead(200, { "Content-Type": "text/html", "Set-Cookie": `fixture_owner=${owner}; Path=/` });
-	response.end(`<!doctype html><title>Browser ${owner}</title><h1>Owner ${owner}</h1><input id="target"><div id="challenge-form" style="min-height:40px"><button id="done" style="position:fixed;bottom:24px;left:16px;height:40px;font-size:16px" onclick="this.parentElement.remove()">Manual fixture completion</button></div><script>localStorage.setItem('owner','${owner}');for(const type of ['mousedown','mouseup','click'])document.addEventListener(type,e=>document.body.dataset[type]=JSON.stringify({x:e.clientX,y:e.clientY,target:e.target.id}))</script>`);
+	response.end(`<!doctype html><title>Browser ${owner}</title><h1>Owner ${owner}</h1><input id="target">${shared ? "" : '<div id="challenge-form" style="min-height:40px"><button id="done" style="position:fixed;bottom:24px;left:16px;height:40px;font-size:16px" onclick="this.parentElement.remove()">Manual fixture completion</button></div>'}<script>localStorage.setItem('owner','${owner}');for(const type of ['mousedown','mouseup','click'])document.addEventListener(type,e=>document.body.dataset[type]=JSON.stringify({x:e.clientX,y:e.clientY,target:e.target.id}))</script>`);
 });
 await new Promise<void>(resolve => fixture.listen(0, "127.0.0.1", resolve));
 const target = `http://127.0.0.1:${(fixture.address() as { port: number }).port}`;
@@ -126,6 +127,26 @@ try {
 	assert.deepEqual(await native.evaluate("({width:innerWidth,height:innerHeight})"), originalViewport, "Returning control restores the agent's actual viewport");
 	scope = ["telegram:111"];
 	assert.equal((await router.command({ action: "status" })).details.paused, false);
+	const shared = await router.command({ action: "handoff", url: `${target}/?owner=111&mode=shared`, reason: "View the agent's browser" });
+	assert.equal(shared.details.paused, false);
+	await phone.goto(links.at(-1)!.url);
+	await phone.locator("#frame").waitFor({ state: "visible" });
+	await phone.locator("#agent-state").filter({ hasText: "Агент может продолжать" }).waitFor();
+	assert.equal((await router.command({ action: "read" })).details.error, undefined, "A live viewer must not lock the agent's browser");
+	assert.equal((await router.command({ action: "fill", selector: "#target", text: "Agent input while shared" })).details.error, undefined);
+	assert.equal(await native.locator("#target").inputValue(), "Agent input while shared");
+	assert.equal((await router.command({ action: "navigate", url: `${target}/?owner=111&mode=shared&step=2` })).details.error, undefined);
+	assert.ok((await router.command({ action: "status" })).details.handoff, "Navigation keeps the viewer's access alive");
+	await phone.locator("#frame").waitFor({ state: "visible" });
+	await phone.getByText("Ещё", { exact: true }).click();
+	assert.equal(await phone.getByRole("button", { name: "Переподключиться" }).isVisible(), true);
+	await phone.getByText("Ещё", { exact: true }).click();
+	await phone.setViewportSize({ width: 1280, height: 900 });
+	if (artifacts) await phone.screenshot({ path: path.join(artifacts, `${driver}-desktop.png`), fullPage: true });
+	await phone.setViewportSize({ width: 375, height: 812 });
+	await router.command({ action: "reclaim" });
+	await phone.locator("#status").filter({ hasText: "Агент отозвал пульт" }).waitFor();
+	assert.equal((await router.command({ action: "read" })).details.error, undefined, "Revocation preserves the page for continued agent work");
 	scope = ["telegram:222"];
 	assert.equal((await router.command({ action: "status" })).details.paused, true, "Returning one user's browser must not resume another");
 	await recoveredContext.close(); phone = await operator.newPage({ viewport: { width: 375, height: 812 } });
