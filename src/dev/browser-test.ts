@@ -1,105 +1,305 @@
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
-import { browserArgs, browserConnection, ensureFortress, runBrowser } from "../fortress-browser.js";
-import { createAliveTools, type ToolDeps } from "../runtime/tools.js";
+import { createHash, createPublicKey, generateKeyPairSync, verify } from "node:crypto";
+import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { BrowserContext, BrowserType } from "playwright";
+import { loadConfig } from "../config.js";
+import { resolveCdpEndpoint } from "../modules/browser/connection.js";
+import type { ModuleContext } from "../events/api.js";
+import { ModuleHost } from "../events/host.js";
+import { loadModules, describeModules } from "../events/loader.js";
+import { Logger } from "../log.js";
+import { BrowserIdentity } from "../modules/browser/identity.js";
+import { BrowserModule } from "../modules/browser/module.js";
+import { DEFAULT_BROWSER_CONFIG } from "../modules/browser/config.js";
+import { EventStore } from "../store/events.js";
+import { HistoryStore } from "../store/history.js";
 
-assert.equal(browserConnection({}).endpoint, "http://127.0.0.1:9223");
-assert.equal(browserConnection({ ALIVE_FORTRESS_PORT: "9444" }).port, 9444);
-assert.equal(browserConnection({ ALIVE_FORTRESS_CDP: "http://localhost:9444/" }).endpoint, "http://localhost:9444");
-assert.throws(() => browserConnection({ ALIVE_FORTRESS_PORT: "NaN" }));
-assert.throws(() => browserConnection({ ALIVE_FORTRESS_CDP: "file:///tmp/browser" }));
-const args = browserArgs("http://localhost:9223", ["snapshot", "-i"]);
-assert.ok(args[0].endsWith("node_modules/agent-browser/bin/agent-browser.js"));
-assert.deepEqual(args.slice(1), ["--session", "alive-fortress", "--cdp", "http://localhost:9223", "snapshot", "-i"]);
-for (const argv of [[], ["connect", "9222"], ["--cdp=9222", "open", "https://example.com"], ["--session", "default", "snapshot"], ["close", "--all"]]) {
-	assert.throws(() => browserArgs("http://localhost:9223", argv));
-}
-const saved = process.env.ALIVE_FORTRESS_CDP;
-const savedPort = process.env.ALIVE_FORTRESS_PORT;
-let healthy = true;
-const server = createServer((_req, res) => {
-	res.setHeader("Content-Type", "application/json");
-	res.end(JSON.stringify(healthy ? { Browser: "Chrome/151.0.7908.0", webSocketDebuggerUrl: "ws://localhost/devtools/browser/test" } : {}));
-});
-await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-const address = server.address();
-assert.ok(address && typeof address !== "string");
-process.env.ALIVE_FORTRESS_CDP = `http://127.0.0.1:${address.port}`;
-try {
-	// Fortress intentionally advertises Chrome: no brand-string rejection.
-	assert.equal(await ensureFortress(), process.env.ALIVE_FORTRESS_CDP);
-	delete process.env.ALIVE_FORTRESS_CDP;
-	process.env.ALIVE_FORTRESS_PORT = String(address.port);
-	await assert.rejects(ensureFortress(), /unmanaged browser/);
-	process.env.ALIVE_FORTRESS_CDP = `http://127.0.0.1:${address.port}`;
-	healthy = false;
-	await assert.rejects(ensureFortress(), /CDP unavailable/);
-} finally {
-	if (saved === undefined) delete process.env.ALIVE_FORTRESS_CDP;
-	else process.env.ALIVE_FORTRESS_CDP = saved;
-	if (savedPort === undefined) delete process.env.ALIVE_FORTRESS_PORT;
-	else process.env.ALIVE_FORTRESS_PORT = savedPort;
-	await new Promise<void>((resolve) => server.close(() => resolve()));
-}
+const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-browser-test-"));
+const log = new Logger({ console: false, level: "error" });
+const modules: BrowserModule[] = [];
+const hosts: ModuleHost[] = [];
 
-// Local identity regression: checks both JS and HTTP UA, without external sites.
-// Opt-in because this starts the real engine (and may download its binary).
-if (process.env.ALIVE_BROWSER_IDENTITY_TEST === "1" || process.env.ALIVE_BROWSER_LIVE_TEST === "1" || process.env.ALIVE_BROWSER_CANVAS_TEST === "1") {
-	let requestUA = "";
-	const probe = createServer((req, res) => {
-		requestUA = req.headers["user-agent"] ?? "";
-		res.setHeader("Content-Type", "text/html");
-		res.end("<!doctype html><title>Browser identity probe</title>");
-	});
-	await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
-	const probeAddress = probe.address();
-	assert.ok(probeAddress && typeof probeAddress !== "string");
-	try {
-		await runBrowser(["tab", "new", `http://127.0.0.1:${probeAddress.port}`]);
-		assert.match(await runBrowser(["eval", "navigator.userAgent"]), /Windows NT 10\.0; Win64; x64/);
-		assert.equal(await runBrowser(["eval", "navigator.platform"]), '"Win32"');
-		assert.equal(await runBrowser(["eval", "navigator.userAgentData.platform"]), '"Windows"');
-		assert.match(requestUA, /Windows NT 10\.0; Win64; x64/);
-		// Canvas must preserve fully transparent pixels, including decoded PNGs.
-		// Returning RGB noise with alpha=0 is not valid unpremultiplied readback.
-		// Separate opt-in: expected to fail until the upstream engine is fixed.
-		if (process.env.ALIVE_BROWSER_CANVAS_TEST === "1") {
-			const pixels = JSON.parse(await runBrowser(["eval", `(async () => {
-				const canvas = document.createElement("canvas");
-				canvas.width = canvas.height = 1;
-				const ctx = canvas.getContext("2d");
-				const read = () => Array.from(ctx.getImageData(0, 0, 1, 1).data);
-				const blank = read();
-				const image = new Image();
-				image.src = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg==";
-				await image.decode();
-				ctx.drawImage(image, 0, 0);
-				const png = read();
-				ctx.fillRect(0, 0, 1, 1);
-				ctx.clearRect(0, 0, 1, 1);
-				return { blank, png, cleared: read() };
-			})()`]));
-			for (const [kind, pixel] of Object.entries(pixels)) {
-				assert.deepEqual(pixel, [0, 0, 0, 0], `Upstream canvas readback corruption: ${kind}`);
-			}
-		}
-	} finally {
-		try { await runBrowser(["tab", "close"]); }
-		finally { await new Promise<void>((resolve) => probe.close(() => resolve())); }
+class FakePage extends EventEmitter {
+	address = "about:blank";
+	challenge = false;
+	statusCode = 200;
+	responseHeaders: Record<string, string> = {};
+	inputs: unknown[] = [];
+	gotos = 0;
+	captures = 0;
+	textFocused = true;
+	url() { return this.address; }
+	isClosed() { return false; }
+	mainFrame() { return this; }
+	frames() { return [this]; }
+	parentFrame() { return null; }
+	viewportSize() { return { width: 900, height: 720 }; }
+	async title() { return "Test page"; }
+	async goto(url: string) {
+		this.address = url;
+		this.gotos++;
+		this.emit("response", { request: () => ({ isNavigationRequest: () => true }), frame: () => this, status: () => this.statusCode, headers: () => this.responseHeaders });
 	}
+	locator(selector: string) {
+		return {
+			innerText: async () => "Test page text",
+			count: async () => selector === "body" ? 1 : selector.includes("input:focus") ? Number(this.textFocused) : selector.includes("#challenge-form") ? Number(this.challenge) : 0,
+			nth: () => ({ isVisible: async () => this.challenge }),
+			first: () => ({ innerText: async () => "Test page text", isEditable: async () => this.textFocused, click: async () => { this.inputs.push("agent-click"); }, fill: async (value: string) => { this.inputs.push(value); } }),
+		};
+	}
+	async screenshot() { this.captures++; return Buffer.from([0xff, 0xd8, 0xff, 0xd9]); }
+	mouse = {
+		move: async (x: number, y: number) => { this.inputs.push({ x, y }); },
+		down: async () => { this.inputs.push("down"); }, up: async () => { this.inputs.push("up"); },
+		wheel: async (_x: number, y: number) => { this.inputs.push({ wheel: y }); },
+	};
+	keyboard = { insertText: async (value: string) => { this.inputs.push(value); }, press: async (value: string) => { this.inputs.push(value); } };
 }
 
-// Optional real-engine check; ordinary tests do not download/start browsers.
-if (process.env.ALIVE_BROWSER_LIVE_TEST === "1") {
-	await runBrowser(["open", "https://example.com"]);
-	assert.match(await runBrowser(["snapshot", "-i"]), /Learn more/);
-	assert.equal(await runBrowser(["eval", "navigator.webdriver"]), "false");
-	assert.doesNotMatch(await runBrowser(["eval", "navigator.userAgent"]), /HeadlessChrome/);
-	const tools = createAliveTools({ log: { child: () => ({}) }, moduleTools: [] } as unknown as ToolDeps);
-	const search = tools.find((tool) => tool.name === "web_search")!;
-	const result = await search.execute("test", { query: "fortress browser", count: 2 }, undefined, undefined, {} as never);
-	assert.match(JSON.stringify(result.content), /tilion/);
-	assert.equal(await runBrowser(["get", "url"]), "https://example.com/");
-	await runBrowser(["close"]);
+async function fixture(options: { notify?: (url: string, reason: string) => Promise<void>; ttl?: number } = {}) {
+	const page = new FakePage();
+	page.address = "https://fixture.test/";
+	const requested: Array<{ url: string; options: unknown }> = [];
+	const context = new EventEmitter() as EventEmitter & Record<string, unknown>;
+	Object.assign(context, {
+		pages: () => [page], newPage: async () => page, setDefaultTimeout: () => {}, close: async () => { context.emit("close"); },
+		request: { get: async (url: string, opts: unknown) => {
+			requested.push({ url, options: opts });
+			return { status: () => 302, headers: () => ({ location: "https://other.test/" }), text: async () => "Redirect", dispose: async () => {} };
+		} },
+	});
+	const module = new BrowserModule({ port: 0, minActionIntervalMs: 0, minNavigationIntervalMs: 0, humanization: { enabled: false }, handoffTtlMs: options.ttl ?? 60_000 }, {
+		launch: (async () => context as unknown as BrowserContext) as BrowserType["launchPersistentContext"], notify: options.notify,
+	});
+	const loaded = loadConfig({ cwd: fs.mkdtempSync(path.join(root, "instance-")) });
+	const store = EventStore.open(loaded.paths.stateDir);
+	const host = new ModuleHost({ config: loaded, log, transports: [], modules: [module], ingest: (e) => store.append(e), outbox: () => [], history: HistoryStore.open(loaded.paths.stateDir), runtimeStatus: () => ({}) });
+	modules.push(module);
+	hosts.push(host);
+	await host.init();
+	assert.equal(host.contributedTools().filter((tool) => tool.name === "browser").length, 1);
+	assert.equal(host.contributedTools().filter((tool) => tool.name === "browser_share").length, 1);
+	return { module, page, requested, store };
 }
-console.log("browser tests passed");
+
+function post(base: string, endpoint: string, credential: string, body: unknown = {}, origin?: string) {
+	return fetch(`${base}/browser/${endpoint}`, { method: "POST", headers: { Authorization: `Bearer ${credential}`, "content-type": "application/json", ...(origin ? { origin } : {}) }, body: JSON.stringify(body) });
+}
+
+try {
+	assert.equal(resolveCdpEndpoint({ cdpEndpointEnv: "" }), undefined);
+	assert.equal(resolveCdpEndpoint({ cdpEndpointEnv: "TEST_CDP" }, { TEST_CDP: "http://127.0.0.1:9222" }), "http://127.0.0.1:9222/");
+	assert.equal(resolveCdpEndpoint({ cdpEndpointEnv: "TEST_CDP" }, { TEST_CDP: "ws://[::1]:9222/devtools/browser/example" }), "ws://[::1]:9222/devtools/browser/example");
+	assert.throws(() => resolveCdpEndpoint({ cdpEndpointEnv: "TEST_CDP" }, {}), /Set TEST_CDP/);
+	assert.throws(() => resolveCdpEndpoint({ cdpEndpointEnv: "bad-name" }), /variable name/);
+	for (const value of ["http://example.com:9222", "ws://127.0.0.1:9222/?token=secret", "http://user:secret@localhost:9222", "file:///tmp/browser", "not a url"]) {
+		assert.throws(() => resolveCdpEndpoint({ cdpEndpointEnv: "TEST_CDP" }, { TEST_CDP: value }), error => error instanceof Error && !error.message.includes("secret"));
+	}
+	const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+	const keyPath = path.join(root, "key.pem");
+	fs.writeFileSync(keyPath, privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600 });
+	const settings = { enabled: true, agentUrl: "https://agent.test", keyFileEnv: "TEST_KEY_FILE", origins: ["https://authorized.test"] };
+	const identity = new BrowserIdentity(settings, { TEST_KEY_FILE: keyPath });
+	const headers = identity.requestHeaders("https://authorized.test/path?q=test", 1_700_000_000_000);
+	const params = headers["Signature-Input"].slice("sig1=".length);
+	const base = `"@authority": authorized.test\n"@method": GET\n"@path": /path\n"@query": ?q=test\n"signature-agent": "https://agent.test"\n"@signature-params": ${params}`;
+	const signature = Buffer.from(headers.Signature.slice("sig1=:".length, -1), "base64");
+	assert.ok(verify(null, Buffer.from(base), publicKey, signature));
+	assert.ok(!verify(null, Buffer.from(base.replace("/path", "/other")), publicKey, signature));
+	assert.match(params, /created=1700000000;expires=1700000060/);
+	assert.notEqual(headers.Signature, identity.requestHeaders("https://authorized.test/path?q=test", 1_700_000_000_000).Signature);
+	assert.throws(() => identity.requestHeaders("https://other.test/"), /not authorized/);
+	assert.throws(() => identity.requestHeaders("http://authorized.test/"), /not authorized/);
+	assert.throws(() => new BrowserIdentity({ ...settings, agentUrl: "http://agent.test" }, { TEST_KEY_FILE: keyPath }), /HTTPS/);
+	const directory = identity.directory(1_700_000_000_000);
+	const jwk = JSON.parse(directory.body).keys[0];
+	assert.equal(jwk.d, undefined);
+	assert.equal(identity.keyId, createHash("sha256").update(JSON.stringify({ crv: jwk.crv, kty: jwk.kty, x: jwk.x })).digest("base64url"));
+	const directoryParams = directory.headers["Signature-Input"].slice(5);
+	assert.ok(verify(null, Buffer.from(`"@authority";req: agent.test\n"@signature-params": ${directoryParams}`), createPublicKey({ key: jwk, format: "jwk" }), Buffer.from(directory.headers.Signature.slice(6, -1), "base64")));
+	assert.equal(directory.headers["Content-Type"], "application/http-message-signatures-directory+json");
+
+	const { module, page, requested, store } = await fixture();
+	await module.command({ action: "navigate", url: "https://authorized.test/" });
+	assert.equal(module.status().paused, false);
+	await assert.rejects(() => module.command({ action: "navigate", url: "file:///etc/passwd" }), /HTTP/);
+	await module.command({ action: "request", url: "https://authorized.test/" });
+	assert.equal((requested[0].options as { maxRedirects: number }).maxRedirects, 0);
+	assert.equal(requested.length, 1, "signed/unsigned requests must not follow redirects");
+	const handoff = await module.command({ action: "handoff", reason: "Test assistance" });
+	const link = new URL(handoff.details.operatorUrl as string);
+	const token = link.hash.slice(1);
+	const origin = link.origin;
+	assert.ok(!JSON.stringify(module.status()).includes(token));
+	assert.ok(!JSON.stringify(store.peekPending(100)).includes(token));
+	assert.equal((await fetch(`${origin}/browser/frame`)).status, 401);
+	assert.equal((await fetch(`${origin}/browser/stream`)).status, 401);
+	assert.equal((await fetch(`${origin}/browser/stream`, { headers: { Authorization: `Bearer ${token}` } })).status, 401, "Stream requires a claimed credential");
+	assert.equal((await post(origin, "claim", token, {}, "https://attacker.test")).status, 403);
+	const before = page.inputs.length;
+	const sharedClick = await module.command({ action: "click", selector: "button" });
+	assert.equal(sharedClick.details.paused, false, "Sharing an ordinary page must not pause agent work");
+	assert.equal(page.inputs.length, before + 1, "The agent may interact while the controller is shared");
+	page.challenge = true;
+	assert.equal((await module.command({ action: "handoff", mode: "shared" })).details.paused, true, "Shared mode cannot override verification detection");
+	const denied = await module.command({ action: "click", selector: "button" });
+	assert.equal(page.inputs.length, before + 1, "Verification still stops automated input");
+	assert.match(denied.details.error as string, /paused/);
+	page.challenge = false;
+	const claim = await post(origin, "claim", token);
+	assert.equal(claim.status, 200);
+	const credential = (await claim.json() as { credential: string }).credential;
+	assert.notEqual(credential, token);
+	assert.equal((await post(origin, "claim", token)).status, 401);
+	assert.equal((await fetch(`${origin}/browser/frame`, { headers: { Authorization: `Bearer ${token}` } })).status, 401);
+	const frame = await fetch(`${origin}/browser/frame`, { headers: { Authorization: `Bearer ${credential}` } });
+	assert.equal(frame.status, 200);
+	assert.equal(frame.headers.get("cache-control"), "no-store");
+	assert.equal(frame.headers.get("content-type"), "image/jpeg");
+	const stream = await fetch(`${origin}/browser/stream`, { headers: { Authorization: `Bearer ${credential}` } });
+	assert.equal(stream.status, 200);
+	assert.equal(stream.headers.get("content-type"), "application/x-ndjson");
+	assert.equal(stream.headers.get("x-accel-buffering"), "no");
+	assert.equal(stream.headers.get("cache-control"), "no-store");
+	const reader = stream.body!.getReader();
+	const firstFrame = JSON.parse(new TextDecoder().decode((await reader.read()).value).split("\n")[0]);
+	assert.equal(Buffer.from(firstFrame.frame, "base64").equals(await page.screenshot()), true);
+	assert.equal((await fetch(`${origin}/browser/stream`, { headers: { Authorization: `Bearer ${credential}` } })).status, 409, "Only one bounded stream may capture a session");
+	assert.equal((await post(origin, "input", credential, { type: "down", x: 901, y: 10 })).status, 400);
+	assert.equal((await post(origin, "input", credential, { type: "key", key: "F12" })).status, 400);
+	assert.equal((await post(origin, "input", credential, { type: "text", text: "x".repeat(4097) })).status, 400);
+	assert.equal((await post(origin, "input", credential, { type: "text", text: "x".repeat(20_000) })).status, 413);
+	const malformed = await fetch(`${origin}/browser/input`, { method: "POST", headers: { Authorization: `Bearer ${credential}`, "content-type": "application/json" }, body: "[1]" });
+	assert.equal(malformed.status, 400);
+	page.textFocused = false;
+	assert.equal((await post(origin, "input", credential, { type: "text", text: "must not disappear" })).status, 409);
+	assert.equal(page.inputs.includes("must not disappear"), false);
+	page.textFocused = true;
+	assert.equal((await post(origin, "input", credential, { type: "text", text: "Ручной ввод" })).status, 200);
+	assert.ok(page.inputs.includes("Ручной ввод"));
+	page.challenge = true;
+	assert.equal((await post(origin, "resume", credential)).status, 409);
+	page.challenge = false;
+	assert.equal((await post(origin, "resume", credential)).status, 200);
+	let ended = false;
+	while (!ended) { const chunk = await reader.read(); ended = chunk.done; }
+	reader.releaseLock();
+	assert.equal((await fetch(`${origin}/browser/stream`, { headers: { Authorization: `Bearer ${credential}` } })).status, 401, "Resume revokes streaming access");
+	assert.equal(module.status().paused, false);
+	assert.equal((await post(origin, "input", credential, { type: "text", text: "after resume" })).status, 401);
+	page.challenge = true; await new Promise(resolve => setTimeout(resolve, 1100));
+	assert.equal(module.status().handoff, undefined, "An idle completed session must not send help again when a provider token expires");
+	assert.equal(module.status().paused, false); page.challenge = false;
+
+	page.statusCode = 403;
+	await module.command({ action: "navigate", url: "https://authorized.test/denied" });
+	assert.equal(module.status().paused, true);
+	const count = page.gotos;
+	await module.command({ action: "navigate", url: "https://authorized.test/retry" });
+	assert.equal(page.gotos, count, "403 cannot trigger an automatic retry");
+	const renewed = await module.command({ action: "handoff", renew: true });
+	const replacement = new URL(renewed.details.operatorUrl as string).hash.slice(1);
+	const claimedAgain = await post(origin, "claim", replacement);
+	const credential2 = (await claimedAgain.json() as { credential: string }).credential;
+	assert.equal((await post(origin, "resume", credential2)).status, 409, "a persistent access denial cannot be resumed");
+	page.statusCode = 429;
+	page.responseHeaders = { "retry-after": "60" };
+	await page.goto("https://authorized.test/limited");
+	page.statusCode = 200;
+	page.responseHeaders = {};
+	await page.goto("https://authorized.test/okay");
+	assert.equal((await post(origin, "resume", credential2)).status, 409, "Retry-After must still apply after a successful navigation");
+	assert.equal((await post(origin, "input", credential2, { type: "reload" })).status, 409, "Operator reload also respects the cooldown");
+	const oldStream = await fetch(`${origin}/browser/stream`, { headers: { Authorization: `Bearer ${credential2}` } });
+	await module.command({ action: "handoff", renew: true });
+	await oldStream.text();
+	assert.equal((await fetch(`${origin}/browser/stream`, { headers: { Authorization: `Bearer ${credential2}` } })).status, 401, "Renewal revokes a running stream");
+	assert.equal((await post(origin, "input", credential2, { type: "key", key: "Tab" })).status, 401, "renewal revokes the previous controller");
+
+	let notifications = 0;
+	let notifiedLink = "";
+	const notified = await fixture({ notify: async (url) => { notifications++; if (notifications === 1) throw new Error("offline"); notifiedLink = url; } });
+	const failed = await notified.module.command({ action: "handoff" });
+	assert.equal(failed.details.notificationFailed, true);
+	assert.equal(failed.details.operatorUrl, undefined, "Telegram links must not enter the agent transcript");
+	const retried = await notified.module.command({ action: "handoff" });
+	assert.equal(retried.details.notificationFailed, false);
+	await notified.module.command({ action: "handoff" });
+	assert.equal(notifications, 2, "successful notification is not repeated");
+	assert.ok(!JSON.stringify(notified.store.peekPending(100)).includes(new URL(notifiedLink).hash.slice(1)));
+
+	const expires = await fixture({ ttl: 1000 });
+	expires.page.challenge = true;
+	const expiringLink = new URL((await expires.module.command({ action: "handoff" })).details.operatorUrl as string);
+	const expiringClaim = await post(expiringLink.origin, "claim", expiringLink.hash.slice(1));
+	const expiringCredential = (await expiringClaim.json() as { credential: string }).credential;
+	const expiringStream = await fetch(`${expiringLink.origin}/browser/stream`, { headers: { Authorization: `Bearer ${expiringCredential}` } });
+	assert.match(await expiringStream.text(), /Link expired/);
+	await new Promise((resolve) => setTimeout(resolve, 1100));
+	assert.equal((await post(expiringLink.origin, "claim", expiringLink.hash.slice(1))).status, 410);
+	assert.equal(expires.module.status().paused, true, "expiration must never auto-resume the agent");
+	assert.equal(expires.module.status().open, false, "Expired assistance must release the browser context");
+	assert.equal(expires.module.status().handoff, undefined, "Expired assistance must erase its capability");
+	const sharedExpiry = await fixture({ ttl: 1000 });
+	const sharedLease = await sharedExpiry.module.command({ action: "handoff" });
+	assert.equal(sharedLease.details.paused, false);
+	await new Promise(resolve => setTimeout(resolve, 1200));
+	assert.equal(sharedExpiry.module.status().open, true, "A viewer's expiry must not cancel the agent's ongoing work");
+	assert.equal(sharedExpiry.module.status().handoff, undefined);
+	assert.equal(sharedExpiry.module.status().paused, false);
+	assert.equal((await sharedExpiry.module.command({ action: "read" })).details.text, "Test page text");
+	const manual = await fixture();
+	assert.equal((await manual.module.command({ action: "handoff", mode: "assistance", reason: "Private entry in a nonstandard form" })).details.paused, true);
+	assert.match((await manual.module.command({ action: "read" })).details.error as string, /paused/, "Explicit manual mode must block reads even for an unrecognized widget");
+	const empty = await fixture(); empty.page.address = "about:blank";
+	await assert.rejects(() => empty.module.command({ action: "handoff" }), /no loaded website/);
+	const prepared = await empty.module.command({ action: "handoff", url: "https://fixture.test/loaded", reason: "Load before sharing" });
+	assert.equal(prepared.details.url, "https://fixture.test/loaded");
+	assert.equal(empty.page.gotos, 1, "Sharing a requested URL must navigate before handing off");
+	const preparedLink = new URL(prepared.details.operatorUrl as string);
+	const preparedClaim = await post(preparedLink.origin, "claim", preparedLink.hash.slice(1));
+	const preparedCredential = (await preparedClaim.json() as { credential: string }).credential;
+	assert.equal((await empty.module.command({ action: "read" })).details.text, "Test page text", "Claiming a normal shared page must not lock agent reads");
+	await post(preparedLink.origin, "input", preparedCredential, { type: "down", x: 20, y: 20 });
+	assert.match((await empty.module.command({ action: "click", selector: "button" })).details.error as string, /gesture/);
+	await post(preparedLink.origin, "input", preparedCredential, { type: "up", x: 20, y: 20 });
+	assert.equal((await empty.module.command({ action: "click", selector: "button" })).details.error, undefined, "Agent input resumes after the human gesture finishes");
+	empty.page.challenge = true;
+	const reclaimed = await empty.module.command({ action: "reclaim" });
+	assert.equal(reclaimed.details.reclaimed, true);
+	assert.equal(empty.module.status().open, true, "Reclaim must preserve the page and context");
+	assert.equal(reclaimed.details.paused, true, "Reclaim must not claim that an incomplete CAPTCHA passed");
+	assert.equal((await post(preparedLink.origin, "input", preparedCredential, { type: "key", key: "Enter" })).status, 401);
+	await new Promise(resolve => setTimeout(resolve, 1100));
+	assert.equal(empty.module.status().handoff, undefined, "A revoked CAPTCHA must not automatically create another pult");
+	empty.page.challenge = false;
+	await empty.module.command({ action: "navigate", url: "https://fixture.test/next" });
+	assert.equal(empty.module.status().paused, false, "After reclaim the agent may abandon the old page and navigate away");
+	const cancel = await fixture();
+	cancel.page.challenge = true;
+	const cancelLink = new URL((await cancel.module.command({ action: "handoff" })).details.operatorUrl as string);
+	const cancelCredential = (await (await post(cancelLink.origin, "claim", cancelLink.hash.slice(1))).json() as { credential: string }).credential;
+	const cancelled = await fetch(`${cancelLink.origin}/browser/stream`, { headers: { Authorization: `Bearer ${cancelCredential}` } });
+	const cancelledReader = cancelled.body!.getReader();
+	await cancelledReader.read(); await cancelledReader.cancel();
+	await new Promise(resolve => setTimeout(resolve, 300));
+	const capturesAfterCancel = cancel.page.captures;
+	await new Promise(resolve => setTimeout(resolve, 300));
+	assert.equal(cancel.page.captures, capturesAfterCancel, "Disconnect must stop browser capture");
+	assert.equal(cancel.module.status().paused, true, "Closing the stream must not resume the agent");
+
+	const defaults = loadConfig({ cwd: root });
+	assert.equal(defaults.config.modules.browser?.enabled, false);
+	assert.equal(describeModules(defaults.config).find((item) => item.name === "browser")?.enabled, false);
+	defaults.config.modules.browser = { ...DEFAULT_BROWSER_CONFIG, enabled: true, port: 0 };
+	assert.ok((await loadModules(defaults, log)).modules.some((item) => item.name === "browser"));
+	await assert.rejects(() => new BrowserModule({ host: "0.0.0.0" }).start({} as ModuleContext), /HTTPS/);
+	console.log("browser identity, handoff, authorization, rate limit and lifecycle tests passed");
+} finally {
+	for (const host of hosts) await host.stop();
+	fs.rmSync(root, { recursive: true, force: true });
+}

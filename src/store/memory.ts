@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 export interface MemoryConfig {
+	enabled?: boolean;
 	databasePath: string;
 	embeddingProvider: "openai" | "cloudflare";
 	embeddingBaseUrl: string;
@@ -44,7 +45,7 @@ export class MemoryStore implements MemoryService {
 	constructor(private readonly config: MemoryConfig) {
 		if (!config.databasePath) throw new Error("SQLite memory database path must be configured");
 		if (!config.embeddingBaseUrl || !config.embeddingModel) throw new Error("Embedding endpoint and model must be configured");
-		if (config.embeddingProvider === "cloudflare" && !config.embeddingApiKey.trim()) {
+		if (config.enabled !== false && config.embeddingProvider === "cloudflare" && !config.embeddingApiKey.trim()) {
 			throw new Error("Cloudflare memory embeddings require a token. Set the environment variable configured by memory.embeddingApiKeyEnv (currently CLOUDFLARE_API_TOKEN) and restart Alive.");
 		}
 		if (!Number.isInteger(config.embeddingDimensions) || config.embeddingDimensions < 1) {
@@ -73,6 +74,7 @@ export class MemoryStore implements MemoryService {
 	}
 
 	async search(query: string, limit = 6, scopes: string[] = [], includeHistory = false): Promise<MemoryFact[]> {
+		if (this.config.enabled === false) return [];
 		const text = cleanText(query);
 		if (!text) return [];
 		const embedding = await this.embed(text);
@@ -108,6 +110,7 @@ export class MemoryStore implements MemoryService {
 	}
 
 	async retain(facts: string[], scopes: string[]): Promise<RetainResult[]> {
+		if (this.config.enabled === false && facts.length) throw new Error("Semantic memory is disabled. No facts were stored; use an empty facts list and persist context in the journal or summary.");
 		const normalizedScopes = [...new Set(scopes.map((scope) => scope.trim()).filter(Boolean))].sort();
 		if (facts.length && !normalizedScopes.length) throw new Error("retain requires at least one scope for non-empty facts");
 		const uniqueFacts = [...new Set(facts.map(cleanText).filter(Boolean))];

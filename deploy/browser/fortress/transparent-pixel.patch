@@ -1,0 +1,28 @@
+diff --git a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+--- a/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
++++ b/third_party/blink/renderer/modules/canvas/canvas2d/base_rendering_context_2d.cc
+@@ -550,6 +550,10 @@
+         for (int ph_y = 0; ph_y < ph_h; ++ph_y) {
+           uint8_t* ph_row = ph_px + ph_y * ph_rb;
+           for (int ph_x = 0; ph_x < ph_w; ++ph_x) {
++            // Preserve the canonical RGBA value of a fully transparent pixel.
++            if (ph_row[static_cast<size_t>(ph_x) * 4 + 3] == 0) {
++              continue;
++            }
+             const uint32_t ax = static_cast<uint32_t>(sx + ph_x);
+             const uint32_t ay = static_cast<uint32_t>(sy + ph_y);
+             for (int ch = 0; ch < 3; ++ch) {
+diff --git a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+--- a/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
++++ b/third_party/blink/renderer/platform/graphics/image_data_buffer.cc
+@@ -78,6 +78,10 @@
+   for (int y = 0; y < h; ++y) {
+     uint8_t* row = UNSAFE_BUFFERS(px + static_cast<size_t>(y) * rb);
+     for (int x = 0; x < w; ++x) {
++      // Match getImageData: transparent pixels must remain unchanged.
++      if (UNSAFE_BUFFERS(row[static_cast<size_t>(x) * 4 + 3]) == 0) {
++        continue;
++      }
+       for (int ch = 0; ch < 3; ++ch) {
+         uint8_t* p = UNSAFE_BUFFERS(row + static_cast<size_t>(x) * 4 + ch);
+         const uint32_t v = *p;

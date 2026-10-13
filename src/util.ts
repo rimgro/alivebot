@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 	const delay = Math.max(0, ms);
@@ -160,13 +161,16 @@ export function nextMidnight(ts: number): number {
 }
 
 /**
- * Kernel-reported process state letter from procfs: `R`, `S`, `D`, `T`
+ * Kernel-reported process state letter from procfs or macOS ps: `R`, `S`, `D`, `T`
  * (suspended by job control), `Z` (zombie). Undefined when the pid is gone or
- * the platform has no procfs (macOS).
+ * the platform does not provide process state.
  */
 export function processState(pid: number): string | undefined {
 	if (!Number.isInteger(pid) || pid <= 0) return undefined;
 	try {
+		if (process.platform === "darwin") {
+			return execFileSync("/bin/ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8", timeout: 1000, stdio: ["ignore", "pipe", "ignore"] }).trim()[0];
+		}
 		const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
 		// `comm` is parenthesised and may itself contain spaces and brackets.
 		return raw.slice(raw.lastIndexOf(")") + 2).split(" ")[0];

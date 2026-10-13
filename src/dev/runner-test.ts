@@ -187,8 +187,10 @@ section("idle returns an event, then sleep resets the context");
 {
 	handler = async (session) => {
 		session.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "thinking" }], stopReason: "endTurn" } });
-		store.append({ kind: "user_message", source: "test", priority: "normal", title: "hi", text: "hello there", thread: "alice", expectsReply: true });
-		const idled = await call(idle, { reason: "waiting for alice" });
+		const incoming = setTimeout(() => store.append({ kind: "user_message", source: "test", priority: "normal", title: "hi", text: "hello there", thread: "alice", expectsReply: true }), 25);
+		let idled: Awaited<ReturnType<typeof call>>;
+		try { idled = await call(idle, { reason: "waiting for alice" }); }
+		finally { clearTimeout(incoming); }
 		session.emit({ type: "message_end", message: { role: "assistant", content: idled.content, stopReason: "endTurn" } });
 		await session.turn();
 		await call(retainTool, { facts: ["Alice asked about the project"], scopes: ["user:alice", "project:alive"] });
