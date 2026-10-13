@@ -52,7 +52,7 @@ async function verifyOwner(owner: Owner): Promise<boolean> {
 }
 
 /** Dedicated profiles only. No shell, personal profile, external debug port or stealth injection. */
-export async function launchNativeBrowser(input: { executable: string; profile: string; initialUrl?: string; headless: boolean; warmupMs: number; timeoutMs: number; signal: AbortSignal }): Promise<NativeBrowser> {
+export async function launchNativeBrowser(input: { executable: string; profile: string; initialUrl?: string; headless: boolean; warmupMs: number; timeoutMs: number; signal: AbortSignal; env?: NodeJS.ProcessEnv }): Promise<NativeBrowser> {
 	input.signal.throwIfAborted();
 	fs.mkdirSync(input.profile, { recursive: true, mode: 0o700 }); fs.chmodSync(input.profile, 0o700);
 	const marker = path.join(input.profile, "alive-native-owner.json");
@@ -74,7 +74,7 @@ export async function launchNativeBrowser(input: { executable: string; profile: 
 	input.signal.throwIfAborted();
 	// Port zero enables Chrome's WebDriver flag. Use a reserved nonzero loopback port.
 	const args = [`--user-data-dir=${input.profile}`, "--remote-debugging-address=127.0.0.1", `--remote-debugging-port=${port}`, "--no-first-run", "--no-default-browser-check", ...(input.headless ? ["--headless=new"] : []), input.initialUrl || "about:blank"];
-	const child = spawn(input.executable, args, { stdio: "ignore" });
+	const child = spawn(input.executable, args, { stdio: "ignore", env: input.env });
 	let spawnError = false; child.once("error", () => { spawnError = true; });
 	const endpoint = `http://127.0.0.1:${port}`;
 	let owner: Owner | undefined;

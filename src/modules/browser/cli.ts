@@ -18,8 +18,10 @@ import { BrowserIdentity } from "./identity.js";
 import { BrowserModule } from "./module.js";
 import { cancelBrowserPairing, readBrowserOperator, requestBrowserPairing, writePrivateJson } from "./operator.js";
 import { startQuickTunnel, type QuickTunnel } from "./tunnel.js";
-import { resolveBrowserExecutable, resolveCdpEndpoint } from "./connection.js";
+import { resolveBrowserExecutable, resolveCdpEndpoint, resolveFortressLicense } from "./connection.js";
 import { diagnoseBrowser } from "./diagnostics.js";
+import { validateFortressImage, fortressImageInstalled } from "./fortress.js";
+import { activateFortress } from "./activation.js";
 
 type Flags = Record<string, string | boolean>;
 const stringFlag = (flags: Flags, name: string) => typeof flags[name] === "string" ? flags[name] as string : undefined;
@@ -36,6 +38,16 @@ export function setupBrowser(loaded: LoadedConfig, flags: Flags): string {
 	const file = path.join(path.dirname(loaded.paths.configPath), "alive.config.local.json");
 	const local = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
 	const browser = { ...DEFAULT_BROWSER_CONFIG, ...loaded.config.modules.browser, enabled: true };
+	const managedEngine = stringFlag(flags, "engine");
+	if (managedEngine !== undefined) {
+		if (!["chrome", "fortress"].includes(managedEngine)) throw new Error("Use --engine chrome or fortress");
+		browser.engine = managedEngine as typeof browser.engine;
+		if (managedEngine === "fortress" && flags.headless === undefined) browser.headless = true;
+		if (managedEngine === "fortress") browser.fortressRequireLicense = true;
+	}
+	if (flags["require-activation"] !== undefined) browser.fortressRequireLicense = boolFlag(flags, "require-activation");
+	const fortressImage = stringFlag(flags, "fortress-image");
+	if (fortressImage !== undefined) { validateFortressImage(fortressImage); browser.fortressImage = fortressImage; }
 	const driver = stringFlag(flags, "driver");
 	if (driver) {
 		if (driver !== "patchright" && driver !== "playwright") throw new Error("Use --driver patchright or playwright");
@@ -121,8 +133,14 @@ export async function browserCommand(loaded: LoadedConfig, action: string, flags
 			return report.canvas.passed ? 0 : 1;
 		}
 		case "pair": return await pair(loaded);
+		case "activate": {
+			const abort = new AbortController(), cancel = () => abort.abort();
+			process.once("SIGINT", cancel); process.once("SIGTERM", cancel);
+			try { await activateFortress(loaded, abort.signal); return 0; }
+			finally { process.off("SIGINT", cancel); process.off("SIGTERM", cancel); }
+		}
 		case "serve": return await serve(loaded, flags);
-		default: throw new Error("usage: alive browser setup [--driver patchright|playwright] [--cdp-env ENV_NAME | --executable-env ENV_NAME] [--channel chrome|chromium] [--launch-mode auto|driver|native] [--native-warmup-ms 10000] [--humanization true|false] [--public-url HTTPS_ORIGIN] [--identity-url HTTPS_ORIGIN] [--headless true|false] [--challenge-wait-ms 15000] [--navigation-interval-ms 2000] [--sign-origins HTTPS_ORIGIN,...] | doctor [--online] | diagnose | pair | serve [--url HTTP_URL] [--local] [--tunnel] [--cloudflared PATH]");
+		default: throw new Error("usage: alive browser setup [--engine chrome|fortress] [--fortress-image tilion/fortress@sha256:DIGEST] [--require-activation true|false] [--driver patchright|playwright] [--cdp-env ENV_NAME | --executable-env ENV_NAME] [--channel chrome|chromium] [--launch-mode auto|driver|native] [--native-warmup-ms 10000] [--humanization true|false] [--public-url HTTPS_ORIGIN] [--identity-url HTTPS_ORIGIN] [--headless true|false] [--challenge-wait-ms 15000] [--navigation-interval-ms 2000] [--sign-origins HTTPS_ORIGIN,...] | activate | doctor [--online] | diagnose | pair | serve [--url HTTP_URL] [--local] [--tunnel] [--cloudflared PATH]");
 	}
 }
 
@@ -135,11 +153,18 @@ async function doctor(loaded: LoadedConfig, online: boolean): Promise<number> {
 	const engine = browser.driver === "patchright" ? (await import("patchright")).chromium : chromium;
 	const endpoint = resolveCdpEndpoint(browser);
 	const executablePath = resolveBrowserExecutable(browser);
+	let activationReady = true;
+	if (browser.engine === "fortress" && !endpoint) {
+		let configured = false;
+		try { configured = !!resolveFortressLicense({ ...browser, fortressRequireLicense: false }); } catch { /* Report state without displaying private credentials. */ }
+		activationReady = configured || !browser.fortressRequireLicense;
+		process.stdout.write(`Fortress activation: ${configured ? "current private token configured; engine verifies signature at startup (not tested here)" : "not configured; v3 is not established"}; require activation ${browser.fortressRequireLicense}\n`);
+	}
 	const candidates = browser.channel === "chromium" ? [engine.executablePath()] : process.platform === "darwin"
 		? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
 		: process.platform === "win32" ? [path.join(process.env.PROGRAMFILES ?? "", "Google/Chrome/Application/chrome.exe"), path.join(process.env.LOCALAPPDATA ?? "", "Google/Chrome/Application/chrome.exe")]
 		: ["/opt/google/chrome/chrome", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"];
-	let installed = endpoint || executablePath ? true : candidates.some(file => fs.existsSync(file));
+	let installed = endpoint || executablePath ? true : browser.engine === "fortress" ? await fortressImageInstalled(browser.fortressImage) : candidates.some(file => fs.existsSync(file));
 	if (online && endpoint) {
 		try {
 			const connection = await engine.connectOverCDP(endpoint, { timeout: browser.actionTimeoutMs, noDefaults: true });
@@ -150,13 +175,14 @@ async function doctor(loaded: LoadedConfig, online: boolean): Promise<number> {
 			finally { await connection.close(); }
 		} catch { throw new Error("Cannot connect to the configured browser CDP endpoint"); }
 	}
-	if (!installed) process.stdout.write(`Install browser: npx ${browser.driver === "patchright" ? "patchright" : "playwright"} install ${browser.channel}\n`);
-	process.stdout.write(`Access policy: ${endpoint ? "external engine (inspect actual binary)" : executablePath ? "managed custom Chromium executable" : `${browser.channel}; ${browser.headless ? "headless" : "headed"}`}; automatic check wait ${browser.challengeWaitMs} ms; per-origin navigation interval ${browser.minNavigationIntervalMs} ms\n`);
+	if (!installed) process.stdout.write(browser.engine === "fortress" ? `Install the official image explicitly: docker pull ${browser.fortressImage}\n` : `Install browser: npx ${browser.driver === "patchright" ? "patchright" : "playwright"} install ${browser.channel}\n`);
+	process.stdout.write(`Managed engine: ${browser.engine}${browser.engine === "fortress" ? `; ${executablePath ? "trusted native executable" : browser.fortressImage}` : ""}\n`);
+	process.stdout.write(`Access policy: ${endpoint ? "external engine (inspect actual binary)" : executablePath ? "managed custom Chromium executable" : `${browser.engine === "fortress" ? "Fortress container" : browser.channel}; ${browser.headless ? "headless" : "headed"}`}; automatic check wait ${browser.challengeWaitMs} ms; per-origin navigation interval ${browser.minNavigationIntervalMs} ms\n`);
 	process.stdout.write(`Launch mode: ${browser.launchMode}; native unsigned initial-navigation warmup ${browser.nativeWarmupMs} ms\n`);
-	if (!endpoint && browser.headless && browser.driver === "patchright") process.stdout.write("Compatibility note: Patchright recommends headed Chrome with a persistent profile. Headless Chrome may expose HeadlessChrome in its user agent.\n");
+	if (!endpoint && browser.engine === "chrome" && browser.headless && browser.driver === "patchright") process.stdout.write("Compatibility note: Patchright recommends headed Chrome with a persistent profile. Headless Chrome may expose HeadlessChrome in its user agent.\n");
 	const chat = browser.notifyChatId || operator?.chatId;
 	const destinationAllowed = !!chat && (!telegram.allowedChatIds.length || telegram.allowedChatIds.map(String).includes(chat));
-	process.stdout.write(`Host: ${process.platform}/${process.arch}; configuration: ${loaded.paths.configPath}\nRuntime: ${snapshot?.alive ? `running (pid ${snapshot.pid})` : "not running here"}\nBrowser: ${browser.enabled ? "enabled" : "disabled"}; ${browser.driver}/${endpoint ? `external CDP (${online ? "reachable" : "reachability unchecked"})` : `${browser.channel} ${installed ? "installed" : "not found"}`}; humanization ${browser.humanization.enabled ? "enabled" : "disabled"}\nPhone HTTPS address: ${browser.publicUrl || "not configured"}\nTelegram token: ${token ? "configured" : "missing"}\nOperator: ${chat ? `${chat}${destinationAllowed ? "" : " (denied by chat allowlist)"}` : "not paired"}\n`);
+	process.stdout.write(`Host: ${process.platform}/${process.arch}; configuration: ${loaded.paths.configPath}\nRuntime: ${snapshot?.alive ? `running (pid ${snapshot.pid})` : "not running here"}\nBrowser: ${browser.enabled ? "enabled" : "disabled"}; ${browser.driver}/${endpoint ? `external CDP (${online ? "reachable" : "reachability unchecked"})` : `${browser.engine === "fortress" ? "fortress" : browser.channel} ${installed ? "installed" : "not found"}`}; humanization ${browser.humanization.enabled ? "enabled" : "disabled"}\nPhone HTTPS address: ${browser.publicUrl || "not configured"}\nTelegram token: ${token ? "configured" : "missing"}\nOperator: ${chat ? `${chat}${destinationAllowed ? "" : " (denied by chat allowlist)"}` : "not paired"}\n`);
 	if (browser.signing.enabled) {
 		const identity = new BrowserIdentity(browser.signing);
 		process.stdout.write(`Web Bot Auth: ${identity.agentUrl}; public key ID ${identity.keyId}\nRegistration: requires operator approval from Cloudflare; a local signature is not registration.\n`);
@@ -182,7 +208,7 @@ async function doctor(loaded: LoadedConfig, online: boolean): Promise<number> {
 		if (directory.keys?.[0]?.x !== expected.keys[0].x || !response.headers.get("signature")) throw new Error("Public directory does not match the configured identity");
 		process.stdout.write("Public identity HTTPS directory reachable\n");
 	}
-	return browser.enabled && installed && token && destinationAllowed && browser.publicUrl ? 0 : 1;
+	return browser.enabled && installed && activationReady && token && destinationAllowed && browser.publicUrl ? 0 : 1;
 }
 
 function runtimeAvailable(loaded: LoadedConfig): void {

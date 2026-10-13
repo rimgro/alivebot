@@ -35,8 +35,9 @@ const engine = driver === "patchright" ? (await import("patchright")).chromium :
 const nativeViewport = process.env.ALIVE_BROWSER_TEST_NATIVE_VIEWPORT === "1";
 const forceCompatibility = process.env.ALIVE_BROWSER_TEST_VIEWPORT_FALLBACK === "1";
 const nativeLaunch = process.env.ALIVE_BROWSER_TEST_NATIVE_LAUNCH === "1";
-const router = new BrowserRouter({ port: 0, viewport: nativeViewport || nativeLaunch ? null : { width: 900, height: 720 }, driver, launchMode: nativeLaunch ? "native" : "driver", nativeWarmupMs: 400, headless: nativeLaunch ? false : process.env.ALIVE_BROWSER_TEST_HEADED !== "1", minActionIntervalMs: 0, minNavigationIntervalMs: 0, humanization: { ...DEFAULT_HUMANIZATION, enabled: false } }, {
-	...(nativeLaunch ? {} : { launch: async (directory: string, options: Parameters<typeof engine.launchPersistentContext>[1]) => {
+const fortressLaunch = process.env.ALIVE_BROWSER_TEST_FORTRESS === "1";
+const router = new BrowserRouter({ port: 0, engine: fortressLaunch ? "fortress" : "chrome", fortressRequireLicense: fortressLaunch && !!process.env.ALIVE_FORTRESS_LICENSE_FILE, viewport: nativeViewport || nativeLaunch || fortressLaunch ? null : { width: 900, height: 720 }, driver, launchMode: nativeLaunch ? "native" : "driver", nativeWarmupMs: 400, headless: fortressLaunch ? true : nativeLaunch ? false : process.env.ALIVE_BROWSER_TEST_HEADED !== "1", minActionIntervalMs: 0, minNavigationIntervalMs: 0, humanization: { ...DEFAULT_HUMANIZATION, enabled: false } }, {
+	...(nativeLaunch || fortressLaunch ? {} : { launch: async (directory: string, options: Parameters<typeof engine.launchPersistentContext>[1]) => {
 		const context = await engine.launchPersistentContext(directory, options) as unknown as BrowserContext;
 		if (forceCompatibility) {
 			const connect = context.newCDPSession.bind(context);
@@ -62,19 +63,38 @@ function identity(user: number) {
 }
 try {
 	await host.init();
+	if (fortressLaunch) {
+		// The local fixture stays bound to host loopback. Fulfill its requests
+		// from this process so containers never need a host/LAN network listener.
+		for (const thread of ["telegram:111", "telegram:222"]) {
+			scope = [thread];
+			const initialized = await router.command({ action: "screenshot", thread });
+			assert.equal(initialized.isError, undefined);
+			if (process.env.ALIVE_FORTRESS_LICENSE_FILE) assert.equal(initialized.details.fortressActivationVerified, true, "Native first-generation fallback must be rejected");
+			const sessions = (router as unknown as { sessions: Map<string, { browser: BrowserModule }> }).sessions;
+			const context = (sessions.get(thread)!.browser as unknown as { context: BrowserContext }).context;
+			await context.route(`${target}/**`, async route => {
+				const response = await fetch(route.request().url());
+				await route.fulfill({ status: response.status, headers: Object.fromEntries(response.headers), body: await response.text() });
+			});
+		}
+		scope = ["telegram:111"];
+	}
 	const share = host.contributedTools().find(tool => tool.name === "browser_share")!;
 	const prepared = await share.execute("loaded-share", { url: `${target}/?owner=111`, thread: "telegram:111", reason: "Load before sending the pult" } as never, undefined, undefined, {} as never) as { details: Record<string, unknown> };
 	assert.equal(prepared.details.url, `${target}/?owner=111`, "The agent's atomic share tool must load the target before delivery");
 	assert.deepEqual(links.map(value => value.thread), ["telegram:111"]);
 	scope = ["telegram:222"];
 	await router.command({ action: "navigate", url: `${target}/?owner=222` });
-	if (nativeLaunch) {
+	if (nativeLaunch || fortressLaunch) {
 		const sessions = (router as unknown as { sessions: Map<string, { browser: BrowserModule }> }).sessions;
 		for (const thread of ["telegram:111", "telegram:222"]) {
 			const browser = sessions.get(thread)!.browser;
 			contexts.push((browser as unknown as { context: BrowserContext }).context);
-			assert.equal(browser.status().launchMode, "native");
+			assert.equal(browser.status().launchMode, fortressLaunch ? "fortress-container" : "native");
+			if (fortressLaunch) assert.equal(browser.status().engine, "fortress");
 			assert.equal(await contexts.at(-1)!.pages()[0].evaluate("navigator.webdriver"), false);
+			assert.ok(!await contexts.at(-1)!.pages()[0].evaluate("navigator.userAgent.includes('HeadlessChrome')"));
 		}
 	}
 	assert.deepEqual(links.map(value => value.thread), ["telegram:111", "telegram:222"]);
@@ -171,7 +191,7 @@ try {
 	assert.equal((await router.command({ action: "status" })).details.handoff, undefined);
 	await router.command({ action: "close" });
 	assert.equal(links.length, before);
-	console.log(`Browser routing E2E passed (${driver}, ${nativeLaunch ? "native launch" : "driver launch"}): isolated profiles, closure/reopen, authenticated recovery without storage, cross-account denial, mobile fit/fullscreen, same-owner input/return and agent revocation`);
+	console.log(`Browser routing E2E passed (${driver}, ${fortressLaunch ? "managed Fortress" : nativeLaunch ? "native launch" : "driver launch"}): isolated profiles, closure/reopen, authenticated recovery without storage, cross-account denial, mobile fit/fullscreen, same-owner input/return and agent revocation`);
 } finally {
 	await operator?.close(); await host.stop(); fixture.closeAllConnections(); await new Promise<void>(resolve => fixture.close(() => resolve())); fs.rmSync(root, { recursive: true, force: true });
 }

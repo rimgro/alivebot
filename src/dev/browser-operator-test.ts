@@ -36,6 +36,14 @@ try {
 	assert.equal(loaded.config.modules.browser!.headless, true);
 	assert.equal(fs.statSync(local).mode & 0o777, 0o600);
 	assert.throws(() => setupBrowser(loaded, { "public-url": "http://phone.test" }), /HTTPS/);
+	assert.throws(() => setupBrowser(loaded, { engine: "unknown" }), /engine/);
+	assert.throws(() => setupBrowser(loaded, { "fortress-image": "tilion/fortress:latest" }), /digest/);
+	setupBrowser(loaded, { engine: "fortress" });
+	const fortressConfig = loadConfig({ cwd: root });
+	assert.equal(fortressConfig.config.modules.browser!.engine, "fortress");
+	assert.equal(fortressConfig.config.modules.browser!.headless, true);
+	assert.equal(fortressConfig.config.modules.browser!.fortressRequireLicense, true);
+	setupBrowser(fortressConfig, { engine: "chrome" });
 
 	const request = requestBrowserPairing(loaded.paths.modulesDir, 1000);
 	assert.equal(fs.statSync(path.join(loaded.paths.modulesDir, "browser", "pairing.json")).mode & 0o777, 0o600);

@@ -10,6 +10,13 @@ export interface BrowserSigningConfig {
 export interface BrowserConfig {
 	enabled: boolean;
 	driver: "patchright" | "playwright";
+	/** Explicit managed engine. A requested Fortress never silently falls back to Chrome. */
+	engine: "chrome" | "fortress";
+	/** Official, immutable Docker image; used when no native Fortress executable is configured. */
+	fortressImage: string;
+	fortressLicenseFileEnv: string;
+	/** Refuse the silent first-generation mode for production Fortress setup. */
+	fortressRequireLicense: boolean;
 	/** Empty launches Chrome; otherwise attach to the loopback CDP URL in this env var. */
 	cdpEndpointEnv: string;
 	/** Optional trusted Chromium/Fortress executable. Managed profiles remain per conversation. */
@@ -56,6 +63,10 @@ export const DEFAULT_HUMANIZATION: HumanizationConfig = {
 export const DEFAULT_BROWSER_CONFIG: BrowserConfig = {
 	enabled: false,
 	driver: "patchright",
+	engine: "chrome",
+	fortressImage: "tilion/fortress@sha256:6c275b96f96199f48ab7ca05366898cdf796ac1da8cb5cceb936a4ce98e41b4e",
+	fortressLicenseFileEnv: "ALIVE_FORTRESS_LICENSE_FILE",
+	fortressRequireLicense: true,
 	cdpEndpointEnv: "",
 	executablePathEnv: "",
 	launchMode: "auto",

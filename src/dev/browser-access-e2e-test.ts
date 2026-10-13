@@ -21,7 +21,13 @@ const server = http.createServer((request, response) => {
 	const route = new URL(request.url!, "http://fixture").pathname;
 	response.setHeader("Content-Type", "text/html; charset=utf-8");
 	response.setHeader("Cache-Control", "no-store");
-	if (route === "/auto" || route === "/auto-form") {
+	if (route === "/wb-auto") {
+		response.writeHead(498);
+		response.end('<title>Проверяем браузер</title><p>Проверка на бота</p><script>setTimeout(()=>location.href="/ready",450)</script>');
+	} else if (route === "/auto-no-header") {
+		response.writeHead(403);
+		response.end('<title>Just a moment...</title><div id="challenge-running">Checking browser</div><script>setTimeout(()=>location.href="/ready",450)</script>');
+	} else if (route === "/auto" || route === "/auto-form") {
 		response.writeHead(403, { "cf-mitigated": "challenge" });
 		response.end(`<title>Just a moment...</title><${route === "/auto-form" ? 'form id="challenge-form"' : 'div id="challenge-running"'}>Checking browser</${route === "/auto-form" ? "form" : "div"}><script>setTimeout(()=>location.href="/ready",450)</script>`);
 	} else if (route === "/auto-inline") {
@@ -73,7 +79,7 @@ async function claim(link: string) {
 }
 
 try {
-	for (const route of ["/auto", "/auto-form", "/auto-inline"]) {
+	for (const route of ["/auto", "/auto-form", "/auto-inline", "/auto-no-header", "/wb-auto"]) {
 		const test = await fixture();
 		const result = await test.module.command({ action: "navigate", url: `${origin}${route}` });
 		assert.equal(result.details.paused, false, "Automatic checks may finish without human assistance");

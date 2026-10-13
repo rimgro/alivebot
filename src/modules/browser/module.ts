@@ -13,13 +13,15 @@ import { BrowserIdentity } from "./identity.js";
 import { controlPage } from "./page.js";
 import { BrowserSigningTransport } from "./transport.js";
 import { readBrowserOperator } from "./operator.js";
-import { resolveBrowserExecutable, resolveCdpEndpoint } from "./connection.js";
+import { resolveBrowserExecutable, resolveCdpEndpoint, resolveFortressLicense } from "./connection.js";
 import { BrowserNavigationBudget, retryDeadline, type BrowserAccessState } from "./access.js";
 import { chromeExecutable, launchNativeBrowser, type NativeBrowser } from "./native.js";
 import { BrowserLive } from "./live.js";
 import { verifyTelegramOperator } from "./telegram-auth.js";
 import { BrowserNotification } from "./notification.js";
 import { BrowserObservation, waitCatalogContent } from "./observation.js";
+import { launchManagedFortress, validateFortressImage, type ManagedFortress } from "./fortress.js";
+import { checkCanvas } from "./diagnostics.js";
 
 type Result = AgentToolResult<Record<string, unknown>>;
 interface Command { action: string; url?: string; selector?: string; timeoutMs?: number; text?: string; key?: string; delta?: number; reason?: string; renew?: boolean; mode?: "shared" | "assistance" }
@@ -54,6 +56,9 @@ export class BrowserModule implements AliveModule {
 	private executablePath?: string;
 	private browserVersion?: string;
 	private nativeBrowser?: NativeBrowser;
+	private fortressBrowser?: ManagedFortress;
+	private fortressLicenseFile?: string;
+	private fortressActivationVerified?: boolean;
 	private seededNativeUrl?: string;
 	private accessState: BrowserAccessState = "ready";
 	private checkingStartedAt?: number;
@@ -194,8 +199,11 @@ export class BrowserModule implements AliveModule {
 		return {
 			listening: !!this.server, open: !!this.context, driver: this.config.driver, channel: this.config.channel, humanization: this.config.humanization.enabled,
 			connection: this.config.cdpEndpointEnv ? "cdp" : "managed",
-			launchMode: this.nativeBrowser ? "native" : this.config.cdpEndpointEnv ? "external" : "driver",
-			engine: this.config.cdpEndpointEnv ? "external-chromium" : this.config.executablePathEnv ? "custom-chromium" : this.config.channel,
+			launchMode: this.fortressBrowser ? "fortress-container" : this.nativeBrowser ? "native" : this.config.cdpEndpointEnv ? "external" : "driver",
+			engine: this.config.cdpEndpointEnv ? "external-chromium" : this.config.engine === "fortress" ? "fortress" : this.config.executablePathEnv ? "custom-chromium" : this.config.channel,
+			fortressImage: this.fortressBrowser?.image,
+			fortressLicenseConfigured: this.config.engine === "fortress" ? !!this.fortressLicenseFile : undefined,
+			fortressActivationVerified: this.fortressActivationVerified,
 			headless: this.config.cdpEndpointEnv ? undefined : this.config.headless, browserVersion: this.browserVersion,
 			access: { state: this.accessState, checkingSince: this.accessState === "checking" ? this.checkingStartedAt : undefined, challengeWaitMs: this.config.challengeWaitMs },
 			url: this.page?.isClosed() ? undefined : this.page?.url(),
@@ -385,6 +393,7 @@ export class BrowserModule implements AliveModule {
 	private async ensurePage(initialUrl?: string, signal?: AbortSignal): Promise<Page> {
 		if (!this.context) {
 			if (this.nativeBrowser) { await this.nativeBrowser.close(); this.nativeBrowser = undefined; }
+			if (this.fortressBrowser) { await this.fortressBrowser.close(); this.fortressBrowser = undefined; }
 			const chromium = (this.config.driver === "patchright" ? (await import("patchright")).chromium : (await import("playwright")).chromium) as unknown as BrowserType;
 			if (this.cdpEndpoint) {
 				const connect = this.deps.connect ?? chromium.connectOverCDP.bind(chromium);
@@ -392,12 +401,21 @@ export class BrowserModule implements AliveModule {
 				catch { throw new Error("Cannot connect to the configured browser CDP endpoint; check the browser and private port forward"); }
 				this.context = this.attachedBrowser.contexts()[0];
 				if (!this.context) { await this.releaseBrowser(); throw new Error("The CDP browser has no default persistent context"); }
-			} else if (!this.deps.launch && (this.config.launchMode === "native" || (this.config.launchMode === "auto" && !this.config.headless && this.config.channel === "chrome"))) {
-				const profile = this.ctx!.moduleDir("profile");
+			} else if (!this.deps.launch && this.config.engine === "fortress" && !this.executablePath) {
+				const cancel = AbortSignal.any([this.ctx!.signal, this.lifecycleAbort.signal, ...(signal ? [signal] : [])]);
+				this.fortressBrowser = await launchManagedFortress({ image: this.config.fortressImage, profile: this.ctx!.moduleDir("profile-fortress"), stateDir: this.ctx!.moduleDir(), licenseFile: this.fortressLicenseFile, timeoutMs: 60_000, signal: cancel });
+				this.fortressActivationVerified = this.fortressBrowser.activationVerified;
+				try {
+					this.attachedBrowser = await chromium.connectOverCDP(this.fortressBrowser.endpoint, { timeout: this.config.actionTimeoutMs, noDefaults: true });
+					this.context = this.attachedBrowser.contexts()[0];
+					if (!this.context) throw new Error("Fortress has no persistent context");
+				} catch { await this.releaseBrowser(); throw new Error("Cannot attach to the owned Fortress browser"); }
+			} else if (!this.deps.launch && (this.config.engine === "fortress" || this.config.launchMode === "native" || (this.config.launchMode === "auto" && !this.config.headless && this.config.channel === "chrome"))) {
+				const profile = this.ctx!.moduleDir(this.config.engine === "fortress" ? "profile-fortress" : "profile");
 				const seed = initialUrl && !this.config.signing.origins.includes(httpUrl(initialUrl).origin) ? httpUrl(initialUrl).href : undefined;
 				const cancel = AbortSignal.any([this.ctx!.signal, this.lifecycleAbort.signal, ...(signal ? [signal] : [])]);
 				if (seed) await this.navigationBudget.wait(seed, cancel, this.config.actionTimeoutMs);
-				this.nativeBrowser = await launchNativeBrowser({ executable: this.executablePath || (this.config.channel === "chrome" ? chromeExecutable() : chromium.executablePath()), profile, initialUrl: seed, headless: this.config.headless, warmupMs: this.config.nativeWarmupMs, timeoutMs: this.config.actionTimeoutMs, signal: cancel });
+				this.nativeBrowser = await launchNativeBrowser({ executable: this.executablePath || (this.config.channel === "chrome" ? chromeExecutable() : chromium.executablePath()), profile, initialUrl: seed, headless: this.config.headless, warmupMs: this.config.nativeWarmupMs, timeoutMs: this.config.actionTimeoutMs, signal: cancel, ...(this.fortressLicenseFile ? { env: { ...process.env, TILION_LICENSE_KEY: fs.readFileSync(this.fortressLicenseFile, "utf8").trim() } } : {}) });
 				try {
 					this.attachedBrowser = await chromium.connectOverCDP(this.nativeBrowser.endpoint, { timeout: this.config.actionTimeoutMs, noDefaults: true });
 					this.context = this.attachedBrowser.contexts()[0];
@@ -405,7 +423,7 @@ export class BrowserModule implements AliveModule {
 					this.seededNativeUrl = this.nativeBrowser.initialUrl;
 				} catch { await this.nativeBrowser.close(); this.nativeBrowser = undefined; throw new Error("Cannot attach to the verified native Chrome process"); }
 			} else {
-				const profile = this.ctx!.moduleDir("profile");
+				const profile = this.ctx!.moduleDir(this.config.engine === "fortress" ? "profile-fortress" : "profile");
 				fs.mkdirSync(profile, { recursive: true, mode: 0o700 });
 				fs.chmodSync(profile, 0o700);
 				const launch = this.deps.launch ?? chromium.launchPersistentContext.bind(chromium);
@@ -413,6 +431,14 @@ export class BrowserModule implements AliveModule {
 					...(this.executablePath ? { executablePath: this.executablePath } : { channel: this.config.channel }), headless: this.config.headless,
 					viewport: this.config.viewport, acceptDownloads: false,
 				});
+			}
+			if (this.config.engine === "fortress" && !this.cdpEndpoint) {
+				const probe = await this.context.newPage();
+				try {
+					if (!(await checkCanvas(probe)).passed) throw new Error("Fortress transparent Canvas diagnostics failed; install a corrected native build/image");
+				}
+				catch (error) { await this.releaseBrowser(); throw error; }
+				finally { await probe.close().catch(() => {}); }
 			}
 			if (this.identity) {
 				this.signingTransport = new BrowserSigningTransport(this.identity, (error) => {
@@ -426,7 +452,7 @@ export class BrowserModule implements AliveModule {
 			}
 			this.context.setDefaultTimeout(this.config.actionTimeoutMs);
 			this.browserVersion = this.context.browser?.()?.version();
-			this.ctx!.log.info("browser engine ready", { driver: this.config.driver, engine: this.config.cdpEndpointEnv ? "external-chromium" : this.executablePath ? "custom-chromium" : this.config.channel, version: this.browserVersion, headless: this.cdpEndpoint ? undefined : this.config.headless });
+			this.ctx!.log.info("browser engine ready", { driver: this.config.driver, engine: this.config.cdpEndpointEnv ? "external-chromium" : this.config.engine === "fortress" ? "fortress" : this.executablePath ? "custom-chromium" : this.config.channel, version: this.browserVersion, headless: this.cdpEndpoint ? undefined : this.config.headless });
 			this.context.on("page", (opened) => this.attachPage(opened));
 			for (const opened of this.context.pages()) this.attachPage(opened);
 			if (this.seededNativeUrl && this.page) {
@@ -464,8 +490,10 @@ export class BrowserModule implements AliveModule {
 		clearTimeout(this.pointerTimer); this.pointerTimer = undefined; this.operatorPointerDown = false; this.monitorArmed = false;
 		clearTimeout(this.expiryTimer); this.expiryTimer = undefined; this.operatorViewport = undefined; this.viewportSnapshots = false;
 		this.endStream();
-		const context = this.context, attached = this.attachedBrowser, transport = this.signingTransport, native = this.nativeBrowser;
+		const context = this.context, attached = this.attachedBrowser, transport = this.signingTransport, native = this.nativeBrowser, fortress = this.fortressBrowser;
 		this.nativeBrowser = undefined; this.seededNativeUrl = undefined;
+		this.fortressBrowser = undefined;
+		this.fortressActivationVerified = undefined;
 		this.context = undefined; this.page = undefined; this.attachedBrowser = undefined;
 		this.signingTransport = undefined; this.handoff = undefined;
 		await transport?.close();
@@ -474,6 +502,7 @@ export class BrowserModule implements AliveModule {
 		if (attached) await attached.close();
 		else await context?.close();
 		await native?.close();
+		await fortress?.close();
 	}
 
 	private attachPage(page: Page): void {
@@ -519,7 +548,7 @@ export class BrowserModule implements AliveModule {
 
 	private async challengeKind(): Promise<"automatic" | "interactive" | undefined> {
 		if (!this.page || this.page.isClosed()) return undefined;
-		const automaticTitle = /^(just a moment[.!… ]*|checking your browser[.!… ]*|проверка браузера[.!… ]*)$/i.test((await this.page.title()).trim());
+		const automaticTitle = /^(just a moment[.!… ]*|checking your browser[.!… ]*|проверка браузера[.!… ]*|проверяем браузер[.!… ]*|проверка на бота[.!… ]*)$/i.test((await this.page.title()).trim());
 		const groups = [
 			{ selector: 'iframe[src*="recaptcha"]', response: 'textarea[name="g-recaptcha-response"]' },
 			{ selector: 'iframe[src*="hcaptcha"]', response: 'textarea[name="h-captcha-response"], textarea[name="g-recaptcha-response"]' },
@@ -555,7 +584,12 @@ export class BrowserModule implements AliveModule {
 
 	private async probeChallenge(signal?: AbortSignal): Promise<void> {
 		const kind = await this.challengeKind();
-		if (kind === "automatic") this.startAutomaticCheck();
+		if (kind === "automatic") {
+			// Some compatibility pages use 403/498 without cf-mitigated. A known
+			// passive marker permits bounded observation, not an access-denial retry.
+			if (!this.handoff && ["denied", "http-error"].includes(this.accessState)) this.pausedReason = undefined;
+			this.startAutomaticCheck();
+		}
 		if (this.accessState === "checking") await this.waitAutomaticCheck(signal);
 		const reason = await this.assistanceReason();
 		if (reason && (!this.pausedReason || this.accessState === "checking" || reason.includes("private"))) this.pauseFor(reason.includes("private") ? "private-entry" : "verification", reason);
@@ -931,8 +965,12 @@ export class BrowserModule implements AliveModule {
 	}
 
 	private validateConfig(): void {
+		if (!["chrome", "fortress"].includes(this.config.engine)) throw new Error("browser.engine must be chrome or fortress");
+		validateFortressImage(this.config.fortressImage);
+		if (this.config.engine === "fortress" && !this.config.cdpEndpointEnv && !this.config.executablePathEnv && !this.config.headless) throw new Error("Managed Docker Fortress runs headless; configure headless:true or a trusted native Fortress executable");
 		this.cdpEndpoint = resolveCdpEndpoint(this.config);
 		this.executablePath = resolveBrowserExecutable(this.config);
+		this.fortressLicenseFile = this.config.engine === "fortress" && !this.cdpEndpoint ? resolveFortressLicense(this.config) : undefined;
 		if (!["auto", "driver", "native"].includes(this.config.launchMode)) throw new Error("Invalid browser launch mode");
 		if (!Number.isInteger(this.config.nativeWarmupMs) || this.config.nativeWarmupMs < 0 || this.config.nativeWarmupMs > 15_000) throw new Error("Invalid native browser warmup");
 		if (!["patchright", "playwright"].includes(this.config.driver)) throw new Error("browser.driver must be patchright or playwright");

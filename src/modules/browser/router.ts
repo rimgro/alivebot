@@ -162,7 +162,7 @@ export class BrowserRouter implements AliveModule {
 		const create = this.serial.then(async () => {
 			if (this.stopped) throw new Error("Browser router is stopped");
 			const existing = this.sessions.get(thread); if (existing) return existing;
-			if (this.sessions.size >= 8) throw new Error("Too many browser conversations; close an unused session first");
+			if (this.sessions.size >= (this.config.engine === "fortress" && !this.config.executablePathEnv ? 2 : 8)) throw new Error("Too many browser conversations; close an unused session first");
 			const ctx = this.ctx!;
 			if (this.config.cdpEndpointEnv) {
 				const file = path.join(ctx.moduleDir(), "external-owner.json");
