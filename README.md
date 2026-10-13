@@ -350,7 +350,8 @@ alive agents disable researcher # also stops the process
 выполните `npm run build`: host supervisor копирует собранный runtime в Linux VM.
 На первом старте VM нужен доступ к npm для установки runtime-зависимостей.
 `sandbox.cpus` и `sandbox.memoryMiB` задают лимиты CPU и памяти; публичный
-исходящий интернет открыт, входящие подключения запрещены.
+исходящий TCP-интернет открыт без доменного allowlist, входящие подключения
+запрещены. UDP, включая WebRTC и QUIC, закрыт.
 
 Текущий срез отказывает в запуске при включённых Telegram/Grafana host-модулях,
 external modules, extensions, OAuth-моделях и credential-полях в `models.json`.
@@ -361,10 +362,54 @@ placeholders блокируются. Это защищает credentials, зар
 механизм placeholders, но не ищет произвольные личные значения в тексте запроса.
 Ключи передаются SDK через краткоживущие host environment references, чтобы не
 класть plaintext в сохранённую конфигурацию sandbox.
-Защита ещё не включает
-подтверждение владельца для произвольных личных секретов, которые агент получил
-в контексте или прочитал на сайте; пока browser egress guard и approval flow не
-готовы, эта сборка не реализует такое требование.
+
+### Подтверждение отправки помеченных секретов
+
+Добавьте в конфиг sandbox-агента ID владельца и выделенного Telegram-бота:
+
+```json
+{
+  "sandbox": {
+    "approvalTelegramTokenEnv": "ALIVE_APPROVAL_TELEGRAM_TOKEN",
+    "approvalOwnerUserIds": ["123456789"],
+    "approvalTimeoutSec": 120
+  }
+}
+```
+
+Задайте `ALIVE_APPROVAL_TELEGRAM_TOKEN` только в окружении host-supervisor;
+это должен быть отдельный бот, не используемый обычным Telegram-модулем. Откройте
+с ним приватный чат и нажмите Start. Без токена или списка владельцев запрос,
+содержащий помеченный секрет, будет заблокирован.
+
+Помечайте значения через переменную окружения, чтобы оно не попадало в историю
+команд shell:
+
+```sh
+export SECRET_VALUE_TO_MARK='точное личное значение'
+alive secrets mark my-private-value --env SECRET_VALUE_TO_MARK --config .alive/agents/researcher/alive.config.json
+unset SECRET_VALUE_TO_MARK
+alive secrets list --config .alive/agents/researcher/alive.config.json
+```
+
+Значения лежат только на хосте в `$HOME/.alive/secret-gateway/<profile-hash>/secret-gateway.json`
+с правами каталога `0700` и файла `0600`; этот путь не входит в монтируемые в VM
+каталоги. Удаление: `alive secrets remove
+my-private-value --config <agent-config.json>`.
+
+Браузерный sidecar перехватывает HTTP(S)-запросы через CDP Fetch. Совпадение с
+помеченным значением или его URL/base64-вариантом приостанавливает ровно этот
+неизменяемый запрос. В личный чат владельца уходят URL, метод, заголовки, тело и
+отпечаток запроса; кнопка разрешает только приостановленный запрос один раз.
+Таймаут, неизвестный владелец, недоступный бот, слишком длинный preview или
+нечитаемое тело означают отказ. Обычные запросы без совпадения продолжаются
+автономно. Для sandbox-профиля отключён `bash`, а UDP и WebSocket закрыты, чтобы
+агент не отправил помеченное значение отдельным сетевым путём.
+
+Это DLP по точным значениям и поддержанным кодировкам, не распознавание любых
+перефразированных, зашифрованных или хешированных вариантов. Пока VM не
+запущена на Linux-сервере, CDP/VSock и реальный Telegram approval flow здесь не
+проверены; sandbox остаётся экспериментальным.
 
 При `alive init` создаётся агент `admin`. Он может создавать и редактировать
 профили, настраивать инструменты и permissions, а также запускать, останавливать,

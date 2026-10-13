@@ -19,6 +19,7 @@ import { resolveToken } from "./modules/telegram/module.js";
 import { TelegramAllowlistStore } from "./modules/telegram/state.js";
 import { AliveRuntime } from "./runtime/loop.js";
 import { superviseInMicrosandbox } from "./sandbox/microsandbox.js";
+import { listMarkedSecrets, markSecret, unmarkSecret } from "./sandbox/secret-gateway.js";
 import { snapshotRuntime, spawnBackground, stdoutLogPath, stopRuntime, waitForRuntime } from "./runtime/daemon.js";
 import { LOG_SOURCES, followFile, readLogTail, renderLogLine, resolveLogSource } from "./logs.js";
 import { term } from "./term.js";
@@ -82,6 +83,9 @@ export async function main(argv: string[]): Promise<number> {
 
 	try {
 		switch (command) {
+			case "secrets": {
+				return secretsCommand(flags, positionals);
+			}
 			case "sandbox-supervisor": {
 				const config = loadForCli(flags);
 				if (config.config.sandbox.backend !== "microsandbox") throw new Error("sandbox-supervisor requires sandbox.backend=microsandbox");
@@ -158,6 +162,32 @@ export async function main(argv: string[]): Promise<number> {
 		process.stderr.write(`${term.red("error:")} ${err instanceof Error ? err.message : String(err)}\n`);
 		return 1;
 	}
+}
+
+function secretsCommand(flags: Record<string, string | boolean>, positionals: string[]): number {
+	const config = loadForCli(flags);
+	const [action, name] = positionals;
+	if (action === "list") {
+		const entries = listMarkedSecrets(config);
+		process.stdout.write(entries.length ? `${entries.map(({ name: item }) => item).join("\n")}\n` : "no marked secrets\n");
+		return 0;
+	}
+	if (action === "mark") {
+		if (!name) throw new Error("usage: alive secrets mark <name> --env SECRET_VALUE_ENV [--config agent-config.json]");
+		const envName = flagString(flags, "env");
+		if (!envName || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(envName)) throw new Error("--env must name an environment variable containing the value");
+		const value = process.env[envName];
+		if (!value) throw new Error(`environment variable ${envName} is empty or unset`);
+		markSecret(config, name, value);
+		process.stdout.write(`marked secret ${name}; value stored in the host-only registry\n`);
+		return 0;
+	}
+	if (action === "remove") {
+		if (!name) throw new Error("usage: alive secrets remove <name> [--config agent-config.json]");
+		process.stdout.write(unmarkSecret(config, name) ? `removed secret ${name}\n` : `no marked secret named ${name}\n`);
+		return 0;
+	}
+	throw new Error("usage: alive secrets list | mark <name> --env SECRET_VALUE_ENV | remove <name>");
 }
 
 function loadForCli(flags: Record<string, string | boolean>): LoadedConfig {
@@ -986,6 +1016,8 @@ usage:
   alive telegram me | chats | chat <id|@name> | send <id|@name> <text> | ping
   alive telegram whitelist [list | add <user-id> | remove <user-id>]
                                               manage Telegram user access without restart
+  alive secrets list | mark <name> --env ENV | remove <name>
+                                              mark values for owner approval in Microsandbox browser requests
   alive thoughts [-n 20]                      the agent's private monologue
 `);
 }

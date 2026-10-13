@@ -89,6 +89,7 @@ export async function runBrowser(args: string[], signal?: AbortSignal, session =
 	signal?.throwIfAborted();
 	const endpoint = await ensureFortress();
 	signal?.throwIfAborted();
+	if (process.env.ALIVE_IN_MICROSANDBOX === "1") await waitForSecretGateway(signal);
 	return new Promise((resolve, reject) => {
 		execFile(process.execPath, browserArgs(endpoint, args, session), {
 			cwd: root, timeout: 60_000, maxBuffer: 4 * 1024 * 1024, signal,
@@ -97,4 +98,17 @@ export async function runBrowser(args: string[], signal?: AbortSignal, session =
 			else resolve(stdout.trim());
 		});
 	});
+}
+
+async function waitForSecretGateway(signal?: AbortSignal): Promise<void> {
+	const deadline = Date.now() + 30_000;
+	while (Date.now() < deadline) {
+		signal?.throwIfAborted();
+		try {
+			const response = await fetch("http://127.0.0.1:7143/ready", { signal: AbortSignal.timeout(500) });
+			if (response.ok) return;
+		} catch { /* sidecar startup race */ }
+		await new Promise((resolve) => setTimeout(resolve, 250));
+	}
+	throw new Error("Browser secret gateway is not ready; request blocked fail-closed");
 }

@@ -9,6 +9,7 @@ import type { TlsBuilder } from "microsandbox/native";
 import { ModelRuntime, resolveCliModel } from "@earendil-works/pi-coding-agent";
 import { defaultModelSpec, type LoadedConfig } from "../config.js";
 import { privateMemoryScope, sharedMemoryScopes } from "../runtime/memory-access.js";
+import { SecretApprovalGateway } from "./secret-gateway.js";
 
 /** Run one managed Alive runtime in an attached, per-agent Microsandbox VM. */
 export async function superviseInMicrosandbox(config: LoadedConfig): Promise<void> {
@@ -24,12 +25,18 @@ export async function superviseInMicrosandbox(config: LoadedConfig): Promise<voi
 	await migratePrivateMemory(config);
 	persistPrivateMemoryPath(config);
 	const stage = fs.mkdtempSync(path.join(os.tmpdir(), "alive-microsandbox-"));
+	const gatewaySocket = path.join(stage, "secret-gateway.sock");
 	const guestConfig = structuredClone(cfg);
 	guestConfig.stateDir = "/alive/state";
 	guestConfig.workspace = "/alive/workspace";
 	guestConfig.soulFile = "/alive/config/SOUL.md";
 	guestConfig.piAgentDir = "/alive/config/pi-agent";
 	guestConfig.memory.databasePath = "/alive/state/memory.sqlite";
+	// Do not expose an uninspected raw network client beside the browser guard.
+	// Browser, search, file and memory tools remain available in this profile.
+	guestConfig.tools.bash = false;
+	guestConfig.tools.builtin = guestConfig.tools.builtin.filter((tool) => tool !== "bash");
+	guestConfig.tools.allowlist = guestConfig.tools.allowlist.filter((tool) => tool !== "bash");
 	guestConfig.modules.external = [];
 	guestConfig.extensions = [];
 	fs.writeFileSync(path.join(stage, "alive.config.json"), `${JSON.stringify(guestConfig, null, 2)}\n`, { mode: 0o600 });
@@ -49,7 +56,9 @@ export async function superviseInMicrosandbox(config: LoadedConfig): Promise<voi
 	const policy = NetworkPolicy.builder()
 		.defaultDeny()
 		.egress((rule) => rule.tcp().udp().port(53).allow((destination) => destination.group("host")))
-		.egress((rule) => rule.allowPublic().allowLoopback());
+		// Browser traffic is inspected by the Fetch-domain sidecar. Keep general
+		// public TCP access for ordinary tools, but block UDP/WebRTC side channels.
+		.egress((rule) => rule.tcp().allowPublic().allowLoopback());
 	const builder = Sandbox.builder(name)
 		.replace()
 		.image(cfg.sandbox.image)
@@ -67,6 +76,7 @@ export async function superviseInMicrosandbox(config: LoadedConfig): Promise<voi
 			network.strict(true).secretViolationAction("block-and-log");
 			return network;
 		})
+		.vsock(gatewaySocket, 7142)
 		.patch((patch) => patch.copyDir(path.join(appRoot, "dist"), "/opt/alive/dist").copyFile(path.join(appRoot, "package.json"), "/opt/alive/package.json").copyFile(path.join(appRoot, "package-lock.json"), "/opt/alive/package-lock.json"))
 		.volume("/alive/config", (mount) => mount.bind(stage).readonly().noexec().nosuid().nodev().statVirtualization("strict"))
 		.volume("/alive/state", (mount) => mount.bind(config.paths.stateDir).noexec().nosuid().nodev().statVirtualization("strict").quota(4096))
@@ -76,6 +86,7 @@ export async function superviseInMicrosandbox(config: LoadedConfig): Promise<voi
 		.env("ALIVE_RUNTIME_PID", String(process.pid));
 	if (embeddingSecret) builder.env(embeddingSecret.envVar, embeddingSecret.placeholder);
 	let sandbox: Sandbox | undefined;
+	let approvalGateway: SecretApprovalGateway | undefined;
 	let cleanupSecretSources: () => void = () => {};
 	let stopping = false;
 	const stop = () => {
@@ -85,10 +96,18 @@ export async function superviseInMicrosandbox(config: LoadedConfig): Promise<voi
 	process.once("SIGTERM", stop);
 	process.once("SIGINT", stop);
 	try {
+		approvalGateway = await SecretApprovalGateway.start(config, gatewaySocket);
 		sandbox = await builder.create();
 		cleanupSecretSources = await installHostReferencedSecrets(sandbox, apiSecrets);
 		const install = await sandbox.exec("npm", ["ci", "--omit=dev", "--ignore-scripts"]);
 		if (!install.success) throw new Error(`guest dependency install failed: ${install.stderr()}`);
+		const gateway = await sandbox.execStream("node", ["/opt/alive/dist/sandbox/gateway-runner.js"]);
+		void (async () => {
+			for await (const event of gateway) {
+				if (event.kind === "stdout") process.stdout.write(Buffer.from(event.data));
+				else if (event.kind === "stderr") process.stderr.write(Buffer.from(event.data));
+			}
+		})().catch(() => undefined);
 		const run = await sandbox.execStream("node", ["/opt/alive/dist/index.js", "run", "--foreground", "--config", "/alive/config/alive.config.json"]);
 		void (async () => {
 			for await (const event of run) {
@@ -104,6 +123,7 @@ export async function superviseInMicrosandbox(config: LoadedConfig): Promise<voi
 		process.removeListener("SIGINT", stop);
 		if (sandbox && !stopping) await sandbox.stop().catch(() => undefined);
 		cleanupSecretSources();
+		await approvalGateway?.stop();
 		fs.rmSync(stage, { recursive: true, force: true });
 	}
 }

@@ -137,6 +137,12 @@ export interface SandboxConfig {
 	cpus: number;
 	/** Guest memory limit in MiB. */
 	memoryMiB: number;
+	/** Dedicated bot used only to approve personal-secret browser requests. Empty owner list means deny all. */
+	approvalTelegramTokenEnv: string;
+	/** Telegram user IDs allowed to approve secret-bearing requests. */
+	approvalOwnerUserIds: string[];
+	/** Maximum time an intercepted request may wait for an owner decision. */
+	approvalTimeoutSec: number;
 }
 
 /** Per-action authority to manage other persistent agents. Targets are explicit ids; '*' grants all current and future ids. */
@@ -262,6 +268,9 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		image: "node:22-bookworm-slim",
 		cpus: 1,
 		memoryMiB: 2048,
+		approvalTelegramTokenEnv: "ALIVE_APPROVAL_TELEGRAM_TOKEN",
+		approvalOwnerUserIds: [],
+		approvalTimeoutSec: 120,
 	},
 	memory: {
 		databasePath: "",

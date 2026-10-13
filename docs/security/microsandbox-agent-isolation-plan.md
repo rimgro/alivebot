@@ -100,12 +100,15 @@ Secret guard надо проверять на навигации, обычных
 
 - Добавлен opt-in backend `sandbox.backend=microsandbox` для managed agents; основной runtime остаётся host-only. Lifecycle запускает host supervisor, runtime пишет в `runtime.json` PID supervisor, остановка supervisor останавливает attached VM.
 - Каждому агенту создаётся отдельная VM с CPU/RAM/root-disk лимитами. В VM доступны только каталоги state/workspace конкретного агента и read-only bootstrap-конфиг; домашний каталог хоста не монтируется.
-- Сеть разрешает public egress без доменного allowlist, private/host destinations наследуют запреты профиля `public`, ingress выставлен в deny.
+- Сеть разрешает public TCP egress без доменного allowlist, private/host destinations наследуют запреты профиля `public`, ingress выставлен в deny; UDP закрыт.
 - HTTPS egress перехватывается с проверкой upstream TLS, QUIC на 443 отключён, а strict network checks и `blockAndLog` включены для нарушений placeholder-политики.
 - Используется Microsandbox SDK `0.7.8`; model/embedding keys резолвятся на хосте через краткоживущие environment references вместо записи raw values в сохранённую конфигурацию VM.
 - API key модели разрешается на хосте, гостю передаётся placeholder, а Microsandbox настраивается на подстановку только для HTTPS host модели. OAuth, custom auth headers, секретоподобные поля в models.json и неподдержанные host-модули блокируют запуск.
 - Память managed agents хранится отдельно. При первом sandbox-start существующего агента в его state копируются только записи с его private scope; профили с настроенными shared scopes пока fail closed.
-- **Не реализовано:** обнаружение явно помеченных или произвольных личных секретов в prompt/workspace/страницах, browser-wide secret guard и owner approval broker. TLS interception закрывает только обход placeholder-защиты зарегистрированных credentials; он не сканирует произвольные значения и не подтверждает точные browser-действия. Следовательно, данный код пока не удовлетворяет требованию подтверждать передачу личных секретов и не должен использоваться как завершённая система защиты.
+- Реализован host-only реестр помеченных значений (`alive secrets mark/list/remove`), отдельный host Unix-socket broker через guest-to-host vsock и Telegram one-shot approval конкретного запроса по его SHA-256 fingerprint. Браузерный CDP Fetch sidecar проверяет URL, заголовки и тело до отправки; request body, который нельзя прочитать, блокируется. Preview включает точные URL, метод, заголовки и тело.
+- В Microsandbox-профиле отключены `bash`, UDP/WebRTC и WebSocket; браузерный инструмент ждёт готовности sidecar. Обычные HTTP(S) browser requests без точного совпадения остаются автономными.
+- **Не реализовано:** перехват всех HTTP-клиентов внутри VM, включая исходящие вызовы модели и инструменты/код вне браузера; предотвращение произвольного хеширования/шифрования помеченного секрета; безопасная подстановка host-held секретов в браузерные поля. Поэтому DLP остаётся точным совпадением и этот срез нельзя представлять как полную защиту от утечки личных данных.
+- Реальный запуск VM, CDP interception и Telegram callbacks требуют Linux host с рабочей поддержкой Microsandbox/KVM и ещё не проверены на сервере.
 - Первый запуск загружает OCI image и устанавливает npm runtime dependencies внутри VM. Требуется Linux host с рабочей поддержкой Microsandbox/KVM; этот checkout на macOS не доказывает, что VM реально стартует.
 
 ### 0. Проверка платформы и прототип границы
