@@ -329,6 +329,26 @@ const bot = { botId: 999, botUsername: "alive_bot", ingestEdits: true };
 	check("photo keeps the largest size", mediaInbound?.attachments[0]?.fileId === "big", mediaInbound?.attachments);
 	check("caption becomes the text", mediaInbound?.text === "look");
 	check("attachment summary reaches the prompt", mediaInbound?.promptText.includes("photo") === true, mediaInbound?.promptText);
+	check("image prompt exposes a downloadable file id", mediaInbound?.promptText.includes('file_id="big"') === true);
+	check("image prompt explains how to see pixels", mediaInbound?.promptText.includes('action="download_file"') === true && mediaInbound.promptText.includes("read the returned local path"));
+
+	const groupPhoto = normalizeUpdate({ update_id: 70, message: { ...media.message!, chat: groupChat } }, bot);
+	check("group photos expose the same vision path", groupPhoto?.promptText.includes('file_id="big"') === true);
+	const photoReply = normalizeUpdate({
+		update_id: 71,
+		message: {
+			...replyToBot.message!,
+			text: "what is in this picture?",
+			reply_to_message: { ...media.message!, chat: groupChat },
+		},
+	}, bot);
+	check("reply to a group photo includes its file id", photoReply?.promptText.includes('reply attachments: photo') === true && photoReply.promptText.includes('file_id="big"'));
+	check("quoted attachments are not attributed to the new message", photoReply?.attachments.length === 0);
+	const documentImage = normalizeUpdate({
+		update_id: 72,
+		message: { ...command.message!, document: { file_id: "png", file_unique_id: "png-id", file_name: "screenshot.png", mime_type: "image/png" } },
+	}, bot);
+	check("images sent as documents include vision instructions", documentImage?.promptText.includes('file_id="png"') === true && documentImage.promptText.includes("read the returned local path"));
 
 	const topic: TelegramUpdate = {
 		update_id: 8,

@@ -4,6 +4,7 @@ import * as path from "node:path";
 import { DEFAULT_CONTRACT, loadConfig, resolveMemoryDatabasePath, type AgentManagementPermissions, type LoadedConfig } from "./config.js";
 import { snapshotRuntime, spawnBackground, stopRuntime, waitForRuntime } from "./runtime/daemon.js";
 import { sleep } from "./util.js";
+import { mergeSandboxConfig, type SandboxConfig } from "./sandbox/config.js";
 
 const ID_RE = /^[a-z0-9][a-z0-9_-]{0,47}$/;
 
@@ -38,6 +39,8 @@ export interface CreateAgentOptions {
 	contract?: string;
 	toolAllowlist?: string[];
 	management?: AgentManagementPermissions;
+	/** Operator-owned setting; agent tools deliberately cannot grant host access. */
+	sandbox?: Partial<SandboxConfig>;
 }
 
 export const NO_AGENT_MANAGEMENT: AgentManagementPermissions = {
@@ -58,6 +61,7 @@ export function createAgent(base: LoadedConfig, idInput: string, name?: string, 
 	const role = options.role?.trim() || `Agent ${name?.trim() || id}`;
 	const contract = options.contract?.trim() || DEFAULT_CONTRACT;
 	if (!role || !contract) throw new Error("agent role and contract must not be empty");
+	const sandboxConfig = mergeSandboxConfig(base.config.sandbox, options.sandbox);
 	fs.mkdirSync(directory, { recursive: true });
 	const configPath = path.join(directory, "alive.config.json");
 	const soulPath = path.join(directory, "SOUL.md");
@@ -69,6 +73,7 @@ export function createAgent(base: LoadedConfig, idInput: string, name?: string, 
 	config.enabled = true;
 	config.agentManagement = validateAgentManagementPermissions(options.management ?? NO_AGENT_MANAGEMENT);
 	config.workspace = path.join(directory, "workspace");
+	config.sandbox = sandboxConfig;
 	config.soulFile = soulPath;
 	// Managed agents may share the database, but memory tools enforce private scope by default.
 	config.memory.databasePath = resolveMemoryDatabasePath(base);
@@ -158,7 +163,7 @@ export function assertCanDelegate(
 export function updateAgentProfile(
 	base: LoadedConfig,
 	idInput: string,
-	updates: { name?: string; role?: string; contract?: string; toolAllowlist?: string[]; management?: AgentManagementPermissions },
+	updates: { name?: string; role?: string; contract?: string; toolAllowlist?: string[]; management?: AgentManagementPermissions; sandbox?: Partial<SandboxConfig> },
 ): ManagedAgent {
 	const agent = findManagedAgent(base, idInput);
 	const raw = readAgentConfig(agent);
@@ -171,6 +176,9 @@ export function updateAgentProfile(
 		raw.tools = { ...raw.tools, allowlist: validateToolAllowlist(updates.toolAllowlist) };
 	}
 	if (updates.management !== undefined) raw.agentManagement = validateAgentManagementPermissions(updates.management);
+	if (updates.sandbox !== undefined) {
+		raw.sandbox = mergeSandboxConfig(loadAgentConfig(base, agent).config.sandbox, updates.sandbox);
+	}
 	if (updates.role !== undefined || updates.contract !== undefined) {
 		const contractPath = path.join(agent.directory, "CONTRACT.md");
 		const oldContract = fs.existsSync(contractPath) ? fs.readFileSync(contractPath, "utf8") : DEFAULT_CONTRACT;
@@ -190,7 +198,7 @@ export function getAgentEnabled(agent: ManagedAgent): boolean {
 export async function updateManagedAgentProfile(
 	base: LoadedConfig,
 	idInput: string,
-	updates: { name?: string; role?: string; contract?: string; toolAllowlist?: string[]; management?: AgentManagementPermissions },
+	updates: { name?: string; role?: string; contract?: string; toolAllowlist?: string[]; management?: AgentManagementPermissions; sandbox?: Partial<SandboxConfig> },
 ): Promise<ManagedAgent> {
 	const agent = findManagedAgent(base, idInput);
 	return withAgentLifecycleLock(base, agent.id, async () => {

@@ -96,6 +96,16 @@ export async function main(argv: string[]): Promise<number> {
 			case "agents": {
 				return agentsCommand(cwd, flags, positionals);
 			}
+			case "sandbox": {
+				if (positionals.length && positionals[0] !== "status") throw new Error("usage: alive sandbox status [--config CONFIG]");
+				const config = loadForCli(flags);
+				if (!config.config.sandbox.enabled) { process.stdout.write('sandbox disabled (host execution explicitly enabled)\n'); return 0; }
+				const { SandboxManager } = await import("./sandbox/manager.js");
+				const manager = new SandboxManager(config, makeLogger(config));
+				try { process.stdout.write(`${JSON.stringify(await manager.control("status"), null, 2)}\n`); }
+				finally { await manager.close(); }
+				return 0;
+			}
 			case "stop": {
 				return await stopCommand(cwd, flags);
 			}
@@ -431,13 +441,15 @@ async function agentsCommand(cwd: string, flags: Record<string, string | boolean
 			process.stdout.write(`disabled and stopped ${agent.id}\n`);
 			return 0;
 		}
-		const updates: { name?: string; role?: string; contract?: string; toolAllowlist?: string[]; management?: import("./config.js").AgentManagementPermissions } = {};
+		const updates: { name?: string; role?: string; contract?: string; toolAllowlist?: string[]; management?: import("./config.js").AgentManagementPermissions; sandbox?: Partial<import("./sandbox/config.js").SandboxConfig> } = {};
 		if (action === "edit") {
 			const name = flagString(flags, "name");
 			const role = flagString(flags, "role");
 			const contract = flagString(flags, "contract");
 			const contractFile = flagString(flags, "contract-file");
 			const tools = flagString(flags, "tools");
+			const sandboxFile = flagString(flags, "sandbox-file");
+			if (sandboxFile) updates.sandbox = JSON.parse((await import("node:fs")).readFileSync(path.resolve(cwd, sandboxFile), "utf8"));
 			if (name !== undefined) updates.name = name;
 			if (role !== undefined) updates.role = role;
 			if (contract !== undefined && contractFile !== undefined) throw new Error("use only one of --contract or --contract-file");
@@ -457,7 +469,9 @@ async function agentsCommand(cwd: string, flags: Record<string, string | boolean
 	if (action === "create") {
 		const id = positionals[1];
 		if (!id) throw new Error("usage: alive agents create <id> [--name <name>]");
-		const agent = createAgent(base, id, flagString(flags, "name"));
+		const sandboxFile = flagString(flags, "sandbox-file");
+		const sandbox = sandboxFile ? JSON.parse((await import("node:fs")).readFileSync(path.resolve(cwd, sandboxFile), "utf8")) : undefined;
+		const agent = createAgent(base, id, flagString(flags, "name"), { sandbox });
 		process.stdout.write(`created agent ${agent.id}\nconfig: ${agent.configPath}\nworkspace: ${path.join(agent.directory, "workspace")}\nstart: alive agents start ${agent.id}\n`);
 		return 0;
 	}
@@ -946,6 +960,7 @@ usage:
                                               (↑/↓ select, Alt+S start, Alt+X stop, Esc quit)
   alive agents start|stop|restart|enable|disable|status <id>
   alive agents edit <id> [--name NAME] [--role ROLE] [--contract TEXT] [--tools read,write,...]
+  alive agents edit <id> --sandbox-file JSON    per-agent sandbox overrides (operator only)
   alive agents permissions <id> --permissions-file JSON
   alive agents send <id> <message>          send a durable local message to an agent
   alive agents inbox <id> [--thread ID]     list/read local messages for an agent
@@ -969,6 +984,7 @@ usage:
   alive policy add <interrupt|queue|mute> [thread]
   alive policy default <interrupt|queue|mute> set the fallback mode
   alive policy remove <rule-id> | reset
+  alive sandbox status [--config CONFIG]       inspect VM/volumes without booting
   alive modules [--json]                      configured event modules
   alive history [--thread t] [--search s] [--all] [-n 30] [--json]
                                               conversation history (no args = list threads)

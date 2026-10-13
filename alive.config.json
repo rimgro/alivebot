@@ -4,6 +4,9 @@
   "thinkingLevel": "",
   "stateDir": ".alive",
   "workspace": ".alive/workspace",
+  "sandbox": {
+    "enabled": true
+  },
   "soulFile": "SOUL.md",
   "session": "continue",
   "tools": {

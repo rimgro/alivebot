@@ -13,6 +13,7 @@ import type {
 	ModuleEventInput,
 	OutboundHandler,
 	UserMessageInput,
+	WorkspaceFiles,
 } from "./api.js";
 
 export interface ModuleHostOptions {
@@ -24,6 +25,7 @@ export interface ModuleHostOptions {
 	outbox: (limit: number) => OutgoingMessage[];
 	history: HistoryStore;
 	runtimeStatus: () => Record<string, unknown>;
+	workspaceFiles?: WorkspaceFiles;
 }
 
 interface ModuleRuntime {
@@ -213,6 +215,7 @@ export class ModuleHost {
 			name,
 			config: config.config,
 			paths: config.paths,
+			workspaceFiles: this.options.workspaceFiles,
 			log: moduleLog,
 			signal: this.abort.signal,
 			emit: (event) => this.options.ingest(event),

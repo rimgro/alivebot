@@ -83,9 +83,11 @@ export function normalizeUpdate(update: TelegramUpdate, options: NormalizeOption
 	if (replyToPreview !== undefined) {
 		const replyAuthor = message.reply_to_message ? authorOf(message.reply_to_message) : undefined;
 		promptLines.push(`↩ replying to ${replyAuthor?.name ?? "someone"}: ${singleLine(replyToPreview, 240)}`);
+		const replyAttachments = message.reply_to_message ? attachmentsOf(message.reply_to_message) : [];
+		if (replyAttachments.length > 0) promptLines.push(attachmentPrompt(replyAttachments, "reply attachments"));
 	}
 	promptLines.push(text);
-	if (attachments.length > 0) promptLines.push(`attachments: ${attachments.map(describeAttachment).join(", ")}`);
+	if (attachments.length > 0) promptLines.push(attachmentPrompt(attachments, "attachments"));
 	if (isEdit) promptLines.push("(this message was edited after it was first sent)");
 
 	return {
@@ -351,6 +353,17 @@ function forwardLabel(message: TelegramMessage): string {
 	if (origin.sender_chat) return origin.sender_chat.title ?? chatLabel(origin.sender_chat);
 	if (origin.chat) return origin.chat.title ?? chatLabel(origin.chat);
 	return origin.type;
+}
+
+function attachmentPrompt(attachments: HistoryAttachment[], label: string): string {
+	const lines = attachments.map((attachment) => {
+		const description = describeAttachment(attachment);
+		return attachment.fileId ? `${description}; file_id=${JSON.stringify(attachment.fileId)}` : description;
+	});
+	const hasImage = attachments.some((attachment) => attachment.kind === "photo" || attachment.mime?.startsWith("image/"));
+	return `${label}: ${lines.join(", ")}${hasImage
+		? '\nTo inspect an image, use telegram(action="download_file", file_id=...) then read the returned local path. The attachment label is not the image content; do not guess what it shows without opening it.'
+		: ""}`;
 }
 
 export function describeAttachment(attachment: HistoryAttachment): string {

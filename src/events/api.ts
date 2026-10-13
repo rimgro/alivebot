@@ -70,12 +70,21 @@ export interface ModuleEventInput {
  */
 export type OutboundHandler = (message: OutgoingMessage) => void | Promise<void>;
 
+/** Workspace bridge for trusted host integrations. Isolated profiles route these
+ * operations through the same guest/offline filesystem and lifecycle lock as tools. */
+export interface WorkspaceFiles {
+	readonly rootDir: string;
+	readFile(file: string): Promise<Buffer>;
+	writeFile(file: string, data: Buffer): Promise<string>;
+}
+
 /** Everything a module gets when it starts. */
 export interface ModuleContext {
 	/** Module name from config, e.g. `telegram`. */
 	readonly name: string;
 	readonly config: AliveConfig;
 	readonly paths: Paths;
+	readonly workspaceFiles?: WorkspaceFiles;
 	/** Scoped logger (`alive:module:telegram`). */
 	readonly log: Logger;
 	/** Aborted when the runtime is stopping; long-running loops must respect it. */
