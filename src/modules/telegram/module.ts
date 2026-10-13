@@ -22,7 +22,7 @@ const DEFAULT_ALLOWED_UPDATES = ["message", "edited_message", "channel_post", "e
  * Inbound: long polling (`getUpdates`) with a persisted offset, so restarts
  * resume instead of replaying. Every accepted update becomes a durable
  * `user_message` event (deduped by message id) and a record in the shared
- * conversation history. Access lists and bot-authored messages are filtered out
+ * conversation history. User allowlists and non-allowlisted or unaddressed bot messages are filtered out
  * before anything reaches the agent.
  *
  * Outbound: `send_message` to a `telegram:<chatId>[/<topicId>]` thread is split
@@ -298,6 +298,8 @@ export class TelegramModule implements AliveModule {
 		const inbound = normalizeUpdate(update, {
 			botId: this.botId,
 			botUsername: this.botUsername,
+			allowedBotIds: this.config.allowedBotIds,
+			requireMentionInGroups: this.config.requireMentionInGroups,
 			ingestEdits: this.config.ingestEdits,
 		});
 		if (!inbound) return;
@@ -409,6 +411,9 @@ export class TelegramModule implements AliveModule {
 			if (!allowed.includes(inbound.chatId)) return false;
 		}
 		if (!inbound.author) return false;
+		if (inbound.author.isBot) {
+			return this.config.allowedBotIds.map(String).includes(inbound.author.id) && inbound.expectsReply;
+		}
 		const allowed = new Set([
 			...this.config.allowedUserIds.map(String),
 			...(this.allowlist?.list() ?? []),

@@ -70,6 +70,10 @@ export interface TelegramConfig {
 	allowedChatIds: string[];
 	/** Initial user allowlist (user ids); runtime access is restricted to configured or dynamically added IDs. */
 	allowedUserIds: string[];
+	/** Explicit peer-bot allowlist; bot messages are accepted only when directly addressed to this bot. */
+	allowedBotIds: string[];
+	/** In group chats, only ingest messages that explicitly mention/reply to this bot. */
+	requireMentionInGroups: boolean;
 	/** Long-poll timeout for getUpdates, in seconds. */
 	pollTimeoutSec: number;
 	/** Telegram update types to subscribe to. */
@@ -289,6 +293,8 @@ export const DEFAULT_CONFIG: AliveConfig = {
 			apiBase: "https://api.telegram.org",
 			allowedChatIds: [],
 			allowedUserIds: [],
+			allowedBotIds: [],
+			requireMentionInGroups: false,
 			pollTimeoutSec: 25,
 			allowedUpdates: [
 				"message",

@@ -268,14 +268,36 @@ const bot = { botId: 999, botUsername: "alive_bot", ingestEdits: true };
 			text: "my own message",
 		},
 	};
-	check("bot messages are ignored", normalizeUpdate(botMessage, bot) === undefined);
+	check("own bot messages are ignored", normalizeUpdate(botMessage, bot) === undefined);
 
 	const groupChat = { id: -1001, type: "supergroup" as const, title: "Team" };
+	const peerBotMessage: TelegramUpdate = {
+		update_id: 22,
+		message: {
+			message_id: 22,
+			date: 1_700_000_000,
+			chat: groupChat,
+			from: { id: 1234, is_bot: true, first_name: "Peer", username: "peer_bot" },
+			text: "@alive_bot can you review this?",
+			entities: [{ type: "mention", offset: 0, length: 10 }],
+		},
+	};
+	check("peer bot messages are ignored unless allowlisted", normalizeUpdate(peerBotMessage, bot) === undefined);
+	const acceptedPeerMessage = normalizeUpdate(peerBotMessage, { ...bot, allowedBotIds: ["1234"] });
+	check("allowlisted peer bot message addressed to us is accepted", acceptedPeerMessage?.author?.isBot === true && acceptedPeerMessage.expectsReply === true, acceptedPeerMessage);
+	check("peer bot message is marked untrusted in prompt", acceptedPeerMessage?.promptText.includes("untrusted input") === true, acceptedPeerMessage?.promptText);
+	const unaddressedPeerMessage: TelegramUpdate = {
+		...peerBotMessage,
+		update_id: 23,
+		message: { ...peerBotMessage.message!, message_id: 23, text: "general bot chatter", entities: [] },
+	};
+	check("allowlisted peer bot chatter without direct mention is ignored", normalizeUpdate(unaddressedPeerMessage, { ...bot, allowedBotIds: ["1234"] }) === undefined);
 	const chatter: TelegramUpdate = {
 		update_id: 3,
 		message: { message_id: 12, date: 1_700_000_000, chat: groupChat, from: { id: 8, is_bot: false, first_name: "Bob" }, text: "just chatting" },
 	};
 	check("group chatter without a mention does not expect a reply", normalizeUpdate(chatter, bot)?.expectsReply === false);
+	check("requireMentionInGroups suppresses ordinary chatter", normalizeUpdate(chatter, { ...bot, requireMentionInGroups: true }) === undefined);
 
 	const mention: TelegramUpdate = {
 		update_id: 4,
@@ -289,6 +311,7 @@ const bot = { botId: 999, botUsername: "alive_bot", ingestEdits: true };
 		},
 	};
 	check("a mention expects a reply", normalizeUpdate(mention, bot)?.expectsReply === true);
+	check("requireMentionInGroups keeps explicit mentions", normalizeUpdate(mention, { ...bot, requireMentionInGroups: true })?.expectsReply === true);
 
 	const replyToBot: TelegramUpdate = {
 		update_id: 5,
@@ -304,6 +327,7 @@ const bot = { botId: 999, botUsername: "alive_bot", ingestEdits: true };
 	const replied = normalizeUpdate(replyToBot, bot);
 	check("a reply to the bot expects a reply", replied?.expectsReply === true);
 	check("the quoted message is included", replied?.promptText.includes("earlier") === true, replied?.promptText);
+	check("requireMentionInGroups keeps replies to the bot", normalizeUpdate(replyToBot, { ...bot, requireMentionInGroups: true })?.expectsReply === true);
 
 	const command: TelegramUpdate = {
 		update_id: 6,
@@ -485,6 +509,8 @@ section("telegram module end-to-end against a fake Bot API");
 					apiBase: "https://api.telegram.org",
 					allowedChatIds: [],
 					allowedUserIds: ["7"],
+					allowedBotIds: [],
+					requireMentionInGroups: false,
 					pollTimeoutSec: 0,
 					allowedUpdates: ["message"],
 					parseMode: "",
@@ -750,6 +776,8 @@ section("telegram module: outage is reported once, not spammed");
 					apiBase: "https://api.telegram.org",
 					allowedChatIds: [],
 					allowedUserIds: [],
+					allowedBotIds: [],
+					requireMentionInGroups: false,
 					pollTimeoutSec: 0,
 					allowedUpdates: ["message"],
 					parseMode: "",
@@ -814,6 +842,8 @@ section("modules config and loader");
 	);
 	const config = loadConfig({ cwd: configRoot });
 	check("telegram config merges with defaults", config.config.modules.telegram.pollTimeoutSec === 25, config.config.modules.telegram);
+	check("allowed bot IDs default to an empty allowlist", config.config.modules.telegram.allowedBotIds.length === 0, config.config.modules.telegram.allowedBotIds);
+	check("requireMentionInGroups defaults off", config.config.modules.telegram.requireMentionInGroups === false, config.config.modules.telegram.requireMentionInGroups);
 	check("grafana config merges with defaults", config.config.modules.grafana.host === "127.0.0.1" && config.config.modules.grafana.port === 5999, config.config.modules.grafana);
 	check("env token wins", resolveToken(config.config.modules.telegram, { MY_TG_TOKEN: "from-env" } as NodeJS.ProcessEnv) === "from-env");
 	check("config token is the fallback", resolveToken({ ...config.config.modules.telegram, token: "from-config" }, {} as NodeJS.ProcessEnv) === "from-config");
