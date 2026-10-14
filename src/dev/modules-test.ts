@@ -27,6 +27,13 @@ import { resolveToken, TelegramModule } from "../modules/telegram/module.js";
 import { escapeHtml, isParseModeError, splitMessage } from "../modules/telegram/text.js";
 import { formatThread, parseThread, resolveChatTarget } from "../modules/telegram/threads.js";
 import { normalizeUpdate } from "../modules/telegram/update.js";
+import {
+	GROQ_TRANSCRIPTION_ENDPOINT,
+	GROQ_TRANSCRIPTION_MODEL,
+	GroqTranscriptionError,
+	TELEGRAM_VOICE_MAX_BYTES,
+	transcribeWithGroq,
+} from "../modules/telegram/voice-transcription.js";
 import type { TelegramUpdate } from "../modules/telegram/types.js";
 
 let failures = 0;
@@ -428,6 +435,102 @@ section("telegram client");
 	}
 	check("api errors keep the code", apiError?.errorCode === 429, apiError?.message);
 	check("retry_after is exposed", apiError?.retryAfterSec === 3, apiError?.retryAfterSec);
+
+	let oversizedStreamCancelled = false;
+	const oversizedBody = new ReadableStream<Uint8Array>({
+		start(controller) {
+			controller.enqueue(Uint8Array.from([1, 2]));
+			controller.enqueue(Uint8Array.from([3]));
+		},
+		cancel() {
+			oversizedStreamCancelled = true;
+		},
+	});
+	const downloadApi = new TelegramApi({ token: "tok", fetchImpl: (async () => new Response(oversizedBody)) as unknown as typeof fetch });
+	let downloadError: unknown;
+	try {
+		await downloadApi.downloadFile("voice.oga", { maxBytes: 2 });
+	} catch (err) {
+		downloadError = err;
+	}
+	check("file downloads stop as soon as the byte limit is exceeded", downloadError instanceof Error && downloadError.message.includes("2 byte limit"));
+	check("oversized response stream is cancelled", oversizedStreamCancelled);
+}
+
+// ---------------------------------------------------------------------------
+section("Groq Whisper transcription client");
+{
+	let authHeader = "";
+	let uploadedName = "";
+	let uploadedType = "";
+	let requestKeys: string[] = [];
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		check("transcription targets the Groq endpoint", String(input) === GROQ_TRANSCRIPTION_ENDPOINT);
+		authHeader = new Headers(init?.headers).get("authorization") ?? "";
+		if (init?.body instanceof FormData) {
+			requestKeys = [...init.body.keys()].sort();
+			const file = init.body.get("file");
+			if (file instanceof Blob) {
+				uploadedName = "name" in file ? String(file.name) : "";
+				uploadedType = file.type;
+			}
+		}
+		return jsonResponse({ text: "  create a bug report  " });
+	}) as unknown as typeof fetch;
+	const transcript = await transcribeWithGroq({
+		apiKey: "test-groq-key",
+		audio: Uint8Array.from([1, 2, 3]),
+		mimeType: "audio/ogg",
+		fetchImpl,
+	});
+	check("transcription text is trimmed", transcript === "create a bug report", transcript);
+	check("Groq receives the bearer authorization", authHeader === "Bearer test-groq-key");
+	check("Groq multipart body includes file, model and JSON response format", requestKeys.join(",") === "file,model,response_format", requestKeys);
+	check("voice bytes retain an audio MIME and safe filename", uploadedType === "audio/ogg" && uploadedName === "telegram-voice.ogg", { uploadedType, uploadedName });
+	check("the configured Whisper model is stable", GROQ_TRANSCRIPTION_MODEL === "whisper-large-v3-turbo");
+
+	let error: unknown;
+	try {
+		await transcribeWithGroq({
+			apiKey: "test-groq-key",
+			audio: new Uint8Array(TELEGRAM_VOICE_MAX_BYTES + 1),
+			fetchImpl: (async () => {
+				throw new Error("oversized audio must not be uploaded");
+			}) as unknown as typeof fetch,
+		});
+	} catch (caught) {
+		error = caught;
+	}
+	check("oversized audio is rejected before upload", error instanceof GroqTranscriptionError && error.code === "too_large");
+	check("safe transcription errors never include the API key", error instanceof Error && !error.message.includes("test-groq-key"));
+
+	let missingKeyError: unknown;
+	let missingKeyFetchCalled = false;
+	try {
+		await transcribeWithGroq({
+			apiKey: " ",
+			audio: Uint8Array.from([1]),
+			fetchImpl: (async () => {
+				missingKeyFetchCalled = true;
+				return jsonResponse({ text: "should not be sent" });
+			}) as unknown as typeof fetch,
+		});
+	} catch (caught) {
+		missingKeyError = caught;
+	}
+	check("empty Groq key is rejected without a request", missingKeyError instanceof GroqTranscriptionError && missingKeyError.code === "missing_api_key" && !missingKeyFetchCalled);
+
+	let httpError: unknown;
+	try {
+		await transcribeWithGroq({
+			apiKey: "test-groq-key",
+			audio: Uint8Array.from([1]),
+			fetchImpl: (async () => new Response('secret not to log', { status: 401 })) as unknown as typeof fetch,
+		});
+	} catch (caught) {
+		httpError = caught;
+	}
+	check("provider HTTP errors are safe and keep the status", httpError instanceof GroqTranscriptionError && httpError.code === "http_error" && httpError.status === 401 && !httpError.message.includes("secret"));
 }
 
 // ---------------------------------------------------------------------------
@@ -443,14 +546,21 @@ section("telegram module end-to-end against a fake Bot API");
 
 	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
 		const url = String(input);
-		const method = url.slice(url.lastIndexOf("/") + 1);
+		const isGroq = url === GROQ_TRANSCRIPTION_ENDPOINT;
+		const method = isGroq ? "groqTranscription" : url.slice(url.lastIndexOf("/") + 1);
 		const params =
 			init?.body instanceof FormData
-				? ({ __multipart: [...init.body.keys()] } as Record<string, unknown>)
+				? ({
+						__multipart: [...init.body.keys()],
+						...(isGroq ? { authorizationValid: new Headers(init.headers).get("authorization") === "Bearer test-groq-key" } : {}),
+				  } as Record<string, unknown>)
 				: init?.body
 					? (JSON.parse(String(init.body)) as Record<string, unknown>)
 					: {};
 		calls.push({ method, params });
+		if (url.includes("/file/bot")) return new Response(Uint8Array.from([1, 2, 3]), { status: 200, headers: { "content-type": "audio/ogg" } });
+		if (isGroq) return jsonResponse({ text: "create a bug report" });
+		if (method === "getFile") return jsonResponse({ ok: true, result: { file_id: "voice-file", file_unique_id: "voice-unique", file_path: "voice.oga", file_size: 3 } });
 		if (method === "getMe") {
 			return jsonResponse({ ok: true, result: { id: 999, is_bot: true, first_name: "Alive", username: "alive_bot" } });
 		}
@@ -480,6 +590,16 @@ section("telegram module end-to-end against a fake Bot API");
 								chat: { id: 43, type: "private", first_name: "Bob" },
 								from: { id: 8, is_bot: false, first_name: "Bob" },
 								text: "unknown user message",
+							},
+						},
+						{
+							update_id: 102,
+							message: {
+								message_id: 7,
+								date: 1_700_000_002,
+								chat: { id: 42, type: "private", first_name: "Alice", username: "alice" },
+								from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
+								voice: { file_id: "voice-file", file_unique_id: "voice-unique", file_size: 3, duration: 2, mime_type: "audio/ogg" },
 							},
 						},
 					],
@@ -530,6 +650,7 @@ section("telegram module end-to-end against a fake Bot API");
 	// Inject the fake fetch before start(): the module builds its client there.
 	const telegram = new TelegramModule(config.config.modules.telegram);
 	const realFetch = globalThis.fetch;
+	process.env.GROQ_API_KEY = "test-groq-key";
 	globalThis.fetch = fetchImpl;
 	try {
 		const host = new ModuleHost({
@@ -546,15 +667,23 @@ section("telegram module end-to-end against a fake Bot API");
 		await new Promise((resolve) => setTimeout(resolve, 60));
 
 		const pending = store.peekPending(10);
-		check("an update became a durable event", pending.length === 1, pending.map((e) => e.title));
+		check("updates became durable events", pending.length === 2, pending.map((e) => e.title));
 		check("the event is a user message on the right thread", pending[0]?.kind === "user_message" && pending[0]?.thread === "telegram:42", pending[0]);
 		check("the event expects a reply", pending[0]?.expectsReply === true);
 		const denial = calls.find((call) => call.method === "sendMessage" && String(call.params.text).includes("Ваш Telegram ID: 8"));
-		check("unknown Telegram users get a whitelist request and are not processed", pending.length === 1 && denial !== undefined, { pending: pending.length, denial });
+		check("unknown Telegram users get a whitelist request and are not processed", pending.length === 2 && denial !== undefined, { pending: pending.length, denial });
 		check("the event carries structured payload", (pending[0]?.payload as { messageId?: string })?.messageId === "5", pending[0]?.payload);
+		const voiceEvent = pending.find((event) => (event.payload as { messageId?: string })?.messageId === "7");
+		check("voice message event includes Groq transcript", voiceEvent?.text.includes("create a bug report") === true, voiceEvent?.text);
+		check("voice message payload records transcription status", (voiceEvent?.payload as { transcription?: { status?: string } })?.transcription?.status === "transcribed");
+		const transcriptionCall = calls.find((call) => call.method === "groqTranscription");
+		check("Telegram resolves the voice file before transcription", calls.some((call) => call.method === "getFile"));
+		check("voice bytes are downloaded from Telegram", calls.some((call) => call.method === "voice.oga"));
+		check("voice is sent to Groq with auth", transcriptionCall?.params.authorizationValid === true, transcriptionCall?.params);
 
 		const records = history.query({ thread: "telegram:42" });
-		check("inbound message landed in history", records.length === 1 && records[0]?.direction === "inbound", records);
+		check("inbound messages landed in history", records.length === 2 && records[0]?.direction === "inbound", records);
+		check("transcript is searchable in history text", records.some((record) => record.text.includes("create a bug report")), records.map((record) => record.text));
 		check("history links back to the event", records[0]?.meta?.eventId === pending[0]?.id, records[0]?.meta);
 		check("the chat directory knows the chat", history.thread("telegram:42")?.title === "Alice (@alice)", history.thread("telegram:42"));
 
@@ -608,11 +737,12 @@ section("telegram module end-to-end against a fake Bot API");
 
 		const status = telegram.status();
 		check("module status reports the bot", (status.bot as { username?: string })?.username === "alive_bot", status);
-		check("module status counts the inbound message", (status.counters as { inbound?: number })?.inbound === 1, status.counters);
+		check("module status counts accepted inbound messages", (status.counters as { inbound?: number })?.inbound === 2, status.counters);
 
 		await host.stop();
 	} finally {
 		globalThis.fetch = realFetch;
+		delete process.env.GROQ_API_KEY;
 	}
 
 	// Long messages are split into several Bot API calls.
