@@ -7,6 +7,9 @@ import {
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { type SandboxManager, type VirtualFiles } from "./manager.js";
+import type { LoadedConfig } from "../config.js";
+import { createGitHubAuthTool } from "../github/app-auth.js";
+import { createGitHubApiTool } from "../github/api-tool.js";
 
 const result = (text: string, details: unknown = undefined) => ({ content: [{ type: "text" as const, text }], details });
 
@@ -14,7 +17,7 @@ const result = (text: string, details: unknown = undefined) => ({ content: [{ ty
  * Pi's stock read also probes ambient host paths and rejects early on abort;
  * the custom reader avoids both and retains the lifecycle lock until IO settles.
  */
-export function createSandboxTools(manager: SandboxManager): ToolDefinition[] {
+export function createSandboxTools(manager: SandboxManager, loaded?: LoadedConfig): ToolDefinition[] {
 	const GUEST_WORKSPACE = manager.workspaceDir;
 	const guestPath = (file: string) => manager.path(file);
 	let files: VirtualFiles;
@@ -222,5 +225,7 @@ export function createSandboxTools(manager: SandboxManager): ToolDefinition[] {
 			return result(JSON.stringify(status, null, 2), status);
 		},
 	});
-	return [read, ...guarded, bash, ls, ...searchTools, fileTool, control] as ToolDefinition[];
+	const githubAuth = loaded ? createGitHubAuthTool(manager, loaded) : undefined;
+	const githubApi = loaded ? createGitHubApiTool(loaded) : undefined;
+	return [read, ...guarded, bash, ls, ...searchTools, fileTool, control, ...(githubAuth ? [githubAuth] : []), ...(githubApi ? [githubApi] : [])] as ToolDefinition[];
 }

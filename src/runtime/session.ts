@@ -57,7 +57,7 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 	if (isolated && !options.sandbox) throw new Error("An isolated session requires a runtime-scoped SandboxManager");
 	if (isolated && cfg.extensions.length) throw new Error("Host pi extensions are disabled for isolated profiles; remove extensions or explicitly disable sandboxing");
 	const workspace = isolated ? options.sandbox!.workspaceDir : paths.workspaceDir;
-	const sandboxTools = isolated ? createSandboxTools(options.sandbox!) : [];
+	const sandboxTools = isolated ? createSandboxTools(options.sandbox!, config) : [];
 	const reserved = new Set([...sandboxTools.map((tool) => tool.name), "browser", "web_search", "tool_registry"]);
 	if (isolated && toolDeps.moduleTools.some((tool) => reserved.has(tool.name))) throw new Error("Module tools cannot override isolated filesystem/shell tools");
 
@@ -130,6 +130,7 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 		builtins: builtinTools,
 		alive: isolated ? [...ALIVE_TOOL_NAMES.filter((name) => name !== "browser" && name !== "web_search"), "file", "sandbox_control"] : [...ALIVE_TOOL_NAMES],
 		modules: toolDeps.moduleTools.map((tool) => tool.name),
+		sandbox: sandboxTools.map((tool) => tool.name),
 		custom: persistedTools,
 		toolRegistryAvailable: !isolated,
 	});
@@ -179,6 +180,7 @@ export function selectAllowedTools(input: {
 	builtins: string[];
 	alive: string[];
 	modules: string[];
+	sandbox?: string[];
 	custom: string[];
 	toolRegistryAvailable?: boolean;
 }): string[] {
@@ -187,6 +189,7 @@ export function selectAllowedTools(input: {
 		...input.builtins,
 		...input.alive,
 		...input.modules,
+		...(input.sandbox ?? []),
 		...input.custom,
 		...(input.toolRegistryAvailable ? ["tool_registry"] : []),
 	];
