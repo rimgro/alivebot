@@ -22,6 +22,9 @@ import { resolveBrowserExecutable, resolveCdpEndpoint, resolveFortressLicense } 
 import { diagnoseBrowser } from "./diagnostics.js";
 import { validateFortressImage, fortressImageInstalled } from "./fortress.js";
 import { activateFortress } from "./activation.js";
+import { sharedMetadata, sharedOrigin, sharedToken } from "./shared-client.js";
+import { sharedHostCommand, sharedHostTokenFile } from "./shared-cli.js";
+import { migrateSharedState } from "./shared-migrate.js";
 
 type Flags = Record<string, string | boolean>;
 const stringFlag = (flags: Flags, name: string) => typeof flags[name] === "string" ? flags[name] as string : undefined;
@@ -38,6 +41,19 @@ export function setupBrowser(loaded: LoadedConfig, flags: Flags): string {
 	const file = path.join(path.dirname(loaded.paths.configPath), "alive.config.local.json");
 	const local = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
 	const browser = { ...DEFAULT_BROWSER_CONFIG, ...loaded.config.modules.browser, enabled: true };
+	const sharedUrl = stringFlag(flags, "shared-url");
+	if (sharedUrl !== undefined) {
+		browser.sharedUrl = sharedUrl ? sharedOrigin(sharedUrl) : "";
+		if (browser.sharedUrl && !process.env[browser.sharedTokenFileEnv] && !process.env[browser.sharedTokenEnv]) {
+			const tokenFile = sharedHostTokenFile(loaded);
+			if (!fs.existsSync(tokenFile)) throw new Error("Start the local browser host first, or configure ALIVE_BROWSER_SHARED_TOKEN_FILE/ALIVE_BROWSER_SHARED_TOKEN for a remote host");
+			const envFile = path.join(path.dirname(loaded.paths.configPath), ".env"), existing = fs.existsSync(envFile) ? fs.readFileSync(envFile, "utf8") : "";
+			if (existing.split(/\r?\n/).some(line => line.trim().startsWith(`${browser.sharedTokenFileEnv}=`))) throw new Error("Load the existing shared token configuration before setup; it was preserved");
+			fs.writeFileSync(envFile, `${existing}${existing && !existing.endsWith("\n") ? "\n" : ""}${browser.sharedTokenFileEnv}=${JSON.stringify(tokenFile)}\n`, { mode: 0o600 }); fs.chmodSync(envFile, 0o600);
+			process.env[browser.sharedTokenFileEnv] = tokenFile;
+		}
+		if (browser.sharedUrl) sharedToken(browser);
+	}
 	const managedEngine = stringFlag(flags, "engine");
 	if (managedEngine !== undefined) {
 		if (!["chrome", "fortress"].includes(managedEngine)) throw new Error("Use --engine chrome or fortress");
@@ -64,6 +80,7 @@ export function setupBrowser(loaded: LoadedConfig, flags: Flags): string {
 		browser.executablePathEnv = executableEnv;
 	}
 	if (browser.cdpEndpointEnv && browser.executablePathEnv) throw new Error("Choose --executable-env or --cdp-env, not both");
+	if (browser.sharedUrl && (browser.cdpEndpointEnv || browser.executablePathEnv)) throw new Error("Clear dedicated CDP/executable overrides before selecting a shared host");
 	const launchMode = stringFlag(flags, "launch-mode");
 	if (launchMode) {
 		if (!["auto", "driver", "native"].includes(launchMode)) throw new Error("Use --launch-mode auto, driver or native");
@@ -140,7 +157,9 @@ export async function browserCommand(loaded: LoadedConfig, action: string, flags
 			finally { process.off("SIGINT", cancel); process.off("SIGTERM", cancel); }
 		}
 		case "serve": return await serve(loaded, flags);
-		default: throw new Error("usage: alive browser setup [--engine chrome|fortress] [--fortress-image tilion/fortress@sha256:DIGEST] [--require-activation true|false] [--driver patchright|playwright] [--cdp-env ENV_NAME | --executable-env ENV_NAME] [--channel chrome|chromium] [--launch-mode auto|driver|native] [--native-warmup-ms 10000] [--humanization true|false] [--public-url HTTPS_ORIGIN] [--identity-url HTTPS_ORIGIN] [--headless true|false] [--challenge-wait-ms 15000] [--navigation-interval-ms 2000] [--sign-origins HTTPS_ORIGIN,...] | activate | doctor [--online] | diagnose | pair | serve [--url HTTP_URL] [--local] [--tunnel] [--cloudflared PATH]");
+		case "host": case "host-stop": case "host-status": return await sharedHostCommand(loaded, action, flags);
+		case "migrate-shared": return await migrateSharedState(loaded);
+		default: throw new Error("usage: alive browser setup [--engine chrome|fortress] [--shared-url PRIVATE_ORIGIN] [--fortress-image tilion/fortress@sha256:DIGEST] [--require-activation true|false] [--driver patchright|playwright] [--cdp-env ENV_NAME | --executable-env ENV_NAME] [--channel chrome|chromium] [--launch-mode auto|driver|native] [--native-warmup-ms 10000] [--humanization true|false] [--public-url HTTPS_ORIGIN] [--identity-url HTTPS_ORIGIN] [--headless true|false] [--challenge-wait-ms 15000] [--navigation-interval-ms 2000] [--sign-origins HTTPS_ORIGIN,...] | host [--background|--foreground] [--bind ADDRESS] [--port 4330] [--max-clients 8] [--token-file PATH] | host-stop | host-status | migrate-shared | activate | doctor [--online] | diagnose | pair | serve [--url HTTP_URL] [--local] [--tunnel] [--cloudflared PATH]");
 	}
 }
 
@@ -154,7 +173,7 @@ async function doctor(loaded: LoadedConfig, online: boolean): Promise<number> {
 	const endpoint = resolveCdpEndpoint(browser);
 	const executablePath = resolveBrowserExecutable(browser);
 	let activationReady = true;
-	if (browser.engine === "fortress" && !endpoint) {
+	if (browser.engine === "fortress" && !endpoint && !browser.sharedUrl) {
 		let configured = false;
 		try { configured = !!resolveFortressLicense({ ...browser, fortressRequireLicense: false }); } catch { /* Report state without displaying private credentials. */ }
 		activationReady = configured || !browser.fortressRequireLicense;
@@ -164,7 +183,12 @@ async function doctor(loaded: LoadedConfig, online: boolean): Promise<number> {
 		? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
 		: process.platform === "win32" ? [path.join(process.env.PROGRAMFILES ?? "", "Google/Chrome/Application/chrome.exe"), path.join(process.env.LOCALAPPDATA ?? "", "Google/Chrome/Application/chrome.exe")]
 		: ["/opt/google/chrome/chrome", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"];
-	let installed = endpoint || executablePath ? true : browser.engine === "fortress" ? await fortressImageInstalled(browser.fortressImage) : candidates.some(file => fs.existsSync(file));
+	let installed = browser.sharedUrl || endpoint || executablePath ? true : browser.engine === "fortress" ? await fortressImageInstalled(browser.fortressImage) : candidates.some(file => fs.existsSync(file));
+	if (browser.sharedUrl) {
+		sharedOrigin(browser.sharedUrl); sharedToken(browser);
+		const metadata = online ? await sharedMetadata(browser) : undefined;
+		process.stdout.write(`Shared browser host: ${browser.sharedUrl}; ${online ? `reachable; ${metadata!.browserVersion}; native activation ${metadata!.fortressActivationVerified}` : "reachability unchecked"}; no local browser installation is required\n`);
+	}
 	if (online && endpoint) {
 		try {
 			const connection = await engine.connectOverCDP(endpoint, { timeout: browser.actionTimeoutMs, noDefaults: true });
@@ -177,13 +201,14 @@ async function doctor(loaded: LoadedConfig, online: boolean): Promise<number> {
 	}
 	if (!installed) process.stdout.write(browser.engine === "fortress" ? `Install the official image explicitly: docker pull ${browser.fortressImage}\n` : `Install browser: npx ${browser.driver === "patchright" ? "patchright" : "playwright"} install ${browser.channel}\n`);
 	process.stdout.write(`Managed engine: ${browser.engine}${browser.engine === "fortress" ? `; ${executablePath ? "trusted native executable" : browser.fortressImage}` : ""}\n`);
-	process.stdout.write(`Access policy: ${endpoint ? "external engine (inspect actual binary)" : executablePath ? "managed custom Chromium executable" : `${browser.engine === "fortress" ? "Fortress container" : browser.channel}; ${browser.headless ? "headless" : "headed"}`}; automatic check wait ${browser.challengeWaitMs} ms; per-origin navigation interval ${browser.minNavigationIntervalMs} ms\n`);
+	process.stdout.write(`Access policy: ${browser.sharedUrl ? "isolated context on the shared host" : endpoint ? "external engine (inspect actual binary)" : executablePath ? "managed custom Chromium executable" : `${browser.engine === "fortress" ? "Fortress container" : browser.channel}; ${browser.headless ? "headless" : "headed"}`}; automatic check wait ${browser.challengeWaitMs} ms; per-origin navigation interval ${browser.minNavigationIntervalMs} ms\n`);
 	process.stdout.write(`Launch mode: ${browser.launchMode}; native unsigned initial-navigation warmup ${browser.nativeWarmupMs} ms\n`);
 	if (!endpoint && browser.engine === "chrome" && browser.headless && browser.driver === "patchright") process.stdout.write("Compatibility note: Patchright recommends headed Chrome with a persistent profile. Headless Chrome may expose HeadlessChrome in its user agent.\n");
 	const chat = browser.notifyChatId || operator?.chatId;
 	const destinationAllowed = !!chat && (!telegram.allowedChatIds.length || telegram.allowedChatIds.map(String).includes(chat));
 	process.stdout.write(`Host: ${process.platform}/${process.arch}; configuration: ${loaded.paths.configPath}\nRuntime: ${snapshot?.alive ? `running (pid ${snapshot.pid})` : "not running here"}\nBrowser: ${browser.enabled ? "enabled" : "disabled"}; ${browser.driver}/${endpoint ? `external CDP (${online ? "reachable" : "reachability unchecked"})` : `${browser.engine === "fortress" ? "fortress" : browser.channel} ${installed ? "installed" : "not found"}`}; humanization ${browser.humanization.enabled ? "enabled" : "disabled"}\nPhone HTTPS address: ${browser.publicUrl || "not configured"}\nTelegram token: ${token ? "configured" : "missing"}\nOperator: ${chat ? `${chat}${destinationAllowed ? "" : " (denied by chat allowlist)"}` : "not paired"}\n`);
-	if (browser.signing.enabled) {
+	if (browser.signing.enabled && browser.sharedUrl) process.stdout.write(`Web Bot Auth: delegated to the shared host; expected operator ${browser.signing.agentUrl}\n`);
+	else if (browser.signing.enabled) {
 		const identity = new BrowserIdentity(browser.signing);
 		process.stdout.write(`Web Bot Auth: ${identity.agentUrl}; public key ID ${identity.keyId}\nRegistration: requires operator approval from Cloudflare; a local signature is not registration.\n`);
 	} else process.stdout.write("Web Bot Auth: disabled\n");
@@ -199,7 +224,7 @@ async function doctor(loaded: LoadedConfig, online: boolean): Promise<number> {
 		if (!response.ok) throw new Error(`Public browser endpoint returned HTTP ${response.status}`);
 		process.stdout.write("Public phone HTTPS endpoint reachable\n");
 	}
-	if (online && browser.signing.enabled) {
+	if (online && browser.signing.enabled && !browser.sharedUrl) {
 		const identity = new BrowserIdentity(browser.signing);
 		const response = await fetch(`${identity.agentUrl}/.well-known/http-message-signatures-directory`, { redirect: "error", signal: AbortSignal.timeout(10_000) });
 		if (!response.ok) throw new Error(`Identity directory returned HTTP ${response.status}`);

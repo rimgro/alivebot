@@ -6,6 +6,7 @@ import type { BrowserConfig } from "./config.js";
 import { resolveBrowserExecutable, resolveCdpEndpoint, resolveFortressLicense } from "./connection.js";
 import { chromeExecutable, launchNativeBrowser, type NativeBrowser } from "./native.js";
 import { launchManagedFortress, type ManagedFortress } from "./fortress.js";
+import { openSharedContext, type SharedContext } from "./shared-client.js";
 
 export interface CanvasReport {
 	passed: boolean;
@@ -51,12 +52,16 @@ export async function diagnoseBrowser(config: BrowserConfig): Promise<{ connecti
 	const engine = (config.driver === "patchright" ? (await import("patchright")).chromium : (await import("playwright")).chromium) as unknown as BrowserType;
 	const endpoint = resolveCdpEndpoint(config);
 	const executablePath = resolveBrowserExecutable(config);
-	const licenseFile = config.engine === "fortress" && !endpoint ? resolveFortressLicense(config) : undefined;
+	const licenseFile = config.engine === "fortress" && !endpoint && !config.sharedUrl ? resolveFortressLicense(config) : undefined;
 	let browser: Browser | undefined, context: BrowserContext | undefined, page: Page | undefined, directory: string | undefined;
 	let native: NativeBrowser | undefined;
 	let fortress: ManagedFortress | undefined;
+	let shared: SharedContext | undefined;
 	try {
-		if (endpoint) {
+		if (config.sharedUrl) {
+			directory = fs.mkdtempSync(path.join(os.tmpdir(), "alive-browser-shared-diagnose-"));
+			shared = await openSharedContext(config, directory, AbortSignal.timeout(30_000)); context = shared.context;
+		} else if (endpoint) {
 			try { browser = await engine.connectOverCDP(endpoint, { timeout: config.actionTimeoutMs, noDefaults: true }); }
 			catch { throw new Error("Cannot connect to the configured browser CDP endpoint"); }
 			context = browser.contexts()[0];
@@ -83,11 +88,12 @@ export async function diagnoseBrowser(config: BrowserConfig): Promise<{ connecti
 			})]);
 		} finally { clearTimeout(timer); }
 		const environment = await page.evaluate(() => ({ userAgent: navigator.userAgent, webdriver: (navigator as unknown as { webdriver?: boolean }).webdriver === true, language: navigator.language, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, headlessMarker: /HeadlessChrome/i.test(navigator.userAgent) }));
-		const fortressActivationVerified = fortress?.activationVerified;
-		return { connection: endpoint ? "cdp" : fortress ? "managed-fortress" : native ? "managed-native" : "managed", version: context.browser()!.version(), ...(fortress ? { fortressActivationVerified } : {}), environment, canvas };
+		const fortressActivationVerified = shared?.metadata.fortressActivationVerified ?? fortress?.activationVerified;
+		return { connection: shared ? "shared" : endpoint ? "cdp" : fortress ? "managed-fortress" : native ? "managed-native" : "managed", version: context.browser()!.version(), ...(fortress || shared ? { fortressActivationVerified } : {}), environment, canvas };
 	} finally {
 		await page?.close().catch(() => {});
-		if (browser) await browser.close();
+		if (shared) await shared.close();
+		else if (browser) await browser.close();
 		else await context?.close();
 		await native?.close();
 		await fortress?.close();

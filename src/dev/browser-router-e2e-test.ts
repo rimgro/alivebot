@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash, createHmac } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as os from "node:os";
@@ -10,7 +10,8 @@ import { ModuleHost } from "../events/host.js";
 import { Logger } from "../log.js";
 import { BrowserRouter } from "../modules/browser/router.js";
 import type { BrowserModule } from "../modules/browser/module.js";
-import { DEFAULT_HUMANIZATION } from "../modules/browser/config.js";
+import { DEFAULT_BROWSER_CONFIG, DEFAULT_HUMANIZATION } from "../modules/browser/config.js";
+import { SharedBrowserHost } from "../modules/browser/shared-server.js";
 import { EventStore } from "../store/events.js";
 import { HistoryStore } from "../store/history.js";
 
@@ -36,8 +37,12 @@ const nativeViewport = process.env.ALIVE_BROWSER_TEST_NATIVE_VIEWPORT === "1";
 const forceCompatibility = process.env.ALIVE_BROWSER_TEST_VIEWPORT_FALLBACK === "1";
 const nativeLaunch = process.env.ALIVE_BROWSER_TEST_NATIVE_LAUNCH === "1";
 const fortressLaunch = process.env.ALIVE_BROWSER_TEST_FORTRESS === "1";
-const router = new BrowserRouter({ port: 0, engine: fortressLaunch ? "fortress" : "chrome", fortressRequireLicense: fortressLaunch && !!process.env.ALIVE_FORTRESS_LICENSE_FILE, viewport: nativeViewport || nativeLaunch || fortressLaunch ? null : { width: 900, height: 720 }, driver, launchMode: nativeLaunch ? "native" : "driver", nativeWarmupMs: 400, headless: fortressLaunch ? true : nativeLaunch ? false : process.env.ALIVE_BROWSER_TEST_HEADED !== "1", minActionIntervalMs: 0, minNavigationIntervalMs: 0, humanization: { ...DEFAULT_HUMANIZATION, enabled: false } }, {
-	...(nativeLaunch || fortressLaunch ? {} : { launch: async (directory: string, options: Parameters<typeof engine.launchPersistentContext>[1]) => {
+const sharedLaunch = process.env.ALIVE_BROWSER_TEST_SHARED === "1";
+const sharedToken = randomBytes(32).toString("base64url"); process.env.ALIVE_ROUTER_SHARED_TEST_TOKEN = sharedToken;
+const sharedHost = sharedLaunch ? new SharedBrowserHost({ config: { ...DEFAULT_BROWSER_CONFIG, engine: fortressLaunch ? "fortress" : "chrome", fortressRequireLicense: fortressLaunch && !!process.env.ALIVE_FORTRESS_LICENSE_FILE, headless: true, driver }, directory: path.join(root, "shared-host"), token: sharedToken, port: 0 }) : undefined;
+await sharedHost?.start();
+const router = new BrowserRouter({ port: 0, sharedUrl: sharedHost?.endpoint() || "", sharedTokenEnv: "ALIVE_ROUTER_SHARED_TEST_TOKEN", sharedTokenFileEnv: "ALIVE_ROUTER_SHARED_TEST_TOKEN_FILE", engine: fortressLaunch ? "fortress" : "chrome", fortressRequireLicense: fortressLaunch && !!process.env.ALIVE_FORTRESS_LICENSE_FILE, viewport: nativeViewport || nativeLaunch || fortressLaunch ? null : { width: 900, height: 720 }, driver, launchMode: nativeLaunch ? "native" : "driver", nativeWarmupMs: 400, headless: fortressLaunch ? true : nativeLaunch ? false : process.env.ALIVE_BROWSER_TEST_HEADED !== "1", minActionIntervalMs: 0, minNavigationIntervalMs: 0, humanization: { ...DEFAULT_HUMANIZATION, enabled: false } }, {
+	...(nativeLaunch || fortressLaunch || sharedLaunch ? {} : { launch: async (directory: string, options: Parameters<typeof engine.launchPersistentContext>[1]) => {
 		const context = await engine.launchPersistentContext(directory, options) as unknown as BrowserContext;
 		if (forceCompatibility) {
 			const connect = context.newCDPSession.bind(context);
@@ -86,17 +91,18 @@ try {
 	assert.deepEqual(links.map(value => value.thread), ["telegram:111"]);
 	scope = ["telegram:222"];
 	await router.command({ action: "navigate", url: `${target}/?owner=222` });
-	if (nativeLaunch || fortressLaunch) {
+	if (nativeLaunch || fortressLaunch || sharedLaunch) {
 		const sessions = (router as unknown as { sessions: Map<string, { browser: BrowserModule }> }).sessions;
 		for (const thread of ["telegram:111", "telegram:222"]) {
 			const browser = sessions.get(thread)!.browser;
 			contexts.push((browser as unknown as { context: BrowserContext }).context);
-			assert.equal(browser.status().launchMode, fortressLaunch ? "fortress-container" : "native");
+			assert.equal(browser.status().launchMode, sharedLaunch ? "shared-service" : fortressLaunch ? "fortress-container" : "native");
 			if (fortressLaunch) assert.equal(browser.status().engine, "fortress");
 			assert.equal(await contexts.at(-1)!.pages()[0].evaluate("navigator.webdriver"), false);
-			assert.ok(!await contexts.at(-1)!.pages()[0].evaluate("navigator.userAgent.includes('HeadlessChrome')"));
+			if (!sharedLaunch || fortressLaunch) assert.ok(!await contexts.at(-1)!.pages()[0].evaluate("navigator.userAgent.includes('HeadlessChrome')"));
 		}
 	}
+	if (sharedHost) assert.equal(sharedHost.status().contexts, 2, "Both Telegram conversations must use isolated contexts on the same shared engine");
 	assert.deepEqual(links.map(value => value.thread), ["telegram:111", "telegram:222"]);
 	assert.equal((await contexts[0].cookies(target)).find(cookie => cookie.name === "fixture_owner")?.value, "111");
 	assert.equal((await contexts[1].cookies(target)).find(cookie => cookie.name === "fixture_owner")?.value, "222");
@@ -191,7 +197,7 @@ try {
 	assert.equal((await router.command({ action: "status" })).details.handoff, undefined);
 	await router.command({ action: "close" });
 	assert.equal(links.length, before);
-	console.log(`Browser routing E2E passed (${driver}, ${fortressLaunch ? "managed Fortress" : nativeLaunch ? "native launch" : "driver launch"}): isolated profiles, closure/reopen, authenticated recovery without storage, cross-account denial, mobile fit/fullscreen, same-owner input/return and agent revocation`);
+	console.log(`Browser routing E2E passed (${driver}, ${sharedLaunch ? "shared host" : fortressLaunch ? "managed Fortress" : nativeLaunch ? "native launch" : "driver launch"}): isolated profiles, closure/reopen, authenticated recovery without storage, cross-account denial, mobile fit/fullscreen, same-owner input/return and agent revocation`);
 } finally {
-	await operator?.close(); await host.stop(); fixture.closeAllConnections(); await new Promise<void>(resolve => fixture.close(() => resolve())); fs.rmSync(root, { recursive: true, force: true });
+	await operator?.close(); await host.stop(); await sharedHost?.close(); fixture.closeAllConnections(); await new Promise<void>(resolve => fixture.close(() => resolve())); fs.rmSync(root, { recursive: true, force: true });
 }

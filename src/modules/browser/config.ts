@@ -19,6 +19,11 @@ export interface BrowserConfig {
 	fortressRequireLicense: boolean;
 	/** Empty launches Chrome; otherwise attach to the loopback CDP URL in this env var. */
 	cdpEndpointEnv: string;
+	/** Private shared-browser host; empty retains a dedicated managed browser. */
+	sharedUrl: string;
+	/** A shared host accepts either a private token file or a token environment variable. */
+	sharedTokenFileEnv: string;
+	sharedTokenEnv: string;
 	/** Optional trusted Chromium/Fortress executable. Managed profiles remain per conversation. */
 	executablePathEnv: string;
 	/** Native launches minimize framework startup flags; auto selects native for headed Chrome. */
@@ -68,6 +73,9 @@ export const DEFAULT_BROWSER_CONFIG: BrowserConfig = {
 	fortressLicenseFileEnv: "ALIVE_FORTRESS_LICENSE_FILE",
 	fortressRequireLicense: true,
 	cdpEndpointEnv: "",
+	sharedUrl: "",
+	sharedTokenFileEnv: "ALIVE_BROWSER_SHARED_TOKEN_FILE",
+	sharedTokenEnv: "ALIVE_BROWSER_SHARED_TOKEN",
 	executablePathEnv: "",
 	launchMode: "auto",
 	nativeWarmupMs: 10_000,

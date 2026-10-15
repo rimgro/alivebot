@@ -24,6 +24,7 @@ export class BrowserLive {
 	private endCapture?: () => void;
 	private counters = { captured: 0, sent: 0, acknowledged: 0, bytesSent: 0, duplicates: 0 };
 	private profile = "balanced";
+	private readonly snapshots = new Set<Promise<void>>();
 
 	constructor(server: Server, private readonly deps: LiveDependencies) {
 		server.on("upgrade", (request, socket, head) => this.upgrade(request, socket, head));
@@ -31,6 +32,12 @@ export class BrowserLive {
 
 	get busy(): boolean { return !!this.active; }
 	status(): Record<string, unknown> { return { connected: this.busy, ...this.counters, profile: this.profile }; }
+	/** Terminal viewport restoration must follow any temporary metrics used by an in-flight screenshot. */
+	async settleCapture(): Promise<void> {
+		let timer: NodeJS.Timeout | undefined;
+		try { await Promise.race([Promise.all([...this.snapshots]), new Promise<void>(resolve => { timer = setTimeout(resolve, 1800); })]); }
+		finally { clearTimeout(timer); }
+	}
 
 	end(message = "No active handoff", completed = false): void {
 		this.endCapture?.(); this.endCapture = undefined;
@@ -100,6 +107,8 @@ export class BrowserLive {
 		const screenshot = async (page: Page, quality: number, current: number, detail = false) => {
 			if (snapshotInFlight) return;
 			snapshotInFlight = true; const before = revision;
+			let finished!: () => void;
+			const completion = new Promise<void>(resolve => { finished = resolve; }); this.snapshots.add(completion);
 			try {
 				this.deps.authorize(credential);
 				const viewport = page.viewportSize() ?? await page.evaluate(() => ({ width: (globalThis as unknown as { innerWidth: number }).innerWidth, height: (globalThis as unknown as { innerHeight: number }).innerHeight }));
@@ -124,7 +133,7 @@ export class BrowserLive {
 					this.counters.captured++; offer(data, viewport, detail);
 				}
 			} catch { /* Navigation or revocation may interrupt an independent capture. */ }
-			finally { snapshotInFlight = false; }
+			finally { snapshotInFlight = false; this.snapshots.delete(completion); finished(); }
 		};
 		const capture = async (page: Page) => {
 			capturing = true; sourcePage = page;

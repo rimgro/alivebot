@@ -12,6 +12,7 @@ import { DEFAULT_BROWSER_CONFIG, type BrowserConfig } from "./config.js";
 import { BrowserModule, type BrowserDependencies } from "./module.js";
 import { writePrivateJson } from "./operator.js";
 import { BrowserIdentity } from "./identity.js";
+import { sharedDirectory } from "./shared-client.js";
 import { controlPage } from "./page.js";
 import { BrowserNavigationBudget } from "./access.js";
 
@@ -44,14 +45,14 @@ export class BrowserRouter implements AliveModule {
 
 	async start(ctx: ModuleContext): Promise<void> {
 		this.ctx = ctx;
-		this.identity = this.config.signing.enabled ? new BrowserIdentity(this.config.signing) : undefined;
+		this.identity = this.config.signing.enabled && !this.config.sharedUrl ? new BrowserIdentity(this.config.signing) : undefined;
 		if (!["127.0.0.1", "localhost", "::1"].includes(this.config.host)) throw new Error("Routed browser sessions require a loopback listener and an HTTPS proxy");
 		if (this.config.publicUrl) {
 			const url = new URL(this.config.publicUrl);
 			if (url.protocol !== "https:" || url.pathname !== "/" || url.username || url.password || url.search || url.hash) throw new Error("Use an exact HTTPS browser origin");
 			this.config.publicUrl = url.origin;
 		}
-		const server = http.createServer((request, response) => this.handle(request, response));
+		const server = http.createServer((request, response) => { void this.handle(request, response).catch(() => { if (response.headersSent) response.destroy(); else { response.writeHead(502); response.end(); } }); });
 		server.maxConnections = 64; server.headersTimeout = 10_000; server.requestTimeout = 20_000;
 		server.on("upgrade", (request, socket, head) => this.upgrade(request, socket, head));
 		await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(this.config.port, this.config.host, resolve); });
@@ -134,7 +135,7 @@ export class BrowserRouter implements AliveModule {
 		const url = new URL(configured);
 		if (url.protocol !== "https:" || url.pathname !== "/" || url.username || url.password || url.search || url.hash) throw new Error("Use an exact HTTPS browser origin");
 		if (url.origin === this.origin) return;
-		if (this.identity?.agentUrl === this.origin) throw new Error("A locally hosted identity requires a stable public origin");
+		if (this.config.signing.enabled && this.config.signing.agentUrl === this.origin) throw new Error("A locally hosted identity requires a stable public origin");
 		const update = this.serial.then(async () => {
 			await Promise.all([...this.sessions.values()].map(session => session.browser.replacePublicOrigin(url.origin)));
 			this.config.publicUrl = url.origin; this.origin = url.origin;
@@ -162,7 +163,7 @@ export class BrowserRouter implements AliveModule {
 		const create = this.serial.then(async () => {
 			if (this.stopped) throw new Error("Browser router is stopped");
 			const existing = this.sessions.get(thread); if (existing) return existing;
-			if (this.sessions.size >= (this.config.engine === "fortress" && !this.config.executablePathEnv ? 2 : 8)) throw new Error("Too many browser conversations; close an unused session first");
+			if (this.sessions.size >= (this.config.engine === "fortress" && !this.config.executablePathEnv && !this.config.sharedUrl ? 2 : 8)) throw new Error("Too many browser conversations; close an unused session first");
 			const ctx = this.ctx!;
 			if (this.config.cdpEndpointEnv) {
 				const file = path.join(ctx.moduleDir(), "external-owner.json");
@@ -192,10 +193,10 @@ export class BrowserRouter implements AliveModule {
 		return session ? { session, path: `/browser${match[2] || ""}` } : undefined;
 	}
 
-	private handle(request: http.IncomingMessage, response: http.ServerResponse): void {
-		if (request.method === "GET" && request.url === "/.well-known/http-message-signatures-directory" && this.identity) {
-			if (request.headers.host !== new URL(this.identity.agentUrl).host) { response.writeHead(421); response.end(); return; }
-			const directory = this.identity.directory(); response.writeHead(200, { ...directory.headers, "Cache-Control": "no-store" }); response.end(directory.body); return;
+	private async handle(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
+		if (request.method === "GET" && request.url === "/.well-known/http-message-signatures-directory" && this.config.signing.enabled) {
+			if (request.headers.host !== new URL(this.config.signing.agentUrl).host) { response.writeHead(421); response.end(); return; }
+			const directory = this.identity ? this.identity.directory() : await sharedDirectory(this.config); response.writeHead(200, { ...directory.headers, "Cache-Control": "no-store" }); response.end(directory.body); return;
 		}
 		const target = this.target(request.url);
 		if (!target) {

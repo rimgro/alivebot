@@ -979,9 +979,12 @@ usage:
   alive telegram me | chats | chat <id|@name> | send <id|@name> <text> | ping
   alive telegram whitelist [list | add <user-id> | remove <user-id>]
                                               manage Telegram user access without restart
-  alive browser setup [--engine chrome|fortress] [--cdp-env ENV_NAME | --executable-env ENV_NAME] [--launch-mode auto|driver|native] [--public-url HTTPS_ORIGIN] [--headless true|false] [--sign-origins ORIGIN,...]
+  alive browser setup [--engine chrome|fortress] [--shared-url PRIVATE_ORIGIN | --cdp-env ENV_NAME | --executable-env ENV_NAME] [--launch-mode auto|driver|native] [--public-url HTTPS_ORIGIN] [--headless true|false] [--sign-origins ORIGIN,...]
   alive browser activate | doctor [--online] | diagnose | pair | serve [--local] [--url URL]
                                               configure, diagnose and test phone handoff without an LLM
+  alive browser host [--background|--foreground] [--bind ADDRESS] [--port 4330] [--max-clients 8]
+  alive browser host-status | host-stop | migrate-shared
+                                              one private browser host for isolated agent connections
   alive thoughts [-n 20]                      the agent's private monologue
 `);
 }

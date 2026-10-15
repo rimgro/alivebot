@@ -22,6 +22,7 @@ import { BrowserNotification } from "./notification.js";
 import { BrowserObservation, waitCatalogContent } from "./observation.js";
 import { launchManagedFortress, validateFortressImage, type ManagedFortress } from "./fortress.js";
 import { checkCanvas } from "./diagnostics.js";
+import { openSharedContext, sharedDirectory, sharedOrigin, sharedToken, type SharedContext } from "./shared-client.js";
 
 type Result = AgentToolResult<Record<string, unknown>>;
 interface Command { action: string; url?: string; selector?: string; timeoutMs?: number; text?: string; key?: string; delta?: number; reason?: string; renew?: boolean; mode?: "shared" | "assistance" }
@@ -57,6 +58,7 @@ export class BrowserModule implements AliveModule {
 	private browserVersion?: string;
 	private nativeBrowser?: NativeBrowser;
 	private fortressBrowser?: ManagedFortress;
+	private sharedBrowser?: SharedContext;
 	private fortressLicenseFile?: string;
 	private fortressActivationVerified?: boolean;
 	private seededNativeUrl?: string;
@@ -107,7 +109,7 @@ export class BrowserModule implements AliveModule {
 		this.lifecycleAbort = new AbortController();
 		this.validateConfig();
 		this.ctx = ctx;
-		this.identity = this.config.signing.enabled ? new BrowserIdentity(this.config.signing) : undefined;
+		this.identity = this.config.signing.enabled && !this.config.sharedUrl ? new BrowserIdentity(this.config.signing) : undefined;
 		this.notify = this.deps.notify;
 		if (!this.notify && (this.config.notifyChatId || readBrowserOperator(ctx.paths.modulesDir) || ctx.config.modules.telegram.enabled)) {
 			const telegram = ctx.config.modules.telegram;
@@ -198,11 +200,11 @@ export class BrowserModule implements AliveModule {
 	status(): Record<string, unknown> {
 		return {
 			listening: !!this.server, open: !!this.context, driver: this.config.driver, channel: this.config.channel, humanization: this.config.humanization.enabled,
-			connection: this.config.cdpEndpointEnv ? "cdp" : "managed",
-			launchMode: this.fortressBrowser ? "fortress-container" : this.nativeBrowser ? "native" : this.config.cdpEndpointEnv ? "external" : "driver",
+			connection: this.config.sharedUrl ? "shared" : this.config.cdpEndpointEnv ? "cdp" : "managed",
+			launchMode: this.sharedBrowser ? "shared-service" : this.fortressBrowser ? "fortress-container" : this.nativeBrowser ? "native" : this.config.cdpEndpointEnv ? "external" : "driver",
 			engine: this.config.cdpEndpointEnv ? "external-chromium" : this.config.engine === "fortress" ? "fortress" : this.config.executablePathEnv ? "custom-chromium" : this.config.channel,
-			fortressImage: this.fortressBrowser?.image,
-			fortressLicenseConfigured: this.config.engine === "fortress" ? !!this.fortressLicenseFile : undefined,
+			fortressImage: this.sharedBrowser?.metadata.fortressImage || this.fortressBrowser?.image,
+			fortressLicenseConfigured: this.config.engine === "fortress" && !this.config.sharedUrl ? !!this.fortressLicenseFile : undefined,
 			fortressActivationVerified: this.fortressActivationVerified,
 			headless: this.config.cdpEndpointEnv ? undefined : this.config.headless, browserVersion: this.browserVersion,
 			access: { state: this.accessState, checkingSince: this.accessState === "checking" ? this.checkingStartedAt : undefined, challengeWaitMs: this.config.challengeWaitMs },
@@ -210,7 +212,7 @@ export class BrowserModule implements AliveModule {
 			paused: !!this.pausedReason, reason: this.pausedReason,
 			lastHttpStatus: this.lastHttpStatus, retryAt: this.retryAt || undefined,
 			handoff: this.handoff ? { claimed: this.handoff.claimed, expiresAt: this.handoff.expiresAt, mode: this.pausedReason ? "assistance" : "shared" } : undefined,
-			signing: this.identity ? { agentUrl: this.identity.agentUrl, keyId: this.identity.keyId } : { enabled: false },
+			signing: this.sharedBrowser?.metadata.signing || (this.identity ? { agentUrl: this.identity.agentUrl, keyId: this.identity.keyId } : { enabled: false }),
 			live: this.live?.status(),
 		};
 	}
@@ -365,11 +367,12 @@ export class BrowserModule implements AliveModule {
 						await this.navigationBudget.wait(url, actionSignal, this.config.actionTimeoutMs);
 						const headers = this.identity?.requestHeaders(url) ?? {};
 						const response = await this.context!.request.get(url, { headers, maxRedirects: 0, timeout: this.config.actionTimeoutMs });
+						const signed = !!this.identity || !!this.sharedBrowser?.metadata.signing?.origins.includes(new URL(url).origin);
 						try {
 							const status = response.status(), headers = response.headers();
 							if (status === 429) this.navigationBudget.defer(url, retryDeadline(headers));
 							const requestAccess = status === 429 ? "rate-limited" : headers["cf-mitigated"] === "challenge" ? "verification" : status === 403 ? "denied" : status >= 400 ? "http-error" : "ready";
-							return result({ ...this.status(), status, location: headers.location, text: (await response.text()).slice(0, 20_000), networkClient: "node", signed: !!this.identity, requestAccess, ...(requestAccess !== "ready" ? { error: "The API client was denied or challenged. This is not a browser result. Respect rate limits; use navigate for an interactive website. No unrelated controller was sent." } : {}) });
+							return result({ ...this.status(), status, location: headers.location, text: (await response.text()).slice(0, 20_000), networkClient: "node", signed, requestAccess, ...(requestAccess !== "ready" ? { error: "The API client was denied or challenged. This is not a browser result. Respect rate limits; use navigate for an interactive website. No unrelated controller was sent." } : {}) });
 						} finally { await response.dispose(); }
 					}
 					default: throw new Error("Unknown browser action");
@@ -392,10 +395,16 @@ export class BrowserModule implements AliveModule {
 
 	private async ensurePage(initialUrl?: string, signal?: AbortSignal): Promise<Page> {
 		if (!this.context) {
+			if (this.sharedBrowser) { await this.sharedBrowser.close().catch(() => {}); this.sharedBrowser = undefined; }
 			if (this.nativeBrowser) { await this.nativeBrowser.close(); this.nativeBrowser = undefined; }
 			if (this.fortressBrowser) { await this.fortressBrowser.close(); this.fortressBrowser = undefined; }
 			const chromium = (this.config.driver === "patchright" ? (await import("patchright")).chromium : (await import("playwright")).chromium) as unknown as BrowserType;
-			if (this.cdpEndpoint) {
+			if (this.config.sharedUrl) {
+				const cancel = AbortSignal.any([this.ctx!.signal, this.lifecycleAbort.signal, ...(signal ? [signal] : [])]);
+				this.sharedBrowser = await openSharedContext(this.config, this.ctx!.moduleDir(), cancel);
+				this.attachedBrowser = this.sharedBrowser.browser; this.context = this.sharedBrowser.context;
+				this.fortressActivationVerified = this.sharedBrowser.metadata.fortressActivationVerified;
+			} else if (this.cdpEndpoint) {
 				const connect = this.deps.connect ?? chromium.connectOverCDP.bind(chromium);
 				try { this.attachedBrowser = await connect(this.cdpEndpoint, { timeout: this.config.actionTimeoutMs, noDefaults: true }); }
 				catch { throw new Error("Cannot connect to the configured browser CDP endpoint; check the browser and private port forward"); }
@@ -490,7 +499,8 @@ export class BrowserModule implements AliveModule {
 		clearTimeout(this.pointerTimer); this.pointerTimer = undefined; this.operatorPointerDown = false; this.monitorArmed = false;
 		clearTimeout(this.expiryTimer); this.expiryTimer = undefined; this.operatorViewport = undefined; this.viewportSnapshots = false;
 		this.endStream();
-		const context = this.context, attached = this.attachedBrowser, transport = this.signingTransport, native = this.nativeBrowser, fortress = this.fortressBrowser;
+		const context = this.context, attached = this.attachedBrowser, transport = this.signingTransport, native = this.nativeBrowser, fortress = this.fortressBrowser, shared = this.sharedBrowser;
+		this.sharedBrowser = undefined;
 		this.nativeBrowser = undefined; this.seededNativeUrl = undefined;
 		this.fortressBrowser = undefined;
 		this.fortressActivationVerified = undefined;
@@ -499,7 +509,8 @@ export class BrowserModule implements AliveModule {
 		await transport?.close();
 		// connectOverCDP's browser.close disconnects this client, preserving the
 		// externally managed process, default context, tabs and cookies.
-		if (attached) await attached.close();
+		if (shared) await shared.close().catch(() => this.ctx!.log.warn("Shared browser checkpoint failed; the last saved state was preserved"));
+		else if (attached) await attached.close();
 		else await context?.close();
 		await native?.close();
 		await fortress?.close();
@@ -720,9 +731,9 @@ export class BrowserModule implements AliveModule {
 		res.setHeader("X-Content-Type-Options", "nosniff");
 		res.setHeader("X-Frame-Options", "DENY");
 		const pathname = new URL(req.url ?? "/", "http://browser.local").pathname;
-		if (req.method === "GET" && pathname === "/.well-known/http-message-signatures-directory" && this.identity) {
-			if (req.headers.host !== new URL(this.identity.agentUrl).host) throw new HttpError(421, "Unexpected identity authority");
-			const directory = this.identity.directory();
+		if (req.method === "GET" && pathname === "/.well-known/http-message-signatures-directory" && this.config.signing.enabled) {
+			if (req.headers.host !== new URL(this.config.signing.agentUrl).host) throw new HttpError(421, "Unexpected identity authority");
+			const directory = this.identity ? this.identity.directory() : await sharedDirectory(this.config);
 			res.writeHead(200, directory.headers);
 			res.end(directory.body);
 			return;
@@ -803,7 +814,7 @@ export class BrowserModule implements AliveModule {
 
 	private async restoreViewport(): Promise<void> {
 		const viewport = this.operatorViewport; this.operatorViewport = undefined;
-		if (viewport && this.page && !this.page.isClosed()) await this.setPageViewport(viewport, this.config.viewport === null);
+		if (viewport && this.page && !this.page.isClosed()) { await this.live?.settleCapture(); await this.setPageViewport(viewport, this.config.viewport === null); }
 	}
 
 	private async setPageViewport(viewport: { width: number; height: number }, native = false): Promise<void> {
@@ -974,12 +985,16 @@ export class BrowserModule implements AliveModule {
 	}
 
 	private validateConfig(): void {
+		if (this.config.sharedUrl) {
+			sharedOrigin(this.config.sharedUrl); sharedToken(this.config);
+			if (this.config.cdpEndpointEnv || this.config.executablePathEnv) throw new Error("Choose a shared browser host or a dedicated/external browser, not both");
+		}
 		if (!["chrome", "fortress"].includes(this.config.engine)) throw new Error("browser.engine must be chrome or fortress");
 		validateFortressImage(this.config.fortressImage);
-		if (this.config.engine === "fortress" && !this.config.cdpEndpointEnv && !this.config.executablePathEnv && !this.config.headless) throw new Error("Managed Docker Fortress runs headless; configure headless:true or a trusted native Fortress executable");
+		if (this.config.engine === "fortress" && !this.config.sharedUrl && !this.config.cdpEndpointEnv && !this.config.executablePathEnv && !this.config.headless) throw new Error("Managed Docker Fortress runs headless; configure headless:true or a trusted native Fortress executable");
 		this.cdpEndpoint = resolveCdpEndpoint(this.config);
 		this.executablePath = resolveBrowserExecutable(this.config);
-		this.fortressLicenseFile = this.config.engine === "fortress" && !this.cdpEndpoint ? resolveFortressLicense(this.config) : undefined;
+		this.fortressLicenseFile = this.config.engine === "fortress" && !this.cdpEndpoint && !this.config.sharedUrl ? resolveFortressLicense(this.config) : undefined;
 		if (!["auto", "driver", "native"].includes(this.config.launchMode)) throw new Error("Invalid browser launch mode");
 		if (!Number.isInteger(this.config.nativeWarmupMs) || this.config.nativeWarmupMs < 0 || this.config.nativeWarmupMs > 15_000) throw new Error("Invalid native browser warmup");
 		if (!["patchright", "playwright"].includes(this.config.driver)) throw new Error("browser.driver must be patchright or playwright");
