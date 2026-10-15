@@ -207,6 +207,8 @@ try {
 	await operator.waitForFunction(() => {
 		const image = document.querySelector("#frame") as unknown as { naturalWidth: number; naturalHeight: number };
 		return remoteWidth === 1760 && remoteHeight === 1120 && image.naturalWidth > 0 && image.naturalWidth <= 1100 && image.naturalHeight <= 900;
+	}).catch(async error => {
+		console.error({ stage: "downscaled-viewport", live: browser.status().live, dimensions: await operator.evaluate(() => ({ remoteWidth, remoteHeight, width: (document.querySelector("#frame") as unknown as { naturalWidth: number }).naturalWidth, height: (document.querySelector("#frame") as unknown as { naturalHeight: number }).naturalHeight })) }); throw error;
 	});
 	const solve = await native.locator("#solve").boundingBox();
 	assert.ok(solve);
@@ -241,6 +243,23 @@ try {
 	const widgetResume = await fetch(`${widgetLink.origin}/browser/resume`, { method: "POST", headers: { "content-type": "application/json", Authorization: `Bearer ${widgetCredential}` }, body: "{}" });
 	assert.equal(widgetResume.status, 200, "Explicit resume must allow a provider-completed widget that stays visible");
 	assert.equal(browser.status().paused, false);
+	await browser.command({ action: "navigate", url: `${targetOrigin}/` });
+	const compatibleLink = (await browser.command({ action: "handoff" })).details.operatorUrl as string;
+	const compatible = await operatorBrowser.newPage({ viewport: { width: 375, height: 812 } });
+	await compatible.routeWebSocket("**/browser/live", socket => socket.close());
+	let compatibleStreams = 0;
+	compatible.on("request", request => { if (new URL(request.url()).pathname === "/browser/stream") compatibleStreams++; });
+	await compatible.goto(compatibleLink);
+	await compatible.waitForFunction(() => document.querySelector("#frame").naturalWidth > 0);
+	await sleep(10_500);
+	assert.equal(compatibleStreams, 1, "Small state keepalives must keep an idle compatible viewer connected without retransmitting images or reconnecting");
+	await widgetPage.locator("#target").click();
+	await compatible.getByLabel("Текст в выбранное поле браузера").fill("Compatible input");
+	await compatible.getByRole("button", { name: "Ввести текст", exact: true }).click();
+	await widgetPage.waitForFunction(() => document.querySelector("#target").value.includes("Compatible input"));
+	await compatible.getByRole("button", { name: "Готово — вернуть агенту" }).click();
+	await compatible.getByRole("status").filter({ hasText: "Управление возвращено агенту" }).waitFor();
+	await compatible.close();
 	await browser.command({ action: "navigate", url: `${targetOrigin}/interrupt` });
 	const typingStarted = Date.now();
 	const interrupted = await browser.command({ action: "fill", selector: "#target", text: "x".repeat(200) });

@@ -836,14 +836,14 @@ export class BrowserModule implements AliveModule {
 		return this.authorize(req);
 	}
 
-	private async captureFrame(req: http.IncomingMessage): Promise<Buffer> {
+	private async captureFrame(req: http.IncomingMessage, quality = 60): Promise<Buffer> {
 		if (!this.authorize(req).claimed) throw new HttpError(401, "Claim the operator link first");
 		if (this.capturingFrame || this.live?.busy) throw new HttpError(409, "A browser frame is already being captured");
 		const page = this.page;
 		if (this.stopped || !page || page.isClosed()) throw new HttpError(410, "Browser page closed");
 		this.capturingFrame = true;
 		try {
-			const buffer = await page.screenshot({ type: "jpeg", quality: 60, scale: "css", timeout: 1500 });
+			const buffer = await page.screenshot({ type: "jpeg", quality, scale: "css", timeout: 1500 });
 			this.authorize(req);
 			if (buffer.length > 4 * 1024 * 1024) throw new HttpError(413, "Browser frame is too large");
 			return buffer;
@@ -864,12 +864,20 @@ export class BrowserModule implements AliveModule {
 		res.once("close", () => abort.abort());
 		res.writeHead(200, { "Content-Type": "application/x-ndjson", "X-Accel-Buffering": "no" });
 		res.flushHeaders();
+		let previousDigest = "", lastStateAt = 0, previousState: boolean | undefined;
 		try {
 			while (!abort.signal.aborted && !res.destroyed && !res.writableEnded) {
 				const started = Date.now();
-				const frame = await this.captureFrame(req);
+				const frame = await this.captureFrame(req, 45);
 				if (!frame || abort.signal.aborted || res.writableEnded) break;
-				if (!res.write(`${JSON.stringify({ frame: frame.toString("base64"), paused: !!this.pausedReason })}\n`)) {
+				const fingerprint = createHash("sha256").update(frame).digest("hex"), paused = !!this.pausedReason;
+				let packet = "";
+				if (fingerprint !== previousDigest) {
+					previousDigest = fingerprint;
+					packet = `${JSON.stringify({ frame: frame.toString("base64"), paused })}\n`;
+				} else if (paused !== previousState || Date.now() - lastStateAt >= 3000) packet = `${JSON.stringify({ type: "state", paused })}\n`;
+				if (packet) { lastStateAt = Date.now(); previousState = paused; }
+				if (packet && !res.write(packet)) {
 					await new Promise<void>((resolve, reject) => {
 						const done = (error?: Error) => { clearTimeout(timer); res.off("drain", drained); res.off("close", closed); error ? reject(error) : resolve(); };
 						const drained = () => done(); const closed = () => done(new Error("Stream closed"));
@@ -877,7 +885,8 @@ export class BrowserModule implements AliveModule {
 						res.once("drain", drained); res.once("close", closed);
 					});
 				}
-				await delay(Math.max(0, 200 - (Date.now() - started)), undefined, { signal: abort.signal });
+				// Include base64/JSON overhead in the compatible transport's sustained budget.
+				await delay(Math.max(0, Math.max(200, Buffer.byteLength(packet) * 1000 / 160_000) - (Date.now() - started)), undefined, { signal: abort.signal });
 			}
 		} catch (error) {
 			if (!res.destroyed && !res.writableEnded) res.write(`${JSON.stringify({ error: error instanceof HttpError ? error.message : "Browser stream interrupted", status: error instanceof HttpError ? error.status : 503 })}\n`);

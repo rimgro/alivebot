@@ -168,6 +168,9 @@ try {
 	const reader = stream.body!.getReader();
 	const firstFrame = JSON.parse(new TextDecoder().decode((await reader.read()).value).split("\n")[0]);
 	assert.equal(Buffer.from(firstFrame.frame, "base64").equals(await page.screenshot()), true);
+	const idlePacket = JSON.parse(new TextDecoder().decode((await reader.read()).value).split("\n")[0]);
+	assert.equal(idlePacket.type, "state", "An unchanged compatible stream sends a small keepalive instead of another JPEG");
+	assert.equal(idlePacket.frame, undefined);
 	assert.equal((await fetch(`${origin}/browser/stream`, { headers: { Authorization: `Bearer ${credential}` } })).status, 409, "Only one bounded stream may capture a session");
 	assert.equal((await post(origin, "input", credential, { type: "down", x: 901, y: 10 })).status, 400);
 	assert.equal((await post(origin, "input", credential, { type: "key", key: "F12" })).status, 400);
