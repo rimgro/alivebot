@@ -20,6 +20,7 @@ import {
 } from "../store/runs.js";
 import { ThreadStore } from "../store/threads.js";
 import { buildAgent, readSoul } from "./session.js";
+import { SandboxManager } from "../sandbox/manager.js";
 import type { RunHandle, ToolDeps } from "./tools.js";
 import { ConsoleTransport, NullTransport } from "../transports/console.js";
 import { HttpTransport } from "../transports/http.js";
@@ -67,6 +68,7 @@ export class AliveRuntime {
 	private history!: HistoryStore;
 	private runs!: RunLog;
 	private runner!: AgentRunner;
+	private sandbox?: SandboxManager;
 	private toolDeps!: ToolDeps;
 	private host!: ModuleHost;
 	private modules: AliveModule[] = [];
@@ -100,6 +102,7 @@ export class AliveRuntime {
 
 	private async build(): Promise<void> {
 		const { paths } = this.config;
+		if (this.config.config.sandbox.enabled) this.sandbox = new SandboxManager(this.config, this.log);
 		this.store = EventStore.open(paths.stateDir);
 		this.reminders = new ReminderStore(paths.stateDir);
 		this.notes = new NoteStore(paths.stateDir);
@@ -164,6 +167,11 @@ export class AliveRuntime {
 		this.modules = loaded.modules;
 		this.moduleErrors = loaded.errors;
 
+		const workspacePath = (file: string) => {
+			const p = this.sandbox!.path(file);
+			if (!p.startsWith(`${this.sandbox!.workspaceDir}/`)) throw new Error(`Integration files must be inside ${this.sandbox!.workspaceDir}`);
+			return p;
+		};
 		this.host = new ModuleHost({
 			config: this.config,
 			log: this.log,
@@ -174,6 +182,15 @@ export class AliveRuntime {
 			history: this.history,
 			runtimeStatus: () => this.status(),
 			currentThreads: () => this.currentRun?.currentThreads ?? [],
+			workspaceFiles: this.sandbox ? {
+				rootDir: this.sandbox.workspaceDir,
+				readFile: (file) => this.sandbox!.exclusive(async () => (await this.sandbox!.files()).read(workspacePath(file))),
+				writeFile: (file, data) => this.sandbox!.exclusive(async () => {
+					const p = workspacePath(file);
+					await (await this.sandbox!.files()).write(p, data);
+					return p;
+				}),
+			} : undefined,
 		});
 	}
 
@@ -184,7 +201,9 @@ export class AliveRuntime {
 			log: this.log.child("agent"),
 			soul: readSoul(this.config.paths.soulPath),
 			forceNewSession: forceNew,
+			sandbox: this.sandbox,
 		});
+		this.sandbox?.startMonitoring();
 		return built.session;
 	}
 
@@ -293,6 +312,7 @@ export class AliveRuntime {
 		await this.host?.stop().catch(() => undefined);
 		await this.memory?.close().catch(() => undefined);
 		session?.dispose();
+		await this.sandbox?.close().catch((error) => this.log.warn("sandbox detach failed; VM retained", { error: String(error) }));
 		this.statusKind = "stopped";
 		this.writeState(true);
 		this.log.info("stopped", { reason });
@@ -499,14 +519,18 @@ export class AliveRuntime {
 	}
 
 	private assertSingleInstance(): void {
-		if (this.force) return;
+		// Two owners could race stopped-volume writes against boot/probes. Force
+		// cannot bypass single-instance safety for an isolated profile.
+		if (this.force && !this.config.config.sandbox.enabled) return;
 		const state = readRuntimeState(this.config.paths.stateDir);
 		if (!state || state.status === "stopped") return;
 		if (state.pid === process.pid) return;
 		if (isProcessAlive(state.pid)) {
 			throw new Error(
 				`another alive runtime is already running (pid ${state.pid}, started ${new Date(state.startedAt).toISOString()}). ` +
-					`Use --force to start anyway (not recommended: cursor writes will race).`,
+					(this.config.config.sandbox.enabled
+						? `Stop the old runtime first; --force cannot create concurrent owners of an isolated workspace.`
+						: `Use --force to start anyway (not recommended: cursor writes will race).`),
 			);
 		}
 		this.log.warn("stale runtime state file found", { pid: state.pid, status: state.status });

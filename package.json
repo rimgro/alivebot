@@ -8,7 +8,7 @@
     "alive": "./dist/index.js"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.5"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -29,8 +29,10 @@
     "browser": "tsx src/index.ts browser",
     "telegram": "tsx src/index.ts telegram",
     "smoke": "tsx src/dev/smoke.ts",
-    "test": "tsc -p tsconfig.json --noEmit && tsx src/dev/onboarding-test.ts && tsx src/dev/agent-lifecycle-test.ts && tsx src/dev/agent-messaging-test.ts && tsx src/dev/agent-tui-test.ts && tsx src/dev/memory-test.ts && tsx src/dev/store-test.ts && tsx src/dev/idle-test.ts && tsx src/dev/runner-test.ts && tsx src/dev/modules-test.ts && tsx src/dev/daemon-test.ts && tsx src/dev/browser-test.ts && tsx src/dev/browser-access-test.ts && tsx src/dev/browser-live-test.ts && tsx src/dev/browser-router-test.ts && tsx src/dev/browser-router-capacity-test.ts && tsx src/dev/browser-identity-worker-test.ts && tsx src/dev/browser-operator-test.ts && tsx src/dev/browser-oss-test.ts && tsx src/dev/browser-shared-test.ts && tsx src/dev/fortress-browser-test.ts",
+    "test": "tsc -p tsconfig.json --noEmit && tsx src/dev/sandbox-test.ts && tsx src/dev/onboarding-test.ts && tsx src/dev/agent-lifecycle-test.ts && tsx src/dev/agent-messaging-test.ts && tsx src/dev/agent-tui-test.ts && tsx src/dev/memory-test.ts && tsx src/dev/store-test.ts && tsx src/dev/idle-test.ts && tsx src/dev/runner-test.ts && tsx src/dev/modules-test.ts && tsx src/dev/daemon-test.ts && tsx src/dev/browser-test.ts && tsx src/dev/browser-access-test.ts && tsx src/dev/browser-live-test.ts && tsx src/dev/browser-router-test.ts && tsx src/dev/browser-router-capacity-test.ts && tsx src/dev/browser-identity-worker-test.ts && tsx src/dev/browser-operator-test.ts && tsx src/dev/browser-oss-test.ts && tsx src/dev/browser-shared-test.ts && tsx src/dev/fortress-browser-test.ts",
     "alive": "tsx src/index.ts",
+    "test:sandbox": "tsx src/dev/sandbox-test.ts",
+    "test:sandbox:vm": "tsx src/dev/sandbox-vm-test.ts",
     "test:store": "tsx src/dev/store-test.ts",
     "test:memory": "tsx src/dev/memory-test.ts",
     "test:idle": "tsx src/dev/idle-test.ts",
@@ -59,6 +61,7 @@
     "@earendil-works/pi-ai": "^0.85.1",
     "@earendil-works/pi-coding-agent": "^0.85.1",
     "agent-browser": "0.27.0",
+    "microsandbox": "0.7.8",
     "tilion-fortress": "151.0.7910",
     "typebox": "1.3.7",
     "patchright": "1.63.0",

@@ -23,7 +23,7 @@ const DEFAULT_ALLOWED_UPDATES = ["message", "edited_message", "channel_post", "e
  * Inbound: long polling (`getUpdates`) with a persisted offset, so restarts
  * resume instead of replaying. Every accepted update becomes a durable
  * `user_message` event (deduped by message id) and a record in the shared
- * conversation history. Access lists and bot-authored messages are filtered out
+ * conversation history. User allowlists and non-allowlisted or unaddressed bot messages are filtered out
  * before anything reaches the agent.
  *
  * Outbound: `send_message` to a `telegram:<chatId>[/<topicId>]` thread is split
@@ -308,6 +308,8 @@ export class TelegramModule implements AliveModule {
 		const inbound = normalizeUpdate(update, {
 			botId: this.botId,
 			botUsername: this.botUsername,
+			allowedBotIds: this.config.allowedBotIds,
+			requireMentionInGroups: this.config.requireMentionInGroups,
 			ingestEdits: this.config.ingestEdits,
 		});
 		if (!inbound) return;
@@ -419,6 +421,9 @@ export class TelegramModule implements AliveModule {
 			if (!allowed.includes(inbound.chatId)) return false;
 		}
 		if (!inbound.author) return false;
+		if (inbound.author.isBot) {
+			return this.config.allowedBotIds.map(String).includes(inbound.author.id) && inbound.expectsReply;
+		}
 		const allowed = new Set([
 			...this.config.allowedUserIds.map(String),
 			...(this.allowlist?.list() ?? []),
@@ -526,21 +531,29 @@ export class TelegramModule implements AliveModule {
 		const ref = parseThread(input.thread);
 		if (!ref) throw new Error(`not a telegram thread: ${input.thread}`);
 		const api = this.requireApi();
-		const workspace = path.resolve(ctx.paths.workspaceDir);
-		const resolved = path.resolve(workspace, input.filePath);
-		if (resolved !== workspace && !resolved.startsWith(`${workspace}${path.sep}`)) {
+		const filePaths = ctx.workspaceFiles ? path.posix : path;
+		const workspace = filePaths.resolve(ctx.workspaceFiles?.rootDir ?? ctx.paths.workspaceDir);
+		const resolved = filePaths.resolve(workspace, input.filePath);
+		if (resolved !== workspace && !resolved.startsWith(`${workspace}${filePaths.sep}`)) {
 			throw new Error(`send_file can only read files inside the workspace (${workspace})`);
 		}
-		const stat = fs.statSync(resolved);
-		if (!stat.isFile()) throw new Error(`not a file: ${resolved}`);
 		const maxBytes = 50 * 1024 * 1024;
-		if (stat.size > maxBytes) throw new Error(`file is ${stat.size} bytes, over the ${maxBytes} byte upload limit`);
-		const name = path.basename(resolved);
+		let data: Buffer;
+		if (ctx.workspaceFiles) {
+			data = await ctx.workspaceFiles.readFile(resolved);
+		} else {
+			const stat = fs.statSync(resolved);
+			if (!stat.isFile()) throw new Error(`not a file: ${resolved}`);
+			if (stat.size > maxBytes) throw new Error(`file is ${stat.size} bytes, over the ${maxBytes} byte upload limit`);
+			data = fs.readFileSync(resolved);
+		}
+		if (data.length > maxBytes) throw new Error(`file is ${data.length} bytes, over the ${maxBytes} byte upload limit`);
+		const name = filePaths.basename(resolved);
 		const field = input.as ?? guessFileField(name);
 		const replyTo = input.replyTo;
 		const sent = await api.sendFile({
 			chat_id: ref.chatId,
-			file: { data: fs.readFileSync(resolved), name, mime: mimeForFile(name) },
+			file: { data, name, mime: mimeForFile(name) },
 			field,
 			caption: input.caption,
 			parse_mode: this.config.parseMode || undefined,
@@ -558,11 +571,11 @@ export class TelegramModule implements AliveModule {
 			text: input.caption ? `${input.caption} [file: ${name}]` : `[file: ${name}]`,
 			messageId: String(sent.message_id),
 			replyTo: replyTo !== undefined ? String(replyTo) : undefined,
-			attachments: [{ kind: field, name, mime: mimeForFile(name), size: stat.size }],
+			attachments: [{ kind: field, name, mime: mimeForFile(name), size: data.length }],
 			meta: { agentMessageId: "tool", chatId: ref.chatId, topicId: ref.topicId, uploadedPath: resolved },
 		});
 		this.counters.outbound += 1;
-		ctx.log.info("telegram file sent", { thread: input.thread, name, bytes: stat.size, field });
+		ctx.log.info("telegram file sent", { thread: input.thread, name, bytes: data.length, field });
 		return sent;
 	}
 
@@ -646,7 +659,8 @@ export class TelegramModule implements AliveModule {
 		return {
 			api: this.requireApi(),
 			history: ctx.history,
-			workspaceDir: ctx.paths.workspaceDir,
+			workspaceDir: ctx.workspaceFiles?.rootDir ?? ctx.paths.workspaceDir,
+			writeWorkspaceFile: ctx.workspaceFiles?.writeFile,
 			defaultParseMode: this.config.parseMode,
 			maxMessageChars: this.config.maxMessageChars,
 			sendText: (input) => this.sendText(input),

@@ -18,6 +18,8 @@ import type { Logger } from "../log.js";
 import { ensureDir } from "../util.js";
 import { buildSystemPrompt } from "./prompt.js";
 import { ALIVE_TOOL_NAMES, createAliveTools, type ToolDeps } from "./tools.js";
+import { SandboxManager } from "../sandbox/manager.js";
+import { createSandboxTools } from "../sandbox/tools.js";
 
 export interface AgentBuildResult {
 	session: AgentSession;
@@ -33,6 +35,8 @@ export interface BuildAgentOptions {
 	soul: string;
 	/** Ignore `config.session` and start a brand-new transcript (used after a sleep). */
 	forceNewSession?: boolean;
+	/** Runtime-scoped owner; must be reused across context resets. */
+	sandbox?: SandboxManager;
 }
 
 /**
@@ -49,6 +53,13 @@ export interface BuildAgentOptions {
 export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuildResult> {
 	const { config, toolDeps, log, soul } = options;
 	const { config: cfg, paths } = config;
+	const isolated = cfg.sandbox.enabled;
+	if (isolated && !options.sandbox) throw new Error("An isolated session requires a runtime-scoped SandboxManager");
+	if (isolated && cfg.extensions.length) throw new Error("Host pi extensions are disabled for isolated profiles; remove extensions or explicitly disable sandboxing");
+	const workspace = isolated ? options.sandbox!.workspaceDir : paths.workspaceDir;
+	const sandboxTools = isolated ? createSandboxTools(options.sandbox!, config) : [];
+	const reserved = new Set([...sandboxTools.map((tool) => tool.name), "browser", "web_search", "tool_registry"]);
+	if (isolated && toolDeps.moduleTools.some((tool) => reserved.has(tool.name))) throw new Error("Module tools cannot override isolated filesystem/shell tools");
 
 	ensureDir(paths.agentDir);
 	ensureDir(paths.sessionsDir);
@@ -77,7 +88,7 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 		name: cfg.name,
 		soul,
 		contract: readContract(paths.contractPath),
-		workspace: paths.workspaceDir,
+		workspace,
 		stateDir: paths.stateDir,
 		runTimeoutMs: cfg.loop.runTimeoutMs,
 		sleepAfterMs: cfg.loop.sleepAfterMs,
@@ -99,15 +110,30 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 		agentDir: paths.agentDir,
 		settingsManager,
 		noThemes: true,
-		systemPrompt,
-		additionalExtensionPaths: [...cfg.extensions, toolboxExtensionPath],
+		noExtensions: isolated,
+		noSkills: isolated,
+		noPromptTemplates: isolated,
+		noContextFiles: isolated,
+		systemPrompt: isolated ? `${systemPrompt}\n\nShell and file tools run in microsandbox, never on the host. Your guest home and workspace is ${workspace} in a private persistent volume. The host workspace is not mounted. Memory, messaging and explicitly granted module tools are trusted host services. Host browser/web_search and executable tool registry are unavailable. Pin critical services with sandbox_control before starting them. VM shutdown requires two empty process/Docker observations; holds prevent shutdown. Ordinary workspace file operations may run without a VM only while it is stopped; running VM writes always use guest permissions/inotify. Shared resources are under configured guest mount paths. No host fallback on sandbox errors.` : systemPrompt,
+		additionalExtensionPaths: isolated ? [] : [...cfg.extensions, toolboxExtensionPath],
 	});
 	await resourceLoader.reload();
 	for (const error of resourceLoader.getExtensions().errors) {
 		log.warn("extension failed to load", { path: error.path, error: error.error });
 	}
 
-	const builtinTools = cfg.tools.builtin.filter((tool) => (tool === "bash" ? cfg.tools.bash : true));
+	const sandboxBuiltins = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
+	const builtinTools = cfg.tools.builtin.filter((tool) => (!isolated || sandboxBuiltins.has(tool)) && (tool !== "bash" || cfg.tools.bash));
+	const persistedTools = isolated ? [] : readPersistedToolNames(path.join(paths.stateDir, "tools", "registry.json"));
+	const allowedTools = selectAllowedTools({
+		allowlist: cfg.tools.allowlist,
+		builtins: builtinTools,
+		alive: isolated ? [...ALIVE_TOOL_NAMES.filter((name) => name !== "browser" && name !== "web_search"), "file", "sandbox_control"] : [...ALIVE_TOOL_NAMES],
+		modules: toolDeps.moduleTools.map((tool) => tool.name),
+		sandbox: sandboxTools.map((tool) => tool.name),
+		custom: persistedTools,
+		toolRegistryAvailable: !isolated,
+	});
 
 	const sessionManager =
 		cfg.session === "continue" && !options.forceNewSession
@@ -120,7 +146,13 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 		model,
 		thinkingLevel: (resolvedThinking || undefined) as ThinkingLevel | undefined,
 		modelRuntime,
-		customTools: createAliveTools(toolDeps),
+		// noTools alone only changes initial activation in Pi; tools is also the
+		// SDK-level name ceiling, so future host builtins cannot become active.
+		noTools: isolated ? "builtin" : undefined,
+		tools: isolated ? allowedTools : undefined,
+		customTools: isolated
+			? [...createAliveTools(toolDeps).filter((tool) => !["browser", "web_search"].includes(tool.name)), ...sandboxTools]
+			: createAliveTools(toolDeps),
 		resourceLoader,
 		sessionManager,
 		settingsManager,
@@ -129,15 +161,7 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 	// Extensions may register tools, but only names selected below become active.
 	// The same configured allowlist is enforced by the toolbox extension for tools
 	// created or loaded after this initial activation.
-	const persistedTools = readPersistedToolNames(path.join(paths.stateDir, "tools", "registry.json"));
-	session.setActiveToolsByName(selectAllowedTools({
-		allowlist: cfg.tools.allowlist,
-		builtins: builtinTools,
-		alive: [...ALIVE_TOOL_NAMES],
-		modules: toolDeps.moduleTools.map((tool) => tool.name),
-		custom: persistedTools,
-		toolRegistryAvailable: true,
-	}));
+	session.setActiveToolsByName(allowedTools);
 
 	if (modelFallbackMessage) log.warn("model fallback", { message: modelFallbackMessage });
 	log.info("agent session ready", {
@@ -156,6 +180,7 @@ export function selectAllowedTools(input: {
 	builtins: string[];
 	alive: string[];
 	modules: string[];
+	sandbox?: string[];
 	custom: string[];
 	toolRegistryAvailable?: boolean;
 }): string[] {
@@ -164,6 +189,7 @@ export function selectAllowedTools(input: {
 		...input.builtins,
 		...input.alive,
 		...input.modules,
+		...(input.sandbox ?? []),
 		...input.custom,
 		...(input.toolRegistryAvailable ? ["tool_registry"] : []),
 	];

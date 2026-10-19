@@ -51,7 +51,28 @@ alive:          system prompt -> работа -> idle (ждёт события) 
 npx alive thoughts -n 5
 ```
 
+## Изоляция по умолчанию
+
+Shell и файловые инструменты каждого агента изолированы через **microsandbox microVM**.
+VM запускается лениво; обычные файлы приватного `/home/<имя-агента>` доступны без boot, пока VM остановлена.
+Этот persistent том также служит `HOME` и рабочей директорией; например, `Alive` получает `/home/alive`.
+Образы и read-only resource volumes переиспользуются; RAM/CPU, общие тома и idle policy настраиваются
+в `sandbox` собственного конфига каждого агента. Спящие процессы, Docker, watcher'ы и durable holds
+не дают автоматике выключить VM. Ошибка проверки означает «оставить включённой», не host fallback.
+Runtime, модель, память и Telegram остаются на хосте; их ключи не передаются в VM.
+Гостевая сеть по умолчанию public-only: доступ к хосту/LAN/metadata закрыт, кроме host DNS.
+Операторский opt-out — `sandbox.networkAccess:"unrestricted"`; `sandbox.network:false` отключает сеть.
+Это не DLP: секрет, явно переданный в guest env или файлы, может утечь в интернет.
+
+Linux: нужен доступ к `/dev/kvm`. Статус без boot: `npm run alive -- sandbox status`.
+Настройки, границы доверия, перенос старого workspace и проверки: **[SANDBOX.md](SANDBOX.md)**.
+Старый host workspace автоматически не монтируется и не импортируется.
+Host `browser`, `web_search`, исполняемый tool registry и pi-расширения недоступны изолированным агентам;
+оператор может явно вернуть прежний режим через `sandbox.enabled:false`.
+
 ## Fortress в agent-browser
+
+Это операторские команды; инструменты `browser`/`web_search` доступны агенту только при явном отключении sandbox.
 
 Команды используют локальный `agent-browser` из зависимостей проекта, отдельную сессию `alive-fortress` и явное подключение по CDP. Если Fortress не запущен, он автоматически стартует в фоне на `127.0.0.1:9223`. Первый запуск скачивает бинарник; ошибки запуска — в `.alive/browser/fortress.log`. Запасной обычный Chrome не запускается.
 

@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { readJson } from "./util.js";
 import { DEFAULT_BROWSER_CONFIG, type BrowserConfig } from "./modules/browser/config.js";
+import { DEFAULT_SANDBOX_CONFIG, validateSandboxConfig, type SandboxConfig } from "./sandbox/config.js";
 
 export interface LoopConfig {
 	/**
@@ -70,6 +71,10 @@ export interface TelegramConfig {
 	allowedChatIds: string[];
 	/** Initial user allowlist (user ids); runtime access is restricted to configured or dynamically added IDs. */
 	allowedUserIds: string[];
+	/** Explicit peer-bot allowlist; bot messages are accepted only when directly addressed to this bot. */
+	allowedBotIds: string[];
+	/** In group chats, only ingest messages that explicitly mention/reply to this bot. */
+	requireMentionInGroups: boolean;
 	/** Long-poll timeout for getUpdates, in seconds. */
 	pollTimeoutSec: number;
 	/** Telegram update types to subscribe to. */
@@ -176,6 +181,8 @@ export interface AliveConfig {
 	/** "continue" keeps one evolving transcript across restarts; "new" starts a fresh session each start. */
 	session: "continue" | "new";
 	tools: ToolsConfig;
+	/** Hardware isolation of agent shell/files. Host integrations remain trusted runtime services. */
+	sandbox: SandboxConfig;
 	memory: MemoryConfig;
 	loop: LoopConfig;
 	budget: BudgetConfig;
@@ -237,6 +244,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		targets: [],
 		grantableTools: [],
 	},
+	sandbox: DEFAULT_SANDBOX_CONFIG,
 	workspace: ".alive/workspace",
 	soulFile: "SOUL.md",
 	session: "continue",
@@ -244,7 +252,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		builtin: ["read", "write", "edit", "bash", "grep", "find", "ls"],
 		bash: true,
 		allowlist: [
-			"read", "write", "edit", "bash", "grep", "find", "ls", "browser", "web_search",
+			"read", "write", "edit", "bash", "grep", "find", "ls", "file", "sandbox_control", "browser", "web_search",
 			"send_message", "message_agent", "idle", "sleep", "notifications", "remind", "list_reminders", "cancel_reminder",
 			"note", "retain", "memory", "journal", "history", "close_thread", "status",
 		],
@@ -290,6 +298,8 @@ export const DEFAULT_CONFIG: AliveConfig = {
 			apiBase: "https://api.telegram.org",
 			allowedChatIds: [],
 			allowedUserIds: [],
+			allowedBotIds: [],
+			requireMentionInGroups: false,
 			pollTimeoutSec: 25,
 			allowedUpdates: [
 				"message",
@@ -385,6 +395,7 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	const localConfig = fs.existsSync(localConfigPath) ? readJson<Partial<AliveConfig>>(localConfigPath, {}) : {};
 	const merged = deepMerge(deepMerge(deepMerge(DEFAULT_CONFIG, fileConfig), localConfig), options.overrides);
 	migrateLoopConfig(merged.loop as unknown as Record<string, unknown>);
+	merged.sandbox = validateSandboxConfig(merged.sandbox);
 	merged.piAgentDir = expandHome(merged.piAgentDir);
 	const paths = resolvePaths(path.dirname(configPath), merged);
 	return { config: merged, paths };

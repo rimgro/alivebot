@@ -20,6 +20,9 @@ importers:
       agent-browser:
         specifier: 0.27.0
         version: 0.27.0
+      microsandbox:
+        specifier: 0.7.8
+        version: 0.7.8
       patchright:
         specifier: 1.63.0
         version: 1.63.0
@@ -576,6 +579,9 @@ packages:
     resolution: {integrity: sha512-ABnA53mdfkGZwOFUdZNv2S0CWGO/EIuPj8Vv9xmBFmSYg/qFc7ihO6q5FcQjvoE67kZpWkEc4AhD6B/os04yuA==}
     engines: {node: '>= 10'}
 
+  '@microsandbox/types@0.7.8':
+    resolution: {integrity: sha512-GCLuiSbTXU/5s8/VhyQzRc8AtDyz4uaIk3fP0GbWAPvj2xJfR7rpUr51UYZIFd9ONwAqa7XEfpyr8jnlFInkhA==}
+
   '@protobufjs/aspromise@1.1.2':
     resolution: {integrity: sha512-j+gKExEuLmKwvz3OgROXtrJ2UG2x8Ch2YZUxahh+s1F2HZ+wAceUNLkvy6zKCPVRkU++ZWQrdxsUeQXmcg4uoQ==}
 
@@ -648,6 +654,38 @@ packages:
 
   '@stablelib/base64@1.0.1':
     resolution: {integrity: sha512-1bnPQqSxSuc3Ii6MhBysoWCg58j97aUjuCSZrGSmDxNqtytIi0k8utUenAwTZN4V5mXXYGsVUI9zeBqy+jBOSQ==}
+
+  '@superradcompany/microsandbox-darwin-arm64@0.7.8':
+    resolution: {integrity: sha512-WoTlB2b06o32AXW3D3Xp6GLiSoAXGNqNikbakA/RP2Uqj2Z8mfoDZ7mYKONLG7PXUAWu/vTTqJkOtVt8JFEWvA==}
+    engines: {node: '>= 22'}
+    cpu: [arm64]
+    os: [darwin]
+
+  '@superradcompany/microsandbox-linux-arm64-gnu@0.7.8':
+    resolution: {integrity: sha512-NRm8GVXlgoPsLYX8BovMTwg4oNWiT0EZp34+6zM7s7slhCbv3TItebbg6urKj8yqKoLP1T+OHH/7Y/RnD9omZw==}
+    engines: {node: '>= 22'}
+    cpu: [arm64]
+    os: [linux]
+    libc: [glibc]
+
+  '@superradcompany/microsandbox-linux-x64-gnu@0.7.8':
+    resolution: {integrity: sha512-4AnLhlDSvgzQPTrKcd6kCpCpgPWq275sGWTy7tg1deo42lU0PXKtwnaUlBx7uBdQO4YFIGfIx0T8lgsGO9h5EA==}
+    engines: {node: '>= 22'}
+    cpu: [x64]
+    os: [linux]
+    libc: [glibc]
+
+  '@superradcompany/microsandbox-win32-arm64-msvc@0.7.8':
+    resolution: {integrity: sha512-wwXD/B9JwmyDAhrkX2V4L4VHVumDK1JbMnUFTOuNCoozyeNV4fogL+BziINp3HeInBTbKOJrAI7+A8kTawKfPA==}
+    engines: {node: '>= 22'}
+    cpu: [arm64]
+    os: [win32]
+
+  '@superradcompany/microsandbox-win32-x64-msvc@0.7.8':
+    resolution: {integrity: sha512-m11kPzyaid/DMXK5kJRvDZEGkdlvndmOzfjNjfhqpL+LFQssnJgQ2WSyYfBQMrHj17pRfDkDxqwZPr9iXZoSMw==}
+    engines: {node: '>= 22'}
+    cpu: [x64]
+    os: [win32]
 
   '@types/node@22.20.5':
     resolution: {integrity: sha512-U2+DNr+wSjpsTS/wZGYHq7GcwfuSmKiKvoPvK22zwTlRhU91yOniN4qRR5KhIjvif7ysw/dz/hKmfDH0Ris4aA==}
@@ -819,6 +857,11 @@ packages:
   marked@18.0.5:
     resolution: {integrity: sha512-S6GcvALHg6K4ohtu4E7x0a1AqhAjp6cV8KhLSyN9qVapnzJkusVBxZRcIU9AeYsbe6P1hKDusSbEOzGyyuce6w==}
     engines: {node: '>= 20'}
+    hasBin: true
+
+  microsandbox@0.7.8:
+    resolution: {integrity: sha512-bUll2JNeVhAdvtlemsD5rNkVpLU0KQSXVpuSjXFmkG6Z52Z2ZL9sP8hAdFT8pIGoEPLj+OB9ohgFEPsJgBVkFg==}
+    engines: {node: '>= 22'}
     hasBin: true
 
   minimatch@10.2.5:
@@ -1486,6 +1529,8 @@ snapshots:
       '@mariozechner/clipboard-win32-x64-msvc': 0.3.9
     optional: true
 
+  '@microsandbox/types@0.7.8': {}
+
   '@protobufjs/aspromise@1.1.2': {}
 
   '@protobufjs/base64@1.1.2': {}
@@ -1562,6 +1607,21 @@ snapshots:
       tslib: 2.8.1
 
   '@stablelib/base64@1.0.1': {}
+
+  '@superradcompany/microsandbox-darwin-arm64@0.7.8':
+    optional: true
+
+  '@superradcompany/microsandbox-linux-arm64-gnu@0.7.8':
+    optional: true
+
+  '@superradcompany/microsandbox-linux-x64-gnu@0.7.8':
+    optional: true
+
+  '@superradcompany/microsandbox-win32-arm64-msvc@0.7.8':
+    optional: true
+
+  '@superradcompany/microsandbox-win32-x64-msvc@0.7.8':
+    optional: true
 
   '@types/node@22.20.5':
     dependencies:
@@ -1771,6 +1831,16 @@ snapshots:
   lru-cache@11.5.3: {}
 
   marked@18.0.5: {}
+
+  microsandbox@0.7.8:
+    dependencies:
+      '@microsandbox/types': 0.7.8
+    optionalDependencies:
+      '@superradcompany/microsandbox-darwin-arm64': 0.7.8
+      '@superradcompany/microsandbox-linux-arm64-gnu': 0.7.8
+      '@superradcompany/microsandbox-linux-x64-gnu': 0.7.8
+      '@superradcompany/microsandbox-win32-arm64-msvc': 0.7.8
+      '@superradcompany/microsandbox-win32-x64-msvc': 0.7.8
 
   minimatch@10.2.5:
     dependencies:

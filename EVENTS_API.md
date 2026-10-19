@@ -108,6 +108,14 @@ interface AliveModule {
 | `runtimeStatus()` | текущий статус рантайма (pid, run, pending, …) |
 | `currentThreads?()` | доверенные треды текущих задач: новый пакет из `idle` заменяет список, прерывание активной задачи дополняет его; текст страницы или модели не задаёт этот список |
 | `moduleDir(...segments)` | приватная durable-папка `<stateDir>/modules/<name>` |
+| `workspaceFiles?` | sandbox bridge: `rootDir`, `readFile(path): Promise<Buffer>`, `writeFile(path, Buffer): Promise<string>` |
+
+При `sandbox.enabled:true` модуль остаётся доверенным кодом **на хосте**. Файлы агента следует читать/писать
+через `ctx.workspaceFiles`, не через `fs` + `ctx.paths.workspaceDir`: workspace теперь находится в приватном
+томе `/home/<имя-агента>` (фактический путь доступен через `workspaceFiles.rootDir`). Bridge сериализует операции с VM lifecycle и выбирает guest/offline route с правильными
+permissions/watchers. Путь ограничен workspace, результат `writeFile` — гостевой путь. Не публикуйте инструменты
+произвольного host exec/FS; файловые/shell имена и host browser/registry зарезервированы.
+Подробности и ограничения: [SANDBOX.md](SANDBOX.md).
 
 ### Порядок жизненного цикла
 

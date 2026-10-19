@@ -289,10 +289,14 @@ try {
 		builtins: ["read", "write", "bash"],
 		alive: ["send_message", "idle", "create_agent"],
 		modules: ["calendar", "telegram_admin"],
+		sandbox: ["github_auth", "github_api"],
 		custom: ["agent_private", "tool_registry"],
 		toolRegistryAvailable: true,
 	});
 	assert.deepEqual(selected, ["read", "send_message", "calendar"]);
+	assert.deepEqual(selectAllowedTools({
+		allowlist: ["github_auth"], builtins: [], alive: [], modules: [], sandbox: ["github_auth", "github_api"], custom: [],
+	}), ["github_auth"], "sandbox tools must be gated by the unified allowlist");
 	assert.deepEqual(selectAllowedTools({
 		allowlist: [], builtins: ["read"], alive: ["idle"], modules: ["m"], custom: ["c"], toolRegistryAvailable: true,
 	}), [], "empty allowlists disable every tool source");

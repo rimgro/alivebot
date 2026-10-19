@@ -13,6 +13,7 @@ export interface TelegramToolHost {
 	readonly api: TelegramApi;
 	readonly history: HistoryStore;
 	readonly workspaceDir: string;
+	writeWorkspaceFile?(file: string, data: Buffer): Promise<string>;
 	readonly defaultParseMode: string;
 	readonly maxMessageChars: number;
 	sendText(input: { thread: string; text: string; replyTo?: number }): Promise<TelegramSentMessage[]>;
@@ -302,10 +303,16 @@ export function createTelegramTools(host: TelegramToolHost): ToolDefinition[] {
 						throw new Error(`file is ${file.file_size} bytes, over the ${maxBytes} byte download limit`);
 					}
 					const buffer = await api.downloadFile(file.file_path, { maxBytes });
-					const dir = path.join(host.workspaceDir, "telegram-files");
-					ensureDir(dir);
-					const target = path.join(dir, safeFileName(params.name ?? path.basename(file.file_path)));
-					fs.writeFileSync(target, buffer);
+					const dir = host.writeWorkspaceFile ? path.posix.join(host.workspaceDir, "telegram-files") : path.join(host.workspaceDir, "telegram-files");
+					const fileName = safeFileName(params.name ?? path.basename(file.file_path));
+					let target: string;
+					if (host.writeWorkspaceFile) {
+						target = await host.writeWorkspaceFile(path.posix.join(dir, fileName), buffer);
+					} else {
+						ensureDir(dir);
+						target = path.join(dir, fileName);
+						fs.writeFileSync(target, buffer);
+					}
 					return ok(`Downloaded ${buffer.length} bytes to ${target}`, {
 						path: target,
 						bytes: buffer.length,

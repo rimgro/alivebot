@@ -41,8 +41,11 @@ alive telegram chats                    # что уже записано лок�
 
 Для приватного чата пользователь должен сначала написать боту сам (или нажать
 `/start`) — Bot API не позволяет писать первым произвольному пользователю.
-В группах бота нужно добавить и (для чтения обычных сообщений) отключить privacy
-mode у BotFather, либо обращаться к нему через упоминание/реплай.
+В группах бот должен состоять в чате; privacy mode влияет на то, какие обычные
+сообщения он получает. Для Bot-to-Bot Communication включи соответствующий режим
+у BotFather. Сам Alive дополнительно принимает bot-authored сообщения только от
+ID в `allowedBotIds` и только при явном упоминании/ответе этому боту; это
+ограничение защищает от случайных ботов и бесконечных цепочек ответов.
 
 ## 2. Конфиг
 
@@ -55,6 +58,7 @@ mode у BotFather, либо обращаться к нему через упом
     "apiBase": "https://api.telegram.org",
     "allowedChatIds": [],
     "allowedUserIds": [],
+    "allowedBotIds": [],
     "pollTimeoutSec": 25,
     "allowedUpdates": ["message", "edited_message", "channel_post", "edited_channel_post", "callback_query"],
     "parseMode": "",
@@ -74,6 +78,7 @@ mode у BotFather, либо обращаться к нему через упом
 | `apiBase` | базовый URL Bot API (для локального bot-api server) |
 | `allowedChatIds` | белый список chat id; пусто = все чаты бота |
 | `allowedUserIds` | белый список user id; пусто = все пользователи |
+| `allowedBotIds` | явный список trusted peer-bot IDs; сообщения принимаются только в группах и только если адресованы этому боту упоминанием/ответом |
 | `pollTimeoutSec` | long-poll таймаут `getUpdates` |
 | `allowedUpdates` | какие типы апдейтов подписывать |
 | `parseMode` | `""` (plain), `"HTML"` или `"MarkdownV2"`; при ошибке разметки сообщение уходит plain-текстом |
@@ -103,8 +108,7 @@ telegram:<chatId>/<topicId>    тема в форуме (message_thread_id)
 Модуль держит long polling `getUpdates` с durable-offset (`.alive/modules/telegram/state.json`),
 поэтому после перезапуска старые апдейты не переигрываются. Каждый апдейт:
 
-- фильтруется (свои сообщения и сообщения других ботов игнорируются, allowlist
-  проверяется);
+- фильтруется (свои сообщения игнорируются; bot-authored сообщения принимаются только от `allowedBotIds` и только при явном упоминании/ответе этому боту; user allowlist проверяется отдельно);
 - превращается в `user_message` в durable-инбоксе с `dedupeKey`
   `telegram:msg:<chatId>:<messageId>` — повторная доставка не создаст дубль;
 - записывается в общую историю (`history`), с `meta.eventId`, чтобы `reply_to`
