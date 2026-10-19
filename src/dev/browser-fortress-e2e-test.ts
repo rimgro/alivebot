@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -30,6 +31,11 @@ try {
 	assert.equal(await context.pages()[0].evaluate("navigator.webdriver"), false);
 	const owner = JSON.parse(fs.readFileSync(record, "utf8"));
 	assert.equal(fs.statSync(record).mode & 0o777, 0o600);
+	if (process.platform === "linux") {
+		assert.equal(execFileSync("docker", ["inspect", owner.id, "--format", "{{.Config.User}}"], { encoding: "utf8" }).trim(), `${process.getuid!()}:${process.getgid!()}`, "The container must retain the service account's bind-mount ownership");
+		assert.equal(fs.statSync(profile).mode & 0o777, 0o700, "The profile must remain private, not world-writable");
+		assert.equal(fs.statSync(path.join(root, "fortress-home")).mode & 0o777, 0o700);
+	}
 	fs.writeFileSync(record, JSON.stringify({ ...owner, token: "0".repeat(32) }));
 	await assert.rejects(launchManagedFortress(input), /ownership cannot be verified/);
 	assert.equal(await context.pages()[0].title(), "Fortress fixture", "Foreign ownership records must not stop the real browser");

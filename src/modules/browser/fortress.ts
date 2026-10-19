@@ -116,8 +116,11 @@ export async function launchManagedFortress(input: { image: string; profile: str
 	// Preserve the launcher's bounded egress-country discovery. Supplying only
 	// the host timezone leaves country unset and can generate an unrelated locale.
 	const geoEnvironment = ["TILION_COUNTRY", "TILION_TZ", "TILION_NO_GEO"].flatMap(name => process.env[name] ? ["--env", `${name}=${process.env[name]}`] : []);
+	// Linux bind mounts retain numeric ownership. The image's default UID cannot
+	// write a mode-0700 profile owned by a different service account.
+	const user = process.platform === "linux" ? ["--user", `${process.getuid!()}:${process.getgid!()}`] : [];
 	const args = ["create", "--name", name, "--label", "alive.browser=fortress", "--label", `alive.owner=${token}`, "--label", `alive.profile=${profileHash}`,
-		"--platform", `linux/${image.Architecture}`, "--publish", "127.0.0.1::9222", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only",
+		"--platform", `linux/${image.Architecture}`, ...user, "--publish", "127.0.0.1::9222", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only",
 		"--memory", "3g", "--cpus", "2", "--pids-limit", "512", "--shm-size", "512m", "--tmpfs", "/tmp:rw,nosuid,size=256m",
 		"--mount", `type=bind,source=${profile},target=/alive/profile`, "--mount", `type=bind,source=${home},target=/alive/home`,
 		"--env", "HOME=/alive/home", ...geoEnvironment,
