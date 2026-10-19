@@ -1,0 +1,10 @@
+# A named tunnel provides a stable hostname for production and Web Bot Auth.
+# Replace placeholders with your Cloudflare account's tunnel and DNS settings.
+tunnel: YOUR_TUNNEL_UUID
+credentials-file: /secure/cloudflared/YOUR_TUNNEL_UUID.json
+ingress:
+  - hostname: browser.example.com
+    service: http://127.0.0.1:4323
+    originRequest:
+      httpHostHeader: browser.example.com
+  - service: http_status:404

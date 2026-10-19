@@ -138,18 +138,21 @@ section("idle returns pending events as tool output");
 	check("run recorded the idle return", run.idleReturns === 1);
 	check("idle is no longer blocked", run.idling === false);
 	check("event is recorded in the run", run.events.some((e) => e.text.includes("hello")));
+	check("idle records the trusted conversation scope", run.currentThreads?.join() === "console");
 	store.endRun();
 }
 
 section("idle wakes on an event that arrives while it is already waiting");
 {
 	run = makeRun(2);
+	run.currentThreads = ["console"];
 	store.beginRun(run.id);
 	const waiting = call(idle, { reason: "nothing yet" });
 	await new Promise((resolve) => setTimeout(resolve, 40));
 	check("idle is blocking", run.idling === true);
 	event("late arrival", "alice");
 	const result = await waiting;
+	check("new idle batch replaces the previous routing scope", run.currentThreads?.join() === "alice");
 	check("blocking idle returned the late event", result.content[0].text.includes("late arrival"), result.content[0].text);
 	check("blocking idle cleared the idling flag", run.idling === false);
 	store.endRun();

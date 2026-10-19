@@ -108,6 +108,7 @@ export class AliveRuntime {
 		this.notes = new NoteStore(paths.stateDir);
 		const memoryConfig = this.config.config.memory;
 		this.memory = new MemoryStore({
+			enabled: memoryConfig.enabled,
 			databasePath: resolveMemoryDatabasePath(this.config),
 			embeddingProvider: memoryConfig.embeddingProvider,
 			embeddingBaseUrl: memoryConfig.embeddingBaseUrl,
@@ -180,6 +181,7 @@ export class AliveRuntime {
 			outbox: (limit) => this.outbox.list(limit),
 			history: this.history,
 			runtimeStatus: () => this.status(),
+			currentThreads: () => this.currentRun?.currentThreads ?? [],
 			workspaceFiles: this.sandbox ? {
 				rootDir: this.sandbox.workspaceDir,
 				readFile: (file) => this.sandbox!.exclusive(async () => (await this.sandbox!.files()).read(workspacePath(file))),

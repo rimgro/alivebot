@@ -25,6 +25,7 @@ export interface ModuleHostOptions {
 	outbox: (limit: number) => OutgoingMessage[];
 	history: HistoryStore;
 	runtimeStatus: () => Record<string, unknown>;
+	currentThreads?: () => string[];
 	workspaceFiles?: WorkspaceFiles;
 }
 
@@ -236,6 +237,7 @@ export class ModuleHost {
 				runtime.statusContributors.push(snapshot);
 			},
 			runtimeStatus: () => this.options.runtimeStatus(),
+			currentThreads: () => [...(this.options.currentThreads?.() ?? [])],
 			moduleDir: (...segments) => {
 				const dir = path.join(config.paths.modulesDir, sanitize(name), ...segments);
 				ensureDir(dir);

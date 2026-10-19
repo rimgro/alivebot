@@ -1,0 +1,19 @@
+[Unit]
+Description=Alive shared browser host
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=alive
+WorkingDirectory=/srv/alive-browser
+ExecStart=/usr/bin/node /srv/alive-browser/dist/index.js browser host --foreground --config /srv/alive-browser/alive.config.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=45
+KillSignal=SIGTERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

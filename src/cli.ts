@@ -16,6 +16,7 @@ import { describeModules } from "./events/loader.js";
 import { TelegramApi } from "./modules/telegram/client.js";
 import { requestAgentTelegram } from "./modules/telegram/managed-request.js";
 import { resolveToken } from "./modules/telegram/module.js";
+import { browserCommand } from "./modules/browser/cli.js";
 import { TelegramAllowlistStore } from "./modules/telegram/state.js";
 import { AliveRuntime } from "./runtime/loop.js";
 import { snapshotRuntime, spawnBackground, stdoutLogPath, stopRuntime, waitForRuntime } from "./runtime/daemon.js";
@@ -148,6 +149,9 @@ export async function main(argv: string[]): Promise<number> {
 			}
 			case "telegram": {
 				return await telegramCommand(cwd, flags, positionals);
+			}
+			case "browser": {
+				return await browserCommand(loadForCli(flags), positionals[0] ?? "help", flags);
 			}
 			case "thoughts": {
 				return thoughtsCommand(cwd, flags);
@@ -991,6 +995,12 @@ usage:
   alive telegram me | chats | chat <id|@name> | send <id|@name> <text> | ping
   alive telegram whitelist [list | add <user-id> | remove <user-id>]
                                               manage Telegram user access without restart
+  alive browser setup [--engine chrome|fortress] [--shared-url PRIVATE_ORIGIN | --cdp-env ENV_NAME | --executable-env ENV_NAME] [--launch-mode auto|driver|native] [--public-url HTTPS_ORIGIN] [--headless true|false] [--sign-origins ORIGIN,...]
+  alive browser activate | doctor [--online] | diagnose | pair | serve [--local] [--url URL]
+                                              configure, diagnose and test phone handoff without an LLM
+  alive browser host [--background|--foreground] [--bind ADDRESS] [--port 4330] [--max-clients 8]
+  alive browser host-status | host-stop | migrate-shared
+                                              one private browser host for isolated agent connections
   alive thoughts [-n 20]                      the agent's private monologue
 `);
 }

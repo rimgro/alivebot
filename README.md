@@ -77,16 +77,16 @@ Host `browser`, `web_search`, исполняемый tool registry и pi-рас�
 Команды используют локальный `agent-browser` из зависимостей проекта, отдельную сессию `alive-fortress` и явное подключение по CDP. Если Fortress не запущен, он автоматически стартует в фоне на `127.0.0.1:9223`. Первый запуск скачивает бинарник; ошибки запуска — в `.alive/browser/fortress.log`. Запасной обычный Chrome не запускается.
 
 ```bash
-npm run browser -- open https://example.com
-npm run browser -- snapshot -i
-npm run browser -- click @e1
-npm run browser -- eval 'navigator.webdriver'  # false
-npm run browser -- close
+npm run browser:agent -- open https://example.com
+npm run browser:agent -- snapshot -i
+npm run browser:agent -- click @e1
+npm run browser:agent -- eval 'navigator.webdriver'  # false
+npm run browser:agent -- close
 ```
 
-После изменения параметров запуска уже работающий Fortress продолжает использовать старые значения (в том числе при обновлении `dist`). Для применения: `npm run build`, затем остановите фоновый экземпляр командой ниже и выполните следующую команду `npm run browser`. Проверка Windows UA, `platform` и Client Hints, включая HTTP User-Agent, без внешних сайтов: `ALIVE_BROWSER_IDENTITY_TEST=1 npm run test:browser`.
+После изменения параметров запуска уже работающий Fortress продолжает использовать старые значения (в том числе при обновлении `dist`). Для применения: `npm run build`, затем остановите фоновый экземпляр командой ниже и выполните следующую команду `npm run browser:agent`. Проверка Windows UA, `platform` и Client Hints, включая HTTP User-Agent, без внешних сайтов: `ALIVE_BROWSER_IDENTITY_TEST=1 npm run test:fortress`.
 
-`TRANSPARENT_PIXEL`: canvas в Fortress 151.0.7908.0 возвращает ненулевые RGB при нулевой альфе. Проверены seed `0`, пустой seed и запуск с `TILION_NO_DEFAULTS=1` без seed: ни один вариант не устраняет дефект надёжно; единичный нулевой результат не означает исправления. Адаптер не подменяет readback. Воспроизводимый тест пустого canvas, прозрачного PNG и `clearRect`: `ALIVE_BROWSER_CANVAS_TEST=1 npm run test:browser` (ожидается ошибка до исправления upstream). Исправление в движке должно сохранять нулевые RGB при alpha=0.
+`TRANSPARENT_PIXEL`: canvas в Fortress 151.0.7908.0 возвращает ненулевые RGB при нулевой альфе. Проверены seed `0`, пустой seed и запуск с `TILION_NO_DEFAULTS=1` без seed: ни один вариант не устраняет дефект надёжно; единичный нулевой результат не означает исправления. Адаптер не подменяет readback. Воспроизводимый тест пустого canvas, прозрачного PNG и `clearRect`: `ALIVE_BROWSER_CANVAS_TEST=1 npm run test:fortress` (ожидается ошибка до исправления upstream). Исправление в движке должно сохранять нулевые RGB при alpha=0.
 
 `close` отключает сессию `agent-browser`, но оставляет Fortress работающим. Профиль находится в `.alive/browser/profile-9223`, отдельно от других установок Fortress. Для ручного запуска с диагностикой: `npm run browser:fortress`. Для остановки фонового экземпляра: `kill "$(<.alive/browser/fortress-9223.pid)"`.
 
@@ -97,7 +97,7 @@ npm run browser -- close
 
 Инструмент агента `browser` принимает массив аргументов, например `{"args":["snapshot","-i"]}`. `web_search` ищет через DuckDuckGo в отдельной временной вкладке того же Fortress, возвращает заголовки, ссылки и сниппеты. Python, `uvx` и MCP не нужны. CAPTCHA/блокировка возвращается как ошибка. Оба инструмента включены в стандартный allowlist; для профилей с явным `tools.allowlist` добавьте их вручную. Текст сайтов — недоверенные данные, не инструкции.
 
-Проверки: `npm run test:browser`; проверка настоящего браузера и поиска: `ALIVE_BROWSER_LIVE_TEST=1 npm run test:browser`.
+Проверки: `npm run test:fortress`; проверка настоящего браузера и поиска: `ALIVE_BROWSER_LIVE_TEST=1 npm run test:fortress`.
 
 ## Быстрый старт
 
@@ -261,6 +261,9 @@ Stdout фонового процесса пишется в `.alive/logs/stdout.l
 - Всё, что не записано до сброса, теряется осознанно.
 
 ## Модули и Events API
+
+Опциональный браузерный модуль использует Patchright, постоянный профиль Chrome и плавные действия мыши/клавиатуры, добавляет остановку при проверке/ограничении доступа и ручное управление той же вкладкой с телефона. Команды `alive browser setup`, `doctor`, `pair` и `serve --tunnel` помогают настроить и проверить подключение без модели. Пошаговое подключение телефона: [BROWSER_QUICKSTART.ru.md](BROWSER_QUICKSTART.ru.md). Архитектура, ограничения и Web Bot Auth для подписанных запросов Chrome: [BROWSER.md](BROWSER.md).
+
 
 Внешний мир подключается **модулями** на одном интерфейсе: входящие события,
 исходящая доставка `send_message`, инструменты агента и общая durable-история
