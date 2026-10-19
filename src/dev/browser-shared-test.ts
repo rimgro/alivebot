@@ -34,8 +34,10 @@ try {
 	assert.throws(() => guard.client({ id: 3, guid: "browser-owned", method: "newContext", params: { acceptDownloads: "accept" } }), /downloads/);
 	guard.client({ id: 4, guid: "browser-owned", method: "newContext", params: { acceptDownloads: "deny" } });
 	assert.throws(() => guard.client({ id: 5, guid: "browser-owned", method: "newContext", params: { acceptDownloads: "deny" } }), /one isolated/);
-	for (const method of ["Target.getTargets", "Target.attachToTarget", "Browser.close", "Storage.getCookies", "Runtime.evaluate"]) assert.throws(() => guard.client({ id: 6, guid: "cdp-owned", method: "send", params: { method } }), /CDP command/);
+	for (const method of ["Target.getTargets", "Target.attachToTarget", "Browser.close", "Storage.getCookies", "Network.getAllCookies", "Network.clearBrowserCookies", "DOM.setFileInputFiles", "Security.setIgnoreCertificateErrors"]) assert.throws(() => guard.client({ id: 6, guid: "cdp-owned", method: "send", params: { method } }), /CDP command/);
 	guard.client({ id: 7, guid: "cdp-owned", method: "send", params: { method: "Page.startScreencast", params: { format: "jpeg" } } });
+	guard.client({ id: 21, guid: "cdp-owned", method: "send", params: { method: "Runtime.evaluate", params: { expression: "document.title" } } });
+	assert.throws(() => guard.client({ id: 22, guid: "cdp-owned", method: "send", params: { method: "Page.navigate", params: { url: "file:///etc/passwd" } } }), /HTTP/);
 	assert.throws(() => guard.client({ id: 8, guid: "cdp-owned", method: "send", params: { method: "Browser.getWindowForTarget", params: { targetId: "foreign" } } }), /current page/);
 	assert.throws(() => guard.client({ id: 9, guid: "cdp-owned", method: "send", params: { method: "Browser.setContentsSize", params: { windowId: 33, width: 500, height: 800 } } }), /does not belong/);
 	guard.client({ id: 10, guid: "cdp-owned", method: "send", params: { method: "Browser.getWindowForTarget" } });

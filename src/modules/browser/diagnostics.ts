@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Browser, BrowserContext, BrowserType, Page } from "playwright";
 import type { BrowserConfig } from "./config.js";
-import { resolveBrowserExecutable, resolveCdpEndpoint, resolveFortressLicense } from "./connection.js";
+import { resolveBrowserExecutable, resolveCdpEndpoint } from "./connection.js";
 import { chromeExecutable, launchNativeBrowser, type NativeBrowser } from "./native.js";
 import { launchManagedFortress, type ManagedFortress } from "./fortress.js";
 import { openSharedContext, type SharedContext } from "./shared-client.js";
@@ -48,11 +48,10 @@ export async function checkCanvas(page: Page): Promise<CanvasReport> {
 }
 
 /** Uses a fresh temporary profile, or a temporary tab in the configured CDP browser. */
-export async function diagnoseBrowser(config: BrowserConfig): Promise<{ connection: string; version: string; fortressActivationVerified?: boolean; environment: { userAgent: string; webdriver: boolean; language: string; timezone: string; headlessMarker: boolean }; canvas: CanvasReport }> {
+export async function diagnoseBrowser(config: BrowserConfig): Promise<{ connection: string; version: string; environment: { userAgent: string; webdriver: boolean; language: string; timezone: string; headlessMarker: boolean }; canvas: CanvasReport }> {
 	const engine = (config.driver === "patchright" ? (await import("patchright")).chromium : (await import("playwright")).chromium) as unknown as BrowserType;
 	const endpoint = resolveCdpEndpoint(config);
 	const executablePath = resolveBrowserExecutable(config);
-	const licenseFile = config.engine === "fortress" && !endpoint && !config.sharedUrl ? resolveFortressLicense(config) : undefined;
 	let browser: Browser | undefined, context: BrowserContext | undefined, page: Page | undefined, directory: string | undefined;
 	let native: NativeBrowser | undefined;
 	let fortress: ManagedFortress | undefined;
@@ -69,11 +68,11 @@ export async function diagnoseBrowser(config: BrowserConfig): Promise<{ connecti
 		} else {
 			directory = fs.mkdtempSync(path.join(os.tmpdir(), "alive-browser-diagnose-"));
 			if (config.engine === "fortress" && !executablePath) {
-				fortress = await launchManagedFortress({ image: config.fortressImage, profile: path.join(directory, "profile"), stateDir: directory, licenseFile, timeoutMs: 60_000, signal: AbortSignal.timeout(60_000) });
+				fortress = await launchManagedFortress({ image: config.fortressImage, profile: path.join(directory, "profile"), stateDir: directory, timeoutMs: 60_000, signal: AbortSignal.timeout(60_000) });
 				browser = await engine.connectOverCDP(fortress.endpoint, { timeout: config.actionTimeoutMs, noDefaults: true });
 				context = browser.contexts()[0];
 			} else if (config.engine === "fortress" || config.launchMode === "native" || (config.launchMode === "auto" && !config.headless && config.channel === "chrome")) {
-				native = await launchNativeBrowser({ executable: executablePath || (config.channel === "chrome" ? chromeExecutable() : engine.executablePath()), profile: directory, headless: config.headless, warmupMs: 0, timeoutMs: config.actionTimeoutMs, signal: AbortSignal.timeout(config.actionTimeoutMs), ...(licenseFile ? { env: { ...process.env, TILION_LICENSE_KEY: fs.readFileSync(licenseFile, "utf8").trim() } } : {}) });
+				native = await launchNativeBrowser({ executable: executablePath || (config.channel === "chrome" ? chromeExecutable() : engine.executablePath()), profile: directory, headless: config.headless, warmupMs: 0, timeoutMs: config.actionTimeoutMs, signal: AbortSignal.timeout(config.actionTimeoutMs) });
 				browser = await engine.connectOverCDP(native.endpoint, { timeout: config.actionTimeoutMs, noDefaults: true });
 				context = browser.contexts()[0];
 			} else context = await engine.launchPersistentContext(directory, { ...(executablePath ? { executablePath } : { channel: config.channel }), headless: config.headless, viewport: null, acceptDownloads: false });
@@ -88,8 +87,7 @@ export async function diagnoseBrowser(config: BrowserConfig): Promise<{ connecti
 			})]);
 		} finally { clearTimeout(timer); }
 		const environment = await page.evaluate(() => ({ userAgent: navigator.userAgent, webdriver: (navigator as unknown as { webdriver?: boolean }).webdriver === true, language: navigator.language, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, headlessMarker: /HeadlessChrome/i.test(navigator.userAgent) }));
-		const fortressActivationVerified = shared?.metadata.fortressActivationVerified ?? fortress?.activationVerified;
-		return { connection: shared ? "shared" : endpoint ? "cdp" : fortress ? "managed-fortress" : native ? "managed-native" : "managed", version: context.browser()!.version(), ...(fortress || shared ? { fortressActivationVerified } : {}), environment, canvas };
+		return { connection: shared ? "shared" : endpoint ? "cdp" : fortress ? "managed-fortress" : native ? "managed-native" : "managed", version: context.browser()!.version(), environment, canvas };
 	} finally {
 		await page?.close().catch(() => {});
 		if (shared) await shared.close();

@@ -2,29 +2,6 @@ import type { BrowserConfig } from "./config.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-/** Structural/expiry check only; the official engine verifies the signature. */
-export function validateFortressToken(token: string, now = Date.now()): void {
-	try {
-		const parts = token.split(".");
-		if (token.length > 16_384 || parts.length !== 3 || !parts.every(part => /^[a-zA-Z0-9_-]+$/.test(part))) throw new Error();
-		const claims = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
-		if (!Number.isSafeInteger(claims?.exp) || claims.exp * 1000 <= now) throw new Error();
-	} catch { throw new Error("Invalid or expired Fortress license token"); }
-}
-
-export function resolveFortressLicense(config: Pick<BrowserConfig, "fortressLicenseFileEnv" | "fortressRequireLicense">, env: NodeJS.ProcessEnv = process.env): string | undefined {
-	const name = config.fortressLicenseFileEnv;
-	if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error("Invalid Fortress license environment variable name");
-	const file = env[name];
-	if (!file) { if (config.fortressRequireLicense) throw new Error("Activate Fortress first with alive browser activate; silent first-generation fallback is disabled"); return; }
-	try {
-		if (!path.isAbsolute(file) || !fs.statSync(file).isFile() || (process.platform !== "win32" && (fs.statSync(file).mode & 0o077))) throw new Error();
-		validateFortressToken(fs.readFileSync(file, "utf8").trim());
-	} catch { throw new Error("Fortress license file must be private and contain a current token; run alive browser activate"); }
-	// Presence/expiry only: the official engine verifies the license signature.
-	return file;
-}
-
 /** Operator configuration only; tool/page input cannot select an executable. */
 export function resolveBrowserExecutable(config: Pick<BrowserConfig, "executablePathEnv" | "cdpEndpointEnv">, env: NodeJS.ProcessEnv = process.env): string | undefined {
 	const name = config.executablePathEnv;

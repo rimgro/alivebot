@@ -14,9 +14,6 @@ export interface BrowserConfig {
 	engine: "chrome" | "fortress";
 	/** Official, immutable Docker image; used when no native Fortress executable is configured. */
 	fortressImage: string;
-	fortressLicenseFileEnv: string;
-	/** Refuse the silent first-generation mode for production Fortress setup. */
-	fortressRequireLicense: boolean;
 	/** Empty launches Chrome; otherwise attach to the loopback CDP URL in this env var. */
 	cdpEndpointEnv: string;
 	/** Private shared-browser host; empty retains a dedicated managed browser. */
@@ -69,9 +66,8 @@ export const DEFAULT_BROWSER_CONFIG: BrowserConfig = {
 	enabled: false,
 	driver: "patchright",
 	engine: "chrome",
-	fortressImage: "tilion/fortress@sha256:6c275b96f96199f48ab7ca05366898cdf796ac1da8cb5cceb936a4ce98e41b4e",
-	fortressLicenseFileEnv: "ALIVE_FORTRESS_LICENSE_FILE",
-	fortressRequireLicense: true,
+	// Official BSD-3-Clause 151 image, published before the source-available/activation switch.
+	fortressImage: "tilion/fortress@sha256:0f81aefbc15fc7aa70cb94efe26ace491bbcfb0d21441b7b2b3383a6587bc925",
 	cdpEndpointEnv: "",
 	sharedUrl: "",
 	sharedTokenFileEnv: "ALIVE_BROWSER_SHARED_TOKEN_FILE",

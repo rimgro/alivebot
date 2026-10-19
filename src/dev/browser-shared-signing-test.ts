@@ -15,6 +15,7 @@ import { ModuleHost } from "../events/host.js";
 import { Logger } from "../log.js";
 import { BrowserModule } from "../modules/browser/module.js";
 import { BrowserRouter } from "../modules/browser/router.js";
+import { ConversationAgentBrowser } from "../modules/browser/agent-browser.js";
 import { EventStore } from "../store/events.js";
 import { HistoryStore } from "../store/history.js";
 
@@ -34,11 +35,16 @@ const fixture = https.createServer({ key: fs.readFileSync(tlsKey), cert: fs.read
 	else response.setHeader("content-type", "text/html");
 	response.end("<title>Signed shared fixture</title>");
 });
-await new Promise<void>(resolve => fixture.listen(0, "127.0.0.1", resolve));
-const origin = `https://127.0.0.1:${(fixture.address() as { port: number }).port}`, token = randomBytes(32).toString("base64url");
-const config = { ...DEFAULT_BROWSER_CONFIG, engine: "chrome" as const, driver: "playwright" as const, headless: true, signing: { ...DEFAULT_BROWSER_CONFIG.signing, enabled: true, keyFileEnv: "ALIVE_SHARED_SIGNING_KEY", agentUrl: "https://identity.test", origins: [origin] } };
+const fortress = process.env.ALIVE_BROWSER_TEST_FORTRESS === "1";
+// The engine container cannot reach host loopback. This disposable HTTPS
+// fixture binds only the Linux Docker bridge, never a phone/public endpoint.
+const fixtureHost = fortress ? execFileSync("docker", ["network", "inspect", "bridge", "--format", "{{(index .IPAM.Config 0).Gateway}}"], { encoding: "utf8" }).trim() : "127.0.0.1";
+await new Promise<void>((resolve, reject) => { fixture.once("error", reject); fixture.listen(0, fixtureHost, resolve); });
+const origin = `https://${fixtureHost}:${(fixture.address() as { port: number }).port}`, token = randomBytes(32).toString("base64url");
+const config = { ...DEFAULT_BROWSER_CONFIG, engine: fortress ? "fortress" as const : "chrome" as const, driver: "playwright" as const, headless: true, signing: { ...DEFAULT_BROWSER_CONFIG.signing, enabled: true, keyFileEnv: "ALIVE_SHARED_SIGNING_KEY", agentUrl: "https://identity.test", origins: [origin] } };
 const host = new SharedBrowserHost({ config, directory: root, token, port: 0 });
 const clients: Browser[] = [];
+const agents: ConversationAgentBrowser[] = [];
 try {
 	await host.start();
 	delete process.env.ALIVE_SHARED_SIGNING_KEY;
@@ -66,8 +72,10 @@ try {
 		// TLS exceptions apply only to this disposable local HTTPS fixture.
 		const context = await browser.newContext({ acceptDownloads: false, ignoreHTTPSErrors: true });
 		await context.addCookies([{ name: "owner", value: owner, url: origin }]);
-		const page = await context.newPage(); await page.goto(`${origin}/${owner}`);
-		assert.equal(await page.title(), "Signed shared fixture");
+		await context.newPage();
+		const agent = new ConversationAgentBrowser(context, () => {}, 15000); agents.push(agent);
+		await agent.run(["open", `${origin}/${owner}`]);
+		assert.equal((await agent.run(["get", "title"])).title, "Signed shared fixture");
 		const response = await context.request.get(`${origin}/api-${owner}`); assert.equal(response.status(), 200); await response.dispose();
 	}
 	const redirect = await clients[0].contexts()[0].request.get(`${origin}/redirect`); assert.equal(redirect.status(), 302); await redirect.dispose();
@@ -76,9 +84,10 @@ try {
 	assert.equal(seen.some(request => request.path === "/must-not-follow"), false);
 	assert.equal(new Set(seen.map(request => request.nonce)).size, seen.length);
 	await clients[0].close();
-	const page = clients[1].contexts()[0].pages()[0]; await page.goto(`${origin}/still-signed`); assert.ok(seen.at(-1)!.valid);
-	console.log("shared signing: one host identity across isolated clients, independently verified browser/API signatures, private cookies, fresh nonces and no signed redirects passed");
+	await agents[1].run(["open", `${origin}/still-signed`]); assert.ok(seen.at(-1)!.valid);
+	console.log(`shared signing on ${config.engine}: one host identity across isolated clients, independently verified native agent-browser/API signatures, private cookies, fresh nonces and no signed redirects passed`);
 } finally {
+	for (const agent of agents) await agent.close();
 	for (const client of clients) await client.close().catch(() => {}); await host.close();
 	fixture.closeAllConnections(); await new Promise<void>(resolve => fixture.close(() => resolve()));
 	delete process.env.ALIVE_SHARED_SIGNING_KEY; delete process.env.ALIVE_SHARED_SIGNING_TOKEN; fs.rmSync(root, { recursive: true, force: true });

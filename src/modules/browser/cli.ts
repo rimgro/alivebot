@@ -18,10 +18,9 @@ import { BrowserIdentity } from "./identity.js";
 import { BrowserModule } from "./module.js";
 import { cancelBrowserPairing, readBrowserOperator, requestBrowserPairing, writePrivateJson } from "./operator.js";
 import { startQuickTunnel, type QuickTunnel } from "./tunnel.js";
-import { resolveBrowserExecutable, resolveCdpEndpoint, resolveFortressLicense } from "./connection.js";
+import { resolveBrowserExecutable, resolveCdpEndpoint } from "./connection.js";
 import { diagnoseBrowser } from "./diagnostics.js";
 import { validateFortressImage, fortressImageInstalled } from "./fortress.js";
-import { activateFortress } from "./activation.js";
 import { sharedMetadata, sharedOrigin, sharedToken } from "./shared-client.js";
 import { sharedHostCommand, sharedHostTokenFile } from "./shared-cli.js";
 import { migrateSharedState } from "./shared-migrate.js";
@@ -59,9 +58,8 @@ export function setupBrowser(loaded: LoadedConfig, flags: Flags): string {
 		if (!["chrome", "fortress"].includes(managedEngine)) throw new Error("Use --engine chrome or fortress");
 		browser.engine = managedEngine as typeof browser.engine;
 		if (managedEngine === "fortress" && flags.headless === undefined) browser.headless = true;
-		if (managedEngine === "fortress") browser.fortressRequireLicense = true;
+		if (managedEngine === "fortress") browser.fortressImage = DEFAULT_BROWSER_CONFIG.fortressImage;
 	}
-	if (flags["require-activation"] !== undefined) browser.fortressRequireLicense = boolFlag(flags, "require-activation");
 	const fortressImage = stringFlag(flags, "fortress-image");
 	if (fortressImage !== undefined) { validateFortressImage(fortressImage); browser.fortressImage = fortressImage; }
 	const driver = stringFlag(flags, "driver");
@@ -132,6 +130,8 @@ export function setupBrowser(loaded: LoadedConfig, flags: Flags): string {
 	}
 	if (identityUrl && !browser.signing.enabled) throw new Error("Use --sign-origins when configuring a new signed identity");
 	local.modules = { ...local.modules, browser: { ...local.modules?.browser, ...browser } };
+	// Old PR-local activation settings have no meaning for the BSD release.
+	for (const key of ["fortressRequireLicense", "fortressLicenseFileEnv"]) Reflect.deleteProperty(local.modules.browser, key);
 	local.tools = { ...local.tools, allowlist: [...new Set([...loaded.config.tools.allowlist, "browser", "browser_share"])] };
 	writePrivateJson(file, local);
 	return file;
@@ -150,16 +150,10 @@ export async function browserCommand(loaded: LoadedConfig, action: string, flags
 			return report.canvas.passed ? 0 : 1;
 		}
 		case "pair": return await pair(loaded);
-		case "activate": {
-			const abort = new AbortController(), cancel = () => abort.abort();
-			process.once("SIGINT", cancel); process.once("SIGTERM", cancel);
-			try { await activateFortress(loaded, abort.signal); return 0; }
-			finally { process.off("SIGINT", cancel); process.off("SIGTERM", cancel); }
-		}
 		case "serve": return await serve(loaded, flags);
 		case "host": case "host-stop": case "host-status": return await sharedHostCommand(loaded, action, flags);
 		case "migrate-shared": return await migrateSharedState(loaded);
-		default: throw new Error("usage: alive browser setup [--engine chrome|fortress] [--shared-url PRIVATE_ORIGIN] [--fortress-image tilion/fortress@sha256:DIGEST] [--require-activation true|false] [--driver patchright|playwright] [--cdp-env ENV_NAME | --executable-env ENV_NAME] [--channel chrome|chromium] [--launch-mode auto|driver|native] [--native-warmup-ms 10000] [--humanization true|false] [--public-url HTTPS_ORIGIN] [--identity-url HTTPS_ORIGIN] [--headless true|false] [--challenge-wait-ms 15000] [--navigation-interval-ms 2000] [--sign-origins HTTPS_ORIGIN,...] | host [--background|--foreground] [--bind ADDRESS] [--port 4330] [--max-clients 8] [--token-file PATH] | host-stop | host-status | migrate-shared | activate | doctor [--online] | diagnose | pair | serve [--url HTTP_URL] [--local] [--tunnel] [--cloudflared PATH]");
+		default: throw new Error("usage: alive browser setup [--engine chrome|fortress] [--shared-url PRIVATE_ORIGIN] [--fortress-image tilion/fortress@sha256:DIGEST] [--driver patchright|playwright] [--cdp-env ENV_NAME | --executable-env ENV_NAME] [--channel chrome|chromium] [--launch-mode auto|driver|native] [--native-warmup-ms 10000] [--humanization true|false] [--public-url HTTPS_ORIGIN] [--identity-url HTTPS_ORIGIN] [--headless true|false] [--challenge-wait-ms 15000] [--navigation-interval-ms 2000] [--sign-origins HTTPS_ORIGIN,...] | host [--background|--foreground] [--bind ADDRESS] [--port 4330] [--max-clients 8] [--token-file PATH] | host-stop | host-status | migrate-shared | doctor [--online] | diagnose | pair | serve [--url HTTP_URL] [--local] [--tunnel] [--cloudflared PATH]");
 	}
 }
 
@@ -172,13 +166,7 @@ async function doctor(loaded: LoadedConfig, online: boolean): Promise<number> {
 	const engine = browser.driver === "patchright" ? (await import("patchright")).chromium : chromium;
 	const endpoint = resolveCdpEndpoint(browser);
 	const executablePath = resolveBrowserExecutable(browser);
-	let activationReady = true;
-	if (browser.engine === "fortress" && !endpoint && !browser.sharedUrl) {
-		let configured = false;
-		try { configured = !!resolveFortressLicense({ ...browser, fortressRequireLicense: false }); } catch { /* Report state without displaying private credentials. */ }
-		activationReady = configured || !browser.fortressRequireLicense;
-		process.stdout.write(`Fortress activation: ${configured ? "current private token configured; engine verifies signature at startup (not tested here)" : "not configured; v3 is not established"}; require activation ${browser.fortressRequireLicense}\n`);
-	}
+	if (browser.engine === "fortress") process.stdout.write("Fortress: pinned BSD-3-Clause 151 release; no account, activation or license token required\n");
 	const candidates = browser.channel === "chromium" ? [engine.executablePath()] : process.platform === "darwin"
 		? ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"]
 		: process.platform === "win32" ? [path.join(process.env.PROGRAMFILES ?? "", "Google/Chrome/Application/chrome.exe"), path.join(process.env.LOCALAPPDATA ?? "", "Google/Chrome/Application/chrome.exe")]
@@ -187,7 +175,7 @@ async function doctor(loaded: LoadedConfig, online: boolean): Promise<number> {
 	if (browser.sharedUrl) {
 		sharedOrigin(browser.sharedUrl); sharedToken(browser);
 		const metadata = online ? await sharedMetadata(browser) : undefined;
-		process.stdout.write(`Shared browser host: ${browser.sharedUrl}; ${online ? `reachable; ${metadata!.browserVersion}; native activation ${metadata!.fortressActivationVerified}` : "reachability unchecked"}; no local browser installation is required\n`);
+		process.stdout.write(`Shared browser host: ${browser.sharedUrl}; ${online ? `reachable; ${metadata!.browserVersion}; Canvas ${metadata!.fortressCanvas?.passed === false ? "native OSS defect detected (see diagnose)" : metadata!.fortressCanvas?.passed ? "passed" : "unchecked"}` : "reachability unchecked"}; no local browser installation is required\n`);
 	}
 	if (online && endpoint) {
 		try {
@@ -233,7 +221,7 @@ async function doctor(loaded: LoadedConfig, online: boolean): Promise<number> {
 		if (directory.keys?.[0]?.x !== expected.keys[0].x || !response.headers.get("signature")) throw new Error("Public directory does not match the configured identity");
 		process.stdout.write("Public identity HTTPS directory reachable\n");
 	}
-	return browser.enabled && installed && activationReady && token && destinationAllowed && browser.publicUrl ? 0 : 1;
+	return browser.enabled && installed && token && destinationAllowed && browser.publicUrl ? 0 : 1;
 }
 
 function runtimeAvailable(loaded: LoadedConfig): void {

@@ -1,3 +1,5 @@
+import { assertAgentCdpCommand } from "./agent-cdp-policy.js";
+
 interface Packet { id?: number; guid?: string; method?: string; params?: Record<string, any>; result?: Record<string, any> }
 
 /** The remote server scopes SDK objects; this gate removes browser-wide and server-filesystem escape hatches. */
@@ -49,8 +51,7 @@ export class SharedProtocol {
 		if (type === "BrowserContext" && method === "newPage" && this.pages.size >= 8) throw new Error("Too many pages in this shared browser session");
 		if (type === "CDPSession" && method === "send") {
 			const command = params.method;
-			const allowed = new Set(["Page.startScreencast", "Page.stopScreencast", "Page.screencastFrameAck", "Page.captureScreenshot", "Browser.getWindowForTarget", "Browser.setContentsSize", "Emulation.clearDeviceMetricsOverride"]);
-			if (!allowed.has(command)) throw new Error("This CDP command is unavailable on a shared host");
+			if (!["Browser.getWindowForTarget", "Browser.setContentsSize"].includes(command)) assertAgentCdpCommand(command, params.params);
 			if (command === "Browser.getWindowForTarget" && Object.keys(params.params || {}).length) throw new Error("Only the current page window is available");
 			if (command === "Browser.setContentsSize" && !this.windows.has(params.params?.windowId)) throw new Error("This browser window does not belong to the connection");
 			if (command === "Browser.getWindowForTarget") this.pending.set(packet.id!, command);

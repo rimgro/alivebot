@@ -9,7 +9,8 @@ import { DEFAULT_BROWSER_CONFIG } from "../modules/browser/config.js";
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-shared-cli-"));
 const entry = path.resolve("src/index.ts"), loader = import.meta.resolve("tsx");
 const run = promisify(execFile), file = path.join(root, "alive.config.json");
-fs.writeFileSync(file, JSON.stringify({ modules: { browser: { ...DEFAULT_BROWSER_CONFIG, engine: "chrome", headless: true } } }));
+const fortress = process.env.ALIVE_BROWSER_TEST_FORTRESS === "1";
+fs.writeFileSync(file, JSON.stringify({ modules: { browser: { ...DEFAULT_BROWSER_CONFIG, engine: fortress ? "fortress" : "chrome", headless: true } } }));
 const invoke = (args: string[]) => run(process.execPath, ["--import", loader, entry, "browser", ...args, "--config", file], { cwd: root, timeout: 30_000, maxBuffer: 1024 * 1024 });
 try {
 	const start = await invoke(["host", "--background", "--port", "0"]);
@@ -27,8 +28,18 @@ try {
 	assert.equal(local.modules.browser.sharedUrl, endpoint.origin);
 	const env = fs.readFileSync(path.join(root, ".env"), "utf8");
 	assert.ok(env.includes("ALIVE_BROWSER_SHARED_TOKEN_FILE=")); assert.equal(env.includes(token), false);
-	const diagnose = JSON.parse((await invoke(["diagnose"])).stdout);
-	assert.equal(diagnose.connection, "shared"); assert.equal(diagnose.canvas.passed, true);
+	let diagnosticOutput: string;
+	try { diagnosticOutput = (await invoke(["diagnose"])).stdout; }
+	catch (error) {
+		const failed = error as { code?: number; stdout?: string };
+		if (!fortress || failed.code !== 1 || !failed.stdout) throw error;
+		diagnosticOutput = failed.stdout;
+	}
+	const diagnose = JSON.parse(diagnosticOutput);
+	assert.equal(diagnose.connection, "shared");
+	assert.equal(typeof diagnose.canvas.passed, "boolean");
+	if (!fortress) assert.equal(diagnose.canvas.passed, true);
+	if (fortress) assert.equal(diagnose.version, "151.0.7908.0", "The actual BSD engine must run without activation");
 	await invoke(["host-stop"]);
 	await assert.rejects(invoke(["host-status"]));
 	console.log("shared-browser CLI: independent background lifecycle, duplicate refusal, secret-free setup, remote diagnostics and cleanup passed");

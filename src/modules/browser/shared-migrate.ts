@@ -4,7 +4,6 @@ import type { BrowserType } from "playwright";
 import type { LoadedConfig } from "../../config.js";
 import { snapshotRuntime } from "../../runtime/daemon.js";
 import { DEFAULT_BROWSER_CONFIG } from "./config.js";
-import { resolveFortressLicense } from "./connection.js";
 import { launchManagedFortress } from "./fortress.js";
 import { writePrivateJson } from "./operator.js";
 
@@ -21,7 +20,7 @@ export async function migrateSharedState(loaded: LoadedConfig): Promise<number> 
 		const profile = path.join(directory, "profile-fortress"), destination = path.join(directory, "shared-storage.json");
 		if (!fs.existsSync(profile)) continue;
 		if (fs.existsSync(destination)) { skipped++; continue; }
-		const managed = await launchManagedFortress({ image: config.fortressImage, profile, stateDir: directory, licenseFile: resolveFortressLicense(config), timeoutMs: 60_000, signal: AbortSignal.timeout(70_000) });
+		const managed = await launchManagedFortress({ image: config.fortressImage, profile, stateDir: directory, timeoutMs: 60_000, signal: AbortSignal.timeout(70_000) });
 		let browser;
 		try {
 			browser = await engine.connectOverCDP(managed.endpoint, { timeout: config.actionTimeoutMs, noDefaults: true });

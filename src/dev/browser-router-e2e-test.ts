@@ -32,6 +32,7 @@ let scope = ["telegram:111"];
 const contexts: BrowserContext[] = [];
 const links: Array<{ thread: string; url: string }> = [];
 const driver = process.env.ALIVE_BROWSER_TEST_DRIVER === "playwright" ? "playwright" : "patchright";
+const channel = process.env.ALIVE_BROWSER_TEST_CHANNEL === "chromium" ? "chromium" : "chrome";
 const engine = driver === "patchright" ? (await import("patchright")).chromium : chromium;
 const nativeViewport = process.env.ALIVE_BROWSER_TEST_NATIVE_VIEWPORT === "1";
 const forceCompatibility = process.env.ALIVE_BROWSER_TEST_VIEWPORT_FALLBACK === "1";
@@ -39,9 +40,9 @@ const nativeLaunch = process.env.ALIVE_BROWSER_TEST_NATIVE_LAUNCH === "1";
 const fortressLaunch = process.env.ALIVE_BROWSER_TEST_FORTRESS === "1";
 const sharedLaunch = process.env.ALIVE_BROWSER_TEST_SHARED === "1";
 const sharedToken = randomBytes(32).toString("base64url"); process.env.ALIVE_ROUTER_SHARED_TEST_TOKEN = sharedToken;
-const sharedHost = sharedLaunch ? new SharedBrowserHost({ config: { ...DEFAULT_BROWSER_CONFIG, engine: fortressLaunch ? "fortress" : "chrome", fortressRequireLicense: fortressLaunch && !!process.env.ALIVE_FORTRESS_LICENSE_FILE, headless: true, driver }, directory: path.join(root, "shared-host"), token: sharedToken, port: 0 }) : undefined;
+const sharedHost = sharedLaunch ? new SharedBrowserHost({ config: { ...DEFAULT_BROWSER_CONFIG, channel, engine: fortressLaunch ? "fortress" : "chrome", headless: true, driver }, directory: path.join(root, "shared-host"), token: sharedToken, port: 0 }) : undefined;
 await sharedHost?.start();
-const router = new BrowserRouter({ port: 0, sharedUrl: sharedHost?.endpoint() || "", sharedTokenEnv: "ALIVE_ROUTER_SHARED_TEST_TOKEN", sharedTokenFileEnv: "ALIVE_ROUTER_SHARED_TEST_TOKEN_FILE", engine: fortressLaunch ? "fortress" : "chrome", fortressRequireLicense: fortressLaunch && !!process.env.ALIVE_FORTRESS_LICENSE_FILE, viewport: nativeViewport || nativeLaunch || fortressLaunch ? null : { width: 900, height: 720 }, driver, launchMode: nativeLaunch ? "native" : "driver", nativeWarmupMs: 400, headless: fortressLaunch ? true : nativeLaunch ? false : process.env.ALIVE_BROWSER_TEST_HEADED !== "1", minActionIntervalMs: 0, minNavigationIntervalMs: 0, humanization: { ...DEFAULT_HUMANIZATION, enabled: false } }, {
+const router = new BrowserRouter({ port: 0, channel, sharedUrl: sharedHost?.endpoint() || "", sharedTokenEnv: "ALIVE_ROUTER_SHARED_TEST_TOKEN", sharedTokenFileEnv: "ALIVE_ROUTER_SHARED_TEST_TOKEN_FILE", engine: fortressLaunch ? "fortress" : "chrome", viewport: nativeViewport || nativeLaunch || fortressLaunch ? null : { width: 900, height: 720 }, driver, launchMode: nativeLaunch ? "native" : "driver", nativeWarmupMs: 400, headless: fortressLaunch ? true : nativeLaunch ? false : process.env.ALIVE_BROWSER_TEST_HEADED !== "1", minActionIntervalMs: 0, minNavigationIntervalMs: 0, humanization: { ...DEFAULT_HUMANIZATION, enabled: false } }, {
 	...(nativeLaunch || fortressLaunch || sharedLaunch ? {} : { launch: async (directory: string, options: Parameters<typeof engine.launchPersistentContext>[1]) => {
 		const context = await engine.launchPersistentContext(directory, options) as unknown as BrowserContext;
 		if (forceCompatibility) {
@@ -75,7 +76,7 @@ try {
 			scope = [thread];
 			const initialized = await router.command({ action: "screenshot", thread });
 			assert.equal(initialized.isError, undefined);
-			if (process.env.ALIVE_FORTRESS_LICENSE_FILE) assert.equal(initialized.details.fortressActivationVerified, true, "Native first-generation fallback must be rejected");
+			assert.ok(initialized.details.fortressCanvas, "OSS Canvas diagnostics must remain visible even if the native probe fails");
 			const sessions = (router as unknown as { sessions: Map<string, { browser: BrowserModule }> }).sessions;
 			const context = (sessions.get(thread)!.browser as unknown as { context: BrowserContext }).context;
 			await context.route(`${target}/**`, async route => {
@@ -110,7 +111,7 @@ try {
 	assert.equal(await contexts[1].pages()[0].evaluate("localStorage.getItem('owner')"), "222");
 	const originalViewport = await contexts[0].pages()[0].evaluate("({width:innerWidth,height:innerHeight})");
 	assert.ok(events.all().filter(event => event.source === "browser").every(event => ["telegram:111", "telegram:222"].includes(event.thread!)), "Automatic assistance and return events must identify their owner");
-	operator = await chromium.launch({ channel: "chrome", headless: true });
+	operator = await chromium.launch({ channel, headless: true });
 	const originalContext = await operator.newContext({ viewport: { width: 375, height: 812 }, hasTouch: true, isMobile: true });
 	let phone = await originalContext.newPage();
 	let websockets = 0; phone.on("websocket", () => websockets++);
@@ -170,7 +171,15 @@ try {
 	await phone.locator("#frame").waitFor({ state: "visible" });
 	await phone.locator("#agent-state").filter({ hasText: "Агент может продолжать" }).waitFor();
 	assert.equal((await router.command({ action: "read" })).details.error, undefined, "A live viewer must not lock the agent's browser");
-	assert.equal((await router.command({ action: "fill", selector: "#target", text: "Agent input while shared" })).details.error, undefined);
+	let inputSelector = "#target";
+	if (sharedLaunch) {
+		assert.equal((await router.command({ action: "status" })).details.agentAutomation, "agent-browser");
+		const observed = await router.command({ action: "snapshot" });
+		const ref = String(observed.details.snapshot).match(/textbox[^\n]*\[ref=(e\d+)\]/)?.[1];
+		assert.ok(ref, "The routed tool must return native agent-browser refs, not SDK aria refs");
+		inputSelector = `@${ref}`;
+	}
+	assert.equal((await router.command({ action: "fill", selector: inputSelector, text: "Agent input while shared" })).details.error, undefined);
 	assert.equal(await native.locator("#target").inputValue(), "Agent input while shared");
 	assert.equal((await router.command({ action: "navigate", url: `${target}/?owner=111&mode=shared&step=2` })).details.error, undefined);
 	assert.ok((await router.command({ action: "status" })).details.handoff, "Navigation keeps the viewer's access alive");

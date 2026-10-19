@@ -5,7 +5,7 @@ import type { BrowserConfig } from "./config.js";
 import { writePrivateJson } from "./operator.js";
 
 export interface SharedMetadata {
-	protocol: 1; engine: string; browserVersion: string; fortressImage?: string; fortressActivationVerified: boolean;
+	protocol: 1; engine: string; browserVersion: string; fortressImage?: string; fortressCanvas?: import("./diagnostics.js").CanvasReport;
 	signing?: { agentUrl: string; keyId: string; origins: string[] };
 }
 export interface SharedContext {
@@ -37,7 +37,7 @@ export async function sharedMetadata(config: BrowserConfig, signal?: AbortSignal
 		if (!response.ok) throw new Error();
 		const metadata = await response.json() as SharedMetadata;
 		if (metadata.protocol !== 1 || !metadata.browserVersion || !["chrome", "fortress"].includes(metadata.engine)) throw new Error();
-		if (metadata.engine !== config.engine || (config.engine === "fortress" && (metadata.fortressImage !== config.fortressImage || (config.fortressRequireLicense && !metadata.fortressActivationVerified)))) throw new Error();
+		if (metadata.engine !== config.engine || (config.engine === "fortress" && metadata.fortressImage !== config.fortressImage)) throw new Error();
 		if (config.signing.enabled && (metadata.signing?.agentUrl !== config.signing.agentUrl || JSON.stringify([...metadata.signing.origins].sort()) !== JSON.stringify([...config.signing.origins].sort()))) throw new Error();
 		return metadata;
 	} catch { throw new Error("Shared browser host is unavailable, unauthorized, or differs from the configured engine/signing policy; no local browser was started"); }

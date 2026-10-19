@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { WebSocket } from "ws";
 
-interface Owner { id: string; token: string; image: string; imageId: string; profileHash: string; endpoint: string; licenseFile?: string; licenseDigest?: string }
+interface Owner { id: string; token: string; image: string; imageId: string; profileHash: string; endpoint: string }
 interface Inspection {
 	Id: string; Image: string;
 	State: { Running: boolean };
@@ -14,7 +14,7 @@ interface Inspection {
 	Mounts: Array<{ Type: string; Source: string; Destination: string; RW: boolean }>;
 	NetworkSettings: { Ports: Record<string, Array<{ HostIp: string; HostPort: string }> | null> };
 }
-export interface ManagedFortress { endpoint: string; image: string; activationVerified: boolean; close(): Promise<void> }
+export interface ManagedFortress { endpoint: string; image: string; close(): Promise<void> }
 
 function dockerExecutable(): string {
 	if (process.platform === "darwin" && fs.existsSync("/usr/local/bin/docker")) return "/usr/local/bin/docker";
@@ -37,23 +37,12 @@ export async function fortressImageInstalled(image: string): Promise<boolean> {
 	catch { return false; }
 }
 
-/** The pinned binary always warns at startup when native license verification fails. */
-async function requireNativeActivation(id: string): Promise<void> {
-	const logs = await new Promise<string>((resolve, reject) => {
-		execFile(dockerExecutable(), ["logs", id], { timeout: 5000, maxBuffer: 2 * 1024 * 1024 }, (error, stdout, stderr) => {
-			if (error) reject(new Error("Cannot verify Fortress native activation; startup logs are unavailable"));
-			else resolve(stdout + "\n" + stderr);
-		});
-	});
-	if (/fortress:\s*no valid license key\s*--\s*running in v1/i.test(logs)) throw new Error("Fortress rejected the license and entered first-generation mode; run alive browser activate");
-}
 function readOwner(file: string): Owner | undefined {
 	if (!fs.existsSync(file)) return;
 	let owner: Owner;
 	try { owner = JSON.parse(fs.readFileSync(file, "utf8")); }
 	catch { throw new Error("Invalid Fortress ownership record"); }
 	if (!/^[a-f0-9]{64}$/.test(owner.id) || !/^sha256:[a-f0-9]{64}$/.test(owner.imageId) || !/^[a-f0-9]{32}$/.test(owner.token) || !/^[a-f0-9]{64}$/.test(owner.profileHash)) throw new Error("Invalid Fortress ownership record");
-	if (owner.licenseFile && !/^[a-f0-9]{64}$/.test(owner.licenseDigest || "")) throw new Error("Invalid Fortress license ownership record");
 	validateFortressImage(owner.image);
 	const endpoint = new URL(owner.endpoint);
 	if (endpoint.protocol !== "http:" || endpoint.hostname !== "127.0.0.1" || !endpoint.port || endpoint.pathname !== "/" || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) throw new Error("Invalid Fortress ownership endpoint");
@@ -72,12 +61,10 @@ function matches(info: Inspection, owner: Owner, profile: string): boolean {
 	const home = info.Mounts.find(mount => mount.Destination === "/alive/home");
 	const ports = info.NetworkSettings.Ports["9222/tcp"];
 	const binding = info.HostConfig.PortBindings["9222/tcp"];
-	const license = info.Mounts.find(mount => mount.Destination === "/alive/home/.tilion/license.jwt");
 	return info.Id === owner.id && info.Image === owner.imageId
 		&& labels["alive.browser"] === "fortress" && labels["alive.owner"] === owner.token && labels["alive.profile"] === owner.profileHash
 		&& mount?.Type === "bind" && mount.RW && path.resolve(mount.Source) === profile
 		&& home?.Type === "bind" && home.RW && path.resolve(home.Source) === path.join(path.dirname(profile), "fortress-home")
-		&& (owner.licenseFile ? license?.Type === "bind" && !license.RW && path.resolve(license.Source) === owner.licenseFile : !license)
 		&& binding?.length === 1 && binding[0].HostIp === "127.0.0.1"
 		&& (!info.State.Running || (ports?.length === 1 && ports[0].HostIp === "127.0.0.1" && `http://127.0.0.1:${ports[0].HostPort}` === owner.endpoint));
 }
@@ -96,7 +83,7 @@ async function waitEndpoint(endpoint: string, timeoutMs: number, signal: AbortSi
 }
 
 /** An owned, isolated container per conversation. No downloads, shared profiles or fallback. */
-export async function launchManagedFortress(input: { image: string; profile: string; stateDir: string; licenseFile?: string; timeoutMs: number; signal: AbortSignal }): Promise<ManagedFortress> {
+export async function launchManagedFortress(input: { image: string; profile: string; stateDir: string; timeoutMs: number; signal: AbortSignal }): Promise<ManagedFortress> {
 	validateFortressImage(input.image); input.signal.throwIfAborted();
 	const profile = path.resolve(input.profile), profileHash = createHash("sha256").update(profile).digest("hex");
 	if (!path.isAbsolute(input.profile) || profile.includes(",")) throw new Error("Fortress requires an absolute dedicated profile path without commas");
@@ -104,18 +91,16 @@ export async function launchManagedFortress(input: { image: string; profile: str
 	const home = path.join(path.dirname(profile), "fortress-home");
 	fs.mkdirSync(home, { recursive: true, mode: 0o700 }); fs.chmodSync(home, 0o700);
 	fs.mkdirSync(path.join(home, ".tilion"), { recursive: true, mode: 0o700 });
-	if (input.licenseFile && (!path.isAbsolute(input.licenseFile) || input.licenseFile.includes(","))) throw new Error("Invalid Fortress license file path");
-	const licenseDigest = input.licenseFile ? createHash("sha256").update(fs.readFileSync(input.licenseFile)).digest("hex") : undefined;
 	fs.mkdirSync(input.stateDir, { recursive: true, mode: 0o700 });
 	const record = path.join(input.stateDir, "fortress-container.json"), previous = readOwner(record);
 	if (previous) {
-		if (previous.image !== input.image || previous.profileHash !== profileHash || previous.licenseFile !== input.licenseFile || previous.licenseDigest !== licenseDigest) throw new Error("Fortress ownership differs from this configuration; close the owned session before changing its image/profile/license");
+		if (previous.image !== input.image || previous.profileHash !== profileHash) throw new Error("Fortress ownership differs from this configuration; close the owned session before changing its image/profile");
 		const info = await inspect(previous.id);
 		if (info) {
 			if (!matches(info, previous, profile)) throw new Error("Fortress ownership cannot be verified; no container was changed or attached");
 			if (info.State.Running) {
 				const browser = owned(previous, profile, record);
-				try { await waitEndpoint(previous.endpoint, input.timeoutMs, input.signal); if (input.licenseFile) await requireNativeActivation(previous.id); return browser; }
+				try { await waitEndpoint(previous.endpoint, input.timeoutMs, input.signal); return browser; }
 				catch (error) { await browser.close(); throw error; }
 			}
 			// A stopped owned container may receive a different ephemeral port on
@@ -135,7 +120,6 @@ export async function launchManagedFortress(input: { image: string; profile: str
 		"--platform", `linux/${image.Architecture}`, "--publish", "127.0.0.1::9222", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only",
 		"--memory", "3g", "--cpus", "2", "--pids-limit", "512", "--shm-size", "512m", "--tmpfs", "/tmp:rw,nosuid,size=256m",
 		"--mount", `type=bind,source=${profile},target=/alive/profile`, "--mount", `type=bind,source=${home},target=/alive/home`,
-		...(input.licenseFile ? ["--mount", `type=bind,source=${input.licenseFile},target=/alive/home/.tilion/license.jwt,readonly`] : []),
 		"--env", "HOME=/alive/home", ...geoEnvironment,
 		input.image, "--user-data-dir=/alive/profile", "about:blank"];
 	let owner: Owner | undefined, created: string | undefined;
@@ -149,11 +133,10 @@ export async function launchManagedFortress(input: { image: string; profile: str
 		const info = await inspect(created);
 		const ports = info?.NetworkSettings.Ports["9222/tcp"];
 		if (!info || ports?.length !== 1 || ports[0].HostIp !== "127.0.0.1") throw new Error("Fortress debug endpoint must be bound only to loopback");
-		owner = { id: created, token, image: input.image, imageId: image.Id, profileHash, endpoint: `http://127.0.0.1:${ports[0].HostPort}`, ...(input.licenseFile ? { licenseFile: input.licenseFile, licenseDigest } : {}) };
+		owner = { id: created, token, image: input.image, imageId: image.Id, profileHash, endpoint: `http://127.0.0.1:${ports[0].HostPort}` };
 		if (!matches(info, owner, profile)) throw new Error("Fortress container ownership verification failed");
 		fs.writeFileSync(record, `${JSON.stringify(owner)}\n`, { mode: 0o600 }); fs.chmodSync(record, 0o600);
 		await waitEndpoint(owner.endpoint, input.timeoutMs, input.signal);
-		if (input.licenseFile) await requireNativeActivation(owner.id);
 		return owned(owner, profile, record);
 	} catch (error) {
 		if (owner) await owned(owner, profile, record).close();
@@ -167,7 +150,7 @@ export async function launchManagedFortress(input: { image: string; profile: str
 
 function owned(owner: Owner, profile: string, record: string): ManagedFortress {
 	let closed = false;
-	return { endpoint: owner.endpoint, image: owner.image, activationVerified: !!owner.licenseFile, close: async () => {
+	return { endpoint: owner.endpoint, image: owner.image, close: async () => {
 		if (closed) return;
 		const info = await inspect(owner.id);
 		if (info && !matches(info, owner, profile)) throw new Error("Fortress cleanup refused an unverifiable container");

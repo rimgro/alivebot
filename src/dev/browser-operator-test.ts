@@ -42,7 +42,7 @@ try {
 	const fortressConfig = loadConfig({ cwd: root });
 	assert.equal(fortressConfig.config.modules.browser!.engine, "fortress");
 	assert.equal(fortressConfig.config.modules.browser!.headless, true);
-	assert.equal(fortressConfig.config.modules.browser!.fortressRequireLicense, true);
+	assert.equal("fortressRequireLicense" in fortressConfig.config.modules.browser!, false);
 	setupBrowser(fortressConfig, { engine: "chrome" });
 
 	const request = requestBrowserPairing(loaded.paths.modulesDir, 1000);

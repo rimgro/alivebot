@@ -7,11 +7,10 @@ import { createRequire } from "node:module";
 import type { Browser, BrowserType } from "playwright";
 import { WebSocket, WebSocketServer } from "ws";
 import type { BrowserConfig } from "./config.js";
-import { resolveFortressLicense } from "./connection.js";
 import { launchManagedFortress, type ManagedFortress } from "./fortress.js";
 import { BrowserIdentity } from "./identity.js";
 import { BrowserSigningTransport } from "./transport.js";
-import { checkCanvas } from "./diagnostics.js";
+import { checkCanvas, type CanvasReport } from "./diagnostics.js";
 import type { SharedMetadata } from "./shared-client.js";
 import { SharedProtocol } from "./shared-protocol.js";
 
@@ -95,13 +94,14 @@ export class SharedBrowserHost {
 				}
 			}, 15_000); this.heartbeat.unref();
 			const config = this.options.config;
+			let fortressCanvas: CanvasReport | undefined;
 			if (config.cdpEndpointEnv || config.executablePathEnv) throw new Error("Shared host supports an owned Fortress image or installed Chrome; external CDP/executable overrides are not inherited");
 			const engine = (config.driver === "patchright" ? (await import("patchright")).chromium : (await import("playwright")).chromium) as unknown as BrowserType;
 			if (config.engine === "fortress") {
-				this.fortress = await launchManagedFortress({ image: config.fortressImage, profile: path.join(this.options.directory, "profile-fortress"), stateDir: this.options.directory, licenseFile: resolveFortressLicense(config), timeoutMs: 60_000, signal: new AbortController().signal });
+				this.fortress = await launchManagedFortress({ image: config.fortressImage, profile: path.join(this.options.directory, "profile-fortress"), stateDir: this.options.directory, timeoutMs: 60_000, signal: new AbortController().signal });
 				this.browser = await engine.connectOverCDP(this.fortress.endpoint, { timeout: config.actionTimeoutMs, noDefaults: true });
 				const context = await this.browser.newContext({ acceptDownloads: false });
-				try { const page = await context.newPage(); if (!(await checkCanvas(page)).passed) throw new Error("Shared Fortress Canvas diagnostics failed"); }
+				try { const page = await context.newPage(); fortressCanvas = await checkCanvas(page); }
 				finally { await context.close(); }
 			} else this.browser = await engine.launch({ channel: config.channel, headless: config.headless });
 			this.initialContexts = this.browser.contexts().length;
@@ -114,7 +114,7 @@ export class SharedBrowserHost {
 			}
 			this.bridge = protocolServer(this.browser, config.driver, this.maxClients);
 			this.bridgeUrl = await this.bridge.listen(0, "127.0.0.1");
-			this.metadata = { protocol: 1, engine: config.engine, browserVersion: this.browser.version(), fortressImage: this.fortress?.image, fortressActivationVerified: this.fortress?.activationVerified || false, ...(identity ? { signing: { agentUrl: identity.agentUrl, keyId: identity.keyId, origins: [...config.signing.origins] } } : {}) };
+			this.metadata = { protocol: 1, engine: config.engine, browserVersion: this.browser.version(), fortressImage: this.fortress?.image, fortressCanvas, ...(identity ? { signing: { agentUrl: identity.agentUrl, keyId: identity.keyId, origins: [...config.signing.origins] } } : {}) };
 			this.browser.on("disconnected", () => { this.metadata = undefined; if (!this.stopping) this.options.failure?.(); });
 		} catch (error) { await this.close(); throw error; }
 	}

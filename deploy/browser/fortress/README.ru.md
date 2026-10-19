@@ -1,29 +1,30 @@
 # Fortress: подключение и прозрачный Canvas
 
-Alive может использовать [один общий Fortress-сервис для всех агентов](../shared/README.ru.md), сам управлять отдельным Fortress для каждого разрешённого Telegram-пользователя или подключиться к внешнему Chromium/Fortress через CDP. Агент и телефон работают с одной страницей и её cookies. Установка пакета `tilion-fortress` сама по себе не подтверждает активацию бинарного движка. Сторонние сервисы решения CAPTCHA не подключаются.
+Alive может использовать [один общий Fortress-сервис для всех агентов](../shared/README.ru.md), сам управлять отдельным Fortress для каждого разрешённого Telegram-пользователя или подключиться к внешнему Chromium/Fortress через CDP. Агент и телефон работают с одной страницей и её cookies. Используется публичный **OSS Fortress 151.0.7908.0** под [BSD-3-Clause](https://github.com/tiliondev/fortress/blob/v151.0.7908.0/LICENSE), как в исходном launcher. Аккаунт, активация и license token не нужны. Новый upstream `latest` — другая source-available ветка; мы её не используем. Сторонние сервисы решения CAPTCHA не подключаются.
 
 ## Управляемый Fortress
 
 Нужен работающий Docker. Образ скачивается оператором; Alive не выполняет скрытых загрузок:
 
 ```sh
-docker pull tilion/fortress@sha256:6c275b96f96199f48ab7ca05366898cdf796ac1da8cb5cceb936a4ce98e41b4e
-npm run browser -- activate
+docker pull tilion/fortress@sha256:0f81aefbc15fc7aa70cb94efe26ace491bbcfb0d21441b7b2b3383a6587bc925
 npm run browser -- setup --engine fortress --driver patchright --headless true --cdp-env "" --executable-env ""
 npm run browser -- diagnose
 ```
 
-`activate` показывает официальную страницу Tilion и короткий код; вход и подтверждение выполняет оператор. Device credential остаётся в памяти; временный `pending.json` содержит только URL, код и срок, затем удаляется. Лицензия сохраняется в `.alive/modules/browser/fortress-license/license.jwt` с правами 600, путь — в gitignored `.env` через `ALIVE_FORTRESS_LICENSE_FILE`. Токен не печатается; невалидный/просроченный ответ не заменяет существующий ключ. Docker получает файл через read-only mount, а не секрет в argv.
+Образ закреплён по digest, npm launcher — на `tilion-fortress@151.0.7910`; исходный BSD tag — `v151.0.7908.0` (`fef9b333ff34e23fdd4b36e918ab5236f3f3e926`). Код активации, проверки JWT, credential mounts и activation metadata удалены. Старые `fortressRequireLicense` / `fortressLicenseFileEnv` больше не используются и удаляются из локального override при `setup`. `setup --engine fortress` выбирает OSS digest; другой образ возможен только как явная настройка `--fortress-image`.
 
-CLI включает `fortressRequireLicense: true` при выборе Fortress. Alive проверяет формат, срок и приватные права; подпись проверяет официальный бинарник. Проверенный launcher без действительной лицензии оставляет `--uxr-*` неактивными и работает в первом поколении. После старта Alive проверяет обязательное предупреждение бинарника о невалидной лицензии/режиме v1 (`fortressActivationVerified`), затем проверяет прозрачный Canvas в пустой вкладке. Нативный отказ лицензии закрывает контейнер; logs анализируются внутри и не возвращаются агенту. Наличие файла отдельно отражается `fortressLicenseConfigured`. Это не сертификат доступа к сайту. `--require-activation false` допускает явные неактивированные тестовые запуски.
+Перед сменой ранее настроенного образа остановите свой host/агент: автоматического принятия контейнера с другим image/profile нет. Сами профили не удаляются. Для нескольких агентов используйте [shared host](../shared/README.ru.md): один движок и отдельные BrowserContext/daemon agent-browser на разговор.
+
+У этого OSS-бинарника есть подтверждённая нативная ошибка прозрачного Canvas. Отчёт `fortressCanvas` остаётся в status, провал даёт предупреждение, но не запрещает запуск браузера. `diagnose` честно возвращает код 1 при провале. JS-подмены не применяются; native-патч ниже не установлен в официальный OSS-образ. Это не гарантия корректности любого рендеринга или доступа к сайтам.
 
 Профили находятся в `sessions/<thread-hash>/profile-fortress/`, постоянный HOME — в соседнем `fortress-home/`. Старые Chrome-профили сохраняются отдельно; cookies не копируются. Штатный launcher сохраняет seed и выполняет ограниченное по времени определение страны/часового пояса по текущему выходному IP. Оператор может задать согласованные `TILION_COUNTRY` / `TILION_TZ`. VPN и идентичности не переключаются при отказе сайта.
 
-На Mac контейнер работает без отдельного окна Chrome, изображение видно в том же Mini App. При закрытии браузер сначала сохраняет cookies/storage, затем Alive удаляет только проверенный принадлежащий ему контейнер. Живой контейнер после остановки runtime может быть принят обратно. Проверяются ID, labels, фактический image ID, mounts и loopback-порт; чужой контейнер не меняется. Ошибки Docker, образа, активации или Canvas возвращают ошибку без автоматической замены на Chrome.
+На Mac контейнер работает без отдельного окна Chrome, изображение видно в том же Mini App. При закрытии браузер сначала сохраняет cookies/storage, затем Alive удаляет только проверенный принадлежащий ему контейнер. Живой контейнер после остановки runtime может быть принят обратно. Проверяются ID, labels, фактический image ID, mounts и loopback-порт; чужой контейнер не меняется. Ошибки Docker/образа/подключения возвращают ошибку без автоматической замены на Chrome. Нативный Canvas-дефект диагностируется отдельно, не выдаётся за исправленный и не останавливает OSS-браузер.
 
-Одновременно допускаются два контейнера. Каждый ограничен 3 GiB памяти, двумя CPU, 512 процессами и 512 MiB `/dev/shm`; root filesystem read-only, capabilities сняты, CDP доступен только на `127.0.0.1`. Проверенный образ — linux/amd64, на Mac ARM используется эмуляция Docker. Будущий телефон Debian/ARM требует отдельной проверки совместимой сборки и ресурсов.
+Одновременно допускаются два контейнера. Каждый ограничен 3 GiB памяти, двумя CPU, 512 процессами и 512 MiB `/dev/shm`; root filesystem read-only, capabilities сняты, CDP доступен только на `127.0.0.1`. OSS-образ и shared-host E2E проверены на Linux x64. На Mac ARM понадобится эмуляция Docker; эта OSS-конфигурация на нём и на будущем телефоне Debian/ARM пока не проверена.
 
-Для доверенного нативного Fortress вместо Docker задайте абсолютный путь в `ALIVE_BROWSER_EXECUTABLE` и `setup --engine fortress --executable-env ALIVE_BROWSER_EXECUTABLE --cdp-env ""`. Лицензия передаётся в окружении дочернего процесса; режим/совместимость конкретной сборки проверяются отдельно. Используйте бинарник или официальный launcher, а не SDK CLI.
+Для доверенного нативного Fortress вместо Docker задайте абсолютный путь в `ALIVE_BROWSER_EXECUTABLE` и `setup --engine fortress --executable-env ALIVE_BROWSER_EXECUTABLE --cdp-env ""`. Режим/совместимость конкретной OSS-сборки проверяются отдельно; Alive не читает и не передаёт license token. Используйте бинарник или официальный launcher, а не SDK CLI.
 
 Закончите ручной ввод перед `alive restart`: перезапуск применяет настройки и отзывает временные ключи пульта. Правила Telegram, инструменты и Web Bot Auth сохраняются.
 
@@ -90,4 +91,4 @@ python3 deploy/browser/fortress/check-canvas-patch.py --fortress-source /PATH/TO
 
 Проверка границы CDP: `npm run test:browser:cdp`. Она запускает внешний Chrome на локальных фикстурах, проверяет сохранение сессии, временную Canvas-диагностику, приватный ввод через телефонный API, iframe, отключение и отзыв доступа. Это проверка адаптера, а не тест конкретного релиза Fortress или доступа к Авито.
 
-Проверка реального управляемого движка: `npm run test:browser:fortress:e2e`; полный пульт на двух контейнерах: `ALIVE_BROWSER_TEST_FORTRESS=1 npm run test:browser:router:e2e`. Для активированного режима загрузите путь из `.env` в процесс теста: `node --env-file=.env --import tsx src/dev/browser-fortress-e2e-test.ts`. Тесты используют локальные фикстуры и не отправляют сообщения реальным Telegram-пользователям.
+Проверка реального управляемого движка: `npm run test:browser:fortress:e2e`; полный пульт на двух контейнерах: `ALIVE_BROWSER_TEST_FORTRESS=1 npm run test:browser:router:e2e`. Общий OSS-хост и настоящий agent-browser: `ALIVE_BROWSER_TEST_FORTRESS=1 pnpm test:browser:agent:e2e`; пульт на одном общем OSS-контейнере: `ALIVE_BROWSER_TEST_CHANNEL=chromium ALIVE_BROWSER_TEST_SHARED=1 ALIVE_BROWSER_TEST_FORTRESS=1 pnpm test:browser:router:e2e`. Активация не нужна. Тесты используют локальные фикстуры и не отправляют сообщения реальным Telegram-пользователям.
