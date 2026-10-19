@@ -14,6 +14,8 @@ import { Logger } from "../log.js";
 import { createTelegramTools, type TelegramToolHost } from "../modules/telegram/tools.js";
 import { NetworkPolicy } from "microsandbox";
 import { publicNetworkPolicy } from "../sandbox/network.js";
+import { BrowserRouter } from "../modules/browser/router.js";
+import { DEFAULT_BROWSER_CONFIG } from "../modules/browser/config.js";
 
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "alive-sandbox-test-"));
 const log = new Logger({ console: false });
@@ -321,6 +323,27 @@ async function testSessionBoundary() {
 		assert.equal(fs.existsSync(path.join(loaded.paths.workspaceDir, "guest.txt")), false, "registered write must not fall through to host builtins");
 		assert.equal(fake.created, 0, "Pi's host context cwd must not cause a VM boot for relative workspace paths");
 	} finally { built.session.dispose(); await manager.close(); }
+	const sharedConfig = { ...DEFAULT_BROWSER_CONFIG, enabled: true, sharedUrl: "http://127.0.0.1:4330" };
+	loaded.config.modules.browser = sharedConfig;
+	loaded.config.tools.allowlist.push("browser", "browser_share");
+	const moduleTools = new BrowserRouter(sharedConfig).tools();
+	const sharedDeps = { ...deps, moduleTools };
+	const shared = await buildAgent({ config: loaded, sandbox: manager, toolDeps: sharedDeps, log: log as Logger, soul: "Test", forceNewSession: true });
+	try {
+		const active = shared.session.getActiveToolNames();
+		assert.ok(active.includes("browser") && active.includes("browser_share"), "Explicit shared-browser module tools must be available alongside sandbox tools");
+		assert.ok(active.includes("read") && active.includes("bash"));
+		assert.ok(!active.includes("web_search") && !active.includes("tool_registry") && !active.includes("powershell"));
+		assert.ok(shared.session.systemPrompt.includes("no local browser fallback"));
+		assert.equal(fake.created, 0, "Registering the remote browser must not boot the shell VM");
+	} finally { shared.session.dispose(); }
+	loaded.config.modules.browser.sharedUrl = "";
+	await assert.rejects(buildAgent({ config: loaded, sandbox: manager, toolDeps: sharedDeps, log: log as Logger, soul: "Test" }), /Module tools cannot override/);
+	loaded.config.modules.browser.sharedUrl = "http://127.0.0.1:4330";
+	await assert.rejects(buildAgent({ config: loaded, sandbox: manager, toolDeps: { ...sharedDeps, moduleTools: [...moduleTools, { ...moduleTools[0], name: "read" }] }, log: log as Logger, soul: "Test" }), /Module tools cannot override/);
+	const missingModule = await buildAgent({ config: loaded, sandbox: manager, toolDeps: deps, log: log as Logger, soul: "Test", forceNewSession: true });
+	try { assert.ok(!missingModule.session.getActiveToolNames().includes("browser"), "A failed/missing shared module must never expose the legacy host browser"); }
+	finally { missingModule.session.dispose(); }
 	loaded.config.extensions = ["untrusted.ts"];
 	await assert.rejects(buildAgent({ config: loaded, sandbox: manager, toolDeps: deps, log: log as Logger, soul: "Test" }), /Host pi extensions are disabled/);
 }

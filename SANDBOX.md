@@ -19,6 +19,10 @@ Alive использует **microsandbox 0.7.8**, закреплённый в `
 - Host browser / `web_search`, исполняемый `tool_registry`, pi-расширения, workspace-discovery
   extensions/skills/templates отключены у изолированных профилей. Заявленные `extensions` вызывают ошибку запуска,
   а не скрытое исполнение на хосте. Браузер внутри VM пока не адаптирован.
+- Исключение — явно включённый модуль браузера с непустым `modules.browser.sharedUrl` и разрешениями
+  `browser` / `browser_share`: он работает через аутентифицированный общий хост с отдельным контекстом разговора.
+  Если модуль не загрузился, legacy host browser не появляется. Dedicated-browser, `web_search`, host FS/shell
+  и tool registry от этого исключения не становятся доступны. См. [развёртывание shared host](deploy/browser/shared/README.ru.md).
 - Runtime, память, Telegram/Grafana и **явно подключённые внешние модули** остаются доверенными хостовыми сервисами.
   Это изоляция shell/FS инструментов, **не изоляция всего Node-процесса**. Внешний модуль имеет права процесса;
   его автор обязан использовать `ctx.workspaceFiles` для файлов агента и не предоставлять произвольный host exec/FS.

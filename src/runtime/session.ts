@@ -58,7 +58,12 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 	if (isolated && cfg.extensions.length) throw new Error("Host pi extensions are disabled for isolated profiles; remove extensions or explicitly disable sandboxing");
 	const workspace = isolated ? options.sandbox!.workspaceDir : paths.workspaceDir;
 	const sandboxTools = isolated ? createSandboxTools(options.sandbox!, config) : [];
-	const reserved = new Set([...sandboxTools.map((tool) => tool.name), "browser", "web_search", "tool_registry"]);
+	// Only the explicitly configured shared-browser module may cross this boundary.
+	// Its scoped protocol is a trusted host service; the legacy host browser and
+	// dedicated engines remain unavailable to isolated profiles.
+	const sharedBrowser = cfg.modules.browser?.enabled === true && !!cfg.modules.browser.sharedUrl && toolDeps.moduleTools.some((tool) => tool.name === "browser");
+	const blockedHostTools = new Set(["web_search", ...(!sharedBrowser ? ["browser"] : [])]);
+	const reserved = new Set([...sandboxTools.map((tool) => tool.name), ...blockedHostTools, "tool_registry"]);
 	if (isolated && toolDeps.moduleTools.some((tool) => reserved.has(tool.name))) throw new Error("Module tools cannot override isolated filesystem/shell tools");
 
 	ensureDir(paths.agentDir);
@@ -114,7 +119,7 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 		noSkills: isolated,
 		noPromptTemplates: isolated,
 		noContextFiles: isolated,
-		systemPrompt: isolated ? `${systemPrompt}\n\nShell and file tools run in microsandbox, never on the host. Your guest home and workspace is ${workspace} in a private persistent volume. The host workspace is not mounted. Memory, messaging and explicitly granted module tools are trusted host services. Host browser/web_search and executable tool registry are unavailable. Pin critical services with sandbox_control before starting them. VM shutdown requires two empty process/Docker observations; holds prevent shutdown. Ordinary workspace file operations may run without a VM only while it is stopped; running VM writes always use guest permissions/inotify. Shared resources are under configured guest mount paths. No host fallback on sandbox errors.` : systemPrompt,
+		systemPrompt: isolated ? `${systemPrompt}\n\nShell and file tools run in microsandbox, never on the host. Your guest home and workspace is ${workspace} in a private persistent volume. The host workspace is not mounted. Memory, messaging and explicitly granted module tools are trusted host services. ${sharedBrowser ? "Browser tools use only the authenticated shared host with a conversation-owned context; no local browser fallback is available." : "Host browser tools are unavailable."} Host web_search and executable tool registry are unavailable. Pin critical services with sandbox_control before starting them. VM shutdown requires two empty process/Docker observations; holds prevent shutdown. Ordinary workspace file operations may run without a VM only while it is stopped; running VM writes always use guest permissions/inotify. Shared resources are under configured guest mount paths. No host fallback on sandbox errors.` : systemPrompt,
 		additionalExtensionPaths: isolated ? [] : [...cfg.extensions, toolboxExtensionPath],
 	});
 	await resourceLoader.reload();
@@ -128,7 +133,7 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 	const allowedTools = selectAllowedTools({
 		allowlist: cfg.tools.allowlist,
 		builtins: builtinTools,
-		alive: isolated ? [...ALIVE_TOOL_NAMES.filter((name) => name !== "browser" && name !== "web_search"), "file", "sandbox_control"] : [...ALIVE_TOOL_NAMES],
+		alive: isolated ? [...ALIVE_TOOL_NAMES.filter((name) => !blockedHostTools.has(name)), "file", "sandbox_control"] : [...ALIVE_TOOL_NAMES],
 		modules: toolDeps.moduleTools.map((tool) => tool.name),
 		sandbox: sandboxTools.map((tool) => tool.name),
 		custom: persistedTools,
@@ -151,7 +156,7 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 		noTools: isolated ? "builtin" : undefined,
 		tools: isolated ? allowedTools : undefined,
 		customTools: isolated
-			? [...createAliveTools(toolDeps).filter((tool) => !["browser", "web_search"].includes(tool.name)), ...sandboxTools]
+			? [...createAliveTools(toolDeps).filter((tool) => !blockedHostTools.has(tool.name)), ...sandboxTools]
 			: createAliveTools(toolDeps),
 		resourceLoader,
 		sessionManager,
