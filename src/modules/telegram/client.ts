@@ -31,6 +31,17 @@ export class TelegramApiError extends Error {
 	}
 }
 
+/** The remote file exceeded the caller's byte budget; safe to surface as "too large". */
+export class TelegramFileTooLargeError extends Error {
+	readonly limitBytes: number;
+
+	constructor(limitBytes: number) {
+		super(`file is larger than the ${limitBytes} byte limit`);
+		this.name = "TelegramFileTooLargeError";
+		this.limitBytes = limitBytes;
+	}
+}
+
 export interface TelegramApiOptions {
 	token: string;
 	/** Defaults to https://api.telegram.org. Point it at a local bot-api server if needed. */
@@ -291,8 +302,8 @@ export class TelegramApi {
 	// files
 	// ------------------------------------------------------------------
 
-	getFile(params: { file_id: string }): Promise<TelegramFile> {
-		return this.call<TelegramFile>("getFile", { ...params });
+	getFile(params: { file_id: string }, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<TelegramFile> {
+		return this.call<TelegramFile>("getFile", { ...params }, options);
 	}
 
 	/** Public URL of a file path returned by getFile. Contains the bot token. */
@@ -307,9 +318,34 @@ export class TelegramApi {
 		if (!response.ok) {
 			throw new Error(`file download failed: HTTP ${response.status}`);
 		}
-		const buffer = Buffer.from(await response.arrayBuffer());
-		if (buffer.length > maxBytes) throw new Error(`file is larger than the ${maxBytes} byte limit`);
-		return buffer;
+		const declaredLength = Number(response.headers.get("content-length"));
+		if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+			await response.body?.cancel().catch(() => undefined);
+			throw new TelegramFileTooLargeError(maxBytes);
+		}
+		const reader = response.body?.getReader();
+		if (!reader) {
+			const buffer = Buffer.from(await response.arrayBuffer());
+			if (buffer.length > maxBytes) throw new TelegramFileTooLargeError(maxBytes);
+			return buffer;
+		}
+		const chunks: Uint8Array[] = [];
+		let total = 0;
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				total += value.byteLength;
+				if (total > maxBytes) {
+					await reader.cancel().catch(() => undefined);
+					throw new TelegramFileTooLargeError(maxBytes);
+				}
+				chunks.push(value);
+			}
+		} finally {
+			reader.releaseLock();
+		}
+		return Buffer.concat(chunks, total);
 	}
 
 	// ------------------------------------------------------------------

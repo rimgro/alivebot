@@ -1,12 +1,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import type { TelegramConfig } from "../../config.js";
+import type { TelegramConfig, TelegramTranscriptionConfig } from "../../config.js";
 import { attachManagedBotToken, clearManagedBotRequest, findManagedBotRequest, validateAgentId, type ManagedAgent } from "../../agents.js";
 import type { AliveModule, ModuleContext } from "../../events/api.js";
+import type { HistoryAttachment } from "../../store/history.js";
 import type { OutgoingMessage } from "../../store/outbox.js";
 import { sleep } from "../../util.js";
-import { TelegramApi, TelegramApiError, type SendMessageParams } from "./client.js";
+import { TelegramApi, TelegramApiError, TelegramFileTooLargeError, type SendMessageParams } from "./client.js";
 import { TelegramAllowlistStore, TelegramStateStore, type TelegramState } from "./state.js";
 import { chatLabel, isParseModeError, splitMessage } from "./text.js";
 import { createTelegramTools, type TelegramToolHost } from "./tools.js";
@@ -14,8 +15,19 @@ import { formatThread, parseThread } from "./threads.js";
 import type { TelegramChat, TelegramSentMessage, TelegramUpdate } from "./types.js";
 import { normalizeUpdate, type NormalizedInbound } from "./update.js";
 import { acceptBrowserPairing } from "../browser/operator.js";
+import {
+	GroqTranscriptionError,
+	transcribeWithGroq,
+} from "./voice-transcription.js";
 
 const DEFAULT_ALLOWED_UPDATES = ["message", "edited_message", "channel_post", "edited_channel_post", "callback_query"];
+
+type VoiceTranscriptionResult =
+	| { status: "transcribed"; text: string }
+	| { status: "disabled" }
+	| { status: "not_configured" }
+	| { status: "too_large" }
+	| { status: "failed"; reason: string };
 
 /**
  * Full Telegram Bot API integration.
@@ -159,6 +171,16 @@ export class TelegramModule implements AliveModule {
 			lastErrorAt: this.lastErrorAt,
 			consecutiveFailures: this.consecutiveFailures,
 			outageMs: this.outageStartedAt ? Date.now() - this.outageStartedAt : 0,
+			transcription: {
+				enabled: this.config.transcription.enabled,
+				// Configuration presence is reported even when the module is not started yet.
+				configured:
+					this.config.transcription.enabled &&
+					Boolean(this.config.transcription.apiKeyEnv) &&
+					Boolean(process.env[this.config.transcription.apiKeyEnv]?.trim()),
+				provider: "groq",
+				model: this.config.transcription.model,
+			},
 			chats,
 			historyMessages: messages,
 			counters: { ...this.counters },
@@ -332,8 +354,32 @@ export class TelegramModule implements AliveModule {
 		}
 
 		try {
+			let eventText = inbound.promptText;
+			let historyText = inbound.text;
+			let payload: Record<string, unknown> = inbound.payload;
+			const voice = inbound.attachments.find((attachment) => attachment.kind === "voice");
+			if (voice) {
+				if (this.config.typingIndicator && inbound.expectsReply) this.startTyping(inbound.thread);
+				const transcriptionConfig = this.config.transcription;
+				const transcription = await this.transcribeVoice(voice, api, ctx, transcriptionConfig);
+				const annotation = voiceAnnotation(transcription, transcriptionConfig);
+				eventText = `${eventText}\n\n${annotation}`;
+				// Only the transcript belongs in durable history: configuration hints and
+				// transient provider failures there would be permanent noise for search.
+				if (transcription.status === "transcribed") historyText = `${historyText}\n\n${annotation}`;
+				payload = {
+					...payload,
+					transcription: {
+						provider: "groq",
+						model: transcriptionConfig.model,
+						status: transcription.status,
+						...(transcription.status === "transcribed" ? { text: transcription.text } : {}),
+					},
+				};
+			}
+
 			const event = ctx.userMessage({
-				text: inbound.promptText,
+				text: eventText,
 				thread: inbound.thread,
 				title: inbound.eventTitle,
 				author: inbound.author?.name,
@@ -341,7 +387,7 @@ export class TelegramModule implements AliveModule {
 				expectsReply: inbound.expectsReply,
 				dedupeKey: inbound.dedupeKey,
 				ts: inbound.ts,
-				payload: inbound.payload,
+				payload,
 				meta: {
 					chatId: inbound.chatId,
 					chatTitle: inbound.chatLabel,
@@ -362,7 +408,7 @@ export class TelegramModule implements AliveModule {
 				ts: inbound.ts,
 				author: inbound.author?.name,
 				authorId: inbound.author?.id,
-				text: inbound.text,
+				text: historyText,
 				messageId: inbound.messageId,
 				replyTo: inbound.replyToMessageId,
 				attachments: inbound.attachments,
@@ -412,6 +458,46 @@ export class TelegramModule implements AliveModule {
 		} catch (err) {
 			this.counters.errors += 1;
 			ctx.log.error("telegram update handling failed", { updateId: update.update_id, error: message(err) });
+		}
+	}
+
+	private async transcribeVoice(
+		voice: HistoryAttachment,
+		api: TelegramApi,
+		ctx: ModuleContext,
+		config: TelegramTranscriptionConfig,
+	): Promise<VoiceTranscriptionResult> {
+		// An explicit switch plus an explicit key keep voice audio from leaving the host
+		// just because some unrelated feature happens to export the same env variable.
+		if (!config.enabled) return { status: "disabled" };
+		if (!config.apiKeyEnv) return { status: "disabled" };
+		const apiKey = process.env[config.apiKeyEnv]?.trim();
+		if (!apiKey) return { status: "not_configured" };
+		if (!voice.fileId) return { status: "failed", reason: "Telegram voice attachment has no file id" };
+		if (voice.size !== undefined && voice.size > config.maxBytes) return { status: "too_large" };
+
+		const signal = AbortSignal.any([this.abort.signal, AbortSignal.timeout(config.timeoutMs)]);
+		try {
+			const file = await api.getFile({ file_id: voice.fileId }, { timeoutMs: config.timeoutMs, signal });
+			if (file.file_size !== undefined && file.file_size > config.maxBytes) return { status: "too_large" };
+			if (!file.file_path) return { status: "failed", reason: "Telegram did not provide a file path" };
+			const audio = await api.downloadFile(file.file_path, { maxBytes: config.maxBytes, signal });
+			const text = await transcribeWithGroq({
+				apiKey,
+				audio,
+				mimeType: voice.mime,
+				model: config.model,
+				maxBytes: config.maxBytes,
+				signal,
+				timeoutMs: config.timeoutMs,
+			});
+			return { status: "transcribed", text };
+		} catch (err) {
+			// The byte cap also fires while streaming, after the update's own size check.
+			if (err instanceof TelegramFileTooLargeError) return { status: "too_large" };
+			const reason = transcriptionFailureReason(err);
+			ctx.log.warn("telegram voice transcription failed", { reason });
+			return { status: "failed", reason };
 		}
 	}
 
@@ -741,6 +827,41 @@ const MIME_BY_EXT: Record<string, string> = {
 
 function mimeForFile(name: string): string | undefined {
 	return MIME_BY_EXT[path.extname(name).toLowerCase()];
+}
+
+/** Human-readable, secret-free annotation appended to the agent-facing event text. */
+function voiceAnnotation(result: VoiceTranscriptionResult, config: TelegramTranscriptionConfig): string {
+	switch (result.status) {
+		case "transcribed":
+			return `voice transcript (${config.model} via Groq):\n${result.text || "(no speech recognized)"}`;
+		case "disabled":
+			return "voice transcription disabled: modules.telegram.transcription.enabled=false";
+		case "not_configured":
+			return `voice transcription unavailable: set ${config.apiKeyEnv} in the host environment`;
+		case "too_large":
+			return `voice transcription skipped: file exceeds the ${mibLabel(config.maxBytes)} limit`;
+		case "failed":
+			return `voice transcription unavailable: ${result.reason}`;
+	}
+}
+
+function mibLabel(bytes: number): string {
+	return bytes > 0 && bytes % (1024 * 1024) === 0 ? `${bytes / (1024 * 1024)} MiB` : `${bytes} bytes`;
+}
+
+/** Map a failure to a short reason that never carries the key, the URL, or a provider body. */
+function transcriptionFailureReason(err: unknown): string {
+	if (err instanceof GroqTranscriptionError) {
+		if (err.status !== undefined) return `Groq returned HTTP ${err.status}`;
+		if (err.code === "timeout") return "Groq request timed out";
+		if (err.code === "invalid_response") return "Groq returned an unreadable response";
+		return "Groq request failed";
+	}
+	if (err instanceof TelegramApiError) {
+		return err.errorCode !== undefined ? `Telegram returned HTTP/API ${err.errorCode}` : "Telegram file download failed";
+	}
+	if (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError")) return "request timed out";
+	return "request failed";
 }
 
 export type { TelegramState };
