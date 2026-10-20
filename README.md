@@ -287,7 +287,9 @@ Stdout фонового процесса пишется в `.alive/logs/stdout.l
 ```
 
 - **Telegram** — полноценная интеграция: бот принимает и отправляет сообщения,
-  читает историю чатов, реакции, файлы, участники. Подробно: [TELEGRAM.md](./TELEGRAM.md).
+  читает историю чатов, реакции, файлы, участники. Голосовые распознаются, если в
+  окружении хоста задан `GROQ_API_KEY` (отключается `modules.telegram.transcription`).
+  Подробно: [TELEGRAM.md](./TELEGRAM.md).
 - **Grafana** — webhook для алертов и generic-событий: `POST /grafana/alert`,
   `POST /grafana/event`.
 - **Свой модуль** — файл с `default`-фабрикой, подключается по `path`. Скелет,

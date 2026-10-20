@@ -3,6 +3,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { readJson } from "./util.js";
 import { DEFAULT_BROWSER_CONFIG, type BrowserConfig } from "./modules/browser/config.js";
+import {
+	GROQ_TRANSCRIPTION_MODEL,
+	GROQ_TRANSCRIPTION_TIMEOUT_MS,
+	TELEGRAM_VOICE_MAX_BYTES,
+} from "./modules/telegram/voice-transcription.js";
 import { DEFAULT_SANDBOX_CONFIG, validateSandboxConfig, type SandboxConfig } from "./sandbox/config.js";
 
 export interface LoopConfig {
@@ -54,6 +59,24 @@ export interface ChatConfig {
 }
 
 /**
+ * Inbound voice-note transcription. Off unless the configured API key is present,
+ * so a key that exists for another feature (e.g. memory embeddings) never starts
+ * shipping audio to a provider behind the operator's back.
+ */
+export interface TelegramTranscriptionConfig {
+	/** Master switch. When false, voice notes are ingested without a transcript. */
+	enabled: boolean;
+	/** Environment variable holding the provider key. Empty = transcription disabled. */
+	apiKeyEnv: string;
+	/** OpenAI-compatible transcription model. */
+	model: string;
+	/** Reject voice notes larger than this many bytes (also caps the in-memory download). */
+	maxBytes: number;
+	/** Upper bound for download + transcription of one voice note, in milliseconds. */
+	timeoutMs: number;
+}
+
+/**
  * Telegram module settings.
  *
  * A bot token is a secret: keep it in the environment (`tokenEnv`) rather than
@@ -93,6 +116,8 @@ export interface TelegramConfig {
 	historyLimitPerThread: number;
 	/** Split outgoing messages longer than this many characters. Telegram hard-limits 4096. */
 	maxMessageChars: number;
+	/** Voice-note transcription settings. */
+	transcription: TelegramTranscriptionConfig;
 }
 
 /** Grafana-compatible inbound webhook module (alerts and annotations → events). */
@@ -315,6 +340,13 @@ export const DEFAULT_CONFIG: AliveConfig = {
 			ingestEdits: true,
 			historyLimitPerThread: 0,
 			maxMessageChars: 4000,
+			transcription: {
+				enabled: true,
+				apiKeyEnv: "GROQ_API_KEY",
+				model: GROQ_TRANSCRIPTION_MODEL,
+				maxBytes: TELEGRAM_VOICE_MAX_BYTES,
+				timeoutMs: GROQ_TRANSCRIPTION_TIMEOUT_MS,
+			},
 		},
 		grafana: {
 			enabled: false,

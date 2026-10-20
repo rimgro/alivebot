@@ -31,6 +31,17 @@ export class TelegramApiError extends Error {
 	}
 }
 
+/** The remote file exceeded the caller's byte budget; safe to surface as "too large". */
+export class TelegramFileTooLargeError extends Error {
+	readonly limitBytes: number;
+
+	constructor(limitBytes: number) {
+		super(`file is larger than the ${limitBytes} byte limit`);
+		this.name = "TelegramFileTooLargeError";
+		this.limitBytes = limitBytes;
+	}
+}
+
 export interface TelegramApiOptions {
 	token: string;
 	/** Defaults to https://api.telegram.org. Point it at a local bot-api server if needed. */
@@ -310,12 +321,12 @@ export class TelegramApi {
 		const declaredLength = Number(response.headers.get("content-length"));
 		if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
 			await response.body?.cancel().catch(() => undefined);
-			throw new Error(`file is larger than the ${maxBytes} byte limit`);
+			throw new TelegramFileTooLargeError(maxBytes);
 		}
 		const reader = response.body?.getReader();
 		if (!reader) {
 			const buffer = Buffer.from(await response.arrayBuffer());
-			if (buffer.length > maxBytes) throw new Error(`file is larger than the ${maxBytes} byte limit`);
+			if (buffer.length > maxBytes) throw new TelegramFileTooLargeError(maxBytes);
 			return buffer;
 		}
 		const chunks: Uint8Array[] = [];
@@ -327,7 +338,7 @@ export class TelegramApi {
 				total += value.byteLength;
 				if (total > maxBytes) {
 					await reader.cancel().catch(() => undefined);
-					throw new Error(`file is larger than the ${maxBytes} byte limit`);
+					throw new TelegramFileTooLargeError(maxBytes);
 				}
 				chunks.push(value);
 			}

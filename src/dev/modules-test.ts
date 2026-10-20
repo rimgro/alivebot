@@ -12,7 +12,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { loadConfig } from "../config.js";
+import { DEFAULT_CONFIG, loadConfig } from "../config.js";
 import { ModuleHost } from "../events/host.js";
 import { describeModules, loadModules } from "../events/loader.js";
 import type { AliveModule, ModuleContext } from "../events/api.js";
@@ -22,7 +22,7 @@ import { HistoryStore } from "../store/history.js";
 import { Outbox, type OutgoingMessage } from "../store/outbox.js";
 import type { ChatTransport } from "../transports/types.js";
 import { GrafanaModule } from "../modules/grafana/module.js";
-import { TelegramApi, TelegramApiError } from "../modules/telegram/client.js";
+import { TelegramApi, TelegramApiError, TelegramFileTooLargeError } from "../modules/telegram/client.js";
 import { resolveToken, TelegramModule } from "../modules/telegram/module.js";
 import { escapeHtml, isParseModeError, splitMessage } from "../modules/telegram/text.js";
 import { formatThread, parseThread, resolveChatTarget } from "../modules/telegram/threads.js";
@@ -454,6 +454,7 @@ section("telegram client");
 		downloadError = err;
 	}
 	check("file downloads stop as soon as the byte limit is exceeded", downloadError instanceof Error && downloadError.message.includes("2 byte limit"));
+	check("oversized downloads raise a typed error", downloadError instanceof TelegramFileTooLargeError && downloadError.limitBytes === 2);
 	check("oversized response stream is cancelled", oversizedStreamCancelled);
 }
 
@@ -531,6 +532,35 @@ section("Groq Whisper transcription client");
 		httpError = caught;
 	}
 	check("provider HTTP errors are safe and keep the status", httpError instanceof GroqTranscriptionError && httpError.code === "http_error" && httpError.status === 401 && !httpError.message.includes("secret"));
+
+	let timeoutError: unknown;
+	try {
+		await transcribeWithGroq({
+			apiKey: "test-groq-key",
+			audio: Uint8Array.from([1]),
+			fetchImpl: (async () => {
+				throw Object.assign(new Error("aborted"), { name: "TimeoutError" });
+			}) as unknown as typeof fetch,
+		});
+	} catch (caught) {
+		timeoutError = caught;
+	}
+	check("a timed-out request is reported as a timeout, not a generic failure", timeoutError instanceof GroqTranscriptionError && timeoutError.code === "timeout");
+
+	let configuredLimitError: unknown;
+	try {
+		await transcribeWithGroq({
+			apiKey: "test-groq-key",
+			audio: Uint8Array.from([1, 2, 3]),
+			maxBytes: 2,
+			fetchImpl: (async () => {
+				throw new Error("audio over the configured limit must not be uploaded");
+			}) as unknown as typeof fetch,
+		});
+	} catch (caught) {
+		configuredLimitError = caught;
+	}
+	check("the byte ceiling is configurable", configuredLimitError instanceof GroqTranscriptionError && configuredLimitError.code === "too_large");
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +573,7 @@ section("telegram module end-to-end against a fake Bot API");
 	const outbox = new Outbox(moduleRoot);
 	const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
 	let getUpdatesCalls = 0;
+	let serveNoKeyBatch = false;
 
 	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
 		const url = String(input);
@@ -558,9 +589,23 @@ section("telegram module end-to-end against a fake Bot API");
 					? (JSON.parse(String(init.body)) as Record<string, unknown>)
 					: {};
 		calls.push({ method, params });
-		if (url.includes("/file/bot")) return new Response(Uint8Array.from([1, 2, 3]), { status: 200, headers: { "content-type": "audio/ogg" } });
-		if (isGroq) return jsonResponse({ text: "create a bug report" });
-		if (method === "getFile") return jsonResponse({ ok: true, result: { file_id: "voice-file", file_unique_id: "voice-unique", file_path: "voice.oga", file_size: 3 } });
+		if (url.includes("/file/bot")) {
+			const bytes = url.endsWith("voice-fail.oga") ? [9, 9, 9] : [1, 2, 3];
+			return new Response(Uint8Array.from(bytes), { status: 200, headers: { "content-type": "audio/ogg" } });
+		}
+		if (isGroq) {
+			const file = init?.body instanceof FormData ? init.body.get("file") : undefined;
+			const bytes = file instanceof Blob ? new Uint8Array(await file.arrayBuffer()) : new Uint8Array();
+			// Byte 9 marks the recording whose provider call must fail.
+			if (bytes[0] === 9) return new Response("provider body must not be logged", { status: 500 });
+			return jsonResponse({ text: "create a bug report" });
+		}
+		if (method === "getFile") {
+			const fileId = String(params.file_id ?? "");
+			if (fileId === "voice-fail") return jsonResponse({ ok: true, result: { file_id: fileId, file_unique_id: "voice-fail-unique", file_path: "voice-fail.oga", file_size: 3 } });
+			if (fileId === "voice-large") return jsonResponse({ ok: true, result: { file_id: fileId, file_unique_id: "voice-large-unique", file_path: "voice-large.oga", file_size: TELEGRAM_VOICE_MAX_BYTES + 1 } });
+			return jsonResponse({ ok: true, result: { file_id: "voice-file", file_unique_id: "voice-unique", file_path: "voice.oga", file_size: 3 } });
+		}
 		if (method === "getMe") {
 			return jsonResponse({ ok: true, result: { id: 999, is_bot: true, first_name: "Alive", username: "alive_bot" } });
 		}
@@ -568,6 +613,24 @@ section("telegram module end-to-end against a fake Bot API");
 		if (method === "getUpdates") {
 			getUpdatesCalls += 1;
 			if (getUpdatesCalls > 1) await new Promise((resolve) => setTimeout(resolve, 10));
+			if (serveNoKeyBatch) {
+				serveNoKeyBatch = false;
+				return jsonResponse({
+					ok: true,
+					result: [
+						{
+							update_id: 200,
+							message: {
+								message_id: 11,
+								date: 1_700_000_010,
+								chat: { id: 42, type: "private", first_name: "Alice", username: "alice" },
+								from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
+								voice: { file_id: "voice-file", file_unique_id: "voice-unique", file_size: 3, duration: 2, mime_type: "audio/ogg" },
+							},
+						},
+					],
+				});
+			}
 			if (getUpdatesCalls === 1) {
 				return jsonResponse({
 					ok: true,
@@ -600,6 +663,36 @@ section("telegram module end-to-end against a fake Bot API");
 								chat: { id: 42, type: "private", first_name: "Alice", username: "alice" },
 								from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
 								voice: { file_id: "voice-file", file_unique_id: "voice-unique", file_size: 3, duration: 2, mime_type: "audio/ogg" },
+							},
+						},
+						{
+							update_id: 103,
+							message: {
+								message_id: 8,
+								date: 1_700_000_003,
+								chat: { id: 42, type: "private", first_name: "Alice", username: "alice" },
+								from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
+								voice: { file_id: "voice-fail", file_unique_id: "voice-fail-unique", file_size: 3, duration: 2, mime_type: "audio/ogg" },
+							},
+						},
+						{
+							update_id: 104,
+							message: {
+								message_id: 9,
+								date: 1_700_000_004,
+								chat: { id: 42, type: "private", first_name: "Alice", username: "alice" },
+								from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
+								voice: { file_id: "voice-large", file_unique_id: "voice-large-unique", file_size: TELEGRAM_VOICE_MAX_BYTES + 1, duration: 2, mime_type: "audio/ogg" },
+							},
+						},
+						{
+							update_id: 105,
+							message: {
+								message_id: 10,
+								date: 1_700_000_005,
+								chat: { id: 42, type: "private", first_name: "Alice", username: "alice" },
+								from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
+								audio: { file_id: "audio-track", file_unique_id: "audio-track-unique", file_size: 4, duration: 2, mime_type: "audio/mpeg" },
 							},
 						},
 					],
@@ -640,6 +733,7 @@ section("telegram module end-to-end against a fake Bot API");
 					ingestEdits: true,
 					historyLimitPerThread: 0,
 					maxMessageChars: 4096,
+					transcription: { ...DEFAULT_CONFIG.modules.telegram.transcription },
 				},
 				grafana: { enabled: false, host: "127.0.0.1", port: 0, path: "/grafana", token: "", firingPriority: "high", resolvedPriority: "low" },
 				external: [],
@@ -650,6 +744,7 @@ section("telegram module end-to-end against a fake Bot API");
 	// Inject the fake fetch before start(): the module builds its client there.
 	const telegram = new TelegramModule(config.config.modules.telegram);
 	const realFetch = globalThis.fetch;
+	const previousGroqKey = process.env.GROQ_API_KEY;
 	process.env.GROQ_API_KEY = "test-groq-key";
 	globalThis.fetch = fetchImpl;
 	try {
@@ -667,11 +762,11 @@ section("telegram module end-to-end against a fake Bot API");
 		await new Promise((resolve) => setTimeout(resolve, 60));
 
 		const pending = store.peekPending(10);
-		check("updates became durable events", pending.length === 2, pending.map((e) => e.title));
+		check("updates became durable events", pending.length === 5, pending.map((e) => e.title));
 		check("the event is a user message on the right thread", pending[0]?.kind === "user_message" && pending[0]?.thread === "telegram:42", pending[0]);
 		check("the event expects a reply", pending[0]?.expectsReply === true);
 		const denial = calls.find((call) => call.method === "sendMessage" && String(call.params.text).includes("Ваш Telegram ID: 8"));
-		check("unknown Telegram users get a whitelist request and are not processed", pending.length === 2 && denial !== undefined, { pending: pending.length, denial });
+		check("unknown Telegram users get a whitelist request and are not processed", pending.length === 5 && denial !== undefined, { pending: pending.length, denial });
 		check("the event carries structured payload", (pending[0]?.payload as { messageId?: string })?.messageId === "5", pending[0]?.payload);
 		const voiceEvent = pending.find((event) => (event.payload as { messageId?: string })?.messageId === "7");
 		check("voice message event includes Groq transcript", voiceEvent?.text.includes("create a bug report") === true, voiceEvent?.text);
@@ -680,9 +775,33 @@ section("telegram module end-to-end against a fake Bot API");
 		check("Telegram resolves the voice file before transcription", calls.some((call) => call.method === "getFile"));
 		check("voice bytes are downloaded from Telegram", calls.some((call) => call.method === "voice.oga"));
 		check("voice is sent to Groq with auth", transcriptionCall?.params.authorizationValid === true, transcriptionCall?.params);
+		check("module status reports the configured transcription model", (telegram.status().transcription as { configured?: boolean; model?: string })?.configured === true && (telegram.status().transcription as { model?: string })?.model === GROQ_TRANSCRIPTION_MODEL, telegram.status().transcription);
+
+		const failedEvent = pending.find((event) => (event.payload as { messageId?: string })?.messageId === "8");
+		check(
+			"a provider failure keeps the message and records the failure",
+			failedEvent !== undefined &&
+				failedEvent.text.includes("Groq returned HTTP 500") &&
+				(failedEvent.payload as { transcription?: { status?: string } })?.transcription?.status === "failed",
+			failedEvent?.text,
+		);
+		check("the provider error body never reaches the event", failedEvent?.text.includes("provider body must not be logged") !== true, failedEvent?.text);
+		const largeEvent = pending.find((event) => (event.payload as { messageId?: string })?.messageId === "9");
+		check(
+			"oversized voice notes are skipped as too large",
+			(largeEvent?.payload as { transcription?: { status?: string } })?.transcription?.status === "too_large" && largeEvent?.text.includes("MiB") === true,
+			largeEvent?.text,
+		);
+		check("an oversized voice note is never downloaded", !calls.some((call) => call.method === "getFile" && call.params.file_id === "voice-large"));
+		const audioEvent = pending.find((event) => (event.payload as { messageId?: string })?.messageId === "10");
+		check(
+			"non-voice audio attachments are left alone",
+			audioEvent !== undefined && !audioEvent.text.includes("voice transcript") && (audioEvent.payload as { transcription?: unknown })?.transcription === undefined,
+			audioEvent?.text,
+		);
 
 		const records = history.query({ thread: "telegram:42" });
-		check("inbound messages landed in history", records.length === 2 && records[0]?.direction === "inbound", records);
+		check("inbound messages landed in history", records.length === 5 && records[0]?.direction === "inbound", records);
 		check("transcript is searchable in history text", records.some((record) => record.text.includes("create a bug report")), records.map((record) => record.text));
 		check("history links back to the event", records[0]?.meta?.eventId === pending[0]?.id, records[0]?.meta);
 		check("the chat directory knows the chat", history.thread("telegram:42")?.title === "Alice (@alice)", history.thread("telegram:42"));
@@ -735,14 +854,27 @@ section("telegram module end-to-end against a fake Bot API");
 		check("upload carries chat, caption and file field", Array.isArray(upload?.params.__multipart) && (upload!.params.__multipart as string[]).includes("chat_id") && (upload!.params.__multipart as string[]).includes("caption") && (upload!.params.__multipart as string[]).includes("document"), upload?.params);
 		check("uploaded file is recorded in history", history.query({ thread: "telegram:42", direction: "outbound" }).some((r) => r.attachments?.some((a) => a.name === "report.txt")));
 
+		// Degrade, do not drop: without a key the voice note still becomes an event.
+		delete process.env.GROQ_API_KEY;
+		const groqCallsBefore = calls.filter((call) => call.method === "groqTranscription").length;
+		serveNoKeyBatch = true;
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		const noKeyEvent = store.peekPending(20).find((event) => (event.payload as { messageId?: string })?.messageId === "11");
+		check("a voice note without a key is still delivered", noKeyEvent !== undefined, store.peekPending(20).map((event) => event.title));
+		check("the event explains how to enable transcription", noKeyEvent?.text.includes("set GROQ_API_KEY in the host environment") === true, noKeyEvent?.text);
+		check("no transcription request is sent without a key", calls.filter((call) => call.method === "groqTranscription").length === groqCallsBefore);
+		check("unconfigured history stays free of configuration hints", history.query({ thread: "telegram:42" }).every((record) => !record.text.includes("GROQ_API_KEY")));
+
 		const status = telegram.status();
 		check("module status reports the bot", (status.bot as { username?: string })?.username === "alive_bot", status);
-		check("module status counts accepted inbound messages", (status.counters as { inbound?: number })?.inbound === 2, status.counters);
+		check("module status counts accepted inbound messages", (status.counters as { inbound?: number })?.inbound === 6, status.counters);
+		check("module status reports missing transcription credentials", (status.transcription as { configured?: boolean })?.configured === false, status.transcription);
 
 		await host.stop();
 	} finally {
 		globalThis.fetch = realFetch;
-		delete process.env.GROQ_API_KEY;
+		if (previousGroqKey === undefined) delete process.env.GROQ_API_KEY;
+		else process.env.GROQ_API_KEY = previousGroqKey;
 	}
 
 	// Long messages are split into several Bot API calls.
@@ -917,6 +1049,7 @@ section("telegram module: outage is reported once, not spammed");
 					ingestEdits: true,
 					historyLimitPerThread: 0,
 					maxMessageChars: 4096,
+					transcription: { ...DEFAULT_CONFIG.modules.telegram.transcription },
 				},
 				grafana: { enabled: false, host: "127.0.0.1", port: 0, path: "/grafana", token: "", firingPriority: "high", resolvedPriority: "low" },
 			external: [],
@@ -974,6 +1107,28 @@ section("modules config and loader");
 	check("telegram config merges with defaults", config.config.modules.telegram.pollTimeoutSec === 25, config.config.modules.telegram);
 	check("allowed bot IDs default to an empty allowlist", config.config.modules.telegram.allowedBotIds.length === 0, config.config.modules.telegram.allowedBotIds);
 	check("requireMentionInGroups defaults off", config.config.modules.telegram.requireMentionInGroups === false, config.config.modules.telegram.requireMentionInGroups);
+	const mergedTranscription = config.config.modules.telegram.transcription;
+	check(
+		"voice transcription defaults to the Groq Whisper config",
+		mergedTranscription.enabled === true &&
+			mergedTranscription.apiKeyEnv === "GROQ_API_KEY" &&
+			mergedTranscription.model === GROQ_TRANSCRIPTION_MODEL &&
+			mergedTranscription.maxBytes === TELEGRAM_VOICE_MAX_BYTES &&
+			mergedTranscription.timeoutMs > 0,
+		mergedTranscription,
+	);
+
+	const transcriptionOverride = loadConfig({
+		cwd: configRoot,
+		overrides: { modules: { telegram: { transcription: { enabled: false, apiKeyEnv: "MY_STT_KEY" } } } as never },
+	});
+	check(
+		"transcription settings merge field by field",
+		transcriptionOverride.config.modules.telegram.transcription.enabled === false &&
+			transcriptionOverride.config.modules.telegram.transcription.apiKeyEnv === "MY_STT_KEY" &&
+			transcriptionOverride.config.modules.telegram.transcription.model === GROQ_TRANSCRIPTION_MODEL,
+		transcriptionOverride.config.modules.telegram.transcription,
+	);
 	check("grafana config merges with defaults", config.config.modules.grafana.host === "127.0.0.1" && config.config.modules.grafana.port === 5999, config.config.modules.grafana);
 	check("env token wins", resolveToken(config.config.modules.telegram, { MY_TG_TOKEN: "from-env" } as NodeJS.ProcessEnv) === "from-env");
 	check("config token is the fallback", resolveToken({ ...config.config.modules.telegram, token: "from-config" }, {} as NodeJS.ProcessEnv) === "from-config");
