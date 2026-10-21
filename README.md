@@ -330,6 +330,9 @@ sessions/               jsonl-сессии pi (контекст живёт зд�
 workspace/              рабочая директория агента для read/write/bash
 agent/                  изолированный pi agent dir (расширения, skills)
 tools/                  созданные агентом Node.js-инструменты и npm-зависимости
+workers/<id>/           записи и pi-сессии эфемерных coding-worker'ов
+workers/worktrees/<id>/  git worktree host-профиля (в sandbox он живёт в guest)
+workers/usage.jsonl     расход worker-run'ов (учитывается в дневном бюджете)
 ```
 
 Факты и история revisions хранятся локально в `.alive/memory.sqlite`.
@@ -413,6 +416,31 @@ TUI показывает состояние `enabled/running`, историю в
 ```bash
 alive agents permissions analyst --permissions-file permissions.json
 ```
+
+### Coding workers (эфемерные субагенты)
+
+Отдельно от постоянных агентов есть **workers** — одноразовые сессии
+pi-coding-agent. У них нет памяти, inbox, напоминаний, `idle` и жизненного цикла:
+агент даёт задачу, worker правит код в репозитории (по умолчанию в изолированном
+git worktree), прогоняет тесты и возвращает краткий отчёт. Follow-up продолжает
+ту же сессию, поэтому «напиши» и «протестируй» — это два сообщения одному worker'у.
+
+Это отдельное операторское разрешение `workers`, а не часть `agentManagement`:
+managed-агенты его не наследуют. Модели ограничиваются `workers.models`, инструменты
+— `workers.tools`, публикация — отдельным `pullRequest` permission. Worker не создаёт
+отдельный host-shell или отдельную VM: в sandbox-профиле его файлы/команды идут в
+той же VM и том же guest workspace, что и у агента, а без sandbox — в host
+workspace профиля. Host-fallback отсутствует.
+
+```bash
+alive workers list
+alive workers status <worker-id>
+alive workers diff <worker-id> [--full]
+alive workers models
+```
+
+Конфиг, workflow (start → событие → send → diff → pr → remove), состояние и границы
+описаны в [WORKERS.md](./WORKERS.md).
 
 ### Telegram-профиль агента
 

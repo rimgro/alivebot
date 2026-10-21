@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { ensureDir, iso, newId, oneLine, readJson, writeJsonAtomic } from "../util.js";
 
-export type EventKind = "user_message" | "reminder" | "observability" | "heartbeat" | "system";
+export type EventKind = "user_message" | "reminder" | "observability" | "heartbeat" | "worker" | "system";
 export type EventPriority = "low" | "normal" | "high" | "interrupt";
 
 /**

@@ -33,6 +33,7 @@ import { canReadMemoryFact, retainedMemoryScopes, searchableMemoryScopes } from 
 import { recordOperatorAgentReply, sendLocalAgentMessage } from "./agent-messaging.js";
 import { snapshotRuntime } from "./daemon.js";
 import { requestAgentTelegram } from "../modules/telegram/managed-request.js";
+import { renderWorkerList, renderWorkerRecord, type WorkerManager } from "../workers/manager.js";
 import { formatDuration, iso, parseTimeSpec, parseTimestamp, sleep, truncate } from "../util.js";
 import { renderIdleEvents, renderSleepOffer } from "./prompt.js"
 
@@ -93,6 +94,8 @@ export interface ToolDeps {
 	history: HistoryStore;
 	/** Tools contributed by event modules (Telegram, Grafana, user modules). */
 	moduleTools: ToolDefinition[];
+	/** Ephemeral coding workers; undefined when workers are disabled. */
+	workers?: WorkerManager;
 	deliver: (message: OutgoingMessage) => Promise<void>;
 	getRun: () => RunHandle | undefined;
 	runtimeStatus: () => Record<string, unknown>;
@@ -120,6 +123,7 @@ export const ALIVE_TOOL_NAMES = [
 	"create_agent",
 	"manage_agents",
 	"message_agent",
+	"worker",
 ] as const;
 
 type ToolResult = AgentToolResult<Record<string, unknown>>;
@@ -315,6 +319,155 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 				recipientAgentId: message.recipientAgentId,
 				thread: message.thread,
 			});
+		},
+	});
+
+	const workerTool = defineTool({
+		name: "worker",
+		label: "Coding workers",
+		description:
+			"Delegate coding work to ephemeral pi worker sessions instead of pulling whole patches into your context. " +
+			"A worker is NOT a persistent agent: it has no memory, reminders, inbox, idle/sleep or lifecycle. It gets read/write/edit/bash/grep/find/ls " +
+			"on your execution boundary (the same sandbox VM when sandboxed, the profile host workspace otherwise), works in the configured repository " +
+			"(optionally an isolated git worktree), runs one task, reports, and then accepts follow-up instructions in the same session. " +
+			"Actions: start, send, wait, list, status, stop, remove, diff, pr. Completion arrives as a `worker` event, so prefer start -> do other work -> inspect the event; " +
+			"use wait only when you need the result immediately. Models and permissions are configured by the operator, not by you. " +
+			"Use diff to review changes and pr to push a worktree branch and open a pull request.",
+		promptSnippet: "Start and manage ephemeral coding workers (worktrees, sessions, PRs)",
+		executionMode: "sequential",
+		parameters: Type.Object({
+			action: Type.Union([
+				Type.Literal("start"),
+				Type.Literal("send"),
+				Type.Literal("wait"),
+				Type.Literal("list"),
+				Type.Literal("status"),
+				Type.Literal("stop"),
+				Type.Literal("remove"),
+				Type.Literal("diff"),
+				Type.Literal("pr"),
+			]),
+			id: Type.Optional(Type.String({ description: "Worker id (required for send/wait/status/stop/remove/diff/pr)." })),
+			task: Type.Optional(Type.String({ description: "For start: the coding task, including how to verify it." })),
+			prompt: Type.Optional(Type.String({ description: "For send: follow-up instruction to the same worker session." })),
+			model: Type.Optional(Type.String({ description: "For start: model spec from the operator's worker allowlist, e.g. anthropic/claude-sonnet-4-5:high." })),
+			isolation: Type.Optional(Type.Union([Type.Literal("worktree"), Type.Literal("shared")], {
+				description: "For start: worktree (default, isolated branch) or shared (the configured repository directly).",
+			})),
+			branch: Type.Optional(Type.String({ description: "For worktree start: branch name; default alive/<worker-id>." })),
+			base_ref: Type.Optional(Type.String({ description: "For worktree start: git ref to branch from, e.g. origin/main or HEAD." })),
+			pr: Type.Optional(Type.Integer({ minimum: 1, description: "For start: check out this pull request into a worktree instead of branching from a ref." })),
+			name: Type.Optional(Type.String({ description: "Optional short worker name for status." })),
+			tools: Type.Optional(Type.Array(Type.String(), { description: "Optional subset of the operator's workers.tools." })),
+			notify: Type.Optional(Type.Boolean({ description: "Override completion notification for this run. Default from operators config." })),
+			wait: Type.Optional(Type.Boolean({ description: "For start/send: block until the worker finishes (or the wait timeout)." })),
+			timeout_seconds: Type.Optional(Type.Number({ description: "For wait/start/send+wait: maximum seconds to block, capped at 600." })),
+			include_finished: Type.Optional(Type.Boolean({ description: "For list: include idle/failed/stopped/interrupted workers (default true)." })),
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200, description: "For list: maximum records." })),
+			full: Type.Optional(Type.Boolean({ description: "For diff: include the full patch, not just status and diffstat." })),
+			force: Type.Optional(Type.Boolean({ description: "For remove: force worktree removal even with uncommitted changes." })),
+			title: Type.Optional(Type.String({ description: "For pr: pull request title." })),
+			body: Type.Optional(Type.String({ description: "For pr: pull request body." })),
+			base_branch: Type.Optional(Type.String({ description: "For pr: target branch; defaults from workers.baseRef." })),
+			draft: Type.Optional(Type.Boolean({ description: "For pr: create a draft pull request." })),
+			commit_message: Type.Optional(Type.String({ description: "For pr: commit all pending changes with this message before pushing." })),
+		}),
+		execute: async (_toolCallId, params): Promise<ToolResult> => {
+			const workers = deps.workers;
+			if (!workers) throw new Error("workers are not enabled for this profile");
+			const action = params.action;
+			const id = params.id?.trim();
+			const requireId = () => {
+				if (!id) throw new Error(`worker ${action} requires id`);
+				return id;
+			};
+			const waitTimeout = params.timeout_seconds !== undefined ? Math.max(1, params.timeout_seconds) * 1000 : undefined;
+			switch (action) {
+				case "start": {
+					requireRun(deps, "worker");
+					if (!params.task?.trim()) throw new Error("worker start requires task");
+					const record = await workers.start({
+						task: params.task,
+						model: params.model,
+						isolation: params.isolation,
+						branch: params.branch,
+						baseRef: params.base_ref,
+						pullRequest: params.pr,
+						name: params.name,
+						tools: params.tools,
+						notify: params.notify,
+						wait: params.wait,
+						waitTimeoutMs: waitTimeout,
+					});
+					const note = record.status === "idle" || record.status === "failed" || record.status === "stopped" || record.status === "interrupted"
+						? ""
+						: "\n\nThe worker is running in the background. A `worker` event will arrive when it finishes; use worker({action:\"diff\",id}) to review changes.";
+					return ok(`${renderWorkerRecord(record)}${note}`, { worker: record });
+				}
+				case "send": {
+					requireRun(deps, "worker");
+					if (!params.prompt?.trim()) throw new Error("worker send requires prompt");
+					const record = await workers.send(requireId(), params.prompt, {
+						wait: params.wait,
+						waitTimeoutMs: waitTimeout,
+						notify: params.notify,
+					});
+					const pending = record.status === "starting" || record.status === "running";
+					return ok(`${renderWorkerRecord(record)}${pending ? "\n\nThe worker is running; its completion event will arrive later." : ""}`, { worker: record });
+				}
+				case "wait": {
+					const record = await workers.wait(requireId(), waitTimeout);
+					const pending = record.status === "starting" || record.status === "running";
+					return ok(`${renderWorkerRecord(record)}${pending ? "\n\nStill running; the completion event will arrive later." : ""}`, { worker: record });
+				}
+				case "list": {
+					const records = workers.list({ includeFinished: params.include_finished, limit: params.limit });
+					return ok(renderWorkerList(records), {
+						count: records.length,
+						workers: records.map((record) => ({
+							id: record.id,
+							status: record.status,
+							model: record.model,
+							isolation: record.isolation,
+							branch: record.branch,
+							runs: record.runs,
+							workspacePath: record.workspacePath,
+						})),
+					});
+				}
+				case "status": {
+					const view = await workers.status(requireId());
+					return ok(renderWorkerRecord(view.record, { activity: view.activity, git: view.git }), { worker: view.record, git: view.git });
+				}
+				case "stop": {
+					requireRun(deps, "worker");
+					const record = await workers.stop(requireId());
+					return ok(renderWorkerRecord(record), { worker: record });
+				}
+				case "remove": {
+					requireRun(deps, "worker");
+					const workerId = requireId();
+					await workers.remove(workerId, { force: params.force });
+					return ok(`Removed worker ${workerId}. Its branch, if any, was left in place.`, { workerId });
+				}
+				case "diff": {
+					return ok(await workers.diff(requireId(), params.full === true), { workerId: id });
+				}
+				case "pr": {
+					requireRun(deps, "worker");
+					if (!params.title?.trim()) throw new Error("worker pr requires title");
+					const result = await workers.createPullRequest(requireId(), {
+						title: params.title,
+						body: params.body,
+						baseBranch: params.base_branch,
+						draft: params.draft,
+						commitMessage: params.commit_message,
+					});
+					return ok(`Pull request created: ${result.url} (branch ${result.branch}).`, { url: result.url, branch: result.branch });
+				}
+				default:
+					throw new Error(`unsupported worker action ${String(action)}`);
+			}
 		},
 	});
 
@@ -528,6 +681,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 					Type.Literal("reminder"),
 					Type.Literal("observability"),
 					Type.Literal("heartbeat"),
+					Type.Literal("worker"),
 					Type.Literal("system"),
 				]),
 			),
@@ -877,6 +1031,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		createManagedAgent,
 		manageAgents,
 		messageAgent,
+		...(deps.workers ? [workerTool] : []),
 		note,
 		retain,
 		memory,

@@ -9,6 +9,7 @@ import {
 	TELEGRAM_VOICE_MAX_BYTES,
 } from "./modules/telegram/voice-transcription.js";
 import { DEFAULT_SANDBOX_CONFIG, validateSandboxConfig, type SandboxConfig } from "./sandbox/config.js";
+import { DEFAULT_WORKERS_CONFIG, validateWorkersConfig, type WorkersConfig } from "./workers/config.js";
 
 export interface LoopConfig {
 	/**
@@ -201,6 +202,12 @@ export interface AliveConfig {
 	enabled: boolean;
 	/** Fine-grained authority this profile may exercise over managed agents. */
 	agentManagement: AgentManagementPermissions;
+	/**
+	 * Ephemeral coding workers: a separate, operator-owned authority. Workers are
+	 * pi coding-agent sessions, not persistent agents. They share the profile's
+	 * execution boundary (sandbox VM or host workspace).
+	 */
+	workers: WorkersConfig;
 	workspace: string;
 	soulFile: string;
 	/** "continue" keeps one evolving transcript across restarts; "new" starts a fresh session each start. */
@@ -269,6 +276,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		targets: [],
 		grantableTools: [],
 	},
+	workers: DEFAULT_WORKERS_CONFIG,
 	sandbox: DEFAULT_SANDBOX_CONFIG,
 	workspace: ".alive/workspace",
 	soulFile: "SOUL.md",
@@ -428,6 +436,7 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	const merged = deepMerge(deepMerge(deepMerge(DEFAULT_CONFIG, fileConfig), localConfig), options.overrides);
 	migrateLoopConfig(merged.loop as unknown as Record<string, unknown>);
 	merged.sandbox = validateSandboxConfig(merged.sandbox);
+	merged.workers = validateWorkersConfig(merged.workers);
 	merged.piAgentDir = expandHome(merged.piAgentDir);
 	const paths = resolvePaths(path.dirname(configPath), merged);
 	return { config: merged, paths };

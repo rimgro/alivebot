@@ -361,9 +361,19 @@ export class AgentRunner {
 			relevantMemories,
 			recentRuns: runs.list(3),
 			policy: this.deps.policy.load(),
-			costTodayUsd: runs.usageToday().cost,
+			costTodayUsd: runs.usageToday().cost + (this.deps.toolDeps.workers?.usageToday() ?? 0),
 			maxDailyCostUsd: config.config.budget.maxDailyCostUsd,
 			pendingAfterClaim: store.pendingCount(),
+			workers: this.deps.toolDeps.workers?.overview(6).map((worker) => ({
+				id: worker.id,
+				status: worker.status,
+				model: worker.model,
+				isolation: worker.isolation,
+				branch: worker.branch,
+				task: worker.task,
+				result: worker.lastResult,
+				error: worker.lastError,
+			})),
 		};
 	}
 

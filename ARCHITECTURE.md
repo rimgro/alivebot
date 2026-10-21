@@ -114,6 +114,7 @@
 | `src/modules/telegram/*` | Telegram Bot API: long polling, приём/отправка, история, инструмент `telegram` |
 | `src/modules/grafana/*` | inbound webhook-модуль: алерты Grafana и generic-события |
 | `src/store/history.ts` | общая durable-история диалогов всех модулей + каталог тредов |
+| `src/workers/*` | эфемерные coding-worker'ы: pi-сессии, worktree, diff/PR, отдельные permissions и model allowlist |
 
 ## 5. Ключевые решения
 
@@ -285,6 +286,30 @@ Bot API: оно знает про `send_message`, треды и историю. 
 **Границы.** Инструменты регистрируются один раз при старте (сессия собирается
 сразу после `ModuleHost.init()`). Горячей перезагрузки модулей нет. Идемпотентность
 входящих событий — на `dedupeKey` модуля, идемпотентность истории — на `id` записи.
+
+### 5.12 Workers — не агенты
+
+Managed agent и worker — разные сущности с разными гарантиями. Агент живёт
+непрерывно, имеет inbox, память, reminders и проактивность. Worker — это
+короткоживущая pi-сессия с coding-инструментами: одна задача, отчёт, follow-up.
+У неё нет `idle`/`sleep`, `send_message`, памяти Alive и доступа к управлению
+агентами. Поэтому основной агент может делегировать «напиши код, прогони тесты»
+и не тащить патчи и логи в собственный контекст.
+
+Worker-доступ — отдельный operator-owned `workers` permission, а не часть
+`agentManagement`; `create_agent` не может его выдать. Модели ограничены
+`workers.models`, инструменты — `workers.tools`. Worker использует ту же границу,
+что и родитель: в sandbox-профиле — тот же microVM, guest-пользователя и
+persistent workspace, без host-fallback; в host-профиле — host workspace.
+Managed-профили получают workers только явным изменением своего конфига
+оператором.
+
+Завершение run приходит в общий durable inbox событием `kind=worker`. Состояние
+worker'а и его pi-сессия лежат в `.alive/workers/<id>/`; при рестарте процесса
+запись помечается `interrupted`, а `send` возобновляет сохранённую сессию.
+Публикация отделена от работы: `pr` — явное действие с отдельным permission,
+которое коммитит/пушит ветку и вызывает `gh`, а `remove` удаляет worktree,
+оставляя ветку. Подробности — в [WORKERS.md](./WORKERS.md).
 
 ## 6. Форматы данных
 

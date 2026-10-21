@@ -6,7 +6,7 @@ import {
 	truncateHead, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, resizeImage, formatDimensionNote,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { type SandboxManager, type VirtualFiles } from "./manager.js";
+import { guestPath as resolveGuestPath, type SandboxManager, type VirtualFiles } from "./manager.js";
 import type { LoadedConfig } from "../config.js";
 import { createGitHubAuthTool } from "../github/app-auth.js";
 import { createGitHubApiTool } from "../github/api-tool.js";
@@ -17,9 +17,14 @@ const result = (text: string, details: unknown = undefined) => ({ content: [{ ty
  * Pi's stock read also probes ambient host paths and rejects early on abort;
  * the custom reader avoids both and retains the lifecycle lock until IO settles.
  */
-export function createSandboxTools(manager: SandboxManager, loaded?: LoadedConfig): ToolDefinition[] {
-	const GUEST_WORKSPACE = manager.workspaceDir;
-	const guestPath = (file: string) => manager.path(file);
+export interface SandboxToolsOptions {
+	/** Guest root the tools operate in. Defaults to the agent workspace. */
+	rootDir?: string;
+}
+
+export function createSandboxTools(manager: SandboxManager, loaded?: LoadedConfig, options: SandboxToolsOptions = {}): ToolDefinition[] {
+	const GUEST_WORKSPACE = options.rootDir ?? manager.workspaceDir;
+	const guestPath = (file: string) => resolveGuestPath(file, GUEST_WORKSPACE);
 	let files: VirtualFiles;
 	let targetPath = GUEST_WORKSPACE;
 	// SDK write/edit use host-platform path helpers (including tilde/Unicode
@@ -103,11 +108,11 @@ export function createSandboxTools(manager: SandboxManager, loaded?: LoadedConfi
 
 	const bash = defineTool({
 		name: "bash", label: "Sandbox bash",
-		description: `Run bash inside your persistent microsandbox VM, cwd ${manager.workspaceDir}. Never runs on the host. Background processes keep the VM alive. Output is capped to the last 64 KiB. Use sandbox_control pin for critical services before launching them.`,
+		description: `Run bash inside your persistent microsandbox VM, cwd ${GUEST_WORKSPACE}. Never runs on the host. Background processes keep the VM alive. Output is capped to the last 64 KiB. Use sandbox_control pin for critical services before launching them.`,
 		parameters: Type.Object({ command: Type.String(), timeout: Type.Optional(Type.Number({ minimum: 1, maximum: 3600, description: "Seconds, default 120." })) }),
 		execute: async (_id, params, signal, update) => manager.exclusive(async () => {
 			const output = await manager.execute(params.command, (params.timeout ?? 120) * 1000, signal,
-				(data) => update?.(result(data.toString("utf8"))));
+				(data) => update?.(result(data.toString("utf8"))), GUEST_WORKSPACE);
 			return result(`${output.text}${output.truncated ? "\n[Output truncated to last 64 KiB]" : ""}\n[exit ${output.code}]`, { exitCode: output.code, truncated: output.truncated });
 		}),
 	});

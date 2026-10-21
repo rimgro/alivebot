@@ -5,6 +5,7 @@ import { DEFAULT_CONTRACT, loadConfig, resolveMemoryDatabasePath, type AgentMana
 import { snapshotRuntime, spawnBackground, stopRuntime, waitForRuntime } from "./runtime/daemon.js";
 import { sleep } from "./util.js";
 import { mergeSandboxConfig, type SandboxConfig } from "./sandbox/config.js";
+import { DEFAULT_WORKERS_CONFIG } from "./workers/config.js";
 
 const ID_RE = /^[a-z0-9][a-z0-9_-]{0,47}$/;
 
@@ -57,7 +58,9 @@ export function createAgent(base: LoadedConfig, idInput: string, name?: string, 
 	const id = validateAgentId(idInput);
 	const directory = path.join(agentsRoot(base), id);
 	if (fs.existsSync(directory)) throw new Error(`agent already exists: ${id}`);
-	const allowedTools = validateToolAllowlist(options.toolAllowlist ?? base.config.tools.allowlist.filter((name) => name !== "create_agent" && name !== "tool_registry"));
+	const allowedTools = validateToolAllowlist(
+		options.toolAllowlist ?? base.config.tools.allowlist.filter((name) => name !== "create_agent" && name !== "tool_registry" && name !== "worker"),
+	);
 	const role = options.role?.trim() || `Agent ${name?.trim() || id}`;
 	const contract = options.contract?.trim() || DEFAULT_CONTRACT;
 	if (!role || !contract) throw new Error("agent role and contract must not be empty");
@@ -72,6 +75,10 @@ export function createAgent(base: LoadedConfig, idInput: string, name?: string, 
 	config.agentsDirectory = agentsRoot(base);
 	config.enabled = true;
 	config.agentManagement = validateAgentManagementPermissions(options.management ?? NO_AGENT_MANAGEMENT);
+	// Workers are a host-side operator grant. Persistent profiles never inherit
+	// them from the creator: an agent tool must not be able to mint host coding
+	// sessions. An operator enables them explicitly in the profile config.
+	config.workers = structuredClone(DEFAULT_WORKERS_CONFIG);
 	config.workspace = path.join(directory, "workspace");
 	config.sandbox = sandboxConfig;
 	config.soulFile = soulPath;
@@ -103,7 +110,7 @@ export function validateToolAllowlist(names: string[]): string[] {
 export function ensureAdminAgent(base: LoadedConfig): ManagedAgent {
 	const existing = listAgents(base).find((agent) => agent.id === "admin");
 	if (!existing) {
-		const safeTools = base.config.tools.allowlist.filter((name) => name !== "bash" && name !== "write" && name !== "edit");
+		const safeTools = base.config.tools.allowlist.filter((name) => name !== "bash" && name !== "write" && name !== "edit" && name !== "worker");
 		return createAgent(base, "admin", "Alive Admin", {
 			role: "Administrator",
 			contract: "Manage the creation, configuration, permissions, and lifecycle of persistent agents. Grant each agent only the tools and actions it needs.",

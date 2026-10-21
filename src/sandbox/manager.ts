@@ -191,12 +191,12 @@ export class SandboxManager {
 	}
 
 	/** Called inside exclusive(), never exposes host environment or host credentials. */
-	async execute(command: string, timeoutMs: number, signal?: AbortSignal, onData?: (data: Buffer) => void): Promise<{ text: string; code: number; truncated: boolean }> {
+	async execute(command: string, timeoutMs: number, signal?: AbortSignal, onData?: (data: Buffer) => void, cwd = this.workspaceDir): Promise<{ text: string; code: number; truncated: boolean }> {
 		signal?.throwIfAborted();
 		const vm = await this.running();
 		signal?.throwIfAborted();
 		const startedAt = Date.now();
-		const exec = await vm.execStreamWith("/bin/bash", (b) => b.args(["-c", command]).cwd(this.workspaceDir)
+		const exec = await vm.execStreamWith("/bin/bash", (b) => b.args(["-c", command]).cwd(guestPath(cwd, this.workspaceDir))
 			.user(`${this.config.uid}:${this.config.gid}`).timeout(timeoutMs).stdinNull());
 		const abort = () => { void exec.kill().catch((error) => this.report(error)); };
 		signal?.addEventListener("abort", abort, { once: true });

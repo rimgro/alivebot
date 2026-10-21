@@ -97,6 +97,15 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 		stateDir: paths.stateDir,
 		runTimeoutMs: cfg.loop.runTimeoutMs,
 		sleepAfterMs: cfg.loop.sleepAfterMs,
+		workers: cfg.workers.enabled
+			? {
+				models: cfg.workers.models,
+				defaultModel: cfg.workers.defaultModel,
+				worktree: cfg.workers.permissions.worktree,
+				pullRequest: cfg.workers.permissions.pullRequest,
+				sandboxed: isolated,
+			}
+			: undefined,
 	});
 
 	const settingsManager = SettingsManager.inMemory({
@@ -130,8 +139,12 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 	const sandboxBuiltins = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
 	const builtinTools = cfg.tools.builtin.filter((tool) => (!isolated || sandboxBuiltins.has(tool)) && (tool !== "bash" || cfg.tools.bash));
 	const persistedTools = isolated ? [] : readPersistedToolNames(path.join(paths.stateDir, "tools", "registry.json"));
+	// Workers use the same execution boundary as this session: the agent's VM
+	// when sandboxed, the profile workspace otherwise. Enable the tool from the
+	// operator-owned workers switch, not from a delegated grant.
+	const workerTools = cfg.workers.enabled ? ["worker"] : [];
 	const allowedTools = selectAllowedTools({
-		allowlist: cfg.tools.allowlist,
+		allowlist: [...cfg.tools.allowlist, ...workerTools],
 		builtins: builtinTools,
 		alive: isolated ? [...ALIVE_TOOL_NAMES.filter((name) => !blockedHostTools.has(name)), "file", "sandbox_control"] : [...ALIVE_TOOL_NAMES],
 		modules: toolDeps.moduleTools.map((tool) => tool.name),

@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { configureAgentTelegram, createAgent, disableManagedAgent, enableManagedAgent, ensureAdminAgent, getAgentEnabled, listAgents, restartManagedAgent, startManagedAgent, stopManagedAgent, updateManagedAgentProfile, validateAgentId } from "./agents.js";
 import type { AliveConfig, LoadedConfig } from "./config.js";
@@ -21,6 +22,10 @@ import { TelegramAllowlistStore } from "./modules/telegram/state.js";
 import { AliveRuntime } from "./runtime/loop.js";
 import { snapshotRuntime, spawnBackground, stdoutLogPath, stopRuntime, waitForRuntime } from "./runtime/daemon.js";
 import { LOG_SOURCES, followFile, readLogTail, renderLogLine, resolveLogSource } from "./logs.js";
+import { WorkerStore, validateWorkerId, workerLabel } from "./workers/store.js";
+import { gitDiff, gitState, isGitRepository } from "./workers/worktree.js";
+import { createHostWorkerEnvironment } from "./workers/environment.js";
+import { renderWorkerRecord } from "./workers/manager.js";
 import { term } from "./term.js";
 import {
 	formatDuration,
@@ -96,6 +101,9 @@ export async function main(argv: string[]): Promise<number> {
 			}
 			case "agents": {
 				return agentsCommand(cwd, flags, positionals);
+			}
+			case "workers": {
+				return workersCommand(cwd, flags, positionals);
 			}
 			case "sandbox": {
 				if (positionals.length && positionals[0] !== "status") throw new Error("usage: alive sandbox status [--config CONFIG]");
@@ -629,6 +637,7 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 					threads: threads.all(),
 					policy: policy.load(),
 					modules: describeModules(config.config),
+					workers: config.config.workers.enabled ? new WorkerStore(config.paths).list() : undefined,
 					usageToday: usage,
 					lastRun: runs.last(),
 				},
@@ -673,6 +682,11 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 	line("last run", last ? `#${last.index} ${formatDuration(last.durationMs)} ${last.stopReason}` : "never");
 	line("workspace", config.paths.workspaceDir);
 	line("journal", config.paths.journalDir);
+	if (config.config.workers.enabled) {
+		const workerRecords = new WorkerStore(config.paths).list();
+		const active = workerRecords.filter((record) => record.status === "running" || record.status === "starting").length;
+		line("workers", `${active}/${config.config.workers.maxConcurrent} active, ${workerRecords.length} total`);
+	}
 	return 0;
 }
 
@@ -682,6 +696,63 @@ function redactSecrets(config: AliveConfig): AliveConfig {
 	safe.modules.grafana.token = safe.modules.grafana.token ? "[redacted]" : "";
 	safe.chat.http.token = safe.chat.http.token ? "[redacted]" : "";
 	return safe;
+}
+
+async function workersCommand(cwd: string, flags: Record<string, string | boolean>, positionals: string[]): Promise<number> {
+	const config = loadForCli(flags);
+	const action = positionals[0] ?? "list";
+	const store = new WorkerStore(config.paths);
+	if (action === "list") {
+		const records = store.list();
+		if (records.length === 0) {
+			process.stdout.write("no workers\n");
+			return 0;
+		}
+		for (const record of records) {
+			const changed = record.lastResult ? ` — ${oneLine(record.lastResult, 160)}` : record.lastError ? ` — error: ${oneLine(record.lastError, 160)}` : "";
+			process.stdout.write(`${workerLabel(record)}${changed}\n`);
+		}
+		return 0;
+	}
+	if (action === "status") {
+		const id = validateWorkerId(positionals[1] ?? "");
+		const record = store.load(id);
+		if (!record) throw new Error(`unknown worker: ${id}`);
+		if (record.sandboxed) {
+			process.stdout.write(`${renderWorkerRecord(record)}\n`);
+			process.stdout.write("git state: inside the agent VM; use the agent's worker({action:\"status\"}) tool\n");
+			return 0;
+		}
+		const env = createHostWorkerEnvironment(config.paths.rootDir);
+		const git = (await env.exists(record.workspacePath)) ? await gitState(env, record.workspacePath).catch(() => undefined) : undefined;
+		process.stdout.write(`${renderWorkerRecord(record, { git })}\n`);
+		return 0;
+	}
+	if (action === "diff") {
+		const id = validateWorkerId(positionals[1] ?? "");
+		const record = store.load(id);
+		if (!record) throw new Error(`unknown worker: ${id}`);
+		if (record.sandboxed) {
+			throw new Error("this worker runs inside the agent VM; use the agent's worker({action:\"diff\"}) tool (the VM cannot be shared with the CLI)");
+		}
+		const env = createHostWorkerEnvironment(config.paths.rootDir);
+		if (!(await isGitRepository(env, record.workspacePath))) throw new Error(`worker workspace is not a git repository: ${record.workspacePath}`);
+		const diff = await gitDiff(env, record.workspacePath, { baseCommit: record.baseCommit, full: flagBool(flags, "full") });
+		process.stdout.write(`${diff.state.changed.length > 0 ? diff.state.changed.join("\n") : "(clean working tree)"}\n`);
+		if (diff.stat) process.stdout.write(`\n${diff.stat}\n`);
+		if (diff.patch) process.stdout.write(`\n${diff.patch}\n`);
+		return 0;
+	}
+	if (action === "models") {
+		const workers = config.config.workers;
+		process.stdout.write(`enabled: ${workers.enabled}\n`);
+		process.stdout.write(`environment: ${config.config.sandbox.enabled ? "sandbox VM (same VM as the agent)" : "host"}\n`);
+		process.stdout.write(`models: ${workers.models.join(", ") || "(none)"}\n`);
+		process.stdout.write(`default: ${workers.defaultModel || "(none)"}\n`);
+		process.stdout.write(`permissions: ${Object.entries(workers.permissions).filter(([, value]) => value).map(([key]) => key).join(", ") || "(none)"}\n`);
+		return 0;
+	}
+	throw new Error("usage: alive workers list | status <id> | diff <id> [--full] | models");
 }
 
 function runsCommand(_cwd: string, flags: Record<string, string | boolean>): number {
@@ -972,6 +1043,10 @@ usage:
   alive agents request-telegram <id> --chat ID
                                               request a Managed Bot for an agent via Telegram 9.6
                                               (--foreground: stay attached, --once: one run)
+  alive workers list                          ephemeral coding workers (not agents)
+  alive workers status <id>                   inspect a worker and its git state
+  alive workers diff <id> [--full]            review worker changes
+  alive workers models                        show the worker model/permission allowlist
   alive stop [--force] [--timeout 30s]        stop the running instance
                                               (--force: SIGKILL immediately)
   alive restart [--verbose]                   stop, then start in the background again

@@ -3,7 +3,7 @@ import type { NotifyPolicyFile } from "../store/policy.js";
 import type { Reminder } from "../store/reminders.js";
 import type { RunRecord } from "../store/runs.js";
 import type { ThreadState } from "../store/threads.js";
-import { formatDuration, iso, localTime, truncate } from "../util.js";
+import { formatDuration, iso, localTime, oneLine, truncate } from "../util.js";
 import { DEFAULT_CONTRACT } from "../config.js";
 
 export interface SystemPromptInput {
@@ -14,6 +14,14 @@ export interface SystemPromptInput {
 	stateDir: string;
 	runTimeoutMs: number;
 	sleepAfterMs: number;
+	/** Present only when the operator enabled host coding workers. */
+	workers?: {
+		models: string[];
+		defaultModel: string;
+		worktree: boolean;
+		pullRequest: boolean;
+		sandboxed: boolean;
+	};
 }
 
 /**
@@ -97,6 +105,38 @@ the conversation, never your memory of the world.
 - For a substantial / multi-step request, send a brief start signal with \`send_message\` before doing the work, then send a progress update when you have a meaningful finding (or if blocked / delayed), and a concise outcome when done. Don't wait until completion to communicate. Skip this for quick tasks; don't send empty play-by-play or invent an ETA. These can be separate short messages, like a natural messenger conversation.
 - Messages should read like a person wrote them: short, concrete, usually lowercase in casual chat, no headings, no
   process narration, no "as an AI". Preserve normal casing for names, acronyms, code, and commands.
+
+${input.workers ? `
+# Coding workers (ephemeral subagents)
+
+You can delegate coding work to ephemeral Pi worker sessions instead of pulling
+whole patches into your context. A worker is **not** a managed agent: it has no
+memory, reminders, inbox, idle/sleep, or lifecycle. It gets coding tools, works
+in the configured repository (by default an isolated git worktree), runs one
+task, reports back, and then accepts follow-up instructions in the same session.
+${input.workers.sandboxed
+	? "Workers run inside your sandbox VM with the same guest workspace, tools and isolation as you. They never get a host fallback. They also share your VM's tool queue, so a long worker command can block your own sandbox tools; prefer idling while it runs."
+	: "Workers run in this profile's host workspace with the same file/shell boundary as you."}
+
+- Models you may use: ${input.workers.models.join(", ") || "(none)"}${input.workers.defaultModel ? ` (default: ${input.workers.defaultModel})` : ""}.
+- Start: \`worker({ action: "start", task: "..." })\`. Prefer the default worktree
+  isolation for changes; use \`isolation: "shared"\` only when the task must touch
+  the existing checkout.
+- Send a follow-up: \`worker({ action: "send", id: "...", prompt: "..." })\`.
+  This continues the same worker session, so "write it" then "test it" is two calls.
+- A \`worker\` event arrives when a run finishes. Prefer doing other work while it
+  runs; use \`worker({ action: "wait", id: "..." })\` only when blocked.
+- Review with \`worker({ action: "diff", id: "...", full: true })\` rather than
+  asking the worker to paste patches.${input.workers.worktree ? `
+- Worktree workers start on their own branch. Use \`worker({ action: "remove", id: "..." })\`
+  to clean up the worktree; the branch is kept.` : ""}${input.workers.pullRequest ? `
+- Publish with \`worker({ action: "pr", id: "...", title: "...", commit_message: "..." })\`.
+  It commits pending changes, pushes the worker branch, and opens a PR.` : ""}
+
+Workers run commands and tests in ${input.workers.sandboxed ? "your sandbox VM" : "the profile workspace"},
+under the operator's worker permission. Do not use them to bypass your own
+boundaries; they are a delegation tool for real coding work, not a second self.
+` : ""}
 
 # The world outside
 
@@ -202,6 +242,16 @@ export interface AwakePromptInput {
 	costTodayUsd: number;
 	maxDailyCostUsd: number;
 	pendingAfterClaim: number;
+	workers?: Array<{
+		id: string;
+		status: string;
+		model: string;
+		isolation: string;
+		branch?: string;
+		task: string;
+		result?: string;
+		error?: string;
+	}>;
 }
 
 function carriedOver(input: AwakePromptInput): string[] {
@@ -251,6 +301,21 @@ function carriedOver(input: AwakePromptInput): string[] {
 					.map((r) => {
 						const out = r.outbound.length > 0 ? `→ ${r.outbound.length} msg` : "no outbound";
 						return `- #${r.index} ${localTime(r.finishedAt)} ${formatDuration(r.durationMs)}: ${r.events.length} events, ${out}, ${r.turns} turns, ended: ${r.stopReason}`;
+					})
+					.join("\n"),
+		);
+	}
+	if (input.workers && input.workers.length > 0) {
+		sections.push(
+			"Your coding workers:\n" +
+				input.workers
+					.map((worker) => {
+						const extra = worker.result
+							? ` — result: ${oneLine(worker.result, 180)}`
+							: worker.error
+								? ` — error: ${oneLine(worker.error, 180)}`
+								: "";
+						return `- ${worker.id} [${worker.status}] model=${worker.model} isolation=${worker.isolation}${worker.branch ? ` branch=${worker.branch}` : ""} — ${oneLine(worker.task, 160)}${extra}`;
 					})
 					.join("\n"),
 		);

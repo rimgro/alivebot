@@ -21,6 +21,7 @@ import {
 import { ThreadStore } from "../store/threads.js";
 import { buildAgent, readSoul } from "./session.js";
 import { SandboxManager } from "../sandbox/manager.js";
+import { WorkerManager } from "../workers/manager.js";
 import type { RunHandle, ToolDeps } from "./tools.js";
 import { ConsoleTransport, NullTransport } from "../transports/console.js";
 import { HttpTransport } from "../transports/http.js";
@@ -69,6 +70,7 @@ export class AliveRuntime {
 	private runs!: RunLog;
 	private runner!: AgentRunner;
 	private sandbox?: SandboxManager;
+	private workers?: WorkerManager;
 	private toolDeps!: ToolDeps;
 	private host!: ModuleHost;
 	private modules: AliveModule[] = [];
@@ -125,6 +127,16 @@ export class AliveRuntime {
 		this.history = HistoryStore.open(paths.stateDir);
 		this.runs = new RunLog(paths.stateDir);
 
+		this.workers = this.config.config.workers.enabled
+			? new WorkerManager({
+				config: this.config,
+				events: this.store,
+				log: this.log,
+				budgetAllows: () => this.budgetAllowsRun(),
+				sandbox: this.sandbox,
+			})
+			: undefined;
+
 		this.toolDeps = {
 			config: this.config,
 			store: this.store,
@@ -137,6 +149,7 @@ export class AliveRuntime {
 			policy: this.policy,
 			history: this.history,
 			moduleTools: [],
+			workers: this.workers,
 			deliver: (message) => this.deliver(message),
 			getRun: () => this.currentRun,
 			runtimeStatus: () => this.status(),
@@ -245,6 +258,16 @@ export class AliveRuntime {
 			});
 		}
 
+		// Worker recovery only reads persisted records and may enqueue one notice;
+		// it must never prevent the main agent from starting.
+		try {
+			await this.workers?.init();
+		} catch (error) {
+			this.log.error("worker recovery failed; workers remain unavailable", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+
 		// Modules start first: they register outbound handlers, contribute status and
 		// hand the agent their tools, and the session is built once right after.
 		await this.host.init();
@@ -309,6 +332,7 @@ export class AliveRuntime {
 			}
 		}
 		await this.loopPromise?.catch(() => undefined);
+		await this.workers?.close().catch((error) => this.log.warn("worker shutdown failed", { error: String(error) }));
 		await this.host?.stop().catch(() => undefined);
 		await this.memory?.close().catch(() => undefined);
 		session?.dispose();
@@ -417,7 +441,7 @@ export class AliveRuntime {
 
 	private budgetAllowsRun(): boolean {
 		const { maxDailyCostUsd, maxWakesPerHour } = this.config.config.budget;
-		if (maxDailyCostUsd > 0 && this.runs.usageToday().cost >= maxDailyCostUsd) return false;
+		if (maxDailyCostUsd > 0 && this.runs.usageToday().cost + (this.workers?.usageToday() ?? 0) >= maxDailyCostUsd) return false;
 		if (maxWakesPerHour > 0 && this.runs.runsLastHour() >= maxWakesPerHour) return false;
 		return true;
 	}
@@ -426,9 +450,11 @@ export class AliveRuntime {
 		this.statusKind = "paused-budget";
 		const { maxDailyCostUsd, maxWakesPerHour } = this.config.config.budget;
 		const usage = this.runs.usageToday();
-		if (maxDailyCostUsd > 0 && usage.cost >= maxDailyCostUsd) {
+		const workerCost = this.workers?.usageToday() ?? 0;
+		const totalCost = usage.cost + workerCost;
+		if (maxDailyCostUsd > 0 && totalCost >= maxDailyCostUsd) {
 			const wakeAt = nextMidnight(Date.now()) + 1_000;
-			const notice = `daily cost budget reached ($${usage.cost.toFixed(4)} / $${maxDailyCostUsd.toFixed(2)}); pausing until ${new Date(wakeAt).toISOString()}`;
+			const notice = `daily cost budget reached ($${totalCost.toFixed(4)} / $${maxDailyCostUsd.toFixed(2)}); pausing until ${new Date(wakeAt).toISOString()}`;
 			if (this.lastBudgetNotice !== notice) {
 				this.lastBudgetNotice = notice;
 				this.log.warn(notice);
@@ -511,6 +537,8 @@ export class AliveRuntime {
 			history: this.history.stats(),
 			modules: this.host?.status(),
 			moduleErrors: this.moduleErrors.length > 0 ? this.moduleErrors : undefined,
+			workers: this.workers?.summary(),
+			workerCostTodayUsd: this.workers ? Number(this.workers.usageToday().toFixed(6)) : undefined,
 		};
 	}
 
