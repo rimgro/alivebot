@@ -115,16 +115,28 @@ export async function launchManagedFortress(input: { image: string; profile: str
 	const token = randomBytes(16).toString("hex"), name = `alive-fortress-${profileHash.slice(0, 12)}-${token.slice(0, 8)}`;
 	// Preserve the launcher's bounded egress-country discovery. Supplying only
 	// the host timezone leaves country unset and can generate an unrelated locale.
-	const geoEnvironment = ["TILION_COUNTRY", "TILION_TZ", "TILION_NO_GEO"].flatMap(name => process.env[name] ? ["--env", `${name}=${process.env[name]}`] : []);
+	const geoEnvironment = ["TILION_COUNTRY", "TILION_TZ", "TILION_LANG", "TILION_NO_GEO"].flatMap(name => process.env[name] ? ["--env", `${name}=${process.env[name]}`] : []);
+	// Container DNS is intentionally separate from the host resolver. A host resolver
+	// that is filtered or hijacked by the local network cannot answer for domains
+	// blocked on that network, while the egress proxy can; point the container at the
+	// resolver that owns the routing policy instead.
+	const resolver = process.env.ALIVE_FORTRESS_DNS?.trim();
+	if (resolver && !/^[0-9A-Fa-f:.]+$/.test(resolver)) throw new Error("ALIVE_FORTRESS_DNS must be a resolver address");
+	// WebRTC advertises the proxy egress address while HTTP uses the direct route, and
+	// sites read that mismatch as an active VPN. The launcher only locks WebRTC to
+	// proxied UDP when it is given a proxy flag, so the policy is passed explicitly.
+	const webrtcPolicy = process.env.ALIVE_FORTRESS_WEBRTC_POLICY?.trim();
+	if (webrtcPolicy && !/^[a-z_]+$/.test(webrtcPolicy)) throw new Error("ALIVE_FORTRESS_WEBRTC_POLICY must be a WebRTC IP handling policy name");
 	// Linux bind mounts retain numeric ownership. The image's default UID cannot
 	// write a mode-0700 profile owned by a different service account.
 	const user = process.platform === "linux" ? ["--user", `${process.getuid!()}:${process.getgid!()}`] : [];
 	const args = ["create", "--name", name, "--label", "alive.browser=fortress", "--label", `alive.owner=${token}`, "--label", `alive.profile=${profileHash}`,
 		"--platform", `linux/${image.Architecture}`, ...user, "--publish", "127.0.0.1::9222", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--read-only",
 		"--memory", "3g", "--cpus", "2", "--pids-limit", "512", "--shm-size", "512m", "--tmpfs", "/tmp:rw,nosuid,size=256m",
+		...(resolver ? ["--dns", resolver] : []),
 		"--mount", `type=bind,source=${profile},target=/alive/profile`, "--mount", `type=bind,source=${home},target=/alive/home`,
 		"--env", "HOME=/alive/home", ...geoEnvironment,
-		input.image, "--user-data-dir=/alive/profile", "about:blank"];
+		input.image, "--user-data-dir=/alive/profile", ...(webrtcPolicy ? [`--uxr-webrtc-policy=${webrtcPolicy}`] : []), "about:blank"];
 	let owner: Owner | undefined, created: string | undefined;
 	try {
 		// Creation completes independently of cancellation so a cancelled command
