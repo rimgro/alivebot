@@ -84,8 +84,11 @@
 
   /* desktop 16:9 */
   .desktop{width:856px;height:482px;border-radius:12px;background:#000;position:relative;overflow:hidden;border:1px solid var(--border);box-shadow:0 24px 60px rgba(0,0,0,.55)}
-  .phone.keyboard .dock{bottom:136px}
+  .phone.keyboard .dock{display:none}
   .phone.keyboard .zoom{opacity:0;pointer-events:none}
+  .sheet-head{display:flex;align-items:center;gap:6px;padding:0 4px 8px;color:var(--muted);font-size:12px;line-height:1}
+  .sheet-head .host{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+  .sheet-head .done{margin-left:auto;height:30px;padding:0 10px;font-size:12px}
   .desktop .dock{left:50%;right:auto;transform:translateX(-50%);bottom:12px;width:min(360px,calc(100% - 24px))}
   .desktop .zoom{bottom:78px}
 
@@ -155,17 +158,9 @@
             <div class="bar"></div><div class="bar w70"></div>
           </div>
         </div>
-        <div class="dock">
-          <div class="site"><span class="dot"></span><span class="host">wildberries.ru</span></div>
-          <button class="icon" aria-label="Клавиатура"><svg viewBox="0 0 24 24"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M8 12h.01M12 12h.01M16 12h.01M7 16h10"/></svg></button>
-          <div class="seg">
-            <button class="on" aria-label="Режим телефона"><svg viewBox="0 0 24 24"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/></svg></button>
-            <button aria-label="Режим ПК 16:9"><svg viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="3" rx="2"/><path d="M8 21h8M12 17v4"/></svg></button>
-          </div>
-          <button class="done">Готово</button>
-        </div>
         <div class="sheet">
           <div class="grab"></div>
+          <div class="sheet-head"><span class="dot"></span><span class="host">wildberries.ru</span><button class="done">Готово</button></div>
           <div class="keys">
             <button class="key">Tab</button>
             <button class="key"><svg viewBox="0 0 24 24"><path d="M20 4v7a4 4 0 0 1-4 4H4"/><path d="m9 10-5 5 5 5"/></svg></button>
