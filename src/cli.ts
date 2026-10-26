@@ -20,6 +20,7 @@ import { resolveToken } from "./modules/telegram/module.js";
 import { browserCommand } from "./modules/browser/cli.js";
 import { TelegramAllowlistStore } from "./modules/telegram/state.js";
 import { AliveRuntime } from "./runtime/loop.js";
+import { readHeartbeatStatus } from "./heartbeat.js";
 import { snapshotRuntime, spawnBackground, stdoutLogPath, stopRuntime, waitForRuntime } from "./runtime/daemon.js";
 import { LOG_SOURCES, followFile, readLogTail, renderLogLine, resolveLogSource } from "./logs.js";
 import { WorkerStore, validateWorkerId, workerLabel } from "./workers/store.js";
@@ -185,6 +186,9 @@ export async function main(argv: string[]): Promise<number> {
 			}
 			case "status": {
 				return statusCommand(cwd, flags);
+			}
+			case "heartbeat": {
+				return heartbeatCommand(flags, positionals);
 			}
 			case "runs": {
 				return runsCommand(cwd, flags);
@@ -736,6 +740,88 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 	return 0;
 }
 
+/**
+ * `alive heartbeat`: is the runtime alive, and which build is running?
+ *
+ * Contract for outside watchdogs: exit 0 while the heartbeat is fresh, 1 when it
+ * is missing or older than `updates.heartbeatStaleMs` (300000 ms by default).
+ * No flags prints the contents and age, `--status` prints one line, `--json`
+ * prints machine-readable JSON.
+ */
+function heartbeatCommand(flags: Record<string, string | boolean>, positionals: string[] = []): number {
+	const usage = "usage: alive heartbeat [--status] [--json] [--config CONFIG]";
+	if (flagBool(flags, "help") || flagBool(flags, "h")) {
+		process.stdout.write(
+			`${usage}\n\n` +
+				"  --status   one line: fresh|stale|missing, age, pid, version and the file path\n" +
+				"  --json     machine-readable status and heartbeat contents\n\n" +
+				"The heartbeat (<stateDir>/heartbeat.json) is written once when the runtime starts:\n" +
+				'{ "pid", "startedAt" (ISO), "version", "tag"?, "ref"? }.\n' +
+				"Exit code: 0 while it is fresh, 1 when it is missing or older than\n" +
+				"updates.heartbeatStaleMs (default 300000 = 5 minutes). This is the signal an\n" +
+				"external watchdog uses to decide that the harness is down.\n",
+		);
+		return 0;
+	}
+	const known = new Set(["status", "json", "config", "help", "h"]);
+	const unknown = Object.keys(flags).filter((key) => !known.has(key));
+	if (unknown.length > 0) {
+		throw new Error(`unknown flag${unknown.length === 1 ? "" : "s"}: --${unknown.join(", --")} (${usage})`);
+	}
+	if (positionals.length > 0) throw new Error(usage);
+
+	const config = loadForCli(flags);
+	const status = readHeartbeatStatus(config.paths.stateDir, config.config.updates.heartbeatStaleMs);
+	const code = status.fresh ? 0 : 1;
+	const limit = formatDuration(status.staleAfterMs);
+	const age = status.ageMs === undefined ? "unknown" : formatDuration(status.ageMs);
+
+	if (flagBool(flags, "json")) {
+		process.stdout.write(
+			`${JSON.stringify(
+				{
+					path: status.path,
+					state: status.state,
+					fresh: status.fresh,
+					ageMs: status.ageMs ?? null,
+					uptimeMs: status.uptimeMs ?? null,
+					staleAfterMs: status.staleAfterMs,
+					heartbeat: status.heartbeat ?? null,
+				},
+				null,
+				2,
+			)}\n`,
+		);
+		return code;
+	}
+
+	const heartbeat = status.heartbeat;
+	if (flagBool(flags, "status")) {
+		const agePart = status.state === "missing" ? "no readable heartbeat file" : `age ${age} (limit ${limit})`;
+		const detail = heartbeat ? `  pid ${heartbeat.pid}  version ${heartbeat.version}` : "";
+		process.stdout.write(`${status.state}  ${agePart}${detail}  ${status.path}\n`);
+		return code;
+	}
+
+	const line = (label: string, value: string) => process.stdout.write(`${label.padEnd(12)} ${value}\n`);
+	line("heartbeat", status.path);
+	line(
+		"status",
+		status.state === "missing"
+			? "missing — no readable heartbeat file (the runtime has not started, or it was removed or corrupt)"
+			: `${status.state} — ${age} old, limit ${limit}`,
+	);
+	if (heartbeat) {
+		line("pid", String(heartbeat.pid));
+		line("startedAt", heartbeat.startedAt);
+		if (status.uptimeMs !== undefined) line("running", formatDuration(status.uptimeMs));
+		line("version", heartbeat.version);
+		line("tag", heartbeat.tag ?? "(unknown)");
+		line("ref", heartbeat.ref ?? "(unknown)");
+	}
+	return code;
+}
+
 function redactSecrets(config: AliveConfig): AliveConfig {
 	const safe = structuredClone(config);
 	safe.modules.telegram.token = safe.modules.telegram.token ? "[redacted]" : "";
@@ -1110,6 +1196,7 @@ usage:
   alive remind <text> --in 5m | --at <ISO>    schedule a reminder for the agent
   alive reminders [--all]                     list reminders
   alive status [--json]                       show runtime + inbox state
+  alive heartbeat [--status] [--json]         process heartbeat: exit 0 fresh, 1 missing/stale
   alive runs [-n 10]                          run history (alias: wakes)
   alive policy [list]                         show the notification policy
   alive policy add <interrupt|queue|mute> [thread]
