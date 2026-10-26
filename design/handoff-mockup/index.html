@@ -36,7 +36,7 @@
   .page .cta{height:40px;border-radius:10px;background:#f4f4f5;border:1px solid #e4e4e7;display:flex;align-items:center;justify-content:center;color:#3f3f46;font-size:13px;font-weight:500}
 
   /* dock — shadcn button group */
-  .dock{position:absolute;left:12px;right:12px;bottom:14px;height:56px;display:flex;align-items:center;gap:6px;padding:0 6px;
+  .dock{position:absolute;left:12px;right:12px;bottom:14px;transition:bottom .28s cubic-bezier(.32,.72,0,1);height:56px;display:flex;align-items:center;gap:6px;padding:0 6px;
     background:rgba(24,24,27,.92);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
     border:1px solid var(--border-strong);border-radius:var(--radius);box-shadow:0 16px 40px rgba(0,0,0,.55)}
   .site{display:flex;align-items:center;gap:6px;min-width:0;flex:1 1 auto;padding:0 4px;color:var(--muted);font-size:12px;line-height:1}
@@ -84,6 +84,7 @@
 
   /* desktop 16:9 */
   .desktop{width:856px;height:482px;border-radius:12px;background:#000;position:relative;overflow:hidden;border:1px solid var(--border);box-shadow:0 24px 60px rgba(0,0,0,.55)}
+  .phone.keyboard .dock{bottom:136px}
   .desktop .dock{left:50%;right:auto;transform:translateX(-50%);bottom:12px;width:min(360px,calc(100% - 24px))}
   .desktop .zoom{bottom:78px}
 
@@ -141,8 +142,8 @@
     </div>
 
     <div>
-      <p class="cap">Телефон — ввод: клавиатура выехала сама</p>
-      <div class="phone">
+      <p class="cap">Телефон — ввод: клавиатура выехала, панель осталась сверху</p>
+      <div class="phone keyboard">
         <div class="stage">
           <div class="page">
             <div class="bar w50"></div><div class="bar"></div><div class="bar w70"></div>
@@ -152,6 +153,15 @@
             <div class="cta" style="width:42%">Купить</div>
             <div class="bar"></div><div class="bar w70"></div>
           </div>
+        </div>
+        <div class="dock">
+          <div class="site"><span class="dot"></span><span class="host">wildberries.ru</span></div>
+          <button class="icon" aria-label="Клавиатура"><svg viewBox="0 0 24 24"><rect x="2.5" y="7" width="19" height="10" rx="2"/><path d="M6.5 10.5h.01M10 10.5h.01M13.5 10.5h.01M17 10.5h.01M8 14h8"/></svg></button>
+          <div class="seg">
+            <button class="on" aria-label="Режим телефона"><svg viewBox="0 0 24 24"><rect x="7.5" y="3" width="9" height="18" rx="2"/><path d="M11 18.5h2"/></svg></button>
+            <button aria-label="Режим ПК 16:9"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="11" rx="1.8"/><path d="M9 20h6M12 16v4"/></svg></button>
+          </div>
+          <button class="done">Готово</button>
         </div>
         <div class="sheet">
           <div class="grab"></div>
