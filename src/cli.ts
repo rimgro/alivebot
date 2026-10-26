@@ -27,6 +27,7 @@ import { gitDiff, gitState, isGitRepository } from "./workers/worktree.js";
 import { createHostWorkerEnvironment } from "./workers/environment.js";
 import { renderWorkerRecord } from "./workers/manager.js";
 import { term } from "./term.js";
+import { createExecRunner, runUpdate } from "./update.js";
 import {
 	formatDuration,
 	iso,
@@ -120,6 +121,51 @@ export async function main(argv: string[]): Promise<number> {
 			}
 			case "restart": {
 				return await restartCommand(cwd, flags);
+			}
+			case "update": {
+				const usage = "usage: alive update [--check] [--tag vX.Y.Z] [--force] | alive update --rollback [--force] | alive update --status";
+				if (flagBool(flags, "help") || flagBool(flags, "h")) {
+					process.stdout.write(
+						`${usage}\n\n` +
+							"  --check          report the current ref, latest stable tag, marker and dist/; change nothing\n" +
+							"  --rollback       restore previousRef from the marker and dist.prev/ (no network needed)\n" +
+							"  --status         report the current ref, marker contents and dist/dist.prev presence\n" +
+							"  --tag vX.Y.Z     target an explicit stable tag instead of the latest one\n" +
+							"  --force          allow apply/rollback with a dirty working tree (local changes are kept)\n\n" +
+							"The update is applied without --check. It never restarts the running harness;\n" +
+							"restart it yourself afterwards with `alive restart`.\n",
+					);
+					return 0;
+				}
+				const known = new Set(["check", "dry-run", "apply", "rollback", "status", "tag", "force", "help", "h"]);
+				const unknown = Object.keys(flags).filter((key) => !known.has(key));
+				if (unknown.length > 0) throw new Error(`unknown flag${unknown.length === 1 ? "" : "s"}: --${unknown.join(", --")} (${usage})`);
+				if (positionals.length > 0) throw new Error(usage);
+				if (flags["tag"] === true) throw new Error("--tag requires a value (vX.Y.Z)");
+
+				const check = flagBool(flags, "check") || flagBool(flags, "dry-run");
+				const apply = flagBool(flags, "apply");
+				const rollback = flagBool(flags, "rollback");
+				const status = flagBool(flags, "status");
+				if ([check, apply, rollback, status].filter(Boolean).length > 1) {
+					throw new Error("choose one of --check, --apply, --rollback, --status");
+				}
+				if ((rollback || status) && flagString(flags, "tag") !== undefined) {
+					throw new Error("--tag cannot be combined with --rollback or --status");
+				}
+				if (status && flagBool(flags, "force")) throw new Error("--force is only used with apply or --rollback");
+
+				return await runUpdate(
+					{
+						cwd,
+						check,
+						rollback,
+						status,
+						tag: flagString(flags, "tag"),
+						force: flagBool(flags, "force"),
+					},
+					{ run: createExecRunner() },
+				);
 			}
 			case "logs":
 			case "log": {
@@ -1050,6 +1096,12 @@ usage:
   alive stop [--force] [--timeout 30s]        stop the running instance
                                               (--force: SIGKILL immediately)
   alive restart [--verbose]                   stop, then start in the background again
+  alive update [--check] [--tag vX.Y.Z] [--force]
+                                              update the harness to the newest stable vX.Y.Z tag
+                                              (--check: report only; --force: allow a dirty tree)
+  alive update --rollback [--force]           restore previousRef and dist.prev/ from .alive-update.json
+  alive update --status                       current ref, update marker, dist/ and dist.prev/
+                                              (update never restarts the harness — restart it yourself)
   alive logs [-n 50] [-f] [--file <source>] [--json]
                                               tail logs; sources: stdout (default), alive, thoughts
   alive say <text> [--thread t] [--no-reply]  send a message into the agent's inbox

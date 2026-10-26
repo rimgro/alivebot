@@ -180,6 +180,7 @@ alive telegram whitelist remove 123456789
 | `alive run [--foreground] [--once] [--force] [--verbose]` | запускает агента **в фоне** (детач, переживает закрытие терминала); `--foreground` — остаться в терминале, `--once` — один run и выход |
 | `alive stop [--force] [--timeout 30s]` | останавливает инстанс: SIGTERM, при игноре — SIGKILL; `--force` — сразу SIGKILL |
 | `alive restart [--verbose]` | `stop` + `run` в фоне |
+| `alive update [--check] [--rollback] [--status] [--tag vX.Y.Z] [--force]` | обновление харнесса до стабильного тега; `--check` — отчёт, `--rollback` — откат по маркеру, `--status` — состояние |
 | `alive logs [-n 50] [-f] [--file stdout\|alive\|thoughts] [--json]` | хвост логов; `-f` — следить за новыми строками |
 | `alive say <text> [--thread t] [--no-reply]` | кладёт сообщение человека в durable-инбокс |
 | `alive emit <text> [--kind k] [--priority p] [--json '<obj>']` | observability-событие |
@@ -219,6 +220,75 @@ alive run --once          # один run в терминале, без демо�
 
 Stdout фонового процесса пишется в `.alive/logs/stdout.log`, структурированный лог —
 в `.alive/logs/alive.jsonl`.
+
+### Обновление харнесса
+
+Харнесс обновляется до последнего стабильного тега `vX.Y.Z` явной командой:
+
+```bash
+alive update --check        # только отчёт: текущий ref, тег, маркер, dist/ и dist.prev/
+alive update                # применить: checkout + npm ci + npm run build + health gate
+alive update --tag v0.2.0   # конкретный стабильный тег вместо последнего
+alive update --status       # текущий ref, содержимое маркера, наличие dist/ и dist.prev/
+alive update --rollback     # вернуть previousRef и dist.prev/ из маркера
+```
+
+`--check` не меняет checkout: команда делает `git fetch --tags origin` (обновляются
+только remote-теги, рабочее дерево не трогается), выбирает самый новый стабильный тег
+(`vX.Y.Z`; пре-релизы вроде `v1.0.0-rc.1` игнорируются), сравнивает его с текущим
+состоянием (тег через `git describe --tags --exact-match`, иначе ветка/коммит и версия
+из `package.json`) и печатает команду для применения. В конце отчёта видны маркер
+обновления и наличие `dist/`/`dist.prev/`.
+
+Перед первым изменяющим шагом `alive update` пишет в корень репозитория маркер
+`.alive-update.json` (файл в `.gitignore`):
+
+```json
+{
+  "previousRef": "main",
+  "previousTag": "v0.1.0",
+  "targetTag": "v0.2.0",
+  "startedAt": "2026-01-01T12:00:00.000Z",
+  "finishedAt": "2026-01-01T12:05:00.000Z",
+  "outcome": "success"
+}
+```
+
+`outcome` принимает `in-progress`, `success`, `rolled-back` или `failed`. Маркер
+обновляется на успехе и после любой неудачи, поэтому `--status` и `--rollback` работают
+даже если процесс обновления был прерван.
+
+Перед сборкой нового тега текущий `dist/` переезжает в `dist.prev/` (хранится одно
+поколение; существующий `dist.prev/` заменяется). После `npm run build` выполняется
+короткая health-проверка `node dist/index.js --help` с таймаутом ~15 с: ненулевой код
+или таймаут считаются провалом и запускают автоматический откат.
+
+`alive update` отказывается работать, если рабочее дерево грязное (`git status
+--porcelain` не пуст): сначала закоммитьте или спрячьте изменения, либо передайте
+`--force`. Даже с `--force` checkout остаётся обычным — локальные изменения никогда не
+выбрасываются, и git может отказать, если они конфликтуют с тегом. Команда также
+откажется обновлять detached HEAD, который не стоит на теге.
+
+При любой неудаче автоматического обновления (checkout, установка, сборка, health gate)
+команда возвращает предыдущий ref, восстанавливает сохранённый `dist.prev/` (мгновенно,
+без сети) или пересобирает старый ref, и завершается с ненулевым кодом, сообщая, что
+именно откатилось. `.alive/`, `alive.config.json`, `SOUL.md` и `.env` не трогаются;
+`git push` не выполняется, ветки не удаляются, за пределы checkout команда не выходит.
+
+`alive update --rollback` читает `.alive-update.json`, возвращает `previousRef` и
+восстанавливает `dist.prev/` (rename, без сети и пересборки). Если сохранённого
+`dist.prev/` нет, старый ref пересобирается (`npm ci` + `npm run build` + health gate).
+Грязное дерево требует `--force`; отсутствующий или повреждённый маркер приводит к
+понятной ошибке, и команда ничего не меняет. `--rollback` работает и тогда, когда
+текущий HEAD или сборка сломаны, а при наличии `dist.prev/` не требует сети.
+
+`alive update --status` показывает текущий ref, поля маркера (`previousRef`,
+`previousTag`, `targetTag`, `outcome`, timestamps) и наличие `dist/`/`dist.prev/`.
+Те же сведения печатает `--check`.
+
+Команда никогда не перезапускает работающий харнесс. После успешного обновления или
+отката старый процесс продолжает исполнять старый код, поэтому перезапустите его
+вручную: `alive restart` (или `alive stop && alive run`).
 
 ## Сон и память
 
