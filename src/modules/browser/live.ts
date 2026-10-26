@@ -7,7 +7,7 @@ import { StreamPolicy } from "./stream-policy.js";
 
 interface LiveDependencies {
 	snapshotMode?(): boolean;
-	state?(): { paused: boolean };
+	state?(): { paused: boolean; url?: string };
 	origin(): string;
 	authorize(credential: string): { expiresAt: number };
 	page(): Page | undefined;
