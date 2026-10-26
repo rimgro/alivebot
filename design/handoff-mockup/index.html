@@ -3,95 +3,97 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SLAVA handoff — макет v2</title>
+<title>SLAVA handoff — макет v3</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
   :root{
     color-scheme: dark;
-    --bg:#0a0b0d; --stage:#101215; --glass:rgba(22,25,30,.72); --glass-2:rgba(30,34,41,.86);
-    --text:#eef1f5; --muted:#98a1ad; --line:rgba(255,255,255,.09); --accent:#6c8cff; --accent-ink:#0a1122;
-    --ok:#43d19e; --warn:#f0b43f;
-    --r-lg:22px; --r-md:14px; --r-sm:10px;
-    --shadow:0 12px 32px rgba(0,0,0,.45);
+    /* shadcn zinc, без акцентного синего */
+    --background:#09090b; --foreground:#fafafa; --card:#18181b; --card-2:#27272a;
+    --muted:#a1a1aa; --border:rgba(250,250,250,.10); --border-strong:rgba(250,250,250,.16);
+    --primary:#fafafa; --primary-foreground:#18181b;
+    --radius:12px;
   }
   *{box-sizing:border-box}
-  body{margin:0;background:#05060a;color:var(--text);
-    font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",ui-sans-serif,system-ui,"Helvetica Neue",Arial,sans-serif;
-    padding:36px; -webkit-font-smoothing:antialiased}
-  h1{font-size:19px;font-weight:600;letter-spacing:-.01em;margin:0 0 6px}
-  .lead{color:var(--muted);font-size:13px;margin:0 0 30px}
+  html,body{height:100%}
+  body{margin:0;background:var(--background);color:var(--foreground);
+    font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;
+    font-feature-settings:"cv11","ss01"; -webkit-font-smoothing:antialiased; padding:36px}
+  h1{font-size:18px;line-height:1.3;font-weight:600;letter-spacing:-.015em;margin:0 0 6px}
+  .lead{color:var(--muted);font-size:13px;line-height:1.5;margin:0 0 30px}
   .frames{display:flex;gap:34px;align-items:flex-start;flex-wrap:wrap}
-  .cap{font-size:12px;color:var(--muted);margin:0 0 10px;letter-spacing:.01em}
+  .cap{font-size:12px;line-height:1.4;color:var(--muted);margin:0 0 10px}
 
-  .phone{width:392px;height:846px;border-radius:44px;background:var(--bg);position:relative;overflow:hidden;
-    border:1px solid rgba(255,255,255,.08);box-shadow:0 30px 70px rgba(0,0,0,.6)}
-  .stage{position:absolute;inset:0;overflow:hidden}
-  .page{position:absolute;inset:0;background:#f6f7f9;color:#14171c;padding:16px 14px;display:flex;flex-direction:column;gap:10px}
-  .page.dim{filter:brightness(.94)}
-  .bar{height:12px;border-radius:6px;background:#e2e6ec;flex:0 0 auto}
-  .bar.w70{width:70%}.bar.w50{width:50%}.bar.w35{width:35%}
-  .field{height:42px;border:1px solid #d3d9e1;border-radius:12px;background:#fff;display:flex;align-items:center;padding:0 12px;color:#939ca8;font-size:14px}
-  .cta{height:44px;border-radius:12px;background:#e8ecf2;display:flex;align-items:center;justify-content:center;color:#39414d;font-size:14px;font-weight:500}
+  .phone{width:392px;height:846px;border-radius:28px;background:#000;position:relative;overflow:hidden;
+    border:1px solid var(--border);box-shadow:0 24px 60px rgba(0,0,0,.55)}
+  .stage{position:absolute;inset:0}
+  .page{position:absolute;inset:0;background:#fbfbfc;color:#18181b;padding:16px 14px;display:flex;flex-direction:column;gap:10px;overflow:hidden}
+  .page .bar{height:10px;border-radius:5px;background:#e7e7ea;flex:0 0 auto}
+  .page .bar.w70{width:70%}.page .bar.w50{width:50%}.page .bar.w35{width:35%}
+  .page .field{height:40px;border:1px solid #e4e4e7;border-radius:10px;background:#fff;display:flex;align-items:center;padding:0 12px;color:#a1a1aa;font-size:13px}
+  .page .cta{height:40px;border-radius:10px;background:#f4f4f5;border:1px solid #e4e4e7;display:flex;align-items:center;justify-content:center;color:#3f3f46;font-size:13px;font-weight:500}
 
-  /* glass dock */
-  .dock{position:absolute;left:14px;right:14px;bottom:16px;height:60px;display:flex;align-items:center;gap:4px;padding:0 8px;overflow:hidden;
-    background:var(--glass);backdrop-filter:blur(18px) saturate(140%);-webkit-backdrop-filter:blur(18px) saturate(140%);
-    border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow)}
-  .icon{width:40px;height:40px;border-radius:var(--r-md);border:0;background:transparent;color:var(--text);
-    display:grid;place-items:center;padding:0;transition:background .18s ease, transform .12s ease}
-  .icon:hover{background:rgba(255,255,255,.07)}
-  .icon:active{transform:scale(.94)}
-  .icon svg{width:22px;height:22px;stroke:currentColor;stroke-width:1.7;fill:none;stroke-linecap:round;stroke-linejoin:round}
-    .site{display:flex;align-items:center;gap:7px;min-width:0;flex:1 1 auto;padding:0 8px 0 6px;color:var(--muted);font-size:12px}
-  .site .host{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
-  .site svg{width:15px;height:15px;stroke:var(--muted);stroke-width:1.6;fill:none;flex:0 0 auto}
-  .dot{width:7px;height:7px;border-radius:50%;background:var(--warn);box-shadow:0 0 0 3px rgba(240,180,63,.16)}
-  .seg{display:flex;margin-left:auto;background:rgba(0,0,0,.32);border:1px solid var(--line);border-radius:var(--r-md);padding:3px;gap:2px}
-  .seg button{border:0;background:transparent;color:var(--muted);height:36px;width:34px;display:grid;place-items:center;border-radius:10px;transition:background .18s ease,color .18s ease}
-  .seg button.on{background:var(--glass-2);color:var(--text);box-shadow:0 1px 0 rgba(255,255,255,.06) inset}
-  .seg svg{width:20px;height:20px;stroke:currentColor;stroke-width:1.7;fill:none;stroke-linecap:round;stroke-linejoin:round}
-  .done{height:42px;padding:0 12px;font-size:13px;white-space:nowrap;border:0;border-radius:var(--r-md);background:var(--accent);color:var(--accent-ink);font-weight:600;font-size:14px;margin-left:6px;transition:filter .18s ease, transform .12s ease}
-  .done:active{transform:scale(.97);filter:brightness(.95)}
+  /* dock — shadcn button group */
+  .dock{position:absolute;left:12px;right:12px;bottom:14px;height:56px;display:flex;align-items:center;gap:6px;padding:0 6px;
+    background:rgba(24,24,27,.92);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+    border:1px solid var(--border-strong);border-radius:var(--radius);box-shadow:0 16px 40px rgba(0,0,0,.55)}
+  .site{display:flex;align-items:center;gap:6px;min-width:0;flex:1 1 auto;padding:0 4px;color:var(--muted);font-size:12px;line-height:1}
+  .site .host{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+  .dot{width:6px;height:6px;border-radius:50%;background:#fbbf24;flex:0 0 auto}
+  .dot.live{background:#34d399}
+  .icon{width:36px;height:36px;flex:0 0 auto;border-radius:9px;border:0;background:transparent;color:var(--muted);
+    display:grid;place-items:center;padding:0;transition:background-color .15s ease,color .15s ease,transform .1s ease}
+  .icon:hover{background:var(--card-2);color:var(--foreground)}
+  .icon:active{transform:scale(.96)}
+  .icon svg{width:18px;height:18px;stroke:currentColor;stroke-width:1.6;fill:none;stroke-linecap:round;stroke-linejoin:round}
+  .seg{display:flex;flex:0 0 auto;background:rgba(0,0,0,.35);border:1px solid var(--border);border-radius:9px;padding:2px;gap:2px}
+  .seg button{width:32px;height:32px;border:0;border-radius:7px;background:transparent;color:var(--muted);display:grid;place-items:center;padding:0;transition:background-color .15s ease,color .15s ease}
+  .seg button.on{background:var(--card-2);color:var(--foreground)}
+  .seg svg{width:17px;height:17px;stroke:currentColor;stroke-width:1.6;fill:none;stroke-linecap:round;stroke-linejoin:round}
+  .done{height:36px;flex:0 0 auto;padding:0 12px;border:0;border-radius:9px;background:var(--primary);color:var(--primary-foreground);
+    font-family:inherit;font-size:13px;font-weight:600;line-height:1;transition:opacity .15s ease,transform .1s ease}
+  .done:active{transform:scale(.97);opacity:.92}
 
-  /* zoom cluster */
-  .zoom{position:absolute;right:12px;top:50%;transform:translateY(-50%);display:flex;flex-direction:column;gap:4px;padding:5px;
-    background:var(--glass);backdrop-filter:blur(18px);border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow);
-    transition:opacity .2s ease}
-  .zoom button{width:40px;height:40px;border-radius:12px;border:0;background:transparent;color:var(--text);font-size:13px;font-weight:600;
-    display:grid;place-items:center}
-  .zoom button:hover{background:rgba(255,255,255,.07)}
-  .zoom svg{width:20px;height:20px;stroke:currentColor;stroke-width:1.7;fill:none;stroke-linecap:round;stroke-linejoin:round}
-  .zoom .pct{font-size:11px;color:var(--muted);font-weight:500}
+  /* zoom — один компактный сегмент */
+  .zoom{position:absolute;right:12px;bottom:82px;display:flex;align-items:center;gap:2px;padding:2px;
+    background:rgba(24,24,27,.92);backdrop-filter:blur(12px);border:1px solid var(--border-strong);border-radius:9px}
+  .zoom button{width:32px;height:32px;border:0;border-radius:7px;background:transparent;color:var(--muted);display:grid;place-items:center;padding:0}
+  .zoom button:hover{background:var(--card-2);color:var(--foreground)}
+  .zoom svg{width:16px;height:16px;stroke:currentColor;stroke-width:1.7;fill:none;stroke-linecap:round;stroke-linejoin:round}
+  .zoom .pct{font-size:11px;line-height:1;color:var(--muted);padding:0 6px;font-variant-numeric:tabular-nums;min-width:38px;text-align:center}
 
   /* keyboard sheet */
-  .sheet{position:absolute;left:0;right:0;bottom:0;background:rgba(19,22,27,.96);backdrop-filter:blur(22px);
-    border-top:1px solid var(--line);border-radius:26px 26px 0 0;padding:10px 10px 18px;transform:translateY(0);
-    transition:transform .26s cubic-bezier(.2,.8,.2,1)}
-  .sheet.hidden{transform:translateY(105%)}
-  .grab{width:38px;height:4px;border-radius:2px;background:rgba(255,255,255,.18);margin:2px auto 10px}
-  .keys{display:flex;gap:6px;margin-bottom:10px}
-  .key{flex:1;height:42px;border-radius:12px;border:1px solid var(--line);background:rgba(255,255,255,.05);color:var(--text);
-    font-size:12px;display:grid;place-items:center}
-  .key svg{width:18px;height:18px;stroke:currentColor;stroke-width:1.7;fill:none;stroke-linecap:round;stroke-linejoin:round}
-  .reply{display:flex;gap:8px}
-  .reply input{flex:1;height:46px;border-radius:14px;border:1px solid rgba(255,255,255,.12);background:rgba(0,0,0,.35);
-    color:var(--text);padding:0 14px;font-size:14px}
-  .reply input::placeholder{color:#7b8593}
-  .reply button{height:46px;padding:0 18px;border-radius:14px;border:0;background:var(--accent);color:var(--accent-ink);font-weight:600;font-size:14px}
+  .sheet{position:absolute;left:0;right:0;bottom:0;background:rgba(24,24,27,.98);backdrop-filter:blur(16px);
+    border-top:1px solid var(--border-strong);border-radius:16px 16px 0 0;padding:8px 10px 16px;
+    transform:translateY(0);transition:transform .28s cubic-bezier(.32,.72,0,1)}
+  .sheet.hidden{transform:translateY(104%)}
+  .grab{width:34px;height:3px;border-radius:2px;background:rgba(250,250,250,.20);margin:2px auto 10px}
+  .keys{display:flex;gap:5px;margin-bottom:8px}
+  .key{flex:1 1 0;min-width:0;height:36px;border-radius:8px;border:1px solid var(--border);background:transparent;
+    color:var(--muted);font-family:inherit;font-size:11px;font-weight:500;display:grid;place-items:center}
+  .key:hover{background:var(--card-2);color:var(--foreground)}
+  .key svg{width:15px;height:15px;stroke:currentColor;stroke-width:1.7;fill:none;stroke-linecap:round;stroke-linejoin:round}
+  .reply{display:flex;gap:6px}
+  .reply input{flex:1 1 auto;min-width:0;height:38px;border-radius:8px;border:1px solid var(--border);background:rgba(0,0,0,.4);
+    color:var(--foreground);padding:0 12px;font-family:inherit;font-size:13px;line-height:1}
+  .reply input::placeholder{color:#71717a}
+  .reply button{flex:0 0 auto;height:38px;padding:0 14px;border:0;border-radius:8px;background:var(--primary);color:var(--primary-foreground);
+    font-family:inherit;font-size:13px;font-weight:600;line-height:1}
 
-  /* desktop */
-  .desktop{width:856px;height:482px;border-radius:18px;background:var(--bg);position:relative;overflow:hidden;
-    border:1px solid rgba(255,255,255,.08);box-shadow:0 30px 70px rgba(0,0,0,.6)}
-  .desktop .page{border-radius:0}
-  .desktop .dock{left:50%;right:auto;transform:translateX(-50%);bottom:14px}
-  .desktop .zoom{right:14px}
+  /* desktop 16:9 */
+  .desktop{width:856px;height:482px;border-radius:12px;background:#000;position:relative;overflow:hidden;border:1px solid var(--border);box-shadow:0 24px 60px rgba(0,0,0,.55)}
+  .desktop .dock{left:50%;right:auto;transform:translateX(-50%);bottom:12px;width:min(360px,calc(100% - 24px))}
+  .desktop .zoom{bottom:78px}
 
   .notes{max-width:1280px;margin-top:26px;color:var(--muted);font-size:12.5px;line-height:1.7}
-  .notes b{color:var(--text);font-weight:600}
+  .notes b{color:var(--foreground);font-weight:600}
 </style>
 </head>
 <body>
-  <h1>Handoff — макет v2</h1>
-  <p class="lead">Стрим на весь экран. Всё управление — стеклянная панель поверх картинки: иконки, зум, режим ПК, «Готово».</p>
+  <h1>Handoff — макет v3</h1>
+  <p class="lead">Стрим на весь экран. Управление — одна панель в стиле shadcn: нейтральная палитра, белая основная кнопка, без цветных отливов.</p>
 
   <div class="frames">
     <div>
@@ -103,15 +105,15 @@
             <div class="field">Поиск на сайте</div>
             <div class="cta">Найти</div>
             <div class="bar w70"></div><div class="bar"></div><div class="bar w35"></div>
-            <div class="cta" style="width:42%;background:#dde3ea">Купить</div>
+            <div class="cta" style="width:42%">Купить</div>
             <div class="bar"></div><div class="bar w70"></div><div class="bar w50"></div><div class="bar"></div>
           </div>
         </div>
         <div class="zoom">
-          <button aria-label="Приблизить"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
-          <span class="pct">100%</span>
           <button aria-label="Отдалить"><svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button>
-          <button aria-label="По ширине экрана"><svg viewBox="0 0 24 24"><path d="M4 9V5h4M20 9V5h-4M4 15v4h4M20 15v4h-4"/></svg></button>
+          <span class="pct">100%</span>
+          <button aria-label="Приблизить"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
+          <button aria-label="Вписать в экран"><svg viewBox="0 0 24 24"><path d="M4 9V5h4M20 9V5h-4M4 15v4h4M20 15v4h-4"/></svg></button>
         </div>
         <div class="sheet hidden" id="sheet-a">
           <div class="grab"></div>
@@ -124,21 +126,14 @@
             <button class="key"><svg viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></svg></button>
             <button class="key"><svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 4v4h-4"/></svg></button>
           </div>
-          <div class="reply">
-            <input placeholder="Текст в выбранное поле">
-            <button>Ввести</button>
-          </div>
+          <div class="reply"><input placeholder="Текст в выбранное поле"><button>Ввести</button></div>
         </div>
         <div class="dock">
-          <div class="site" title="агент ждёт">
-            <span class="dot"></span>
-            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 2.5 15.4 0 18M12 3c-2.5 2.6-2.5 15.4 0 18"/></svg>
-            <span class="host">wildberries.ru</span>
-          </div>
-          <button class="icon" data-to="sheet-a" aria-label="Клавиатура"><svg viewBox="0 0 24 24"><rect x="2.5" y="6.5" width="19" height="11" rx="2.5"/><path d="M7 10.5h.01M11 10.5h.01M15 10.5h.01M8 14h8"/></svg></button>
+          <div class="site"><span class="dot"></span><span class="host">wildberries.ru</span></div>
+          <button class="icon" data-to="sheet-a" aria-label="Клавиатура"><svg viewBox="0 0 24 24"><rect x="2.5" y="7" width="19" height="10" rx="2"/><path d="M6.5 10.5h.01M10 10.5h.01M13.5 10.5h.01M17 10.5h.01M8 14h8"/></svg></button>
           <div class="seg">
-            <button class="on" aria-label="Режим телефона"><svg viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/></svg></button>
-            <button aria-label="Режим ПК 16:9"><svg viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></button>
+            <button class="on" aria-label="Режим телефона"><svg viewBox="0 0 24 24"><rect x="7.5" y="3" width="9" height="18" rx="2"/><path d="M11 18.5h2"/></svg></button>
+            <button aria-label="Режим ПК 16:9"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="11" rx="1.8"/><path d="M9 20h6M12 16v4"/></svg></button>
           </div>
           <button class="done">Готово</button>
         </div>
@@ -146,15 +141,15 @@
     </div>
 
     <div>
-      <p class="cap">Телефон — ввод (клавиатура выехала сама)</p>
+      <p class="cap">Телефон — ввод: клавиатура выехала сама</p>
       <div class="phone">
         <div class="stage">
-          <div class="page dim">
+          <div class="page">
             <div class="bar w50"></div><div class="bar"></div><div class="bar w70"></div>
             <div class="field">Поиск на сайте</div>
             <div class="cta">Найти</div>
             <div class="bar w70"></div><div class="bar"></div><div class="bar w35"></div>
-            <div class="cta" style="width:42%;background:#dde3ea">Купить</div>
+            <div class="cta" style="width:42%">Купить</div>
             <div class="bar"></div><div class="bar w70"></div>
           </div>
         </div>
@@ -169,40 +164,34 @@
             <button class="key"><svg viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></svg></button>
             <button class="key"><svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.3-5.6"/><path d="M20 4v4h-4"/></svg></button>
           </div>
-          <div class="reply">
-            <input placeholder="Текст в выбранное поле">
-            <button>Ввести</button>
-          </div>
+          <div class="reply"><input placeholder="Текст в выбранное поле"><button>Ввести</button></div>
         </div>
       </div>
     </div>
 
     <div>
-      <p class="cap">ПК 16:9 — на телефоне и десктопе</p>
+      <p class="cap">ПК 16:9</p>
       <div class="desktop">
         <div class="stage">
           <div class="page" style="padding:22px 26px">
             <div class="bar w35"></div><div class="bar"></div><div class="bar w70"></div>
             <div class="field" style="max-width:520px">Поиск на сайте</div>
-            <div class="cta" style="width:160px">Найти</div>
+            <div class="cta" style="width:150px">Найти</div>
             <div class="bar w70"></div><div class="bar"></div><div class="bar w35"></div>
           </div>
         </div>
         <div class="zoom">
-          <button aria-label="Приблизить"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
-          <span class="pct">80%</span>
           <button aria-label="Отдалить"><svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button>
+          <span class="pct">80%</span>
+          <button aria-label="Приблизить"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg></button>
+          <button aria-label="Вписать в экран"><svg viewBox="0 0 24 24"><path d="M4 9V5h4M20 9V5h-4M4 15v4h4M20 15v4h-4"/></svg></button>
         </div>
         <div class="dock">
-          <div class="site" title="агент работает">
-            <span class="dot" style="background:var(--ok);box-shadow:0 0 0 3px rgba(67,209,158,.16)"></span>
-            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 2.5 15.4 0 18M12 3c-2.5 2.6-2.5 15.4 0 18"/></svg>
-            <span class="host">ozon.ru</span>
-          </div>
-          <button class="icon" aria-label="Клавиатура"><svg viewBox="0 0 24 24"><rect x="2.5" y="6.5" width="19" height="11" rx="2.5"/><path d="M7 10.5h.01M11 10.5h.01M15 10.5h.01M8 14h8"/></svg></button>
+          <div class="site"><span class="dot live"></span><span class="host">ozon.ru</span></div>
+          <button class="icon" aria-label="Клавиатура"><svg viewBox="0 0 24 24"><rect x="2.5" y="7" width="19" height="10" rx="2"/><path d="M6.5 10.5h.01M10 10.5h.01M13.5 10.5h.01M17 10.5h.01M8 14h8"/></svg></button>
           <div class="seg">
-            <button aria-label="Режим телефона"><svg viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/></svg></button>
-            <button class="on" aria-label="Режим ПК 16:9"><svg viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></button>
+            <button aria-label="Режим телефона"><svg viewBox="0 0 24 24"><rect x="7.5" y="3" width="9" height="18" rx="2"/><path d="M11 18.5h2"/></svg></button>
+            <button class="on" aria-label="Режим ПК 16:9"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="11" rx="1.8"/><path d="M9 20h6M12 16v4"/></svg></button>
           </div>
           <button class="done">Готово</button>
         </div>
@@ -211,12 +200,11 @@
   </div>
 
   <p class="notes">
-    <b>Что учёл:</b> верхнюю пилюлю убрал — статус агента переехал в панель точкой и короткой подписью. Иконки — линейные SVG вместо эмодзи, скругления выровнены по шкале (10/14/22), панель стеклянная с блюром.
-    Добавил управление картинкой: зум +/−, сброс к ширине экрана, процент по центру.
-    <b>Анимации:</b> панель клавиатуры выезжает снизу пружиной (260 мс), панель управления плавно скрывается при бездействии и появляется по тапу, кнопки сжимаются на нажатие, сегмент режима переключается с подсветкой.
+    <b>Что поменял:</b> палитра — shadcn zinc, акцент убран, основная кнопка белая; иконки и радиусы в одном наборе (9/12), шрифт Inter, размеры текста и высоты строк зафиксированы, чтобы ничего не съезжало.
+    Зум собрал в один компактный сегмент: −, процент, +, «вписать». Домен сайта — слева в панели, с точкой статуса. Клавиатура выезжает снизу, панель прячется после простоя.
   </p>
+
   <script>
-    // Демо-поведение: сегмент режима, выезд клавиатуры, авто-скрытие панели.
     document.querySelectorAll(".seg").forEach((seg) => {
       seg.addEventListener("click", (event) => {
         const button = event.target.closest("button");
@@ -225,22 +213,8 @@
       });
     });
     document.querySelectorAll("[data-to]").forEach((button) => {
-      button.addEventListener("click", () => {
-        const sheet = document.getElementById(button.dataset.to);
-        if (sheet) sheet.classList.toggle("hidden");
-      });
+      button.addEventListener("click", () => document.getElementById(button.dataset.to)?.classList.toggle("hidden"));
     });
-    const docks = document.querySelectorAll(".phone .dock");
-    let hideTimer;
-    const scheduleHide = () => {
-      clearTimeout(hideTimer);
-      hideTimer = setTimeout(() => docks.forEach((dock) => { dock.style.opacity = "0"; dock.style.transform = "translateY(12px)"; }), 3000);
-    };
-    docks.forEach((dock) => {
-      dock.style.transition = "opacity .25s ease, transform .25s ease";
-      dock.addEventListener("pointerdown", () => { docks.forEach((item) => { item.style.opacity = "1"; item.style.transform = "none"; }); scheduleHide(); });
-    });
-    scheduleHide();
   </script>
 </body>
 </html>
