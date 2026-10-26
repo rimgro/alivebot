@@ -45,6 +45,10 @@ export interface BrowserConfig {
 	/** Maximum passive wait for a known automatic browser check before human handoff. */
 	challengeWaitMs: number;
 	actionTimeoutMs: number;
+	/** Hard cap on page text returned by `read`; the rest is replaced by a truncation marker. */
+	maxPageTextChars: number;
+	/** Hard cap on snapshot nodes returned by `snapshot`; the rest is replaced by a truncation marker. */
+	maxSnapshotNodes: number;
 	humanization: HumanizationConfig;
 	signing: BrowserSigningConfig;
 }
@@ -61,6 +65,12 @@ export const DEFAULT_HUMANIZATION: HumanizationConfig = {
 	enabled: true, minDelayMs: 120, maxDelayMs: 350,
 	minTypingDelayMs: 25, maxTypingDelayMs: 75,
 };
+
+/** Validated in `BrowserModule.start`; extraction limits are operator policy, not page data. */
+export function validateExtractionLimits(config: Pick<BrowserConfig, "maxPageTextChars" | "maxSnapshotNodes">): void {
+	if (!Number.isInteger(config.maxPageTextChars) || config.maxPageTextChars < 1_000 || config.maxPageTextChars > 1_000_000) throw new Error("browser.maxPageTextChars must be an integer between 1000 and 1000000");
+	if (!Number.isInteger(config.maxSnapshotNodes) || config.maxSnapshotNodes < 50 || config.maxSnapshotNodes > 50_000) throw new Error("browser.maxSnapshotNodes must be an integer between 50 and 50000");
+}
 
 export const DEFAULT_BROWSER_CONFIG: BrowserConfig = {
 	enabled: false,
@@ -87,6 +97,8 @@ export const DEFAULT_BROWSER_CONFIG: BrowserConfig = {
 	minNavigationIntervalMs: 2000,
 	challengeWaitMs: 15_000,
 	actionTimeoutMs: 15_000,
+	maxPageTextChars: 200_000,
+	maxSnapshotNodes: 2_000,
 	humanization: DEFAULT_HUMANIZATION,
 	signing: { enabled: false, agentUrl: "", keyFileEnv: "ALIVE_BROWSER_SIGNING_KEY_FILE", origins: [] },
 };

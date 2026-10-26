@@ -7,7 +7,7 @@ import { defineTool, type ToolDefinition, type AgentToolResult } from "@earendil
 import type { Browser, BrowserContext, Page, Response as BrowserResponse, BrowserType } from "playwright";
 import type { AliveModule, ModuleContext } from "../../events/api.js";
 import { TelegramApi } from "../telegram/client.js";
-import { DEFAULT_BROWSER_CONFIG, DEFAULT_HUMANIZATION, type BrowserConfig, type HumanizationConfig } from "./config.js";
+import { DEFAULT_BROWSER_CONFIG, DEFAULT_HUMANIZATION, validateExtractionLimits, type BrowserConfig, type HumanizationConfig } from "./config.js";
 import { HumanActions } from "./human.js";
 import { BrowserIdentity } from "./identity.js";
 import { controlPage } from "./page.js";
@@ -19,7 +19,8 @@ import { chromeExecutable, launchNativeBrowser, type NativeBrowser } from "./nat
 import { BrowserLive } from "./live.js";
 import { verifyTelegramOperator } from "./telegram-auth.js";
 import { BrowserNotification } from "./notification.js";
-import { BrowserObservation, waitCatalogContent } from "./observation.js";
+import { BrowserObservation, waitCatalogContent, type CatalogContent } from "./observation.js";
+import { MAX_SNAPSHOT_NODE_CHARS, extractSnapshot, extractText, extractionNote, isTimeoutError, pageTextExtractor } from "./extract.js";
 import { launchManagedFortress, validateFortressImage, type ManagedFortress } from "./fortress.js";
 import { checkCanvas, type CanvasReport } from "./diagnostics.js";
 import { openSharedContext, sharedDirectory, sharedOrigin, sharedToken, type SharedContext } from "./shared-client.js";
@@ -345,15 +346,53 @@ export class BrowserModule implements AliveModule {
 					}
 					case "read":
 					case "snapshot": {
-						const content = await waitCatalogContent(page, Math.min(this.config.actionTimeoutMs, params.timeoutMs === undefined ? 10_000 : finite(params.timeoutMs, 100, 15_000)), actionSignal, () => this.probeChallenge(signal));
-						await this.probeChallenge(signal);
-						if (this.pausedReason) return result(this.handoffResult());
-						const target = page.locator(params.selector || "body").first();
-						const native = this.agentBrowser ? await this.agentBrowser.run(params.action === "snapshot" ? ["snapshot", "-i", "-u", ...(params.selector ? ["-s", params.selector] : [])] : ["get", "text", params.selector || "body"], actionSignal) : undefined;
-						const observation = params.action === "snapshot" ? { snapshot: String(native ? native.snapshot || "" : await target.ariaSnapshot({ mode: "ai", timeout: this.config.actionTimeoutMs })).slice(0, 30_000) } : { text: String(native ? native.text || "" : await target.innerText()).slice(0, 20_000) };
-						await this.probeChallenge(signal);
-						if (this.pausedReason) return result(this.handoffResult());
-						return result({ ...this.status(), ...observation, content, diagnostics: this.observation.summary(page) });
+						// Extraction has its own bounded budget and signal: a heavy page must
+						// fail this result only, never cancel the action (and with it the
+						// agent-browser/CDP session) as a whole.
+						const readSignal = AbortSignal.any([abort.signal, this.ctx!.signal, ...(signal ? [signal] : [])]);
+						const budget = Math.min(this.config.actionTimeoutMs, params.timeoutMs === undefined ? 10_000 : finite(params.timeoutMs, 100, 15_000));
+						let content: CatalogContent | undefined;
+						try {
+							content = await waitCatalogContent(page, budget, readSignal, () => this.probeChallenge(signal));
+							await this.probeChallenge(signal);
+							if (this.pausedReason) return result(this.handoffResult());
+							const target = page.locator(params.selector || "body").first();
+							const agentBrowser = this.agentBrowser;
+							const limits = { maxPageTextChars: this.config.maxPageTextChars, maxSnapshotNodes: this.config.maxSnapshotNodes };
+							// The native CLI caps its own output; anything at the transport cap is
+							// reported as truncated instead of being presented as complete.
+							const nativeMaxChars = this.config.maxPageTextChars + 1;
+							if (params.action === "snapshot") {
+								const source = agentBrowser
+									? async () => {
+										const data = await agentBrowser.run(["snapshot", "-i", "-u", ...(params.selector ? ["-s", params.selector] : [])], readSignal, this.config.actionTimeoutMs, nativeMaxChars);
+										const snapshot = String(data.snapshot || "");
+										return { snapshot, capped: snapshot.length > this.config.maxPageTextChars, maxChars: nativeMaxChars };
+									}
+									: () => target.ariaSnapshot({ mode: "ai", timeout: this.config.actionTimeoutMs });
+								const extraction = await extractSnapshot(source, { maxNodes: this.config.maxSnapshotNodes, maxNodeChars: MAX_SNAPSHOT_NODE_CHARS, timeoutMs: this.config.actionTimeoutMs, signal: readSignal });
+								await this.probeChallenge(signal);
+								if (this.pausedReason) return result(this.handoffResult());
+								return result({ ...this.status(), snapshot: extraction.snapshot, extraction: { ...extraction, limits }, content, diagnostics: this.observation.summary(page), ...(extraction.failed || extraction.timedOut ? { error: extraction.note || "Page snapshot could not be read" } : {}) });
+							}
+							const source = agentBrowser
+								? async () => {
+									const data = await agentBrowser.run(["get", "text", params.selector || "body"], readSignal, this.config.actionTimeoutMs, nativeMaxChars);
+									const text = String(data.text || "");
+									return { text, capped: text.length > this.config.maxPageTextChars };
+								}
+								: () => target.evaluate(pageTextExtractor, this.config.maxPageTextChars);
+							const extraction = await extractText(source, { maxChars: this.config.maxPageTextChars, timeoutMs: this.config.actionTimeoutMs, signal: readSignal });
+							await this.probeChallenge(signal);
+							if (this.pausedReason) return result(this.handoffResult());
+							return result({ ...this.status(), text: extraction.text, extraction: { ...extraction, limits }, content, diagnostics: this.observation.summary(page), ...(extraction.failed || extraction.timedOut ? { error: extraction.note || "Page text could not be read" } : {}) });
+						} catch (error) {
+							// A CDP/protocol failure during catalog observation or extraction
+							// fails this result only; the conversation's browser stays alive.
+							if (readSignal.aborted || this.ctx!.signal.aborted || this.stopped) throw error;
+							const note = extractionNote(error, this.config.actionTimeoutMs, params.action === "snapshot" ? "build the page snapshot" : "read the page text");
+							return result({ ...this.status(), ...(params.action === "snapshot" ? { snapshot: "" } : { text: "" }), extraction: { failed: true, timedOut: isTimeoutError(error), truncated: false, note }, content, diagnostics: this.observation.summary(page), error: note });
+						}
 					}
 					case "wait": {
 						const timeout = Math.min(this.config.actionTimeoutMs, params.timeoutMs === undefined ? 10_000 : finite(params.timeoutMs, 100, 15_000));
@@ -1035,6 +1074,7 @@ export class BrowserModule implements AliveModule {
 		if (!Number.isInteger(this.config.minNavigationIntervalMs) || this.config.minNavigationIntervalMs < 0 || this.config.minNavigationIntervalMs > 60_000) throw new Error("Invalid browser navigation interval");
 		if (!Number.isInteger(this.config.challengeWaitMs) || this.config.challengeWaitMs < 0 || this.config.challengeWaitMs > 60_000) throw new Error("Invalid browser challenge wait");
 		if (!Number.isFinite(this.config.actionTimeoutMs) || this.config.actionTimeoutMs < 100 || this.config.actionTimeoutMs > 60_000) throw new Error("Invalid browser action timeout");
+		validateExtractionLimits(this.config);
 		const loopback = ["127.0.0.1", "localhost", "::1"].includes(this.config.host);
 		if (!loopback && !this.config.publicUrl) throw new Error("Non-loopback listeners require an HTTPS publicUrl");
 		if (this.config.publicUrl) {

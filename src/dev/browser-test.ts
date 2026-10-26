@@ -44,11 +44,14 @@ class FakePage extends EventEmitter {
 		this.emit("response", { request: () => ({ isNavigationRequest: () => true }), frame: () => this, status: () => this.statusCode, headers: () => this.responseHeaders });
 	}
 	locator(selector: string) {
+		const text = () => "Test page text";
 		return {
-			innerText: async () => "Test page text",
+			innerText: async () => text(),
+			evaluate: async (fn: (element: unknown, arg: unknown) => unknown, arg: unknown) => fn({ innerText: text(), textContent: text() }, arg),
+			ariaSnapshot: async () => '- text: "Test page text"',
 			count: async () => selector === "body" ? 1 : selector.includes("input:focus") ? Number(this.textFocused) : selector.includes("#challenge-form") ? Number(this.challenge) : 0,
 			nth: () => ({ isVisible: async () => this.challenge }),
-			first: () => ({ innerText: async () => "Test page text", isEditable: async () => this.textFocused, click: async () => { this.inputs.push("agent-click"); }, fill: async (value: string) => { this.inputs.push(value); } }),
+			first: () => ({ innerText: async () => text(), evaluate: async (fn: (element: unknown, arg: unknown) => unknown, arg: unknown) => fn({ innerText: text(), textContent: text() }, arg), ariaSnapshot: async () => '- text: "Test page text"', isEditable: async () => this.textFocused, click: async () => { this.inputs.push("agent-click"); }, fill: async (value: string) => { this.inputs.push(value); } }),
 		};
 	}
 	async screenshot() { this.captures++; return Buffer.from([0xff, 0xd8, 0xff, 0xd9]); }
