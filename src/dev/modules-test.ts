@@ -27,6 +27,7 @@ import { resolveToken, TelegramModule } from "../modules/telegram/module.js";
 import { escapeHtml, isParseModeError, splitMessage } from "../modules/telegram/text.js";
 import { formatThread, parseThread, resolveChatTarget } from "../modules/telegram/threads.js";
 import { normalizeUpdate } from "../modules/telegram/update.js";
+import { TELEGRAM_IMAGE_MAX_BYTES, imageAnnotation, imageFileName, imageMime, imageRelativePath } from "../modules/telegram/images.js";
 import {
 	GROQ_TRANSCRIPTION_ENDPOINT,
 	GROQ_TRANSCRIPTION_MODEL,
@@ -476,6 +477,26 @@ const bot = { botId: 999, botUsername: "alive_bot", ingestEdits: true };
 }
 
 // ---------------------------------------------------------------------------
+section("telegram inbound image paths");
+{
+	const photo = { kind: "photo", fileId: "big", fileUniqueId: "AbCd", size: 4 };
+	check("photos default to image/jpeg", imageMime(photo) === "image/jpeg", imageMime(photo));
+	check("explicit image mime is kept", imageMime({ kind: "photo", mime: "image/png; charset=binary" }) === "image/png");
+	check("file names use the message id and file_unique_id", imageFileName("123", "AbCd", "image/jpeg") === "123-AbCd.jpg", imageFileName("123", "AbCd", "image/jpeg"));
+	check("the extension follows the mime type", imageRelativePath("7", "u1", "image/png") === "telegram-files/7-u1.png", imageRelativePath("7", "u1", "image/png"));
+	check("unknown image mime types fall back to .jpg", imageFileName("1", "u", "image/avif") === "1-u.jpg");
+	check(
+		"file name components are sanitized",
+		imageRelativePath("../9", "../../etc/passwd", "image/jpeg") === "telegram-files/9-etc_passwd.jpg",
+		imageRelativePath("../9", "../../etc/passwd", "image/jpeg"),
+	);
+	const saved = imageAnnotation({ status: "saved", path: "telegram-files/1-u.jpg", mime: "image/jpeg", bytes: 4 });
+	check("a saved image annotation carries the path and a read hint", saved.includes("image saved: telegram-files/1-u.jpg") && saved.includes("read this local file"), saved);
+	check("an oversize annotation is short and states the cap", imageAnnotation({ status: "too_large" }) === "image not saved: file exceeds the 10 MiB limit");
+	check("a failed annotation never includes the token or URL", !imageAnnotation({ status: "failed", reason: "Telegram file download failed" }).includes("bot"));
+}
+
+// ---------------------------------------------------------------------------
 section("telegram client");
 {
 	const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
@@ -684,6 +705,7 @@ section("telegram module end-to-end against a fake Bot API");
 	const history = HistoryStore.open(moduleRoot);
 	const outbox = new Outbox(moduleRoot);
 	const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+	const writtenFiles: Array<{ path: string; bytes: number }> = [];
 	let getUpdatesCalls = 0;
 	let serveNoKeyBatch = false;
 
@@ -702,6 +724,8 @@ section("telegram module end-to-end against a fake Bot API");
 					: {};
 		calls.push({ method, params });
 		if (url.includes("/file/bot")) {
+			if (url.endsWith("photos/missing.jpg")) return new Response("gone", { status: 404 });
+			if (url.endsWith("photos/photo.jpg")) return new Response(Uint8Array.from([0xff, 0xd8, 0xff, 0xd9]), { status: 200, headers: { "content-type": "image/jpeg" } });
 			const bytes = url.endsWith("voice-fail.oga") ? [9, 9, 9] : [1, 2, 3];
 			return new Response(Uint8Array.from(bytes), { status: 200, headers: { "content-type": "audio/ogg" } });
 		}
@@ -714,6 +738,9 @@ section("telegram module end-to-end against a fake Bot API");
 		}
 		if (method === "getFile") {
 			const fileId = String(params.file_id ?? "");
+			if (fileId === "photo-file") return jsonResponse({ ok: true, result: { file_id: fileId, file_unique_id: "photo-unique", file_path: "photos/photo.jpg", file_size: 4 } });
+			if (fileId === "photo-missing") return jsonResponse({ ok: true, result: { file_id: fileId, file_unique_id: "photo-missing-unique", file_path: "photos/missing.jpg", file_size: 4 } });
+			if (fileId === "photo-large") return jsonResponse({ ok: true, result: { file_id: fileId, file_unique_id: "photo-large-unique", file_path: "photos/photo.jpg", file_size: TELEGRAM_IMAGE_MAX_BYTES + 1 } });
 			if (fileId === "voice-fail") return jsonResponse({ ok: true, result: { file_id: fileId, file_unique_id: "voice-fail-unique", file_path: "voice-fail.oga", file_size: 3 } });
 			if (fileId === "voice-large") return jsonResponse({ ok: true, result: { file_id: fileId, file_unique_id: "voice-large-unique", file_path: "voice-large.oga", file_size: TELEGRAM_VOICE_MAX_BYTES + 1 } });
 			return jsonResponse({ ok: true, result: { file_id: "voice-file", file_unique_id: "voice-unique", file_path: "voice.oga", file_size: 3 } });
@@ -807,6 +834,50 @@ section("telegram module end-to-end against a fake Bot API");
 								audio: { file_id: "audio-track", file_unique_id: "audio-track-unique", file_size: 4, duration: 2, mime_type: "audio/mpeg" },
 							},
 						},
+						{
+							update_id: 106,
+							message: {
+								message_id: 12,
+								date: 1_700_000_006,
+								chat: { id: 42, type: "private", first_name: "Alice", username: "alice" },
+								from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
+								caption: "what is this?",
+								photo: [
+									{ file_id: "photo-small", file_unique_id: "photo-small-unique", width: 90, height: 60, file_size: 1 },
+									{ file_id: "photo-file", file_unique_id: "photo-unique", width: 1280, height: 720, file_size: 4 },
+								],
+							},
+						},
+						{
+							update_id: 107,
+							message: {
+								message_id: 13,
+								date: 1_700_000_007,
+								chat: { id: 42, type: "private", first_name: "Alice", username: "alice" },
+								from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
+								photo: [{ file_id: "photo-large", file_unique_id: "photo-large-unique", width: 4000, height: 3000, file_size: TELEGRAM_IMAGE_MAX_BYTES + 1 }],
+							},
+						},
+						{
+							update_id: 108,
+							message: {
+								message_id: 14,
+								date: 1_700_000_008,
+								chat: { id: 42, type: "private", first_name: "Alice", username: "alice" },
+								from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
+								photo: [{ file_id: "photo-missing", file_unique_id: "photo-missing-unique", width: 640, height: 480, file_size: 4 }],
+							},
+						},
+						{
+							update_id: 109,
+							message: {
+								message_id: 15,
+								date: 1_700_000_009,
+								chat: { id: 42, type: "private", first_name: "Alice", username: "alice" },
+								from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
+								document: { file_id: "doc-pdf", file_unique_id: "doc-pdf-unique", file_name: "report.pdf", mime_type: "application/pdf", file_size: 1000 },
+							},
+						},
 					],
 				});
 			}
@@ -869,16 +940,26 @@ section("telegram module end-to-end against a fake Bot API");
 			outbox: (limit) => outbox.list(limit),
 			history,
 			runtimeStatus: () => ({}),
+			workspaceFiles: {
+				rootDir: config.paths.workspaceDir,
+				readFile: async (file) => fs.readFileSync(file),
+				writeFile: async (file, data) => {
+					writtenFiles.push({ path: file, bytes: data.length });
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, data);
+					return file;
+				},
+			},
 		});
 		await host.init();
 		await new Promise((resolve) => setTimeout(resolve, 60));
 
-		const pending = store.peekPending(10);
-		check("updates became durable events", pending.length === 5, pending.map((e) => e.title));
+		const pending = store.peekPending(20);
+		check("updates became durable events", pending.length === 9, pending.map((e) => e.title));
 		check("the event is a user message on the right thread", pending[0]?.kind === "user_message" && pending[0]?.thread === "telegram:42", pending[0]);
 		check("the event expects a reply", pending[0]?.expectsReply === true);
 		const denial = calls.find((call) => call.method === "sendMessage" && String(call.params.text).includes("Ваш Telegram ID: 8"));
-		check("unknown Telegram users get a whitelist request and are not processed", pending.length === 5 && denial !== undefined, { pending: pending.length, denial });
+		check("unknown Telegram users get a whitelist request and are not processed", pending.length === 9 && denial !== undefined, { pending: pending.length, denial });
 		check("the event carries structured payload", (pending[0]?.payload as { messageId?: string })?.messageId === "5", pending[0]?.payload);
 		const voiceEvent = pending.find((event) => (event.payload as { messageId?: string })?.messageId === "7");
 		check("voice message event includes Groq transcript", voiceEvent?.text.includes("create a bug report") === true, voiceEvent?.text);
@@ -912,8 +993,54 @@ section("telegram module end-to-end against a fake Bot API");
 			audioEvent?.text,
 		);
 
+		const imageEvent = pending.find((event) => (event.payload as { messageId?: string })?.messageId === "12");
+		const savedImagePath = "telegram-files/12-photo-unique.jpg";
+		const imagePayload = (imageEvent?.payload as { image?: { path?: string; mime?: string; bytes?: number } })?.image;
+		check("incoming photos are saved automatically", imageEvent?.text.includes(`image saved: ${savedImagePath}`) === true, imageEvent?.text);
+		check("the saved-image line tells the agent to read the local file", imageEvent?.text.includes("read this local file") === true, imageEvent?.text);
+		check("the existing download hint is kept as a fallback", imageEvent?.text.includes('action="download_file"') === true, imageEvent?.text);
+		check("the payload records the saved image", imagePayload?.path === savedImagePath && imagePayload?.mime === "image/jpeg" && imagePayload?.bytes === 4, imagePayload);
+		check(
+			"the image is written through workspaceFiles",
+			writtenFiles.some((file) => file.path === path.join(config.paths.workspaceDir, savedImagePath) && file.bytes === 4),
+			writtenFiles,
+		);
+		const savedImage = fs.existsSync(path.join(config.paths.workspaceDir, savedImagePath)) ? fs.readFileSync(path.join(config.paths.workspaceDir, savedImagePath)) : undefined;
+		check("the saved file contains the downloaded bytes", savedImage?.length === 4 && savedImage[0] === 0xff && savedImage[3] === 0xd9, savedImage);
+		check("only the largest photo of the message is fetched", !calls.some((call) => call.method === "getFile" && call.params.file_id === "photo-small"));
+		const imageRecord = history.query({ thread: "telegram:42" }).find((record) => record.messageId === "12");
+		check("history carries the saved image path", imageRecord?.text.includes(`image saved: ${savedImagePath}`) === true, imageRecord?.text);
+		check("the caption and photo metadata survive", imageRecord?.text.startsWith("what is this?") === true && imageRecord?.attachments?.[0]?.kind === "photo", imageRecord);
+
+		const largeImageEvent = pending.find((event) => (event.payload as { messageId?: string })?.messageId === "13");
+		check(
+			"oversized photos are skipped with a note",
+			largeImageEvent !== undefined && largeImageEvent.text.includes("image not saved: file exceeds the 10 MiB limit"),
+			largeImageEvent?.text,
+		);
+		check("an oversized photo is never downloaded", !calls.some((call) => call.method === "getFile" && call.params.file_id === "photo-large"));
+		check("a skipped image has no payload image", (largeImageEvent?.payload as { image?: unknown })?.image === undefined);
+
+		const brokenImageEvent = pending.find((event) => (event.payload as { messageId?: string })?.messageId === "14");
+		check("a failed image download keeps the message", brokenImageEvent !== undefined && brokenImageEvent.text.includes("image not saved: Telegram file download failed (HTTP 404)"), brokenImageEvent?.text);
+		check("a failed image has no payload image", (brokenImageEvent?.payload as { image?: unknown })?.image === undefined);
+		check("the failed download never leaks the file URL or token", brokenImageEvent?.text.includes("bot") !== true && brokenImageEvent?.text.includes("test-token") !== true, brokenImageEvent?.text);
+		const brokenImageRecord = history.query({ thread: "telegram:42" }).find((record) => record.messageId === "14");
+		check("transient image failures stay out of durable history", brokenImageRecord !== undefined && !brokenImageRecord.text.includes("image not saved"), brokenImageRecord?.text);
+
+		const documentEvent = pending.find((event) => (event.payload as { messageId?: string })?.messageId === "15");
+		check(
+			"documents are not downloaded automatically",
+			documentEvent !== undefined &&
+				!documentEvent.text.includes("image saved") &&
+				(documentEvent.payload as { image?: unknown })?.image === undefined &&
+				!calls.some((call) => call.method === "getFile" && call.params.file_id === "doc-pdf"),
+			documentEvent?.text,
+		);
+		check("documents keep the on-demand download hint", documentEvent?.text.includes('action="download_file"') === true, documentEvent?.text);
+
 		const records = history.query({ thread: "telegram:42" });
-		check("inbound messages landed in history", records.length === 5 && records[0]?.direction === "inbound", records);
+		check("inbound messages landed in history", records.length === 9 && records[0]?.direction === "inbound", records.length);
 		check("transcript is searchable in history text", records.some((record) => record.text.includes("create a bug report")), records.map((record) => record.text));
 		check("history links back to the event", records[0]?.meta?.eventId === pending[0]?.id, records[0]?.meta);
 		check("the chat directory knows the chat", history.thread("telegram:42")?.title === "Alice (@alice)", history.thread("telegram:42"));
@@ -979,7 +1106,7 @@ section("telegram module end-to-end against a fake Bot API");
 
 		const status = telegram.status();
 		check("module status reports the bot", (status.bot as { username?: string })?.username === "alive_bot", status);
-		check("module status counts accepted inbound messages", (status.counters as { inbound?: number })?.inbound === 6, status.counters);
+		check("module status counts accepted inbound messages", (status.counters as { inbound?: number })?.inbound === 10, status.counters);
 		check("module status reports missing transcription credentials", (status.transcription as { configured?: boolean })?.configured === false, status.transcription);
 
 		await host.stop();

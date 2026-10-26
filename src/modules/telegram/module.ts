@@ -6,8 +6,17 @@ import { attachManagedBotToken, clearManagedBotRequest, findManagedBotRequest, v
 import type { AliveModule, ModuleContext } from "../../events/api.js";
 import type { HistoryAttachment } from "../../store/history.js";
 import type { OutgoingMessage } from "../../store/outbox.js";
-import { sleep } from "../../util.js";
+import { ensureDir, sleep } from "../../util.js";
 import { TelegramApi, TelegramApiError, TelegramFileTooLargeError, type SendMessageParams } from "./client.js";
+import {
+	TELEGRAM_IMAGE_MAX_BYTES,
+	TELEGRAM_IMAGE_TIMEOUT_MS,
+	imageAnnotation,
+	imageFailureReason,
+	imageMime,
+	imageRelativePath,
+	type InboundImageResult,
+} from "./images.js";
 import { TelegramAllowlistStore, TelegramStateStore, type TelegramState } from "./state.js";
 import { chatLabel, isParseModeError, splitMessage } from "./text.js";
 import { createTelegramTools, type TelegramToolHost } from "./tools.js";
@@ -357,6 +366,20 @@ export class TelegramModule implements AliveModule {
 			let eventText = inbound.promptText;
 			let historyText = inbound.text;
 			let payload: Record<string, unknown> = inbound.payload;
+			const photo = inbound.attachments.find((attachment) => attachment.kind === "photo");
+			if (photo) {
+				if (this.config.typingIndicator && inbound.expectsReply) this.startTyping(inbound.thread);
+				const image = await this.saveInboundImage(photo, inbound.messageId, api, ctx);
+				const annotation = imageAnnotation(image);
+				eventText = `${eventText}\n\n${annotation}`;
+				// The saved path is durable knowledge for later searches; transient failures
+				// stay in the event text only, like voice transcription errors.
+				if (image.status === "saved") {
+					historyText = `${historyText}\n\n${annotation}`;
+					payload = { ...payload, image: { path: image.path, mime: image.mime, bytes: image.bytes } };
+				}
+			}
+
 			const voice = inbound.attachments.find((attachment) => attachment.kind === "voice");
 			if (voice) {
 				if (this.config.typingIndicator && inbound.expectsReply) this.startTyping(inbound.thread);
@@ -458,6 +481,48 @@ export class TelegramModule implements AliveModule {
 		} catch (err) {
 			this.counters.errors += 1;
 			ctx.log.error("telegram update handling failed", { updateId: update.update_id, error: message(err) });
+		}
+	}
+
+	/**
+	 * Save the largest photo of an incoming message into the workspace so the agent
+	 * can read it without spending a tool round-trip on `download_file`.
+	 *
+	 * Photos only: documents (including image PDFs), stickers and voice notes keep
+	 * their existing on-demand behaviour. A failure here is reported in the event
+	 * text but never drops the message.
+	 */
+	private async saveInboundImage(
+		photo: HistoryAttachment,
+		messageId: string,
+		api: TelegramApi,
+		ctx: ModuleContext,
+	): Promise<InboundImageResult> {
+		if (!photo.fileId) return { status: "failed", reason: "Telegram photo attachment has no file id" };
+		if (photo.size !== undefined && photo.size > TELEGRAM_IMAGE_MAX_BYTES) return { status: "too_large" };
+		const mime = imageMime(photo);
+		// One budget for the metadata call and the streamed download, aborted with the module.
+		const signal = AbortSignal.any([this.abort.signal, AbortSignal.timeout(TELEGRAM_IMAGE_TIMEOUT_MS)]);
+		try {
+			const file = await api.getFile({ file_id: photo.fileId }, { timeoutMs: TELEGRAM_IMAGE_TIMEOUT_MS, signal });
+			if (file.file_size !== undefined && file.file_size > TELEGRAM_IMAGE_MAX_BYTES) return { status: "too_large" };
+			if (!file.file_path) return { status: "failed", reason: "Telegram did not provide a file path" };
+			const data = await api.downloadFile(file.file_path, { maxBytes: TELEGRAM_IMAGE_MAX_BYTES, signal });
+			const relativePath = imageRelativePath(messageId, photo.fileUniqueId, mime);
+			if (ctx.workspaceFiles) {
+				await ctx.workspaceFiles.writeFile(path.posix.join(ctx.workspaceFiles.rootDir, relativePath), data);
+			} else {
+				const target = path.join(ctx.paths.workspaceDir, relativePath);
+				ensureDir(path.dirname(target));
+				fs.writeFileSync(target, data);
+			}
+			return { status: "saved", path: relativePath, mime, bytes: data.length };
+		} catch (err) {
+			// The byte cap also fires while streaming, after the metadata size check.
+			if (err instanceof TelegramFileTooLargeError) return { status: "too_large" };
+			const reason = imageFailureReason(err);
+			ctx.log.warn("telegram image save failed", { reason, messageId });
+			return { status: "failed", reason };
 		}
 	}
 
