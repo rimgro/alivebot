@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SLAVA handoff — макет</title>
+<style>
+  :root{
+    color-scheme: dark;
+    --bg:#0b0d10; --stage:#111418; --panel:#171b21; --panel-2:#1e232b;
+    --text:#e9edf2; --muted:#9aa3af; --line:#2a313a; --accent:#5b8cff; --accent-ink:#0a1020;
+    --ok:#3ecf8e; --warn:#f2b544;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:#07080a;color:var(--text);font:15px/1.45 ui-sans-serif,system-ui,"Helvetica Neue",Arial,sans-serif;padding:32px}
+  h1{font-size:18px;font-weight:500;margin:0 0 4px}
+  .lead{color:var(--muted);font-size:13px;margin:0 0 28px}
+  .frames{display:flex;gap:32px;align-items:flex-start;flex-wrap:wrap}
+  .frame-label{font-size:12px;color:var(--muted);margin:0 0 8px}
+
+  /* phone frame */
+  .phone{width:390px;height:844px;border-radius:36px;background:var(--bg);border:1px solid #222831;overflow:hidden;position:relative;box-shadow:0 24px 60px #0008}
+  .stage{position:absolute;inset:0;background:
+      radial-gradient(120% 80% at 30% 0%,#1a2028 0%,#0d1014 60%),
+      var(--stage);
+      display:flex;align-items:flex-start;justify-content:center}
+  .page{width:100%;min-height:100%;background:#f7f8fa;color:#15181d;padding:18px 16px;display:flex;flex-direction:column;gap:12px}
+  .page .bar{height:14px;border-radius:4px;background:#dfe3e9}
+  .page .bar.w60{width:60%}
+  .page .bar.w40{width:40%}
+  .page .field{height:38px;border:1px solid #cfd6df;border-radius:8px;background:#fff;display:flex;align-items:center;padding:0 10px;color:#8d97a3;font-size:13px}
+  .page .btn{height:40px;border-radius:8px;background:#e7ebf1;display:flex;align-items:center;justify-content:center;font-size:13px;color:#3c4450}
+
+  /* overlays */
+  .status{position:absolute;top:14px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:7px;
+    background:#0b0d10cc;backdrop-filter:blur(8px);border:1px solid #ffffff14;border-radius:999px;padding:6px 12px;font-size:12px;color:var(--text)}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--warn)}
+  .done{position:absolute;top:12px;right:12px;background:var(--accent);color:var(--accent-ink);font-weight:600;font-size:13px;
+    border:0;border-radius:999px;padding:9px 16px;box-shadow:0 6px 18px #5b8cff44}
+  .dock{position:absolute;left:12px;right:12px;bottom:12px;display:flex;gap:8px;align-items:center;
+    background:#0b0d10e6;backdrop-filter:blur(10px);border:1px solid #ffffff14;border-radius:16px;padding:8px}
+  .dock button{flex:0 0 auto;background:var(--panel);border:1px solid var(--line);color:var(--text);border-radius:11px;
+    min-height:44px;padding:0 13px;font-size:13px;display:flex;align-items:center;gap:7px}
+  .dock button.primary{background:var(--panel-2);border-color:#33404f}
+  .seg{display:flex;background:#0f1318;border:1px solid var(--line);border-radius:11px;padding:3px;gap:2px;margin-left:auto}
+  .seg span{font-size:12px;padding:8px 10px;border-radius:8px;color:var(--muted)}
+  .seg span.on{background:#26303c;color:var(--text)}
+  .sheet{position:absolute;left:0;right:0;bottom:0;background:#12161c;border-top:1px solid var(--line);border-radius:18px 18px 0 0;padding:12px 12px 20px}
+  .sheet .row{display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap}
+  .sheet .key{background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:9px 11px;font-size:12px;color:var(--text)}
+  .sheet .reply{display:flex;gap:8px}
+  .sheet .reply input{flex:1;background:#0e1217;border:1px solid #303a46;border-radius:10px;padding:11px 12px;color:var(--text);font-size:14px}
+  .sheet .reply button{background:var(--accent);color:var(--accent-ink);border:0;border-radius:10px;padding:0 16px;font-weight:600;font-size:14px}
+  .hint{color:var(--muted);font-size:11px;margin-top:8px;text-align:center}
+
+  /* desktop frame */
+  .desktop{width:860px;height:484px;border-radius:14px;background:var(--bg);border:1px solid #222831;overflow:hidden;position:relative}
+  .desktop .stage{inset:44px 0 0 0;border-radius:0}
+  .desktop .chrome{position:absolute;top:0;left:0;right:0;height:44px;display:flex;align-items:center;gap:8px;padding:0 12px;background:#0b0d10;border-bottom:1px solid #ffffff0f}
+  .desktop .chrome .pill{font-size:12px;color:var(--muted);background:#12161c;border:1px solid var(--line);border-radius:999px;padding:5px 10px}
+  .desktop .dock{left:50%;right:auto;transform:translateX(-50%);bottom:16px}
+  .legend{max-width:860px;color:var(--muted);font-size:12px;margin-top:18px;line-height:1.6}
+</style>
+</head>
+<body>
+  <h1>Handoff — макет</h1>
+  <p class="lead">Полноэкранный стрим, без шапок и логотипа. Управление поверх картинки, клавиатура — сама при вводе.</p>
+
+  <div class="frames">
+    <div>
+      <p class="frame-label">Телефон — обычный режим</p>
+      <div class="phone">
+        <div class="stage">
+          <div class="page">
+            <div class="bar w40"></div>
+            <div class="bar"></div>
+            <div class="bar w60"></div>
+            <div class="field">Поиск на сайте</div>
+            <div class="btn">Найти</div>
+            <div class="bar w60"></div>
+            <div class="bar"></div>
+            <div class="bar w40"></div>
+            <div class="btn" style="width:44%;background:#d8dee7">Купить</div>
+            <div class="bar"></div>
+            <div class="bar w60"></div>
+            <div class="bar w40"></div>
+            <div class="bar"></div>
+            <div class="bar w60"></div>
+            <div class="bar w40"></div>
+            <div class="bar"></div>
+            <div class="bar w60"></div>
+          </div>
+        </div>
+        <div class="status"><span class="dot"></span> агент ждёт тебя</div>
+        <button class="done">Готово</button>
+        <div class="dock">
+          <button class="primary">⌨ Ввод</button>
+          <button>⤢</button>
+          <div class="seg"><span class="on">Телефон</span><span>ПК 16:9</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <p class="frame-label">Телефон — ввод текста (клавиатура открылась сама)</p>
+      <div class="phone">
+        <div class="stage">
+          <div class="page">
+            <div class="bar w40"></div>
+            <div class="bar"></div>
+            <div class="bar w60"></div>
+            <div class="field">Поиск на сайте</div>
+            <div class="btn">Найти</div>
+            <div class="bar w60"></div>
+            <div class="bar"></div>
+            <div class="bar w40"></div>
+            <div class="btn" style="width:44%;background:#d8dee7">Купить</div>
+            <div class="bar"></div>
+            <div class="bar w60"></div>
+            <div class="bar w40"></div>
+            <div class="bar"></div>
+            <div class="bar w60"></div>
+            <div class="bar w40"></div>
+            <div class="bar"></div>
+            <div class="bar w60"></div>
+          </div>
+        </div>
+        <div class="status"><span class="dot"></span> агент ждёт тебя</div>
+        <div class="sheet">
+          <div class="row">
+            <span class="key">Tab</span><span class="key">↵</span><span class="key">⌫</span><span class="key">Esc</span>
+            <span class="key">↑</span><span class="key">↓</span><span class="key">⟳</span>
+          </div>
+          <div class="reply"><input placeholder="Текст в выбранное поле" value=""><button>Ввести</button></div>
+          <div class="hint">Откроется сразу, как только нужно печатать</div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <p class="frame-label">ПК 16:9 — на телефоне и на десктопе</p>
+      <div class="desktop">
+        <div class="chrome">
+          <span class="pill">● агент может продолжать</span>
+          <span class="pill">16:9</span>
+          <span class="pill" style="margin-left:auto">Готово</span>
+        </div>
+        <div class="stage">
+          <div class="page" style="max-width:720px;margin-top:24px;border-radius:8px">
+            <div class="bar w40"></div>
+            <div class="bar"></div>
+            <div class="bar"></div>
+            <div class="bar w60"></div>
+            <div class="field">Поиск на сайте</div>
+            <div class="btn">Найти</div>
+            <div class="bar w60"></div>
+            <div class="bar"></div>
+            <div class="bar w40"></div>
+            <div class="btn" style="width:44%;background:#d8dee7">Купить</div>
+            <div class="bar"></div>
+            <div class="bar w60"></div>
+            <div class="bar w40"></div>
+            <div class="bar"></div>
+            <div class="bar w60"></div>
+            <div class="bar w40"></div>
+            <div class="bar"></div>
+            <div class="bar w60"></div>
+          </div>
+        </div>
+        <div class="dock">
+          <button class="primary">⌨ Ввод</button>
+          <button>⤢</button>
+          <div class="seg"><span>Телефон</span><span class="on">ПК 16:9</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <p class="legend">
+    Что поменялось: убраны шапка, логотип и заголовок — стрим занимает весь экран. Кнопки собраны в одну плавающую панель поверх картинки:
+    ввод, полноэкранный режим и переключатель «Телефон / ПК 16:9». Клавиатура и служебные клавиши (Tab, Enter, Esc, прокрутка) живут в выезжающей панели
+    и появляются сами, когда нужно печатать. Один акцентный цвет вместо градиента, нейтральный тёмный фон.
+  </p>
+</body>
+</html>
