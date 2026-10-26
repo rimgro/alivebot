@@ -5,6 +5,10 @@
  * and again in Node, snapshots are capped per node and in node count, and every
  * extraction has a deadline. A heavy page then produces a truncated or failed
  * result instead of a wedged or closed browser session.
+ *
+ * The model never receives the capped text either. `read` writes it to a file
+ * under `browser-pages/` and returns a preview plus that path, so a busy page
+ * cannot flood the conversation the way a full dump would.
  */
 
 /** Longest single snapshot line (node name, role plus attributes) kept in a result. */
@@ -81,6 +85,25 @@ export function snapshotTruncationMarker(omittedNodes: number): string {
 /** Used when the transport already cut the snapshot, so node totals are unknown. */
 export function cappedSnapshotMarker(maxChars: number): string {
 	return `[truncated: snapshot output exceeded ${maxChars} characters; the rest was dropped]`;
+}
+
+/**
+ * Bounded preview handed to the model. The full text is not returned: it is
+ * written to a workspace file that the agent can read in chunks.
+ */
+export function previewText(value: string, maxChars: number): string {
+	return value.length > maxChars ? value.slice(0, maxChars) : value;
+}
+
+/**
+ * Snapshot preview cut at a line boundary, so every `@eN`/`ref=eN` in it stays
+ * usable. Only whole node lines are kept; the dropped nodes are counted
+ * separately instead of being appended as an unreadable partial line.
+ */
+export function previewSnapshot(value: string, maxChars: number): { preview: string; truncated: boolean } {
+	if (value.length <= maxChars) return { preview: value, truncated: false };
+	const cut = value.lastIndexOf("\n", maxChars);
+	return { preview: cut > 0 ? value.slice(0, cut) : value.slice(0, maxChars), truncated: true };
 }
 
 /**

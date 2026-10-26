@@ -45,9 +45,11 @@ export interface BrowserConfig {
 	/** Maximum passive wait for a known automatic browser check before human handoff. */
 	challengeWaitMs: number;
 	actionTimeoutMs: number;
-	/** Hard cap on page text returned by `read`; the rest is replaced by a truncation marker. */
+	/** Hard cap on the page text written to a workspace file; the rest is replaced by a truncation marker inside that file. */
 	maxPageTextChars: number;
-	/** Hard cap on snapshot nodes returned by `snapshot`; the rest is replaced by a truncation marker. */
+	/** Hard cap on the preview returned to the model; the full text stays in the workspace file. */
+	maxPagePreviewChars: number;
+	/** Hard cap on snapshot nodes kept in a result; the dropped nodes are counted, not returned. */
 	maxSnapshotNodes: number;
 	humanization: HumanizationConfig;
 	signing: BrowserSigningConfig;
@@ -67,8 +69,9 @@ export const DEFAULT_HUMANIZATION: HumanizationConfig = {
 };
 
 /** Validated in `BrowserModule.start`; extraction limits are operator policy, not page data. */
-export function validateExtractionLimits(config: Pick<BrowserConfig, "maxPageTextChars" | "maxSnapshotNodes">): void {
+export function validateExtractionLimits(config: Pick<BrowserConfig, "maxPageTextChars" | "maxPagePreviewChars" | "maxSnapshotNodes">): void {
 	if (!Number.isInteger(config.maxPageTextChars) || config.maxPageTextChars < 1_000 || config.maxPageTextChars > 1_000_000) throw new Error("browser.maxPageTextChars must be an integer between 1000 and 1000000");
+	if (!Number.isInteger(config.maxPagePreviewChars) || config.maxPagePreviewChars < 500 || config.maxPagePreviewChars > 50_000) throw new Error("browser.maxPagePreviewChars must be an integer between 500 and 50000");
 	if (!Number.isInteger(config.maxSnapshotNodes) || config.maxSnapshotNodes < 50 || config.maxSnapshotNodes > 50_000) throw new Error("browser.maxSnapshotNodes must be an integer between 50 and 50000");
 }
 
@@ -98,6 +101,7 @@ export const DEFAULT_BROWSER_CONFIG: BrowserConfig = {
 	challengeWaitMs: 15_000,
 	actionTimeoutMs: 15_000,
 	maxPageTextChars: 200_000,
+	maxPagePreviewChars: 8_000,
 	maxSnapshotNodes: 2_000,
 	humanization: DEFAULT_HUMANIZATION,
 	signing: { enabled: false, agentUrl: "", keyFileEnv: "ALIVE_BROWSER_SIGNING_KEY_FILE", origins: [] },
