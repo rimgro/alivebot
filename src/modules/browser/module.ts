@@ -138,7 +138,7 @@ export class BrowserModule implements AliveModule {
 		server.maxConnections = 32;
 		this.live = new BrowserLive(server, {
 			snapshotMode: () => this.viewportSnapshots,
-			state: () => ({ paused: !!this.pausedReason }),
+			state: () => ({ paused: !!this.pausedReason, url: this.currentPageUrl() }),
 			origin: () => this.publicOrigin,
 			authorize: (credential) => {
 				const handoff = this.authorizeCredential(credential);
@@ -197,6 +197,8 @@ export class BrowserModule implements AliveModule {
 		await this.releaseBrowser();
 		await this.finishNotification("closed");
 	}
+
+	private currentPageUrl(): string | undefined { return this.page && !this.page.isClosed() ? this.page.url() : undefined; }
 
 	status(): Record<string, unknown> {
 		return {
@@ -765,7 +767,7 @@ export class BrowserModule implements AliveModule {
 			const websocketOrigin = this.publicOrigin.replace(/^http/, "ws");
 			res.setHeader("Content-Security-Policy", `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; img-src blob:; connect-src 'self' ${websocketOrigin}; frame-ancestors https://web.telegram.org; base-uri 'none'; form-action 'none'`);
 			res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-			res.end(controlPage(nonce, this.deps.controlPath));
+			res.end(controlPage(nonce, this.deps.controlPath, this.currentPageUrl() || ""));
 			return;
 		}
 		if (req.method === "POST" && req.headers.origin && req.headers.origin !== this.publicOrigin) throw new HttpError(403, "Unexpected origin");
@@ -896,19 +898,23 @@ export class BrowserModule implements AliveModule {
 		res.once("close", () => abort.abort());
 		res.writeHead(200, { "Content-Type": "application/x-ndjson", "X-Accel-Buffering": "no" });
 		res.flushHeaders();
-		let previousDigest = "", lastStateAt = 0, previousState: boolean | undefined;
+		let previousDigest = "", lastStateAt = 0, previousState: boolean | undefined, previousUrl: string | undefined;
 		try {
 			while (!abort.signal.aborted && !res.destroyed && !res.writableEnded) {
 				const started = Date.now();
 				const frame = await this.captureFrame(req, 45);
 				if (!frame || abort.signal.aborted || res.writableEnded) break;
-				const fingerprint = createHash("sha256").update(frame).digest("hex"), paused = !!this.pausedReason;
-				let packet = "";
+				const fingerprint = createHash("sha256").update(frame).digest("hex"), paused = !!this.pausedReason, currentUrl = this.currentPageUrl();
+				let packet = "", statePacket = false;
 				if (fingerprint !== previousDigest) {
 					previousDigest = fingerprint;
 					packet = `${JSON.stringify({ frame: frame.toString("base64"), paused })}\n`;
-				} else if (paused !== previousState || Date.now() - lastStateAt >= 3000) packet = `${JSON.stringify({ type: "state", paused })}\n`;
-				if (packet) { lastStateAt = Date.now(); previousState = paused; }
+				}
+				if (paused !== previousState || currentUrl !== previousUrl || Date.now() - lastStateAt >= 3000) {
+					packet += `${JSON.stringify({ type: "state", paused, url: currentUrl })}\n`;
+					statePacket = true;
+				}
+				if (statePacket) { lastStateAt = Date.now(); previousState = paused; previousUrl = currentUrl; }
 				if (packet && !res.write(packet)) {
 					await new Promise<void>((resolve, reject) => {
 						const done = (error?: Error) => { clearTimeout(timer); res.off("drain", drained); res.off("close", closed); error ? reject(error) : resolve(); };

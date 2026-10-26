@@ -216,7 +216,7 @@ export class BrowserRouter implements AliveModule {
 			if (request.method === "GET" && /^\/browser\/s\/[a-f0-9]{24}$/.test(pathname)) {
 				const nonce = randomBytes(18).toString("base64");
 				response.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "X-Content-Type-Options": "nosniff", "Content-Security-Policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; img-src blob:; connect-src 'self' ${this.origin.replace(/^http/, "ws")}; frame-ancestors https://web.telegram.org; base-uri 'none'; form-action 'none'` });
-				response.end(controlPage(nonce, pathname)); return;
+				response.end(controlPage(nonce, pathname, "")); return;
 			}
 			response.writeHead(request.url === "/browser" ? 200 : 410, { "Content-Type": request.url === "/browser" ? "text/html; charset=utf-8" : "application/json", "Cache-Control": "no-store", "Content-Security-Policy": "default-src 'none'" });
 			response.end(request.url === "/browser" ? "<!doctype html><meta charset=utf-8><title>Alive browser</title><p>Alive: открой новую кнопку браузера из своего личного чата.</p>" : JSON.stringify({ error: "No active handoff" })); return;
