@@ -363,6 +363,21 @@ const bot = { botId: 999, botUsername: "alive_bot", ingestEdits: true };
 	check("image prompt exposes a downloadable file id", mediaInbound?.promptText.includes('file_id="big"') === true);
 	check("image prompt explains how to see pixels", mediaInbound?.promptText.includes('action="download_file"') === true && mediaInbound.promptText.includes("read the returned local path"));
 
+	const documentMessage: TelegramUpdate = {
+		update_id: 8,
+		message: {
+			message_id: 17,
+			date: 1_700_000_000,
+			chat: privateMessage.message!.chat,
+			from: { id: 7, is_bot: false, first_name: "Alice" },
+			document: { file_id: "doc-1", file_unique_id: "du-1", file_name: "report.pdf", mime_type: "application/pdf", file_size: 20_000 },
+		},
+	};
+	const documentInbound = normalizeUpdate(documentMessage, bot);
+	check("document prompt exposes a downloadable file id", documentInbound?.promptText.includes('file_id="doc-1"') === true, documentInbound?.promptText);
+	check("document prompt explains download_file", documentInbound?.promptText.includes('action="download_file"') === true && documentInbound.promptText.includes("read the returned local path"));
+	check("document prompt does not claim to describe content", documentInbound?.promptText.includes("not the image content") !== true);
+
 	const groupPhoto = normalizeUpdate({ update_id: 70, message: { ...media.message!, chat: groupChat } }, bot);
 	check("group photos expose the same vision path", groupPhoto?.promptText.includes('file_id="big"') === true);
 	const photoReply = normalizeUpdate({

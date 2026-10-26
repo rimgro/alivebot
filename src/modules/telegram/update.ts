@@ -396,9 +396,12 @@ function attachmentPrompt(attachments: HistoryAttachment[], label: string): stri
 		return attachment.fileId ? `${description}; file_id=${JSON.stringify(attachment.fileId)}` : description;
 	});
 	const hasImage = attachments.some((attachment) => attachment.kind === "photo" || attachment.mime?.startsWith("image/"));
-	return `${label}: ${lines.join(", ")}${hasImage
-		? '\nTo inspect an image, use telegram(action="download_file", file_id=...) then read the returned local path. The attachment label is not the image content; do not guess what it shows without opening it.'
-		: ""}`;
+	const hasFile = attachments.some((attachment) => attachment.fileId !== undefined);
+	if (!hasFile) return `${label}: ${lines.join(", ")}`;
+	const imageWarning = hasImage
+		? " The attachment label is not the image content; do not guess what it shows without opening it."
+		: "";
+	return `${label}: ${lines.join(", ")}\nTo read an attachment, use telegram(action="download_file", file_id=...) then read the returned local path.${imageWarning}`;
 }
 
 export function describeAttachment(attachment: HistoryAttachment): string {
