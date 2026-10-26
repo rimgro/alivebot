@@ -19,6 +19,15 @@ import {
 } from "./images.js";
 import { TelegramAllowlistStore, TelegramStateStore, type TelegramState } from "./state.js";
 import { chatLabel, isParseModeError, splitMessage } from "./text.js";
+import {
+	TELEGRAM_CAPTION_MAX_CHARS,
+	AttachmentNotFoundError,
+	assertAttachmentSize,
+	attachmentKind,
+	attachmentRelativePath,
+	inspectHostAttachment,
+	mimeForFile,
+} from "../../runtime/attachments.js";
 import { createTelegramTools, type TelegramToolHost } from "./tools.js";
 import { formatThread, parseThread } from "./threads.js";
 import type { TelegramChat, TelegramSentMessage, TelegramUpdate } from "./types.js";
@@ -30,6 +39,16 @@ import {
 } from "./voice-transcription.js";
 
 const DEFAULT_ALLOWED_UPDATES = ["message", "edited_message", "channel_post", "edited_channel_post", "callback_query"];
+
+/** A validated attachment, loaded and ready for one Bot API upload. */
+interface PreparedUpload {
+	data: Buffer;
+	name: string;
+	mime?: string;
+	kind: "photo" | "document";
+	/** Workspace-relative path, recorded in the outbound history entry. */
+	path: string;
+}
 
 type VoiceTranscriptionResult =
 	| { status: "transcribed"; text: string }
@@ -593,32 +612,51 @@ export class TelegramModule implements AliveModule {
 		if (!ref) throw new Error(`not a telegram thread: ${message.thread}`);
 		const api = this.requireApi();
 		const topicId = ref.topicId !== undefined ? Number(ref.topicId) : undefined;
-		const chunks = splitMessage(message.text, this.config.maxMessageChars);
+		const threadId = Number.isFinite(topicId) ? topicId : undefined;
 		const replyTo = this.resolveReplyTo(message);
-		const sent: Array<{ result: TelegramSentMessage; text: string }> = [];
+		// Attachments are read and limit-checked before the first API call: an
+		// unreadable or oversize file must not leave half a message in the chat.
+		const uploads = await this.prepareAttachments(ctx, message.attachments);
+		const sent: Array<{ result: TelegramSentMessage; text: string; attachment?: PreparedUpload }> = [];
+		let replyUsed = false;
+		const nextReplyTo = () => (replyUsed ? undefined : ((replyUsed = true), replyTo));
 
-		for (let index = 0; index < chunks.length; index += 1) {
-			const text = chunks[index]!;
-			const base: SendMessageParams = {
-				chat_id: ref.chatId,
-				text,
-				message_thread_id: Number.isFinite(topicId) ? topicId : undefined,
-				disable_web_page_preview: !this.config.linkPreview,
-				reply_to_message_id: index === 0 ? replyTo : undefined,
-				allow_sending_without_reply: true,
-			};
-			let result: TelegramSentMessage;
-			try {
-				result = await api.sendMessage({ ...base, parse_mode: this.config.parseMode || undefined });
-			} catch (err) {
-				if (this.config.parseMode && isParseModeError(err)) {
-					ctx.log.warn("telegram rejected the message markup; resending as plain text", { thread: message.thread });
-					result = await api.sendMessage({ ...base, parse_mode: undefined });
-				} else {
-					throw err;
+		if (uploads.length > 0) {
+			// Telegram captions are limited to 1024 characters; the remainder becomes
+			// ordinary text messages so no part of the reply is lost. Only the first
+			// attachment carries the caption (one file per `send_message` today).
+			const captions = splitMessage(message.text, TELEGRAM_CAPTION_MAX_CHARS);
+			for (const [index, upload] of uploads.entries()) {
+				const caption = index === 0 ? captions[0] ?? "" : "";
+				const params = {
+					chat_id: ref.chatId,
+					file: { data: upload.data, name: upload.name, mime: upload.mime },
+					field: upload.kind,
+					caption: caption || undefined,
+					message_thread_id: threadId,
+					reply_to_message_id: nextReplyTo(),
+				};
+				let result: TelegramSentMessage;
+				try {
+					result = await api.sendFile({ ...params, parse_mode: this.config.parseMode || undefined });
+				} catch (err) {
+					if (this.config.parseMode && isParseModeError(err)) {
+						ctx.log.warn("telegram rejected the caption markup; resending as plain text", { thread: message.thread });
+						result = await api.sendFile({ ...params, parse_mode: undefined });
+					} else {
+						throw err;
+					}
 				}
+				sent.push({ result, text: caption || `[${upload.kind}: ${upload.name}]`, attachment: upload });
 			}
-			sent.push({ result, text });
+			for (const text of captions.slice(1)) {
+				sent.push({ result: await this.sendTextChunk(ctx, api, ref.chatId, threadId, text, nextReplyTo()), text });
+			}
+		} else {
+			const chunks = splitMessage(message.text, this.config.maxMessageChars);
+			for (const text of chunks) {
+				sent.push({ result: await this.sendTextChunk(ctx, api, ref.chatId, threadId, text, nextReplyTo()), text });
+			}
 		}
 
 		this.stopTyping(message.thread);
@@ -635,6 +673,7 @@ export class TelegramModule implements AliveModule {
 				text: entry.text,
 				messageId: String(entry.result.message_id),
 				replyTo: index === 0 && replyTo !== undefined ? String(replyTo) : undefined,
+				...(entry.attachment ? { attachments: [historyAttachment(entry.attachment)] } : {}),
 				meta: {
 					agentMessageId: message.id,
 					part: index + 1,
@@ -650,8 +689,85 @@ export class TelegramModule implements AliveModule {
 			const current = state.load();
 			state.patch({ outbound: current.outbound + sent.length });
 		}
-		ctx.log.info("telegram message sent", { thread: message.thread, parts: sent.length, chars: message.text.length });
+		ctx.log.info("telegram message sent", {
+			thread: message.thread,
+			parts: sent.length,
+			chars: message.text.length,
+			attachments: uploads.map((upload) => `${upload.kind}:${upload.name}`),
+		});
 		return sent.map((entry) => entry.result);
+	}
+
+	/** One text chunk of an outbound message, with the plain-text fallback for broken markup. */
+	private async sendTextChunk(
+		ctx: ModuleContext,
+		api: TelegramApi,
+		chatId: string,
+		threadId: number | undefined,
+		text: string,
+		replyTo: number | undefined,
+	): Promise<TelegramSentMessage> {
+		const base: SendMessageParams = {
+			chat_id: chatId,
+			text,
+			message_thread_id: threadId,
+			disable_web_page_preview: !this.config.linkPreview,
+			reply_to_message_id: replyTo,
+			allow_sending_without_reply: true,
+		};
+		try {
+			return await api.sendMessage({ ...base, parse_mode: this.config.parseMode || undefined });
+		} catch (err) {
+			if (this.config.parseMode && isParseModeError(err)) {
+				ctx.log.warn("telegram rejected the message markup; resending as plain text", { thread: `telegram:${chatId}` });
+				return api.sendMessage({ ...base, parse_mode: undefined });
+			}
+			throw err;
+		}
+	}
+
+	/**
+	 * Read every attachment and apply Telegram's limits before any API call.
+	 *
+	 * Host-side validation (realpath containment, regular file, size) runs
+	 * whenever the host can see the workspace. Inside a sandbox it usually cannot,
+	 * so a missing host file is deferred and the bridge read proves existence.
+	 */
+	private async prepareAttachments(ctx: ModuleContext, attachments: OutgoingMessage["attachments"]): Promise<PreparedUpload[]> {
+		const uploads: PreparedUpload[] = [];
+		const bridge = ctx.workspaceFiles;
+		const workspace = path.resolve(bridge?.rootDir ?? ctx.paths.workspaceDir);
+		for (const attachment of attachments ?? []) {
+			if (!attachment || typeof attachment.path !== "string" || !attachment.path.trim()) continue;
+			const requestedKind = attachment.kind;
+			const relativePath = attachmentRelativePath(attachment.path);
+			let inspected: ReturnType<typeof inspectHostAttachment> | undefined;
+			try {
+				inspected = inspectHostAttachment(workspace, relativePath, requestedKind);
+			} catch (err) {
+				// A sandbox workspace is not visible on the host; only that case may defer.
+				if (!bridge || !(err instanceof AttachmentNotFoundError)) throw err;
+			}
+			const name = uploadName(attachment.name, relativePath);
+			const mime = mimeForFile(name);
+			const kind = attachmentKind(mime, requestedKind);
+			if (attachment.size !== undefined) assertAttachmentSize(kind, attachment.size, name);
+			if (inspected?.size !== undefined) assertAttachmentSize(kind, inspected.size, name);
+			let data: Buffer;
+			if (bridge) {
+				try {
+					data = await bridge.readFile(path.posix.join(bridge.rootDir, relativePath));
+				} catch (err) {
+					if (isMissingFileError(err)) throw new AttachmentNotFoundError(relativePath);
+					throw new Error(`attachment not readable in the workspace: ${relativePath} (${message(err)})`);
+				}
+			} else {
+				data = fs.readFileSync(inspected!.absolutePath);
+			}
+			assertAttachmentSize(kind, data.length, name);
+			uploads.push({ data, name, mime, kind, path: relativePath });
+		}
+		return uploads;
 	}
 
 	/** Send used by the `telegram` tool (proactive messages to any chat). */
@@ -870,29 +986,28 @@ function guessFileField(name: string): "document" | "photo" | "audio" | "video" 
 	return "document";
 }
 
-const MIME_BY_EXT: Record<string, string> = {
-	".png": "image/png",
-	".jpg": "image/jpeg",
-	".jpeg": "image/jpeg",
-	".webp": "image/webp",
-	".gif": "image/gif",
-	".pdf": "application/pdf",
-	".json": "application/json",
-	".txt": "text/plain; charset=utf-8",
-	".md": "text/markdown; charset=utf-8",
-	".csv": "text/csv",
-	".zip": "application/zip",
-	".gz": "application/gzip",
-	".mp3": "audio/mpeg",
-	".ogg": "audio/ogg",
-	".m4a": "audio/mp4",
-	".wav": "audio/wav",
-	".mp4": "video/mp4",
-	".webm": "video/webm",
-};
+/** Upload file name: the recorded one, reduced to a bare name, or the path's basename. */
+function uploadName(recorded: string | undefined, relativePath: string): string {
+	const base = path.posix.basename((recorded ?? "").trim());
+	if (base && base !== "." && base !== "..") return base;
+	return path.posix.basename(relativePath);
+}
 
-function mimeForFile(name: string): string | undefined {
-	return MIME_BY_EXT[path.extname(name).toLowerCase()];
+/** Bridge read failed because the file is not in the (possibly sandboxed) workspace. */
+function isMissingFileError(err: unknown): boolean {
+	const code = (err as NodeJS.ErrnoException | undefined)?.code;
+	return code === "ENOENT" || code === "ENOTDIR" || message(err).includes("ENOENT");
+}
+
+/** Outbound history keeps the attachment path next to the provider metadata. */
+function historyAttachment(upload: PreparedUpload): HistoryAttachment {
+	return {
+		kind: upload.kind,
+		name: upload.name,
+		...(upload.mime ? { mime: upload.mime } : {}),
+		size: upload.data.length,
+		meta: { path: upload.path },
+	};
 }
 
 /** Human-readable, secret-free annotation appended to the agent-facing event text. */

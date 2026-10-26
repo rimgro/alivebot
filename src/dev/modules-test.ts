@@ -41,6 +41,12 @@ import {
 	PdfTextError,
 } from "../modules/telegram/pdf-text.js";
 import { createTelegramTools } from "../modules/telegram/tools.js";
+import {
+	OUTBOUND_DOCUMENT_MAX_BYTES,
+	OUTBOUND_PHOTO_MAX_BYTES,
+	assertAttachmentSize,
+	resolveOutgoingAttachment,
+} from "../runtime/attachments.js";
 import type { TelegramUpdate } from "../modules/telegram/types.js";
 
 let failures = 0;
@@ -1125,6 +1131,268 @@ section("telegram module end-to-end against a fake Bot API");
 	await api.sendLongMessage({ chat_id: 42, text: `${"x".repeat(2500)}\n\n${"y".repeat(2500)}` });
 	const callsAfter = calls.filter((call) => call.method === "sendMessage").length;
 	check("sendLongMessage splits and sends every part", callsAfter - callsBefore === 2, callsAfter - callsBefore);
+}
+
+// ---------------------------------------------------------------------------
+section("telegram outbound attachments: send_message delivers a workspace file");
+{
+	const moduleRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-attachment-test-"));
+	const log = new Logger({ console: false, level: "error", scope: "telegram-attachment-test" });
+	const store = EventStore.open(moduleRoot);
+	const history = HistoryStore.open(moduleRoot);
+	const outbox = new Outbox(moduleRoot);
+	const calls: Array<{ method: string; params: Record<string, unknown>; form?: Record<string, unknown> }> = [];
+
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		const method = url.slice(url.lastIndexOf("/") + 1);
+		const isForm = init?.body instanceof FormData;
+		const form = isForm
+			? Object.fromEntries(
+					[...(init!.body as FormData).entries()].map(([key, value]) => [
+						key,
+						typeof value === "string" ? value : { name: value.name, type: value.type, size: value.size },
+					]),
+			  )
+			: undefined;
+		const params = isForm
+			? { __multipart: [...(init!.body as FormData).keys()] }
+			: init?.body
+				? (JSON.parse(String(init.body)) as Record<string, unknown>)
+				: {};
+		calls.push({ method, params, form });
+		if (method === "getMe") return jsonResponse({ ok: true, result: { id: 999, is_bot: true, first_name: "Alive", username: "alive_bot" } });
+		if (method === "deleteWebhook") return jsonResponse({ ok: true, result: true });
+		if (method === "getUpdates") {
+			// Long-poll stand-in: stay pending until the module aborts. Answering
+			// immediately would spin the poll loop on microtasks and starve the
+			// test's own timers, so nothing after host.init() would ever run.
+			return new Promise<Response>((_resolve, reject) => {
+				const signal = init?.signal;
+				if (!signal) return reject(new Error("getUpdates: missing abort signal"));
+				const fail = () => reject(signal.reason instanceof Error ? signal.reason : new Error("getUpdates aborted"));
+				if (signal.aborted) return fail();
+				signal.addEventListener("abort", fail, { once: true });
+			});
+		}
+		if (method === "sendChatAction") return jsonResponse({ ok: true, result: true });
+		if (method === "sendPhoto") {
+			const id = 810 + calls.filter((call) => call.method === "sendPhoto").length;
+			return jsonResponse({ ok: true, result: { message_id: id, date: 1, chat: { id: 42, type: "private" } } });
+		}
+		if (method === "sendDocument") {
+			const id = 830 + calls.filter((call) => call.method === "sendDocument").length;
+			return jsonResponse({ ok: true, result: { message_id: id, date: 1, chat: { id: 42, type: "private" } } });
+		}
+		if (method === "sendMessage") {
+			const id = 800 + calls.filter((call) => call.method === "sendMessage").length;
+			return jsonResponse({ ok: true, result: { message_id: id, date: 1, chat: { id: 42, type: "private" } } });
+		}
+		return jsonResponse({ ok: true, result: true });
+	}) as unknown as typeof fetch;
+
+	const config = loadConfig({
+		cwd: moduleRoot,
+		overrides: {
+			chat: { console: false, http: { enabled: false, host: "127.0.0.1", port: 0, token: "" } },
+			modules: {
+				telegram: {
+					enabled: true,
+					token: "test-token",
+					tokenEnv: "ALIVE_TEST_TELEGRAM_TOKEN_UNSET",
+					apiBase: "https://api.telegram.org",
+					allowedChatIds: [],
+					allowedUserIds: ["7"],
+					allowedBotIds: [],
+					requireMentionInGroups: false,
+					pollTimeoutSec: 0,
+					allowedUpdates: ["message"],
+					parseMode: "",
+					linkPreview: true,
+					typingIndicator: true,
+					ackReaction: "",
+					ingestEdits: true,
+					historyLimitPerThread: 0,
+					maxMessageChars: 4096,
+					transcription: { ...DEFAULT_CONFIG.modules.telegram.transcription },
+				},
+				grafana: { enabled: false, host: "127.0.0.1", port: 0, path: "/grafana", token: "", firingPriority: "high", resolvedPriority: "low" },
+				external: [],
+			},
+		},
+	});
+
+	const workspace = config.paths.workspaceDir;
+	fs.mkdirSync(workspace, { recursive: true });
+	const photoBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+	fs.writeFileSync(path.join(workspace, "shot.png"), photoBytes);
+	fs.writeFileSync(path.join(workspace, "report.pdf"), buildPdf([["Attachment report"]]));
+
+	const telegram = new TelegramModule(config.config.modules.telegram);
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = fetchImpl;
+	// Stop the module even if an expectation throws: its long-poll loop would
+	// otherwise keep the process alive and turn a failed check into a hang.
+	let started: ModuleHost | undefined;
+	try {
+		const host = new ModuleHost({
+			config,
+			log,
+			transports: [],
+			modules: [telegram],
+			ingest: (event) => store.append(event),
+			outbox: (limit) => outbox.list(limit),
+			history,
+			runtimeStatus: () => ({}),
+			workspaceFiles: {
+				rootDir: workspace,
+				readFile: async (file) => fs.readFileSync(file),
+				writeFile: async (file, data) => {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, data);
+					return file;
+				},
+			},
+		});
+		started = host;
+		await host.init();
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		calls.length = 0;
+
+		const deliver = (message: Omit<OutgoingMessage, "runId" | "ts">) => host.deliver({ runId: "run", ts: Date.now(), ...message } as OutgoingMessage);
+		const lastCall = (method: string) => calls.filter((call) => call.method === method).pop();
+
+		// Image attachment: the kind is inferred from the mime type.
+		await deliver({ id: "att_photo", thread: "telegram:42", text: "Look at this", attachments: [{ path: "shot.png" }] });
+		const photoForm = lastCall("sendPhoto")?.form;
+		const photoFile = photoForm?.photo as { name?: string; type?: string; size?: number } | undefined;
+		check("an image attachment is uploaded with sendPhoto", lastCall("sendPhoto") !== undefined && lastCall("sendMessage") === undefined, calls.map((call) => call.method));
+		check("the photo upload carries the message text as caption", photoForm?.caption === "Look at this", photoForm);
+		check("the photo upload sends the workspace file", photoFile?.name === "shot.png" && photoFile?.type === "image/png" && photoFile?.size === photoBytes.length, photoFile);
+		check("the photo upload keeps the chat routing", photoForm?.chat_id === "42", photoForm);
+		const photoRecord = history.query({ thread: "telegram:42", direction: "outbound" }).find((record) => record.meta?.agentMessageId === "att_photo");
+		check("history records the outbound caption", photoRecord?.text === "Look at this", photoRecord?.text);
+		check("history records the attachment kind", photoRecord?.attachments?.[0]?.kind === "photo", photoRecord?.attachments);
+		check("history records the attachment path", photoRecord?.attachments?.[0]?.meta?.path === "shot.png", photoRecord?.attachments);
+		check("history records the attachment size", photoRecord?.attachments?.[0]?.size === photoBytes.length, photoRecord?.attachments);
+
+		// A caption longer than 1024 characters spills into a normal follow-up message.
+		const longText = "a".repeat(1500);
+		const beforeLong = calls.length;
+		await deliver({ id: "att_long", thread: "telegram:42", text: longText, attachments: [{ path: "shot.png", kind: "photo" }] });
+		const longCalls = calls.slice(beforeLong);
+		const longCaption = longCalls.find((call) => call.method === "sendPhoto")?.form?.caption as string | undefined;
+		const followUp = longCalls.find((call) => call.method === "sendMessage");
+		check("a long caption is truncated to the 1024-character limit", longCaption?.length === 1024, longCaption?.length);
+		check("the caption remainder is sent as a follow-up text message", followUp?.params.text === longText.slice(1024), followUp?.params);
+		check("the follow-up keeps the chat and thread", followUp?.params.chat_id === "42" && followUp?.params.message_thread_id === undefined, followUp?.params);
+
+		// Non-image files (and a forced kind) go out as documents.
+		await deliver({ id: "att_doc", thread: "telegram:42", text: "Report attached", attachments: [{ path: "report.pdf" }] });
+		const docForm = lastCall("sendDocument")?.form;
+		check("a non-image attachment is uploaded with sendDocument", (docForm?.document as { name?: string })?.name === "report.pdf", docForm);
+		check("the document upload carries the mime type and caption", (docForm?.document as { type?: string })?.type === "application/pdf" && docForm?.caption === "Report attached", docForm);
+		const docRecord = history.query({ thread: "telegram:42", direction: "outbound" }).find((record) => record.meta?.agentMessageId === "att_doc");
+		check("history records the document attachment", docRecord?.attachments?.[0]?.kind === "document" && docRecord?.attachments?.[0]?.meta?.path === "report.pdf", docRecord?.attachments);
+
+		await deliver({ id: "att_forced", thread: "telegram:42", text: "As a file", attachments: [{ path: "shot.png", kind: "document" }] });
+		check("attachment_kind=document sends an image as a file", (lastCall("sendDocument")?.form?.document as { name?: string })?.name === "shot.png", lastCall("sendDocument")?.form);
+
+		// Topic and reply routing survive an attachment.
+		await deliver({ id: "att_topic", thread: "telegram:42/7", replyTo: "1005", text: "In the topic", attachments: [{ path: "shot.png", kind: "photo" }] });
+		const topicForm = lastCall("sendPhoto")?.form;
+		check("an attachment keeps topic routing", topicForm?.message_thread_id === "7", topicForm);
+		check("an attachment keeps the explicit reply target", topicForm?.reply_to_message_id === "1005", topicForm);
+
+		// Rejections happen before any Bot API call.
+		const callsBeforeRejections = calls.length;
+		const rejected = async (attachment: Record<string, unknown>, message = "See file") => {
+			try {
+				await deliver({ id: `att_${Math.random().toString(36).slice(2)}`, thread: "telegram:42", text: message, attachments: [attachment as never] });
+				return undefined;
+			} catch (err) {
+				return err instanceof Error ? err : new Error(String(err));
+			}
+		};
+
+		const escaped = await rejected({ path: "../../../../etc/passwd" });
+		check("an attachment path that climbs out of the workspace is rejected", escaped !== undefined && /must not contain '\.\.'|outside the workspace/.test(escaped.message), escaped?.message);
+		const absolute = await rejected({ path: "/etc/passwd" });
+		check("an absolute attachment path is rejected", absolute !== undefined && /must be relative to the workspace/.test(absolute.message), absolute?.message);
+		const missing = await rejected({ path: "does-not-exist.png" });
+		check("a missing attachment is rejected clearly", missing !== undefined && /attachment not found in the workspace: does-not-exist\.png/.test(missing.message), missing?.message);
+		const link = path.join(workspace, "passwd-link.txt");
+		try {
+			fs.symlinkSync("/etc/passwd", link);
+		} catch {
+			// symlinks unavailable: the escape test above still covers containment
+		}
+		if (fs.existsSync(link)) {
+			const symlinkEscape = await rejected({ path: "passwd-link.txt" });
+			check("a symlink pointing outside the workspace is rejected", symlinkEscape !== undefined && /outside the workspace/.test(symlinkEscape.message), symlinkEscape?.message);
+		}
+		const huge = Buffer.alloc(OUTBOUND_PHOTO_MAX_BYTES + 1);
+		fs.writeFileSync(path.join(workspace, "huge.png"), huge);
+		const oversize = await rejected({ path: "huge.png" });
+		check("an oversize photo is rejected with the limit and a way out", oversize !== undefined && /photo limit/.test(oversize.message) && /attachment_kind="document"/.test(oversize.message), oversize?.message);
+		check("no API call is made for a rejected attachment", calls.length === callsBeforeRejections, calls.slice(callsBeforeRejections).map((call) => call.method));
+		check(
+			"an oversize document is rejected with the document limit",
+			(() => {
+				try {
+					assertAttachmentSize("document", OUTBOUND_DOCUMENT_MAX_BYTES + 1, "big.zip");
+					return false;
+				} catch (err) {
+					return /document limit/.test((err as Error).message);
+				}
+			})(),
+		);
+
+		// The tool-level validator (what `send_message` calls before writing the outbox).
+		const inferred = resolveOutgoingAttachment(workspace, "shot.png");
+		check("the tool validator infers photo from the mime type", inferred.kind === "photo" && inferred.path === "shot.png" && inferred.size === photoBytes.length, inferred);
+		const forcedDocument = resolveOutgoingAttachment(workspace, "shot.png", "document");
+		check("the tool validator honours attachment_kind", forcedDocument.kind === "document", forcedDocument);
+		const deferred = resolveOutgoingAttachment(workspace, "guest-only.png", undefined, { deferHostChecks: true });
+		check("a sandbox workspace defers the existence check to delivery", deferred.path === "guest-only.png" && deferred.kind === "photo", deferred);
+		check(
+			"the tool validator rejects a missing file when the workspace is host-visible",
+			(() => {
+				try {
+					resolveOutgoingAttachment(workspace, "guest-only.png");
+					return false;
+				} catch (err) {
+					return /attachment not found/.test((err as Error).message);
+				}
+			})(),
+		);
+		check(
+			"the tool validator rejects paths outside the workspace",
+			(() => {
+				try {
+					resolveOutgoingAttachment(workspace, "../outside.png");
+					return false;
+				} catch (err) {
+					return /must not contain '\.\.'/.test((err as Error).message);
+				}
+			})(),
+		);
+
+		// Regression: a text-only message is byte-for-byte the old behaviour.
+		const beforeText = calls.length;
+		await deliver({ id: "att_text", thread: "telegram:42", text: "plain text only" });
+		const textCalls = calls.slice(beforeText);
+		check(
+			"a text-only message still goes through sendMessage only",
+			textCalls.length === 1 && textCalls[0]?.method === "sendMessage" && textCalls[0]?.params.text === "plain text only",
+			textCalls,
+		);
+		const textRecord = history.query({ thread: "telegram:42", direction: "outbound" }).find((record) => record.meta?.agentMessageId === "att_text");
+		check("a text-only message has no attachment record", textRecord !== undefined && textRecord.attachments === undefined, textRecord);
+	} finally {
+		await started?.stop();
+		globalThis.fetch = realFetch;
+	}
 }
 
 // ---------------------------------------------------------------------------

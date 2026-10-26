@@ -1,11 +1,31 @@
 import * as path from "node:path";
 import { appendJsonl, ensureDir, newId, readJsonl } from "../util.js";
 
+/**
+ * A local file the agent wants delivered with its message.
+ *
+ * `path` is always workspace-relative: a module must never be handed a host path
+ * it was not already trusted with, and the durable outbox record stays portable.
+ */
+export interface OutgoingAttachment {
+	path: string;
+	/** `photo` for inlined images, `document` for a file upload. Inferred when omitted. */
+	kind?: "photo" | "document";
+	/** Display/upload file name; defaults to the basename of `path`. */
+	name?: string;
+	/** Mime type as inferred by the producer; a module may recompute it. */
+	mime?: string;
+	/** Size hint for early limit checks; the delivering module re-checks the real bytes. */
+	size?: number;
+}
+
 export interface OutgoingMessage {
 	id: string;
 	runId: string;
 	thread: string;
 	text: string;
+	/** Files delivered together with the text (`text` becomes the caption). */
+	attachments?: OutgoingAttachment[];
 	/** Explicit recipient for local managed-agent routing; thread remains a conversation id. */
 	recipientAgentId?: string;
 	senderId?: string;
@@ -41,7 +61,16 @@ export class Outbox {
 	}
 
 	async send(
-		input: { runId: string; thread: string; text: string; replyTo?: string; recipientAgentId?: string; senderId?: string; senderName?: string },
+		input: {
+			runId: string;
+			thread: string;
+			text: string;
+			replyTo?: string;
+			recipientAgentId?: string;
+			senderId?: string;
+			senderName?: string;
+			attachments?: OutgoingAttachment[];
+		},
 		deliver: (message: OutgoingMessage) => Promise<void>,
 	): Promise<OutgoingMessage> {
 		const message: OutgoingMessage = {
@@ -49,6 +78,7 @@ export class Outbox {
 			runId: input.runId,
 			thread: input.thread,
 			text: input.text,
+			...(input.attachments && input.attachments.length > 0 ? { attachments: input.attachments } : {}),
 			recipientAgentId: input.recipientAgentId,
 			senderId: input.senderId,
 			senderName: input.senderName,
