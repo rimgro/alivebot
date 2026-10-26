@@ -747,6 +747,7 @@ export class TelegramModule implements AliveModule {
 			history: ctx.history,
 			workspaceDir: ctx.workspaceFiles?.rootDir ?? ctx.paths.workspaceDir,
 			writeWorkspaceFile: ctx.workspaceFiles?.writeFile,
+			readWorkspaceFile: ctx.workspaceFiles?.readFile,
 			defaultParseMode: this.config.parseMode,
 			maxMessageChars: this.config.maxMessageChars,
 			sendText: (input) => this.sendText(input),

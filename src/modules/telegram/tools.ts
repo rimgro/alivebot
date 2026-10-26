@@ -8,12 +8,14 @@ import type { TelegramApi } from "./client.js";
 import type { TelegramChat, TelegramChatMember, TelegramSentMessage } from "./types.js";
 import { formatThread, parseThread, resolveChatTarget } from "./threads.js";
 import { describeAttachment } from "./update.js";
+import { extractPdfText, PDF_TEXT_MAX_BYTES, PDF_TEXT_MAX_CHARS, PDF_TEXT_TIMEOUT_MS } from "./pdf-text.js";
 
 export interface TelegramToolHost {
 	readonly api: TelegramApi;
 	readonly history: HistoryStore;
 	readonly workspaceDir: string;
 	writeWorkspaceFile?(file: string, data: Buffer): Promise<string>;
+	readWorkspaceFile?(file: string): Promise<Buffer>;
 	readonly defaultParseMode: string;
 	readonly maxMessageChars: number;
 	sendText(input: { thread: string; text: string; replyTo?: number }): Promise<TelegramSentMessage[]>;
@@ -29,6 +31,8 @@ type ToolResult = AgentToolResult<Record<string, unknown>>;
 function ok(text: string, details: Record<string, unknown> = {}): ToolResult {
 	return { content: [{ type: "text", text }], details };
 }
+
+const TELEGRAM_FILES_DIR = "telegram-files";
 
 const ACTION = Type.Union([
 	Type.Literal("me"),
@@ -49,6 +53,7 @@ const ACTION = Type.Union([
 	Type.Literal("pin"),
 	Type.Literal("unpin"),
 	Type.Literal("download_file"),
+	Type.Literal("pdf_text"),
 	Type.Literal("set_commands"),
 ]);
 
@@ -72,6 +77,7 @@ export function createTelegramTools(host: TelegramToolHost): ToolDefinition[] {
 			"`history` reads the local durable log of everything this bot saw and sent, newest first by default. " +
 			"Use `action:\"list_chats\"` first to discover conversations, then `history` with a chat or thread.\n" +
 			"`send_file` uploads a file from the workspace as a document/photo/audio/video with an optional caption. " +
+			"`pdf_text` reads text from a PDF already saved by `download_file`; pass its local `path` and page through the text with `offset`/`limit`. " +
 			"To answer a human, prefer `send_message` (it routes to Telegram automatically); `send`/`send_file` are for reaching a chat you were not addressed in.",
 		parameters: Type.Object({
 			action: ACTION,
@@ -81,7 +87,7 @@ export function createTelegramTools(host: TelegramToolHost): ToolDefinition[] {
 			message_id: Type.Optional(Type.Number({ description: "Telegram message id for edit/delete/react/pin/unpin." })),
 			reply_to: Type.Optional(Type.Number({ description: "Telegram message id to reply to when sending." })),
 			topic: Type.Optional(Type.Number({ description: "Forum topic id (message_thread_id) for send/forward." })),
-			path: Type.Optional(Type.String({ description: "Local file path inside the workspace for `send_file`." })),
+			path: Type.Optional(Type.String({ description: "Local file path for `send_file`, or a path under the telegram-files download directory for `pdf_text`." })),
 			caption: Type.Optional(Type.String({ description: "Caption for `send_file`." })),
 			as: Type.Optional(
 				Type.Union([Type.Literal("document"), Type.Literal("photo"), Type.Literal("audio"), Type.Literal("video")], {
@@ -89,7 +95,10 @@ export function createTelegramTools(host: TelegramToolHost): ToolDefinition[] {
 				}),
 			),
 			query: Type.Optional(Type.String({ description: "Substring to search for in history." })),
-			limit: Type.Optional(Type.Number({ description: "Max results (default 30, max 200)." })),
+			limit: Type.Optional(
+				Type.Number({ description: "Max results for list/history/members (default 30, max 200), or characters for `pdf_text` (default 12000, max 40000)." }),
+			),
+			offset: Type.Optional(Type.Number({ description: "Character offset into the extracted PDF text for `pdf_text` (default 0)." })),
 			before: Type.Optional(Type.Number({ description: "Only messages older than this Telegram message id." })),
 			after: Type.Optional(Type.Number({ description: "Only messages newer than this Telegram message id." })),
 			since: Type.Optional(Type.String({ description: "Lower time bound: ISO timestamp or relative like 2h, 1d." })),
@@ -303,7 +312,7 @@ export function createTelegramTools(host: TelegramToolHost): ToolDefinition[] {
 						throw new Error(`file is ${file.file_size} bytes, over the ${maxBytes} byte download limit`);
 					}
 					const buffer = await api.downloadFile(file.file_path, { maxBytes });
-					const dir = host.writeWorkspaceFile ? path.posix.join(host.workspaceDir, "telegram-files") : path.join(host.workspaceDir, "telegram-files");
+					const dir = host.writeWorkspaceFile ? path.posix.join(host.workspaceDir, TELEGRAM_FILES_DIR) : path.join(host.workspaceDir, TELEGRAM_FILES_DIR);
 					const fileName = safeFileName(params.name ?? path.basename(file.file_path));
 					let target: string;
 					if (host.writeWorkspaceFile) {
@@ -318,6 +327,44 @@ export function createTelegramTools(host: TelegramToolHost): ToolDefinition[] {
 						bytes: buffer.length,
 						filePath: file.file_path,
 					});
+				}
+				case "pdf_text": {
+					if (params.file_id) {
+						throw new Error("`file_id` is not accepted by pdf_text; download the file with action=\"download_file\" and pass the returned local path");
+					}
+					if (!params.path?.trim()) throw new Error("`path` is required for pdf_text");
+					const offset = Number.isFinite(params.offset) ? Math.max(0, Math.floor(params.offset!)) : 0;
+					const limit = clamp(params.limit ?? 12_000, 1, PDF_TEXT_MAX_CHARS);
+					const downloaded = await readDownloadedPdf(host, params.path);
+					const parsed = await extractPdfText(downloaded.bytes, { timeoutMs: PDF_TEXT_TIMEOUT_MS });
+					const totalChars = parsed.text.length;
+					const details = { path: downloaded.path, pages: parsed.pages, totalChars, offset, truncated: parsed.truncated };
+					if (totalChars === 0) {
+						return ok(`The PDF contains no extractable text (pages=${parsed.pages}).`, details);
+					}
+					if (offset >= totalChars) {
+						return ok(
+							`Offset ${offset} is at or beyond the end of the extracted text: this PDF has ${totalChars} characters across ${parsed.pages} page(s). Use offset=0 to start over.`,
+							details,
+						);
+					}
+					const text = parsed.text.slice(offset, offset + limit);
+					const nextOffset = offset + text.length < totalChars ? offset + text.length : undefined;
+					const header = [
+						`pages=${parsed.pages}`,
+						`totalChars=${totalChars}`,
+						`offset=${offset}`,
+						...(nextOffset !== undefined ? [`nextOffset=${nextOffset}`] : []),
+						...(parsed.truncated ? ["truncated=true"] : []),
+					].join(", ");
+					let body = `PDF text (${header}):\n${text}`;
+					if (nextOffset !== undefined) {
+						body += `\n\n[more text follows; call pdf_text with path=${JSON.stringify(downloaded.path)} and offset=${nextOffset}]`;
+					}
+					if (parsed.truncated) {
+						body += "\n\n[PDF text extraction hit its local page/character limit; later content is not available]";
+					}
+					return ok(body, { ...details, nextOffset, chars: text.length });
 				}
 				case "set_commands": {
 					const commands = (params.commands ?? []).map((entry) => ({
@@ -371,6 +418,54 @@ function clamp(value: number, min: number, max: number): number {
 function safeFileName(name: string): string {
 	const base = path.basename(name).replace(/[^a-zA-Z0-9._-]+/g, "_");
 	return base.length > 0 ? base : "file";
+}
+
+/** Read a PDF only from the directory `download_file` writes to, never from a file id. */
+async function readDownloadedPdf(host: TelegramToolHost, requestedPath: string): Promise<{ path: string; bytes: Buffer }> {
+	const sandboxed = host.readWorkspaceFile !== undefined;
+	const filePaths = sandboxed ? path.posix : path;
+	const root = filePaths.resolve(host.workspaceDir, TELEGRAM_FILES_DIR);
+	const target = filePaths.resolve(host.workspaceDir, requestedPath);
+	if (target === root || !target.startsWith(`${root}${filePaths.sep}`)) {
+		throw new Error(`pdf_text can only read files in ${root}, where telegram(action="download_file") saves them`);
+	}
+	if (filePaths.extname(target).toLowerCase() !== ".pdf") {
+		throw new Error("pdf_text only accepts .pdf files; download the document first and pass its local path");
+	}
+
+	if (sandboxed) {
+		const bytes = await host.readWorkspaceFile!(target);
+		if (bytes.length > PDF_TEXT_MAX_BYTES) {
+			throw new Error(`PDF is ${bytes.length} bytes, over the ${PDF_TEXT_MAX_BYTES} byte limit`);
+		}
+		return { path: target, bytes };
+	}
+
+	let rootReal: string;
+	try {
+		rootReal = fs.realpathSync(root);
+	} catch {
+		throw new Error(`No downloaded Telegram files directory at ${root}; use telegram(action="download_file") first`);
+	}
+	let fileReal: string;
+	try {
+		fileReal = fs.realpathSync(target);
+	} catch {
+		throw new Error(`PDF not found: ${target}`);
+	}
+	// Resolve symlinks before opening so a link cannot escape the download directory.
+	if (!fileReal.startsWith(`${rootReal}${path.sep}`)) {
+		throw new Error(`pdf_text can only read files inside ${rootReal}`);
+	}
+	if (path.extname(fileReal).toLowerCase() !== ".pdf") {
+		throw new Error("pdf_text only accepts .pdf files; download the document first and pass its local path");
+	}
+	const stat = fs.statSync(fileReal);
+	if (!stat.isFile()) throw new Error(`not a file: ${fileReal}`);
+	if (stat.size > PDF_TEXT_MAX_BYTES) {
+		throw new Error(`PDF is ${stat.size} bytes, over the ${PDF_TEXT_MAX_BYTES} byte limit`);
+	}
+	return { path: fileReal, bytes: fs.readFileSync(fileReal) };
 }
 
 function formatTranscript(records: Array<{ ts: number; direction: string; author?: string; text: string; messageId?: string; attachments?: unknown[] }>): string {
