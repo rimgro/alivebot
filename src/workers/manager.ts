@@ -64,6 +64,10 @@ interface WorkerHandle {
 	abortReason?: "stop" | "shutdown" | "timeout";
 	waiters: Set<() => void>;
 	activity?: string;
+	/** Last assistant turn that ended with stopReason "error" or "aborted" in this run. */
+	sessionError?: string;
+	/** Tool executions started during the current run. */
+	toolCalls: number;
 }
 
 export interface StartWorkerOptions {
@@ -298,7 +302,7 @@ export class WorkerManager {
 			notifyOnFinish: options.notify ?? this.cfg.notifyOnFinish,
 		};
 		this.store.save(record);
-		const handle: WorkerHandle = { record, waiters: new Set() };
+		const handle: WorkerHandle = { record, waiters: new Set(), toolCalls: 0 };
 		this.handles.set(id, handle);
 		this.log.info("worker starting", { id, model, isolation, branch, pullRequest: options.pullRequest });
 		handle.runPromise = this.launch(handle, this.initialPrompt(task))
@@ -567,16 +571,48 @@ export class WorkerManager {
 		record.sessionFile = session.sessionFile;
 		record.updatedAt = Date.now();
 		this.store.save(record);
+		this.log.info("worker session created", {
+			id: record.id,
+			model: record.model,
+			sandboxed: record.sandboxed === true,
+			isolation: record.isolation,
+		});
 		session.subscribe((event) => {
+			const handle = this.handles.get(record.id);
 			if (event.type === "tool_execution_start" && typeof event.toolName === "string") {
-				const handle = this.handles.get(record.id);
-				if (handle) handle.activity = `tool: ${event.toolName}`;
+				if (handle) {
+					handle.activity = `tool: ${event.toolName}`;
+					handle.toolCalls += 1;
+				}
 			} else if (event.type === "turn_start") {
-				const handle = this.handles.get(record.id);
 				if (handle) handle.activity = "thinking";
+			} else if (event.type === "turn_end" || event.type === "agent_end") {
+				if (handle) this.captureSessionError(handle, event);
 			}
 		});
 		return session;
+	}
+
+	/**
+	 * A provider failure does not throw out of `prompt()`; it ends the turn as an
+	 * assistant message with stopReason "error". Keep that reason so an empty run
+	 * is reported as failed instead of silently succeeding.
+	 */
+	private captureSessionError(handle: WorkerHandle, event: { type: string; [key: string]: unknown }): void {
+		const messages: unknown[] = [];
+		if (Array.isArray(event.messages)) messages.push(...event.messages);
+		if (event.message !== undefined) messages.push(event.message);
+		for (const message of messages) {
+			if (!message || typeof message !== "object") continue;
+			const candidate = message as { role?: unknown; stopReason?: unknown; errorMessage?: unknown };
+			if (candidate.role !== "assistant") continue;
+			if (candidate.stopReason !== "error" && candidate.stopReason !== "aborted") continue;
+			const detail =
+				typeof candidate.errorMessage === "string" && candidate.errorMessage.trim().length > 0
+					? candidate.errorMessage.trim()
+					: `assistant turn stopped with reason "${String(candidate.stopReason)}"`;
+			handle.sessionError = detail;
+		}
 	}
 
 	private async execute(handle: WorkerHandle, prompt: string): Promise<void> {
@@ -595,6 +631,10 @@ export class WorkerManager {
 		record.updatedAt = record.lastRunStartedAt;
 		this.store.save(record);
 		const startedAt = record.lastRunStartedAt;
+		handle.sessionError = undefined;
+		handle.toolCalls = 0;
+		const tokensBefore = this.tokenTotal(session);
+		const textBefore = session.getLastAssistantText()?.trim();
 		let timedOut = false;
 		const timer = setTimeout(() => {
 			timedOut = true;
@@ -614,6 +654,12 @@ export class WorkerManager {
 			else if (timedOut || handle.abortReason === "timeout") {
 				status = "failed";
 				error = `worker run exceeded ${this.cfg.maxRuntimeMs} ms and was aborted`;
+			} else if (handle.sessionError) {
+				status = "failed";
+				error = handle.sessionError;
+			} else if (!this.runProducedOutput(handle, session, tokensBefore, textBefore)) {
+				status = "failed";
+				error = "worker produced no output: the model returned no text, no tool calls and no new tokens";
 			} else {
 				status = "idle";
 			}
@@ -677,6 +723,22 @@ export class WorkerManager {
 			if (status !== "stopped") void this.notifyCompletion(record, record.lastRunFinishedAt - startedAt);
 			this.notifyWaiters(handle);
 		}
+	}
+
+	private tokenTotal(session: WorkerSession): number {
+		try {
+			return session.getSessionStats().tokens?.total ?? 0;
+		} catch {
+			return 0;
+		}
+	}
+
+	/** True when the run left a visible trace: assistant text, a tool call, or new tokens. */
+	private runProducedOutput(handle: WorkerHandle, session: WorkerSession, tokensBefore: number, textBefore?: string): boolean {
+		const text = session.getLastAssistantText()?.trim();
+		if (text && text !== textBefore) return true;
+		if (handle.toolCalls > 0) return true;
+		return this.tokenTotal(session) > tokensBefore;
 	}
 
 	private finishWithoutRun(handle: WorkerHandle): void {
@@ -814,7 +876,7 @@ export class WorkerManager {
 		const existing = this.handles.get(normalized);
 		if (existing) return existing;
 		const record = this.requireRecord(normalized);
-		const handle: WorkerHandle = { record, waiters: new Set() };
+		const handle: WorkerHandle = { record, waiters: new Set(), toolCalls: 0 };
 		this.handles.set(normalized, handle);
 		return handle;
 	}
