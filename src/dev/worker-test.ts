@@ -57,8 +57,12 @@ class FakeSession implements WorkerSession {
 	prompts: string[] = [];
 	disposed = false;
 	hang = false;
+	/** Simulate a provider failure: the run ends without text, tokens or tool calls. */
+	silent = false;
+	/** Simulate an assistant turn that ended with stopReason "error". */
+	errorMessage?: string;
 	private lastText: string | undefined;
-	private listeners: Array<(event: { type: string; toolName?: string }) => void> = [];
+	private listeners: Array<(event: { type: string; toolName?: string; [key: string]: unknown }) => void> = [];
 	private abortReject?: (error: Error) => void;
 
 	constructor(id: string, sessionFile?: string) {
@@ -74,6 +78,12 @@ class FakeSession implements WorkerSession {
 					this.abortReject = reject;
 				});
 			}
+			if (this.errorMessage) {
+				const message = { role: "assistant", stopReason: "error", errorMessage: this.errorMessage };
+				for (const listener of this.listeners) listener({ type: "turn_end", message, toolResults: [] });
+				return;
+			}
+			if (this.silent) return;
 			this.lastText = `completed: ${text.split("\n")[0] ?? "task"}`;
 			for (const listener of this.listeners) listener({ type: "turn_start" });
 		} finally {
@@ -82,7 +92,7 @@ class FakeSession implements WorkerSession {
 		}
 	}
 
-	subscribe(listener: (event: { type: string; toolName?: string }) => void): () => void {
+	subscribe(listener: (event: { type: string; toolName?: string; [key: string]: unknown }) => void): () => void {
 		this.listeners.push(listener);
 		return () => {
 			this.listeners = this.listeners.filter((item) => item !== listener);
@@ -103,6 +113,7 @@ class FakeSession implements WorkerSession {
 	}
 
 	getSessionStats() {
+		if (this.silent || this.errorMessage) return { tokens: { input: 0, output: 0, total: 0 }, cost: 0 };
 		return { tokens: { input: 11, output: 22, total: 33 }, cost: 0.001 };
 	}
 }
@@ -137,10 +148,12 @@ function makeManager(
 	hang = false,
 	budgetAllows?: () => boolean,
 	sandbox?: SandboxManager,
+	prepare?: (session: FakeSession) => void,
 ): WorkerManager {
 	const factory: WorkerSessionFactory = async (input) => {
 		const session = new FakeSession(input.id, input.sessionFile);
 		session.hang = hang;
+		prepare?.(session);
 		sessions.push(session);
 		return session;
 	};
@@ -186,6 +199,31 @@ try {
 }
 check("base ref strips remote", baseBranchName("origin/main") === "main");
 check("HEAD base ref is omitted", baseBranchName("HEAD") === undefined);
+
+section("empty runs surface as failures instead of idle");
+{
+	const config = makeConfig(root);
+	const silentSessions: FakeSession[] = [];
+	const silentManager = makeManager(config, silentSessions, false, undefined, undefined, (session) => {
+		session.silent = true;
+	});
+	await silentManager.init();
+	const silent = await silentManager.start({ task: "Do nothing", isolation: "shared", wait: true, waitTimeoutMs: 5_000 });
+	check("silent run is failed", silent.status === "failed", silent.status);
+	check("silent run explains itself", silent.lastError?.includes("no output") === true, silent.lastError);
+	check("silent run keeps no result", silent.lastResult === undefined, silent.lastResult);
+	await silentManager.close();
+
+	const errorSessions: FakeSession[] = [];
+	const errorManager = makeManager(config, errorSessions, false, undefined, undefined, (session) => {
+		session.errorMessage = "provider rejected the request (401 invalid api key)";
+	});
+	await errorManager.init();
+	const errored = await errorManager.start({ task: "Call the model", isolation: "shared", wait: true, waitTimeoutMs: 5_000 });
+	check("provider error is failed", errored.status === "failed", errored.status);
+	check("provider error text is kept", errored.lastError?.includes("401 invalid api key") === true, errored.lastError);
+	await errorManager.close();
+}
 
 section("start, wait, completion event and session reuse");
 {
