@@ -36,18 +36,20 @@
   .dock{position:absolute;left:14px;right:14px;bottom:16px;height:60px;display:flex;align-items:center;gap:4px;padding:0 8px;overflow:hidden;
     background:var(--glass);backdrop-filter:blur(18px) saturate(140%);-webkit-backdrop-filter:blur(18px) saturate(140%);
     border:1px solid var(--line);border-radius:var(--r-lg);box-shadow:var(--shadow)}
-  .icon{width:44px;height:44px;border-radius:var(--r-md);border:0;background:transparent;color:var(--text);
+  .icon{width:40px;height:40px;border-radius:var(--r-md);border:0;background:transparent;color:var(--text);
     display:grid;place-items:center;padding:0;transition:background .18s ease, transform .12s ease}
   .icon:hover{background:rgba(255,255,255,.07)}
   .icon:active{transform:scale(.94)}
   .icon svg{width:22px;height:22px;stroke:currentColor;stroke-width:1.7;fill:none;stroke-linecap:round;stroke-linejoin:round}
-  .status{display:flex;align-items:center;padding:0 6px 0 6px}
+    .site{display:flex;align-items:center;gap:7px;min-width:0;flex:1 1 auto;padding:0 8px 0 6px;color:var(--muted);font-size:12px}
+  .site .host{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+  .site svg{width:15px;height:15px;stroke:var(--muted);stroke-width:1.6;fill:none;flex:0 0 auto}
   .dot{width:7px;height:7px;border-radius:50%;background:var(--warn);box-shadow:0 0 0 3px rgba(240,180,63,.16)}
   .seg{display:flex;margin-left:auto;background:rgba(0,0,0,.32);border:1px solid var(--line);border-radius:var(--r-md);padding:3px;gap:2px}
-  .seg button{border:0;background:transparent;color:var(--muted);height:38px;width:38px;display:grid;place-items:center;border-radius:10px;transition:background .18s ease,color .18s ease}
+  .seg button{border:0;background:transparent;color:var(--muted);height:36px;width:34px;display:grid;place-items:center;border-radius:10px;transition:background .18s ease,color .18s ease}
   .seg button.on{background:var(--glass-2);color:var(--text);box-shadow:0 1px 0 rgba(255,255,255,.06) inset}
   .seg svg{width:20px;height:20px;stroke:currentColor;stroke-width:1.7;fill:none;stroke-linecap:round;stroke-linejoin:round}
-  .done{height:44px;padding:0 14px;white-space:nowrap;border:0;border-radius:var(--r-md);background:var(--accent);color:var(--accent-ink);font-weight:600;font-size:14px;margin-left:6px;transition:filter .18s ease, transform .12s ease}
+  .done{height:42px;padding:0 12px;font-size:13px;white-space:nowrap;border:0;border-radius:var(--r-md);background:var(--accent);color:var(--accent-ink);font-weight:600;font-size:14px;margin-left:6px;transition:filter .18s ease, transform .12s ease}
   .done:active{transform:scale(.97);filter:brightness(.95)}
 
   /* zoom cluster */
@@ -128,9 +130,12 @@
           </div>
         </div>
         <div class="dock">
-          <div class="status" title="агент ждёт"><span class="dot"></span></div>
+          <div class="site" title="агент ждёт">
+            <span class="dot"></span>
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 2.5 15.4 0 18M12 3c-2.5 2.6-2.5 15.4 0 18"/></svg>
+            <span class="host">wildberries.ru</span>
+          </div>
           <button class="icon" data-to="sheet-a" aria-label="Клавиатура"><svg viewBox="0 0 24 24"><rect x="2.5" y="6.5" width="19" height="11" rx="2.5"/><path d="M7 10.5h.01M11 10.5h.01M15 10.5h.01M8 14h8"/></svg></button>
-          <button class="icon" aria-label="Полный экран"><svg viewBox="0 0 24 24"><path d="M9 4H5v4M15 4h4v4M9 20H5v-4M15 20h4v-4"/></svg></button>
           <div class="seg">
             <button class="on" aria-label="Режим телефона"><svg viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/></svg></button>
             <button aria-label="Режим ПК 16:9"><svg viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></button>
@@ -189,9 +194,12 @@
           <button aria-label="Отдалить"><svg viewBox="0 0 24 24"><path d="M5 12h14"/></svg></button>
         </div>
         <div class="dock">
-          <div class="status" title="агент работает"><span class="dot" style="background:var(--ok);box-shadow:0 0 0 3px rgba(67,209,158,.16)"></span></div>
+          <div class="site" title="агент работает">
+            <span class="dot" style="background:var(--ok);box-shadow:0 0 0 3px rgba(67,209,158,.16)"></span>
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.6 2.5 15.4 0 18M12 3c-2.5 2.6-2.5 15.4 0 18"/></svg>
+            <span class="host">ozon.ru</span>
+          </div>
           <button class="icon" aria-label="Клавиатура"><svg viewBox="0 0 24 24"><rect x="2.5" y="6.5" width="19" height="11" rx="2.5"/><path d="M7 10.5h.01M11 10.5h.01M15 10.5h.01M8 14h8"/></svg></button>
-          <button class="icon" aria-label="Полный экран"><svg viewBox="0 0 24 24"><path d="M9 4H5v4M15 4h4v4M9 20H5v-4M15 20h4v-4"/></svg></button>
           <div class="seg">
             <button aria-label="Режим телефона"><svg viewBox="0 0 24 24"><rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/></svg></button>
             <button class="on" aria-label="Режим ПК 16:9"><svg viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="12" rx="2"/><path d="M8 20h8M12 16v4"/></svg></button>
