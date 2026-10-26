@@ -34,6 +34,12 @@ import {
 	TELEGRAM_VOICE_MAX_BYTES,
 	transcribeWithGroq,
 } from "../modules/telegram/voice-transcription.js";
+import {
+	extractPdfText,
+	PDF_TEXT_MAX_BYTES,
+	PdfTextError,
+} from "../modules/telegram/pdf-text.js";
+import { createTelegramTools } from "../modules/telegram/tools.js";
 import type { TelegramUpdate } from "../modules/telegram/types.js";
 
 let failures = 0;
@@ -53,6 +59,55 @@ function section(name: string): void {
 
 function jsonResponse(value: unknown, status = 200): Response {
 	return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
+}
+
+/** Minimal valid PDF with one Helvetica text line per array entry. */
+function buildPdf(pages: string[][]): Buffer {
+	const objects = [
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		`<< /Type /Pages /Kids [${pages.map((_, index) => `${4 + index * 2} 0 R`).join(" ")}] /Count ${pages.length} >>`,
+		"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+	];
+	for (const [index, lines] of pages.entries()) {
+		const content = [
+			"BT",
+			"/F1 12 Tf",
+			"72 720 Td",
+			...lines.map((line, lineIndex) => `${lineIndex === 0 ? "" : "0 -16 Td "}(${line.replace(/[\\()]/g, (char) => `\\${char}`)}) Tj`),
+			"ET",
+		].join("\n");
+		objects.push(
+			`<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ${5 + index * 2} 0 R >>`,
+			`<< /Length ${Buffer.byteLength(content, "latin1")} >>\nstream\n${content}\nendstream`,
+		);
+	}
+
+	const chunks = [Buffer.from("%PDF-1.4\n", "latin1")];
+	const offsets: number[] = [];
+	let offset = chunks[0]!.length;
+	for (const [index, object] of objects.entries()) {
+		offsets.push(offset);
+		const body = Buffer.from(`${index + 1} 0 obj\n${object}\nendobj\n`, "latin1");
+		chunks.push(body);
+		offset += body.length;
+	}
+	const xref = `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n${offsets
+		.map((value) => `${String(value).padStart(10, "0")} 00000 n \n`)
+		.join("")}`;
+	chunks.push(Buffer.from(xref, "latin1"));
+	chunks.push(
+		Buffer.from(`trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${offset}\n%%EOF\n`, "latin1"),
+	);
+	return Buffer.concat(chunks);
+}
+
+async function waitFor(check: () => boolean, timeoutMs = 3000): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (check()) return true;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	return check();
 }
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-modules-test-"));
@@ -564,6 +619,48 @@ section("Groq Whisper transcription client");
 }
 
 // ---------------------------------------------------------------------------
+section("PDF text extraction: local, bounded, fail-safe");
+{
+	const extracted = await extractPdfText(buildPdf([["Hello PDF from Alive", "Second line"]]));
+	check(
+		"PDF text is extracted locally",
+		extracted.text.includes("Hello PDF from Alive") && extracted.text.includes("Second line"),
+		extracted,
+	);
+	check("a normal PDF is one page and not truncated", extracted.pages === 1 && !extracted.truncated, extracted);
+
+	const capped = await extractPdfText(buildPdf([Array.from({ length: 12 }, () => "A".repeat(50))]), { maxChars: 100 });
+	check(
+		"the character cap is respected and marked",
+		capped.truncated && capped.text.length <= 100 && capped.text.includes("[PDF text truncated"),
+		capped,
+	);
+
+	const pageLimited = await extractPdfText(buildPdf([["page one"], ["page two"]]), { maxPages: 1 });
+	check(
+		"the page cap stops after the configured page",
+		pageLimited.pages === 1 && pageLimited.truncated && !pageLimited.text.includes("page two"),
+		pageLimited,
+	);
+
+	let oversized: unknown;
+	try {
+		await extractPdfText(new Uint8Array(PDF_TEXT_MAX_BYTES + 1));
+	} catch (err) {
+		oversized = err;
+	}
+	check("an oversized PDF is rejected before parsing", oversized instanceof PdfTextError && oversized.code === "too_large", oversized);
+
+	let parseFailure: unknown;
+	try {
+		await extractPdfText(Buffer.from("%PDF-1.4\nthis is not a PDF\n%%EOF", "latin1"));
+	} catch (err) {
+		parseFailure = err;
+	}
+	check("unparseable PDF bytes fail safely", parseFailure instanceof PdfTextError && parseFailure.code === "failed", parseFailure);
+}
+
+// ---------------------------------------------------------------------------
 section("telegram module end-to-end against a fake Bot API");
 {
 	const moduleRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-test-"));
@@ -886,6 +983,169 @@ section("telegram module end-to-end against a fake Bot API");
 	await api.sendLongMessage({ chat_id: 42, text: `${"x".repeat(2500)}\n\n${"y".repeat(2500)}` });
 	const callsAfter = calls.filter((call) => call.method === "sendMessage").length;
 	check("sendLongMessage splits and sends every part", callsAfter - callsBefore === 2, callsAfter - callsBefore);
+}
+
+// ---------------------------------------------------------------------------
+section("telegram pdf_text tool: downloaded PDFs, paging and path safety");
+{
+	const moduleRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-pdf-tool-test-"));
+	const workspace = path.join(moduleRoot, "workspace");
+	fs.mkdirSync(workspace, { recursive: true });
+	const history = HistoryStore.open(moduleRoot);
+	const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+	const pdfBytes = buildPdf([
+		[
+			"Quarterly report",
+			"Revenue grew 12 percent",
+			...Array.from({ length: 8 }, (_, index) => `Line ${index + 1}: ${"x".repeat(40)}`),
+		],
+	]);
+
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		const method = url.includes("/file/bot") ? "file" : url.slice(url.lastIndexOf("/") + 1);
+		const params = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+		calls.push({ method, params: { ...params, url } });
+		if (method === "file") return new Response(pdfBytes, { status: 200, headers: { "content-type": "application/pdf" } });
+		if (method === "getFile") {
+			return jsonResponse({
+				ok: true,
+				result: { file_id: "pdf-tool", file_unique_id: "pdf-tool-unique", file_path: "report.pdf", file_size: pdfBytes.length },
+			});
+		}
+		return jsonResponse({ ok: true, result: true });
+	}) as unknown as typeof fetch;
+
+	const api = new TelegramApi({ token: "tok", fetchImpl });
+	const tool = createTelegramTools({
+		api,
+		history,
+		workspaceDir: workspace,
+		defaultParseMode: "",
+		maxMessageChars: 4096,
+		sendText: async () => {
+			throw new Error("pdf_text tests must not send messages");
+		},
+		sendFile: async () => {
+			throw new Error("pdf_text tests must not upload files");
+		},
+		upsertChat: () => undefined,
+		typing: () => undefined,
+		botIdentity: () => ({}),
+		snapshot: () => ({}),
+	}).find((entry) => entry.name === "telegram")!;
+	const run = (params: Record<string, unknown>) =>
+		tool.execute("call", params as never, undefined, undefined, {} as never) as Promise<{
+			content: Array<{ text: string }>;
+			details: Record<string, unknown>;
+		}>;
+
+	const download = await run({ action: "download_file", file_id: "pdf-tool", name: "report.pdf" });
+	const pdfPath = String(download.details.path ?? "");
+	check(
+		"download_file saves the PDF into telegram-files",
+		pdfPath.includes(`${path.sep}telegram-files${path.sep}`) && fs.existsSync(pdfPath),
+		pdfPath,
+	);
+
+	const callsBeforeText = calls.length;
+	const first = await run({ action: "pdf_text", path: pdfPath, limit: 120 });
+	const firstText = first.content[0]!.text;
+	check(
+		"pdf_text returns text from the downloaded PDF",
+		firstText.includes("Quarterly report") && firstText.includes("Revenue grew 12 percent"),
+		firstText,
+	);
+	check(
+		"pdf_text header carries pages, totalChars, offset and nextOffset",
+		/pages=1/.test(firstText) &&
+			/totalChars=\d+/.test(firstText) &&
+			/offset=0/.test(firstText) &&
+			/nextOffset=\d+/.test(firstText),
+		firstText,
+	);
+	check(
+		"pdf_text details expose paging metadata",
+		first.details.pages === 1 &&
+			typeof first.details.totalChars === "number" &&
+			first.details.totalChars > 120 &&
+			first.details.offset === 0 &&
+			typeof first.details.nextOffset === "number",
+		first.details,
+	);
+	check("pdf_text makes no network calls", calls.length === callsBeforeText, calls.slice(callsBeforeText));
+
+	const nextOffset = first.details.nextOffset as number;
+	const second = await run({ action: "pdf_text", path: pdfPath, offset: nextOffset, limit: 120 });
+	const secondText = second.content[0]!.text;
+	check(
+		"offset pages through the PDF without repeating the first slice",
+		second.details.offset === nextOffset && secondText !== firstText && secondText.includes(`offset=${nextOffset}`),
+		secondText,
+	);
+
+	const beyond = await run({ action: "pdf_text", path: pdfPath, offset: 1_000_000 });
+	check(
+		"an offset beyond the extracted text is reported plainly",
+		/beyond the end/.test(beyond.content[0]!.text) && beyond.content[0]!.text.includes("1000000"),
+		beyond.content[0]!.text,
+	);
+
+	const downloadDir = path.join(workspace, "telegram-files");
+	const outsidePdf = path.join(workspace, "outside.pdf");
+	fs.writeFileSync(outsidePdf, pdfBytes);
+	let outsideError: unknown;
+	try {
+		await run({ action: "pdf_text", path: outsidePdf });
+	} catch (err) {
+		outsideError = err;
+	}
+	check(
+		"pdf_text rejects paths outside the download directory",
+		outsideError instanceof Error && /only read files in/.test(outsideError.message),
+		outsideError instanceof Error ? outsideError.message : outsideError,
+	);
+
+	const escapeLink = path.join(downloadDir, "escape.pdf");
+	fs.symlinkSync(outsidePdf, escapeLink);
+	let escapeError: unknown;
+	try {
+		await run({ action: "pdf_text", path: escapeLink });
+	} catch (err) {
+		escapeError = err;
+	}
+	check(
+		"pdf_text resolves symlinks before reading",
+		escapeError instanceof Error && /can only read files inside/.test(escapeError.message),
+		escapeError instanceof Error ? escapeError.message : escapeError,
+	);
+
+	const textPath = path.join(downloadDir, "notes.txt");
+	fs.writeFileSync(textPath, "plain text");
+	let nonPdfError: unknown;
+	try {
+		await run({ action: "pdf_text", path: textPath });
+	} catch (err) {
+		nonPdfError = err;
+	}
+	check(
+		"pdf_text rejects non-PDF files",
+		nonPdfError instanceof Error && /only accepts \.pdf files/.test(nonPdfError.message),
+		nonPdfError instanceof Error ? nonPdfError.message : nonPdfError,
+	);
+
+	let fileIdError: unknown;
+	try {
+		await run({ action: "pdf_text", file_id: "pdf-tool" });
+	} catch (err) {
+		fileIdError = err;
+	}
+	check(
+		"pdf_text never accepts a Telegram file_id",
+		fileIdError instanceof Error && /not accepted by pdf_text/.test(fileIdError.message),
+		fileIdError instanceof Error ? fileIdError.message : fileIdError,
+	);
+	check("rejected pdf_text calls make no network calls", calls.length === callsBeforeText, calls.slice(callsBeforeText));
 }
 
 // ---------------------------------------------------------------------------
