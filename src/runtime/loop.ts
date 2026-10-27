@@ -1,5 +1,6 @@
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { resolveMemoryDatabasePath, type LoadedConfig } from "../config.js";
+import { recordHeartbeat, refreshHeartbeat } from "../heartbeat.js";
 import type { Logger } from "../log.js";
 import { EventStore } from "../store/events.js";
 import { HistoryStore } from "../store/history.js";
@@ -88,6 +89,7 @@ export class AliveRuntime {
 	private initialized = false;
 	private startedAt = Date.now();
 	private lastStateWriteAt = 0;
+	private lastHeartbeatAt = 0;
 	private lastBudgetNotice = "";
 
 	private constructor(options: AliveRuntimeOptions) {
@@ -240,6 +242,9 @@ export class AliveRuntime {
 		// wait both key off it, and it narrows the window where a second instance
 		// could pass assertSingleInstance().
 		this.writeState(true);
+		// Liveness signal for outside watchdogs: written once per process start, never
+		// per run. A failure is logged and ignored — it must not stop the boot.
+		this.writeHeartbeat();
 
 		const crashRange = this.store.recoverAfterCrash();
 		if (crashRange) {
@@ -378,6 +383,7 @@ export class AliveRuntime {
 			this.fireDueReminders();
 			this.runner.checkActiveTimeout();
 			this.writeState();
+			this.keepHeartbeatFresh();
 		} catch (err) {
 			this.log.error("scheduler tick failed", { error: err instanceof Error ? err.message : String(err) });
 		}
@@ -508,6 +514,36 @@ export class AliveRuntime {
 	private sessionModel(): string | undefined {
 		const model = this.runner?.currentSession?.model;
 		return model ? `${model.provider}/${model.id}` : undefined;
+	}
+
+	// ---------------------------------------------------------------------
+	// heartbeat
+	// ---------------------------------------------------------------------
+
+	private writeHeartbeat(): void {
+		const record = recordHeartbeat({
+			stateDir: this.config.paths.stateDir,
+			startedAt: this.startedAt,
+			log: this.log,
+		});
+		if (record) this.lastHeartbeatAt = Date.now();
+	}
+
+	/**
+	 * The record is written once at start; only its mtime moves afterwards, so a
+	 * long-lived process never looks dead to a watchdog while the pid, start time
+	 * and version it reports stay those of the real process start.
+	 */
+	private keepHeartbeatFresh(): void {
+		const intervalMs = Math.max(1_000, Math.floor(this.config.config.updates.heartbeatStaleMs / 3));
+		const now = Date.now();
+		if (now - this.lastHeartbeatAt < intervalMs) return;
+		if (refreshHeartbeat(this.config.paths.stateDir, this.log, now)) {
+			this.lastHeartbeatAt = now;
+			return;
+		}
+		// The file disappeared or cannot be touched: rewrite the full record.
+		this.writeHeartbeat();
 	}
 
 	status(): Record<string, unknown> {

@@ -12,7 +12,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_CONFIG, loadConfig } from "../config.js";
+import { DEFAULT_CONFIG, DEFAULT_UPDATES_CONFIG, isValidUpdatesWindow, loadConfig } from "../config.js";
 import { ModuleHost } from "../events/host.js";
 import { describeModules, loadModules } from "../events/loader.js";
 import type { AliveModule, ModuleContext } from "../events/api.js";
@@ -1543,6 +1543,69 @@ section("modules config and loader");
 	const loaded = await loadModules(config, new Logger({ console: false, level: "error" }));
 	check("telegram and grafana load as built-ins", loaded.modules.map((m) => m.name).sort().join(",") === "grafana,telegram", loaded.modules.map((m) => m.name));
 	check("loading reports no errors", loaded.errors.length === 0, loaded.errors);
+}
+
+// ---------------------------------------------------------------------------
+section("updates config");
+{
+	/** Load a config from a throwaway project root; only `updates` matters here. */
+	const loadUpdates = (config: Record<string, unknown> = {}) => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "alive-updates-config-"));
+		try {
+			fs.writeFileSync(path.join(dir, "alive.config.json"), JSON.stringify(config), "utf8");
+			return loadConfig({ cwd: dir }).config.updates;
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	};
+	/** The validation error message, or "" when the config loads. */
+	const updatesError = (config: Record<string, unknown>): string => {
+		try {
+			loadUpdates(config);
+			return "";
+		} catch (error) {
+			return error instanceof Error ? error.message : String(error);
+		}
+	};
+
+	const defaults = loadUpdates();
+	check(
+		"updates default to everything off",
+		defaults.auto === false &&
+			defaults.window === "" &&
+			defaults.restartCommand === "" &&
+			defaults.heartbeatStaleMs === 300_000,
+		defaults,
+	);
+	check("the shipped default block matches what loads", JSON.stringify(defaults) === JSON.stringify(DEFAULT_UPDATES_CONFIG), DEFAULT_UPDATES_CONFIG);
+	check("an older config without an updates block still gets the defaults", loadUpdates({ name: "Legacy" }).auto === false);
+
+	const configured = loadUpdates({
+		updates: { auto: true, window: " 02:00-05:00 ", heartbeatStaleMs: 120_000, restartCommand: " alive restart " },
+	});
+	check(
+		"updates settings merge field by field",
+		configured.auto === true &&
+			configured.window === "02:00-05:00" &&
+			configured.heartbeatStaleMs === 120_000 &&
+			configured.restartCommand === "alive restart",
+		configured,
+	);
+	check("an overnight window is a valid local-time range", loadUpdates({ updates: { window: "23:30-02:15" } }).window === "23:30-02:15");
+
+	check("the empty window means any time", isValidUpdatesWindow(""));
+	for (const invalid of ["2:00-5:00", "02:00", "02:00-25:00", "02:00-05:60", "02:00-05:00-07:00", "aa:bb-cc:dd", "02:00 - 05:00"]) {
+		check(`window ${JSON.stringify(invalid)} is rejected`, updatesError({ updates: { window: invalid } }) === 'updates.window must be empty (any time) or a local-time "HH:MM-HH:MM" range', updatesError({ updates: { window: invalid } }));
+	}
+	for (const invalid of [0, -1, 1.5, "300000", null]) {
+		check(
+			`heartbeatStaleMs ${JSON.stringify(invalid)} is rejected`,
+			updatesError({ updates: { heartbeatStaleMs: invalid } }) === "updates.heartbeatStaleMs must be a positive integer (milliseconds)",
+			updatesError({ updates: { heartbeatStaleMs: invalid } }),
+		);
+	}
+	check("updates.auto must be boolean", updatesError({ updates: { auto: "yes" } }) === "updates.auto must be boolean", updatesError({ updates: { auto: "yes" } }));
+	check("updates.restartCommand must be a string", updatesError({ updates: { restartCommand: 1 } }) === "updates.restartCommand must be a string", updatesError({ updates: { restartCommand: 1 } }));
 }
 
 process.stdout.write(failures === 0 ? "\nALL MODULE TESTS PASSED\n" : `\n${failures} MODULE TEST(S) FAILED\n`);

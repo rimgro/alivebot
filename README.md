@@ -187,6 +187,7 @@ alive telegram whitelist remove 123456789
 | `alive remind <text> --in 5m \| --at <ISO>` | напоминание агенту |
 | `alive reminders [--all]` | список напоминаний |
 | `alive status [--json]` | состояние рантайма, инбокса, политики, бюджета |
+| `alive heartbeat [--status] [--json]` | живость процесса: pid, `startedAt`, версия, возраст heartbeat; код 0 — свежий, 1 — нет/устарел |
 | `alive runs [-n 10]` | история run'ов (алиас: `wakes`) |
 | `alive policy [list\|add\|remove\|default\|reset]` | показать/править политику уведомлений |
 | `alive modules [--json]` | какие event-модули загружены и включены |
@@ -220,6 +221,42 @@ alive run --once          # один run в терминале, без демо�
 
 Stdout фонового процесса пишется в `.alive/logs/stdout.log`, структурированный лог —
 в `.alive/logs/alive.jsonl`.
+
+### Heartbeat и внешний watchdog
+
+При старте рантайм один раз на процесс (не на каждый run) атомарно пишет
+`.alive/heartbeat.json`: временный файл в том же каталоге, затем `rename`, поэтому
+читатель никогда не увидит половину записи.
+
+```json
+{
+  "pid": 4242,
+  "startedAt": "2026-01-02T03:04:05.000Z",
+  "version": "0.2.0",
+  "tag": "v0.2.0",
+  "ref": "master"
+}
+```
+
+`tag` и `ref` необязательны: это последний успешно применённый тег `alive update` и
+git-ветка (или короткий коммит), с которой запущен харнесс — насколько их можно
+определить на месте. Запись делается один раз при старте; чтобы долгоживущий процесс
+не выглядел мёртвым, рантайм раз в треть `updates.heartbeatStaleMs` обновляет только
+mtime файла — `startedAt`, pid и версия остаются теми же. Ошибка записи логируется на
+уровне warn и никогда не мешает старту.
+
+```bash
+alive heartbeat            # содержимое: pid, start, uptime, version, tag/ref, возраст
+alive heartbeat --status   # одной строкой: fresh | stale | missing, возраст, pid, версия
+alive heartbeat --json     # то же машинно-читаемо: path, state, fresh, ageMs,
+                           # uptimeMs, staleAfterMs, heartbeat
+```
+
+Код возврата: `0` — heartbeat свежий, `1` — файла нет или он старше
+`updates.heartbeatStaleMs` (по умолчанию 300000 мс = 5 минут). Именно по этому сигналу
+внешний watchdog (systemd timer, cron, мониторинг) понимает, что харнесс жив; автообновление
+по этому сигналу появится отдельной задачей. После штатной остановки файл остаётся, поэтому
+«свежий» значит «процесс писал heartbeat недавно», а не «прямо сейчас работает».
 
 ### Релизы и теги
 
@@ -411,6 +448,8 @@ history/threads.json    каталог тредов (заголовки, уча�
 modules/<name>/         приватное durable-состояние модуля (offset Telegram и т.п.)
 outbox/messages.jsonl   всё, что агент реально отправил, + результат доставки
 runs/runs.jsonl         запись каждого run: события, idle-время, токены, стоимость
+heartbeat.json          признак жизни процесса: pid, startedAt, version, tag/ref
+                        (его читает `alive heartbeat` и внешний watchdog)
 logs/alive.jsonl        структурный лог рантайма
 logs/thoughts.jsonl     приватный монолог (текст и thinking)
 sessions/               jsonl-сессии pi (контекст живёт здесь, пока агент не уснул)
@@ -441,6 +480,23 @@ workers/usage.jsonl     расход worker-run'ов (учитывается в 
 Старые ключи (`heartbeatMs`, `wakeTimeoutMs`, `maxTurnsPerWake`, `maxEventsPerWake`)
 мигрируют на новые при загрузке. Лимит на число шагов (`maxTurnsPerRun`) убран
 совсем: run длится столько, сколько нужно агенту.
+
+## Конфиг обновлений
+
+```json
+"updates": {
+  "auto": false,               // автообновление выключено по умолчанию
+  "window": "",                // локальное окно "HH:MM-HH:MM"; пусто = любое время
+  "heartbeatStaleMs": 300000,  // heartbeat старше — процесс считается мёртвым
+  "restartCommand": ""         // чем перезапускать после обновления; пусто = вручную
+}
+```
+
+Всё выключено по умолчанию: агент не обновляет и не перезапускает себя без явного
+разрешения оператора. `window` проверяется на формат `HH:MM-HH:MM` (24-часовое
+локальное время, переход через полночь разрешён), `heartbeatStaleMs` должен быть
+положительным целым. `alive heartbeat` использует `updates.heartbeatStaleMs` как порог
+устаревания. Автообновление и рестарт по heartbeat появятся отдельной задачей.
 
 ## Несколько изолированных агентов
 

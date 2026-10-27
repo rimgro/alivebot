@@ -46,6 +46,53 @@ export interface BudgetConfig {
 	maxWakesPerHour: number;
 }
 
+/**
+ * Harness updates. Everything is off by default: an unattended agent never
+ * updates or restarts itself unless the operator opts in explicitly.
+ */
+export interface UpdatesConfig {
+	/** Apply updates automatically. */
+	auto: boolean;
+	/** Local-time `HH:MM-HH:MM` window updates may start in. Empty = any time. */
+	window: string;
+	/** A heartbeat older than this means the runtime is gone; `alive heartbeat` fails on it. */
+	heartbeatStaleMs: number;
+	/** Command used to restart the harness after an update. Empty = the operator restarts it. */
+	restartCommand: string;
+}
+
+export const DEFAULT_UPDATES_CONFIG: UpdatesConfig = {
+	auto: false,
+	window: "",
+	heartbeatStaleMs: 5 * 60_000,
+	restartCommand: "",
+};
+
+/** `HH:MM-HH:MM` in local time, 24-hour clock. */
+const UPDATES_WINDOW_RE = /^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$/;
+
+export function isValidUpdatesWindow(window: string): boolean {
+	return window === "" || UPDATES_WINDOW_RE.test(window);
+}
+
+export function validateUpdatesConfig(value: UpdatesConfig): UpdatesConfig {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("updates must be an object");
+	if (typeof value.auto !== "boolean") throw new Error("updates.auto must be boolean");
+	if (typeof value.window !== "string" || !isValidUpdatesWindow(value.window.trim())) {
+		throw new Error('updates.window must be empty (any time) or a local-time "HH:MM-HH:MM" range');
+	}
+	if (!Number.isSafeInteger(value.heartbeatStaleMs) || value.heartbeatStaleMs <= 0) {
+		throw new Error("updates.heartbeatStaleMs must be a positive integer (milliseconds)");
+	}
+	if (typeof value.restartCommand !== "string") throw new Error("updates.restartCommand must be a string");
+	return {
+		auto: value.auto,
+		window: value.window.trim(),
+		heartbeatStaleMs: value.heartbeatStaleMs,
+		restartCommand: value.restartCommand.trim(),
+	};
+}
+
 export interface HttpConfig {
 	enabled: boolean;
 	host: string;
@@ -218,6 +265,8 @@ export interface AliveConfig {
 	memory: MemoryConfig;
 	loop: LoopConfig;
 	budget: BudgetConfig;
+	/** Harness updates: off by default, including the restart watchdog. */
+	updates: UpdatesConfig;
 	chat: ChatConfig;
 	/** Event modules: inbound events, outbound delivery, extra agent tools. */
 	modules: ModulesConfig;
@@ -314,6 +363,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		maxDailyCostUsd: 0,
 		maxWakesPerHour: 0,
 	},
+	updates: DEFAULT_UPDATES_CONFIG,
 	chat: {
 		console: true,
 		http: {
@@ -437,6 +487,7 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	migrateLoopConfig(merged.loop as unknown as Record<string, unknown>);
 	merged.sandbox = validateSandboxConfig(merged.sandbox);
 	merged.workers = validateWorkersConfig(merged.workers);
+	merged.updates = validateUpdatesConfig(merged.updates);
 	merged.piAgentDir = expandHome(merged.piAgentDir);
 	const paths = resolvePaths(path.dirname(configPath), merged);
 	return { config: merged, paths };
