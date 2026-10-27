@@ -1,5 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 import type { Page, Request } from "playwright";
+import { withDeadline } from "./extract.js";
 
 interface Failure { origin: string; type: string; status?: number; code?: string }
 interface Observation { pending: Set<Request>; failures: Failure[]; scriptErrors: number }
@@ -41,11 +42,22 @@ export class BrowserObservation {
 
 export interface CatalogContent { state: "ready" | "empty" | "unconfirmed"; productLinks: number; waitedMs: number; expectation: string }
 
+/** Matched inside the renderer; only the boolean result crosses CDP. */
+const EMPTY_STATE_PATTERN = "ничего не (нашлось|найдено)|по вашему запросу[^\\n]{0,100}(нет|не найден)|товары не найдены";
+/** Runs in the page so an empty-state check never transfers the whole catalog text. */
+export function catalogEmptyStateExtractor(element: { innerText?: string | null; textContent?: string | null }, pattern: string): boolean {
+	const value = typeof element.innerText === "string" ? element.innerText : element.textContent ?? "";
+	return new RegExp(pattern, "i").test(value);
+}
+
 /** Wait for the reported public catalog's actual cards or explicit empty state, not networkidle. */
 export async function waitCatalogContent(page: Page, timeoutMs: number, signal: AbortSignal, guard: () => Promise<void>): Promise<CatalogContent | undefined> {
 	const url = new URL(page.url());
 	if (url.hostname !== "www.wildberries.ru" || url.pathname !== "/catalog/0/search.aspx") return undefined;
 	const started = Date.now();
+	// At most one empty-state probe is in flight: a probe abandoned at its
+	// deadline settles on its own instead of piling up on a heavy renderer.
+	let probe: Promise<boolean> | undefined;
 	while (true) {
 		signal.throwIfAborted(); await guard(); signal.throwIfAborted();
 		const current = new URL(page.url());
@@ -54,8 +66,19 @@ export async function waitCatalogContent(page: Page, timeoutMs: number, signal: 
 		const elapsed = Date.now() - started;
 		if (links) return { state: "ready", productLinks: links, waitedMs: elapsed, expectation: "Rendered catalog product links; verify each item's details and price separately." };
 		const main = page.locator("main, [role=main]").first();
-		const text = await main.count() ? await main.innerText({ timeout: 1000 }) : "";
-		if (/ничего не (нашлось|найдено)|по вашему запросу[^\n]{0,100}(нет|не найден)|товары не найдены/i.test(text)) return { state: "empty", productLinks: 0, waitedMs: elapsed, expectation: "The rendered page explicitly reports no search results." };
+		// The check runs in the renderer and is deadline-bounded; a slow heavy page
+		// is treated as "not empty yet" instead of stalling the read.
+		let empty = false;
+		if (await main.count()) {
+			probe ??= (async () => {
+				try { return await main.evaluate(catalogEmptyStateExtractor, EMPTY_STATE_PATTERN); }
+				catch { return false; }
+				finally { probe = undefined; }
+			})();
+			try { empty = await withDeadline(() => probe!, 2_000, signal); }
+			catch (error) { if (signal.aborted) throw error; }
+		}
+		if (empty) return { state: "empty", productLinks: 0, waitedMs: elapsed, expectation: "The rendered page explicitly reports no search results." };
 		if (elapsed >= timeoutMs) return { state: "unconfirmed", productLinks: 0, waitedMs: elapsed, expectation: "No product links or explicit empty state observed. Inspect snapshot, screenshot and network diagnostics; do not infer a block. Keep the page for operator assistance if needed." };
 		await delay(Math.min(200, timeoutMs - elapsed), undefined, { signal });
 	}
