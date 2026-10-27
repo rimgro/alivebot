@@ -24,6 +24,8 @@ export class BrowserLive {
 	private endCapture?: () => void;
 	private counters = { captured: 0, sent: 0, acknowledged: 0, bytesSent: 0, duplicates: 0 };
 	private profile = "balanced";
+	private retargetRequested = false;
+	private retargetRevision = 0;
 	private readonly snapshots = new Set<Promise<void>>();
 
 	constructor(server: Server, private readonly deps: LiveDependencies) {
@@ -32,6 +34,8 @@ export class BrowserLive {
 
 	get busy(): boolean { return !!this.active; }
 	status(): Record<string, unknown> { return { connected: this.busy, ...this.counters, profile: this.profile }; }
+	/** Force the capture loop to stop the current screencast and attach to the active page. */
+	retarget(): void { this.retargetRequested = true; this.retargetRevision++; }
 	/** Terminal viewport restoration must follow any temporary metrics used by an in-flight screenshot. */
 	async settleCapture(): Promise<void> {
 		let timer: NodeJS.Timeout | undefined;
@@ -137,16 +141,18 @@ export class BrowserLive {
 		};
 		const capture = async (page: Page) => {
 			capturing = true; sourcePage = page;
-			const pending = detach(), current = generation;
-			captureKey = desiredKey(); nativeFingerprint = ""; detailedRevision = -1;
+			const pending = detach(), current = generation, retarget = this.retargetRevision;
+			// A new page must emit its own first frame even when it happens to
+			// byte-match the previous tab's last frame.
+			captureKey = desiredKey(); nativeFingerprint = ""; sentFingerprint = ""; detailedRevision = -1;
 			forcedSnapshots = !!this.deps.snapshotMode?.();
 			try {
-				await pending; if (stopped || current !== generation) return;
+				await pending; if (stopped || current !== generation || retarget !== this.retargetRevision) return;
 				if (forcedSnapshots || geometrySnapshots) throw new Error("Viewport requires logical snapshots");
 				await page.bringToFront();
 				const captureViewport = page.viewportSize() ?? await page.evaluate(() => ({ width: (globalThis as unknown as { innerWidth: number }).innerWidth, height: (globalThis as unknown as { innerHeight: number }).innerHeight }));
 				const session = await page.context().newCDPSession(page);
-				if (stopped || current !== generation) { await session.detach(); return; }
+				if (stopped || current !== generation || retarget !== this.retargetRevision) { await session.detach(); return; }
 				cdp = session;
 				session.on("Page.screencastFrame", (event: { data: string; sessionId: number; metadata: { deviceWidth: number; deviceHeight: number } }) => {
 					void session.send("Page.screencastFrameAck", { sessionId: event.sessionId }).catch(() => {});
@@ -162,6 +168,7 @@ export class BrowserLive {
 					const data = Buffer.from(event.data, "base64");
 					offer(data, viewport);
 				});
+				if (retarget !== this.retargetRevision) { await session.detach().catch(() => {}); return; }
 				const profile = policy.profile;
 				await session.send("Page.startScreencast", { format: "jpeg", quality: profile.quality, maxWidth: profile.maxWidth, maxHeight: profile.maxHeight, everyNthFrame: 1 });
 				mode = "screencast";
@@ -195,7 +202,10 @@ export class BrowserLive {
 				if (oldest !== undefined && Date.now() - oldest > 10_000) throw { status: 503, message: "Stream receiver is too slow" };
 				policy.observe(oldest === undefined ? 0 : Date.now() - oldest, socket.bufferedAmount);
 				this.profile = policy.profile.name;
-				if ((page !== sourcePage || captureKey !== desiredKey()) && !capturing) void capture(page);
+				if ((this.retargetRequested || page !== sourcePage || captureKey !== desiredKey()) && !capturing) {
+					this.retargetRequested = false;
+					void capture(page);
+				}
 				// Refine once after motion stops; a later native update invalidates an in-flight still.
 				if (!capturing && !latest && !snapshotInFlight && revision > 0 && detailedRevision !== revision && outstanding.size === 0 && performance.now() - changedAt >= 650) {
 					detailedRevision = revision; void screenshot(page, 70, generation, true);

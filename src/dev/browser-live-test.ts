@@ -7,6 +7,13 @@ import { BrowserLive } from "../modules/browser/live.js";
 import { StreamPolicy } from "../modules/browser/stream-policy.js";
 import { sleep } from "../util.js";
 
+class RetargetCDP extends EventEmitter {
+	commands: string[] = [];
+	async send(command: string) { this.commands.push(command); }
+	async detach() { this.commands.push("detach"); this.removeAllListeners("Page.screencastFrame"); }
+	frame(value: number) { this.emit("Page.screencastFrame", { data: Buffer.from([0xff, 0xd8, value, 0xff, 0xd9]).toString("base64"), sessionId: value, metadata: { deviceWidth: 1760, deviceHeight: 1120 } }); }
+}
+
 class FakeCDP extends EventEmitter {
 	commands: string[] = [];
 	calls: Array<{ command: string; params?: Record<string, unknown> }> = [];
@@ -53,10 +60,11 @@ const page = {
 	context: () => ({ newCDPSession: async () => { if (fallback) throw Error("Unsupported screencast"); return cdp; } }),
 	screenshot: (options: { quality: number }) => new Promise<Buffer>(resolve => { snapshotQualities.push(options.quality); finishSnapshot = resolve; }),
 } as unknown as Page;
+let activePage: Page = page;
 const server = http.createServer((_req, res) => { res.writeHead(404); res.end(); });
 let origin = "";
 const live = new BrowserLive(server, {
-	origin: () => origin, page: () => page, busy: () => false,
+	origin: () => origin, page: () => activePage, busy: () => false,
 	authorize: value => { if (value !== credential) throw { status: 401, message: "Invalid access key" }; if (Date.now() >= expiresAt) throw { status: 410, message: "Link expired. Request a new handoff." }; return { expiresAt }; },
 	input: async body => { inputs.push(body); }, release: async () => { releaseCount++; }, resume: async () => { credential = "returned"; },
 });
@@ -187,7 +195,28 @@ try {
 	assert.ok(returned.messages.some(m => !m.binary && JSON.parse(m.data.toString()).id === 4 && JSON.parse(m.data.toString()).ok === true), "Return must be acknowledged before closing");
 	assert.equal(has(returned.messages, "error"), false, "Successful return must not look like lost authorization");
 	assert.equal(credential, "returned");
-	console.log("browser-live: adaptive byte budget, duplicate suppression, bounded frame pipeline, cumulative ACKs, independent input, origin/auth/revocation and slow-capture fallback passed");
+
+	// Switching the active tab must stop the old screencast/listener and start a
+	// new one for the new page, without delivering stale frames.
+	const firstCdp = new RetargetCDP(), secondCdp = new RetargetCDP();
+	const tabPage = (session: RetargetCDP) => ({
+		bringToFront: async () => {}, isClosed: () => false, viewportSize: () => ({ width: 1760, height: 1120 }),
+		context: () => ({ newCDPSession: async () => session }), screenshot: async () => Buffer.from([0xff, 0xd8, 0xff, 0xd9]),
+	}) as unknown as Page;
+	const firstPage = tabPage(firstCdp), secondPage = tabPage(secondCdp);
+	activePage = firstPage;
+	const retargeted = open(); await until(() => retargeted.socket.readyState === WebSocket.OPEN, "Retarget socket opened");
+	packet(retargeted.socket, { type: "auth", credential });
+	await until(() => firstCdp.commands.includes("Page.startScreencast"), "First tab screencast started");
+	activePage = secondPage; live.retarget();
+	await until(() => secondCdp.commands.includes("Page.startScreencast"), "Retarget starts screencast on the new page");
+	assert.ok(firstCdp.commands.includes("Page.stopScreencast") && firstCdp.commands.includes("detach"), "The previous tab capture is stopped and detached");
+	firstCdp.frame(90); secondCdp.frame(91);
+	await until(() => retargeted.messages.some(m => m.binary && m.data[18] === 91), "New page frame delivered");
+	await sleep(150);
+	assert.equal(retargeted.messages.some(m => m.binary && m.data[18] === 90), false, "A detached page must not leak frames");
+	retargeted.socket.close(); await until(() => retargeted.socket.readyState === WebSocket.CLOSED, "Retarget viewer closed");
+	console.log("browser-live: adaptive byte budget, duplicate suppression, bounded frame pipeline, cumulative ACKs, independent input, origin/auth/revocation, slow-capture fallback and tab retargeting passed");
 } finally {
 	live.close(); for (const socket of sockets) socket.terminate();
 	finishSnapshot?.(Buffer.from([0xff, 0xd8, 0xff, 0xd9]));

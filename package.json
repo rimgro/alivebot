@@ -48,6 +48,7 @@
 		"test:browser:shared:e2e": "tsx src/dev/browser-shared-e2e-test.ts",
 		"test:browser:shared:cli": "tsx src/dev/browser-shared-cli-test.ts",
 		"test:browser:e2e": "tsx src/dev/browser-e2e-test.ts",
+		"test:browser:tabs:e2e": "tsx src/dev/browser-tabs-e2e-test.ts",
 		"test:browser:cdp": "tsx src/dev/browser-cdp-e2e-test.ts",
 		"test:browser:operator": "tsx src/dev/browser-operator-test.ts",
 		"test:browser:signing": "tsx src/dev/browser-signing-e2e-test.ts",
