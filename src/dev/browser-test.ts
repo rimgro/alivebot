@@ -30,14 +30,21 @@ class FakePage extends EventEmitter {
 	inputs: unknown[] = [];
 	gotos = 0;
 	captures = 0;
+	closed = false;
 	textFocused = true;
+	titleText = "Test page";
+	screenshotBytes = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+	popupUrl?: string;
+	openPopup?: (url: string) => FakePage;
 	url() { return this.address; }
-	isClosed() { return false; }
+	isClosed() { return this.closed; }
+	async close() { if (!this.closed) { this.closed = true; this.emit("close"); } }
+	async bringToFront() {}
 	mainFrame() { return this; }
 	frames() { return [this]; }
 	parentFrame() { return null; }
 	viewportSize() { return { width: 900, height: 720 }; }
-	async title() { return "Test page"; }
+	async title() { return this.titleText; }
 	async goto(url: string) {
 		this.address = url;
 		this.gotos++;
@@ -51,10 +58,15 @@ class FakePage extends EventEmitter {
 			ariaSnapshot: async () => '- text: "Test page text"',
 			count: async () => selector === "body" ? 1 : selector.includes("input:focus") ? Number(this.textFocused) : selector.includes("#challenge-form") ? Number(this.challenge) : 0,
 			nth: () => ({ isVisible: async () => this.challenge }),
-			first: () => ({ innerText: async () => text(), evaluate: async (fn: (element: unknown, arg: unknown) => unknown, arg: unknown) => fn({ innerText: text(), textContent: text() }, arg), ariaSnapshot: async () => '- text: "Test page text"', isEditable: async () => this.textFocused, click: async () => { this.inputs.push("agent-click"); }, fill: async (value: string) => { this.inputs.push(value); } }),
+			first: () => ({ innerText: async () => text(), evaluate: async (fn: (element: unknown, arg: unknown) => unknown, arg: unknown) => fn({ innerText: text(), textContent: text() }, arg), ariaSnapshot: async () => '- text: "Test page text"', isEditable: async () => this.textFocused, click: async () => {
+				this.inputs.push("agent-click");
+				// Models a real window.open/target=_blank click: the context creates a
+				// popup page and Playwright emits its "page" event.
+				if (this.popupUrl) { const url = this.popupUrl; this.popupUrl = undefined; this.openPopup?.(url); }
+			}, fill: async (value: string) => { this.inputs.push(value); } }),
 		};
 	}
-	async screenshot() { this.captures++; return Buffer.from([0xff, 0xd8, 0xff, 0xd9]); }
+	async screenshot() { this.captures++; return this.screenshotBytes; }
 	mouse = {
 		move: async (x: number, y: number) => { this.inputs.push({ x, y }); },
 		down: async () => { this.inputs.push("down"); }, up: async () => { this.inputs.push("up"); },
@@ -66,10 +78,24 @@ class FakePage extends EventEmitter {
 async function fixture(options: { notify?: (url: string, reason: string) => Promise<void>; ttl?: number } = {}) {
 	const page = new FakePage();
 	page.address = "https://fixture.test/";
+	const pages = [page];
 	const requested: Array<{ url: string; options: unknown }> = [];
 	const context = new EventEmitter() as EventEmitter & Record<string, unknown>;
+	const openPopup = (url: string): FakePage => {
+		const popup = new FakePage();
+		popup.address = url;
+		popup.titleText = `Popup ${pages.length}`;
+		popup.screenshotBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe0, pages.length]);
+		popup.openPopup = openPopup;
+		pages.push(popup);
+		context.emit("page", popup);
+		return popup;
+	};
+	page.openPopup = openPopup;
 	Object.assign(context, {
-		pages: () => [page], newPage: async () => page, setDefaultTimeout: () => {}, close: async () => { context.emit("close"); },
+		pages: () => pages,
+		newPage: async () => { const created = new FakePage(); created.openPopup = openPopup; pages.push(created); context.emit("page", created); return created; },
+		setDefaultTimeout: () => {}, close: async () => { context.emit("close"); },
 		request: { get: async (url: string, opts: unknown) => {
 			requested.push({ url, options: opts });
 			return { status: () => 302, headers: () => ({ location: "https://other.test/" }), text: async () => "Redirect", dispose: async () => {} };
@@ -86,11 +112,36 @@ async function fixture(options: { notify?: (url: string, reason: string) => Prom
 	await host.init();
 	assert.equal(host.contributedTools().filter((tool) => tool.name === "browser").length, 1);
 	assert.equal(host.contributedTools().filter((tool) => tool.name === "browser_share").length, 1);
-	return { module, page, requested, store };
+	return { module, page, pages, openPopup, requested, store };
 }
 
 function post(base: string, endpoint: string, credential: string, body: unknown = {}, origin?: string) {
 	return fetch(`${base}/browser/${endpoint}`, { method: "POST", headers: { Authorization: `Bearer ${credential}`, "content-type": "application/json", ...(origin ? { origin } : {}) }, body: JSON.stringify(body) });
+}
+
+async function* packets(body: ReadableStream<Uint8Array>): AsyncGenerator<Record<string, unknown>> {
+	const reader = body.getReader(); const decoder = new TextDecoder(); let pending = "";
+	try {
+		while (true) {
+			const chunk = await reader.read();
+			if (chunk.done) return;
+			pending += decoder.decode(chunk.value, { stream: true });
+			for (let newline = pending.indexOf("\n"); newline >= 0; newline = pending.indexOf("\n")) {
+				const line = pending.slice(0, newline); pending = pending.slice(newline + 1);
+				if (line) yield JSON.parse(line) as Record<string, unknown>;
+			}
+		}
+	} finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+}
+
+async function until(reader: AsyncGenerator<Record<string, unknown>>, predicate: (packet: Record<string, unknown>) => boolean, label: string): Promise<Record<string, unknown>> {
+	const deadline = Date.now() + 5000;
+	while (Date.now() < deadline) {
+		const next = await reader.next();
+		if (next.done) break;
+		if (predicate(next.value)) return next.value;
+	}
+	throw new Error(`Timed out waiting for ${label}`);
 }
 
 try {
@@ -297,6 +348,69 @@ try {
 	await new Promise(resolve => setTimeout(resolve, 300));
 	assert.equal(cancel.page.captures, capturesAfterCancel, "Disconnect must stop browser capture");
 	assert.equal(cancel.module.status().paused, true, "Closing the stream must not resume the agent");
+
+	// Popup/new-tab handoff: the fixture click models window.open/target=_blank by
+	// creating a page and emitting the same context "page" event Playwright does.
+	const tabbed = await fixture();
+	tabbed.page.screenshotBytes = Buffer.from([0xff, 0xd8, 0xff, 0xe1, 0x01]);
+	tabbed.page.titleText = "Main fixture";
+	tabbed.page.popupUrl = "https://popup.test/oauth";
+	await tabbed.module.command({ action: "navigate", url: "https://fixture.test/" });
+	const oneTab = (await tabbed.module.command({ action: "tabs" })).details.tabs as Array<{ id: string; url: string; title: string; active: boolean }>;
+	assert.equal(oneTab.length, 1, "A single-page session exposes exactly one tab");
+	assert.deepEqual({ url: oneTab[0].url, title: oneTab[0].title, active: oneTab[0].active }, { url: "https://fixture.test/", title: "Main fixture", active: true });
+	const mainId = oneTab[0].id;
+	const tabHandoff = await tabbed.module.command({ action: "handoff", reason: "Popup visibility" });
+	const tabLink = new URL(tabHandoff.details.operatorUrl as string);
+	const tabCredential = (await (await post(tabLink.origin, "claim", tabLink.hash.slice(1))).json() as { credential: string }).credential;
+	const tabStream = await fetch(`${tabLink.origin}/browser/stream`, { headers: { Authorization: `Bearer ${tabCredential}` } });
+	const tabReader = packets(tabStream.body!);
+	const initialFrame = await until(tabReader, packet => typeof packet.frame === "string", "initial single-page frame");
+	assert.deepEqual(Buffer.from(initialFrame.frame as string, "base64"), tabbed.page.screenshotBytes);
+
+	await tabbed.module.command({ action: "click", selector: "#open-popup" });
+	const popup = tabbed.pages[1];
+	assert.ok(popup, "The fixture must create a popup page");
+	assert.equal(tabbed.module.status().url, "https://popup.test/oauth", "A popup becomes the active page automatically");
+	const twoTabs = (await tabbed.module.command({ action: "tabs" })).details.tabs as Array<{ id: string; url: string; title: string; active: boolean }>;
+	assert.deepEqual(twoTabs.map(tab => ({ url: tab.url, active: tab.active })), [
+		{ url: "https://fixture.test/", active: false },
+		{ url: "https://popup.test/oauth", active: true },
+	], "tabs lists both pages and marks only the popup active");
+	const popupId = twoTabs[1].id;
+	assert.notEqual(popupId, mainId);
+	const popupFrame = await until(tabReader, packet => typeof packet.frame === "string" && Buffer.from(packet.frame as string, "base64").equals(popup.screenshotBytes), "popup frame");
+	assert.ok(popupFrame);
+	assert.equal((await until(tabReader, packet => packet.type === "state" && packet.url === "https://popup.test/oauth", "popup state URL")).url, "https://popup.test/oauth");
+	const control = await (await fetch(`${tabLink.origin}/browser`)).text();
+	assert.ok(control.includes(JSON.stringify("https://popup.test/oauth")), "The control page renders the active popup URL");
+	assert.ok(!control.includes(JSON.stringify("https://fixture.test/")), "A switched control page must not keep the previous host");
+
+	const switched = await tabbed.module.command({ action: "switch_tab", tab: mainId });
+	assert.equal(switched.details.url, "https://fixture.test/", "switch_tab moves the active page");
+	await until(tabReader, packet => typeof packet.frame === "string" && Buffer.from(packet.frame as string, "base64").equals(tabbed.page.screenshotBytes), "main frame after switch");
+	assert.equal((await until(tabReader, packet => packet.type === "state" && packet.url === "https://fixture.test/", "main state URL after switch")).url, "https://fixture.test/");
+	const switchedTabs = (await tabbed.module.command({ action: "tabs" })).details.tabs as Array<{ url: string; active: boolean }>;
+	assert.deepEqual(switchedTabs.map(tab => ({ url: tab.url, active: tab.active })), [
+		{ url: "https://fixture.test/", active: true },
+		{ url: "https://popup.test/oauth", active: false },
+	], "switch_tab updates the active flag");
+	await tabbed.module.command({ action: "switch_tab", tab: popupId });
+	await until(tabReader, packet => typeof packet.frame === "string" && Buffer.from(packet.frame as string, "base64").equals(popup.screenshotBytes), "popup frame after switching back");
+
+	await popup.close();
+	assert.equal(tabbed.module.status().url, "https://fixture.test/", "Closing the active tab falls back to the previous live tab");
+	await until(tabReader, packet => typeof packet.frame === "string" && Buffer.from(packet.frame as string, "base64").equals(tabbed.page.screenshotBytes), "fallback frame");
+	assert.equal((await until(tabReader, packet => packet.type === "state" && packet.url === "https://fixture.test/", "fallback state URL")).url, "https://fixture.test/");
+	const afterClose = (await tabbed.module.command({ action: "tabs" })).details.tabs as Array<{ url: string; active: boolean }>;
+	assert.deepEqual(afterClose.map(tab => ({ url: tab.url, active: tab.active })), [{ url: "https://fixture.test/", active: true }], "A closed tab is removed from the list");
+
+	await tabReader.return({});
+	await tabbed.page.close();
+	assert.equal(tabbed.module.status().url, undefined, "A session with no pages reports no active URL");
+	assert.deepEqual((await tabbed.module.command({ action: "tabs" })).details.tabs, [], "No closed pages remain in the tab list");
+	const recreated = await tabbed.module.command({ action: "navigate", url: "https://fixture.test/again" });
+	assert.equal(recreated.details.url, "https://fixture.test/again", "With every page closed the next action opens a new page");
 
 	const defaults = loadConfig({ cwd: root });
 	assert.equal(defaults.config.modules.browser?.enabled, false);
