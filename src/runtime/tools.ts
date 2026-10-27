@@ -31,6 +31,7 @@ import type { ThreadStore } from "../store/threads.js";
 import type { Logger } from "../log.js";
 import { canReadMemoryFact, retainedMemoryScopes, searchableMemoryScopes } from "./memory-access.js";
 import { recordOperatorAgentReply, sendLocalAgentMessage } from "./agent-messaging.js";
+import { resolveOutgoingAttachment, toOutgoingAttachment } from "./attachments.js";
 import { snapshotRuntime } from "./daemon.js";
 import { requestAgentTelegram } from "../modules/telegram/managed-request.js";
 import { renderWorkerList, renderWorkerRecord, type WorkerManager } from "../workers/manager.js";
@@ -476,20 +477,45 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		label: "Send message",
 		description:
 			"Send a message to a human. This is the ONLY way your words reach anyone: your plain assistant text is private thought. " +
-			"Use the thread id from the incoming event. Returns a message id when delivered.",
+			"Use the thread id from the incoming event. Returns a message id when delivered. " +
+			"Set attachment to a workspace-relative file to deliver it with the text (Telegram sends images as photos, other files as documents).",
 		parameters: Type.Object({
 			text: Type.String({ description: "Message body. Write like a person: short, concrete, no process narration." }),
 			thread: Type.Optional(
 				Type.String({ description: "Conversation / person to send to. Defaults to the thread of the newest event." }),
 			),
 			reply_to: Type.Optional(Type.String({ description: "Event id or message id this replies to, if any." })),
+			attachment: Type.Optional(
+				Type.String({
+					description:
+						"Workspace-relative path of a file to deliver with the message, e.g. 'telegram-files/42-photo.jpg'. " +
+						"Images up to 10 MiB go out as photos; other files as documents up to 50 MiB. " +
+						"An image over 10 MiB needs attachment_kind='document'. " +
+						"The text becomes the caption (first 1024 characters; the rest follows as a normal message).",
+				}),
+			),
+			attachment_kind: Type.Optional(
+				Type.Union([Type.Literal("photo"), Type.Literal("document")], {
+					description: "Force the delivery kind. Defaults to the mime type: images are photos, other files are documents.",
+				}),
+			),
 		}),
 		execute: async (_toolCallId, params): Promise<ToolResult> => {
 			const run = requireRun(deps, "send_message");
 			if (!params.text.trim()) throw new Error("send_message requires non-empty text");
 			const thread = params.thread ?? defaultThread(run) ?? "console";
+			// Validate before the outbox record and before any delivery attempt: an
+			// escaping or oversize file must fail as a tool error, not a half-sent message.
+			const attachment =
+				params.attachment?.trim()
+					? toOutgoingAttachment(
+							resolveOutgoingAttachment(deps.config.paths.workspaceDir, params.attachment, params.attachment_kind, {
+								deferHostChecks: deps.config.config.sandbox.enabled,
+							}),
+						)
+					: undefined;
 			const message = await deps.outbox.send(
-				{ runId: run.id, thread, text: params.text, replyTo: params.reply_to },
+				{ runId: run.id, thread, text: params.text, replyTo: params.reply_to, attachments: attachment ? [attachment] : undefined },
 				deps.deliver,
 			);
 			recordOperatorAgentReply(deps.history, deps.config, thread, {
@@ -500,11 +526,13 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 			});
 			run.outbound.push({ thread, text: params.text, delivered: message.delivered ?? false });
 			deps.threads.recordOutbound(thread, message.ts);
-			log.info("outbound message", { thread, chars: params.text.length, messageId: message.id });
-			return ok(`Delivered to ${thread} (message ${message.id}).`, {
+			log.info("outbound message", { thread, chars: params.text.length, messageId: message.id, attachment: attachment?.path });
+			const attached = attachment ? ` with ${attachment.kind ?? "file"} ${attachment.name ?? attachment.path}` : "";
+			return ok(`Delivered to ${thread}${attached} (message ${message.id}).`, {
 				messageId: message.id,
 				thread,
 				delivered: message.delivered ?? false,
+				...(attachment ? { attachment: { path: attachment.path, kind: attachment.kind } } : {}),
 			});
 		},
 	});
