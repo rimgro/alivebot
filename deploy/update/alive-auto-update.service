@@ -1,0 +1,36 @@
+[Unit]
+Description=Alive harness auto-update (unattended, external watchdog)
+Documentation=file:///opt/alive/deploy/update/README.md
+# The update needs the network (git fetch + npm ci); the restart needs whatever
+# supervises the harness.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Run as the same user that owns the checkout and the state directory.
+User=alive
+Group=alive
+WorkingDirectory=/opt/alive
+
+# Arguments: <repo-dir> <state-dir> <restart-command>.
+# - repo-dir: the Alive checkout (must be a clean git worktree on a branch/tag)
+# - state-dir: the directory from alive.config.json (default <repo>/.alive)
+# - restart-command: how to restart the harness. Quote it as ONE argument.
+#   Examples: "alive restart"
+#             "systemctl restart alive.service"
+#             "/usr/local/bin/alive restart --verbose"
+ExecStart=/opt/alive/deploy/update/alive-auto-update.sh /opt/alive /opt/alive/.alive "alive restart"
+
+# Keep the whole cycle (update + two restart attempts + 2 x 180 s polls) bounded.
+TimeoutStartSec=1h
+# A failed unit is how systemd tells you that the update did not stick.
+# Notification hooks (pick one):
+# OnFailure=alive-update-notify@%n.service
+# ExecStopPost=/usr/local/bin/alive-update-notify.sh %n
+#
+# No secrets belong in this unit. The watchdog writes its own log to
+# <state-dir>/logs/auto-update.log and never logs the restart command.
+
+[Install]
+WantedBy=multi-user.target

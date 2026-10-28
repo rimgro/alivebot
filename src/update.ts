@@ -11,6 +11,11 @@
  *   - rollback: restore `previousRef` from the marker and either restore
  *     `dist.prev/` instantly or rebuild if no saved build exists.
  *   - status: report the current ref, marker contents and build directories.
+ *   - auto: run the unattended guards (config switch, maintenance window, a busy
+ *     runtime, a readable marker, a newer stable tag) and apply only when all of
+ *     them allow it. Success exits 10 and records `restartRequested: true` in the
+ *     marker so an external watchdog knows to restart the harness. `--auto`
+ *     never restarts or stops anything by itself.
  *
  * Safety rules enforced here:
  *   - never restart the harness (the operator does that after the update);
@@ -23,7 +28,9 @@
  *     failure updates it after the rollback attempt.
  *
  * The command runner and filesystem are injected so the flow is testable
- * without real git, npm, network or filesystem access.
+ * without real git, npm, network or filesystem access. `--auto` additionally
+ * takes a small probe (config, heartbeat age, runtime state, local clock) from
+ * the caller, so the busiest guard is testable without touching `.alive/`.
  */
 import { execFile } from "node:child_process";
 import { readFile, rename as renameFile, rm, stat, writeFile } from "node:fs/promises";
@@ -45,6 +52,22 @@ export const HEALTH_TIMEOUT_MS = 15_000;
 export const UPDATE_MARKER_FILE = ".alive-update.json";
 export const DIST_DIR = "dist";
 export const DIST_PREV_DIR = "dist.prev";
+
+/**
+ * Exit-code contract for `alive update --auto` and the watchdog:
+ *   0  nothing to do (a guard refused, or there is no newer stable tag);
+ *   1  the update failed and was rolled back (or the guard probe itself failed);
+ *   10 the update was applied and the harness must be restarted.
+ */
+export const AUTO_UPDATE_RESTART_EXIT_CODE = 10;
+
+/**
+ * A heartbeat younger than this means the runtime process is alive. The busy
+ * guard pairs it with the run state the loop already writes (`runtime.json`).
+ * This is intentionally shorter than the configurable stale threshold: "busy"
+ * is about a run that is happening *now*.
+ */
+export const AUTO_BUSY_HEARTBEAT_MS = 120_000;
 
 /** Stable release tags only: `v1.2.3`, with no prerelease or build suffix. */
 const STABLE_TAG_PATTERN = /^v(\d+)\.(\d+)\.(\d+)$/;
@@ -202,6 +225,8 @@ export interface UpdateMarker {
 	startedAt: string;
 	finishedAt?: string;
 	outcome: UpdateOutcome;
+	/** Set by a successful `alive update --auto`: a watchdog should restart the harness. */
+	restartRequested?: boolean;
 }
 
 type MarkerRead =
@@ -222,6 +247,34 @@ export interface UpdateDeps {
 	readPackageVersion?: (root: string) => Promise<string | undefined>;
 	/** ISO clock used for marker timestamps. */
 	now?: () => string;
+	/** Probe required by `--auto`; never read by the other modes. */
+	auto?: AutoUpdateContext;
+}
+
+/**
+ * Everything `--auto` is allowed to know about the runtime, gathered by the CLI
+ * (or a test) before the update flow starts. Keeping it a plain value object
+ * means the guards never read `.alive/` from inside this module.
+ *
+ * Why these signals: the loop already writes `runtime.json` with a `status`
+ * (`working` only while a run is active and not idling) every few seconds, and
+ * the heartbeat file's mtime proves the process that wrote it is still alive.
+ * A fresh heartbeat plus `status: "working"` is the run lock; a stale heartbeat
+ * means the record is leftover state and the runtime is down. When the
+ * heartbeat is fresh but `runtime.json` cannot be read, the guard is
+ * conservative and treats the runtime as busy.
+ */
+export interface AutoUpdateContext {
+	/** The two fields that decide whether automatic updates may run at all. */
+	updates: { auto: boolean; window: string };
+	/** Age of `<stateDir>/heartbeat.json`; undefined when it is missing or unreadable. */
+	heartbeatAgeMs?: number;
+	/** `runtime.json` status, when that file is readable. */
+	runtimeStatus?: string;
+	/** `runtime.json` run id, used only in log lines. */
+	runtimeRunId?: string;
+	/** Local clock, used for the maintenance window and log lines. */
+	now: Date;
 }
 
 export interface UpdateOptions {
@@ -233,6 +286,8 @@ export interface UpdateOptions {
 	rollback?: boolean;
 	/** Report ref, marker and build directories without fetching or changing anything. */
 	status?: boolean;
+	/** Unattended mode: run the guards and apply only when all of them allow it. */
+	auto?: boolean;
 	/** Update to this exact stable tag instead of the newest stable one. */
 	tag?: string;
 	/** Bypass the dirty-working-tree guard. Never turns into a forced git checkout. */
@@ -246,6 +301,7 @@ interface ResolvedDeps {
 	err: (line: string) => void;
 	readPackageVersion: (root: string) => Promise<string | undefined>;
 	now: () => string;
+	auto?: AutoUpdateContext;
 }
 
 export class UpdateError extends Error {
@@ -257,12 +313,13 @@ export class UpdateError extends Error {
 
 /**
  * Entry point used by the CLI. Returns a process exit code instead of throwing.
- * `status`/`rollback` win over `check`; otherwise `check` is read-only and no
- * mode means apply.
+ * `status`/`rollback` win over `auto`/`check`; `auto` wins over `check`; no mode
+ * means apply.
  */
 export async function runUpdate(options: UpdateOptions, deps: UpdateDeps): Promise<number> {
 	if (options.status) return statusUpdate(options, deps);
 	if (options.rollback) return rollbackUpdate(options, deps);
+	if (options.auto) return autoUpdate(options, deps);
 	return options.check ? checkForUpdate(options, deps) : applyUpdate(options, deps);
 }
 
@@ -286,6 +343,130 @@ export async function applyUpdate(options: UpdateOptions, deps: UpdateDeps): Pro
 		d.err(`error: ${errorMessage(error)}`);
 		return 1;
 	}
+}
+
+/**
+ * `alive update --auto`: unattended mode for a watchdog.
+ *
+ * Every guard is logged, and any refusal is a successful no-op (exit 0). The
+ * order is deliberate: cheap local checks first, then the runtime-busy check,
+ * then the marker (a baseline is required before unattended changes), and only
+ * then the network tag check. A successful apply exits 10 and writes
+ * `restartRequested: true`; the caller's watchdog owns the restart.
+ */
+export async function autoUpdate(options: UpdateOptions, deps: UpdateDeps): Promise<number> {
+	const d = resolveDeps(deps);
+	try {
+		const probe = d.auto;
+		if (!probe) throw new UpdateError("alive update --auto requires the auto-update probe (config, heartbeat, runtime state)");
+
+		if (!probe.updates.auto) {
+			d.out("auto-update: updates.auto is false; nothing to do");
+			return 0;
+		}
+		d.out("auto-update: guard updates.auto is true");
+		if (!isInsideUpdateWindow(probe.updates.window, probe.now)) {
+			d.out(
+				`auto-update: outside updates.window ${probe.updates.window || "(empty)"} at local ${formatClock(probe.now)}; nothing to do`,
+			);
+			return 0;
+		}
+		d.out(
+			`auto-update: guard updates.window is open (${probe.updates.window || "any time"}, local ${formatClock(probe.now)})`,
+		);
+
+		const busy = autoBusyReason(probe);
+		if (busy) {
+			d.out(`auto-update: runtime looks busy (${busy}); nothing to do`);
+			return 0;
+		}
+		d.out(
+			`auto-update: guard runtime is idle (heartbeat ${probe.heartbeatAgeMs === undefined ? "missing or stale" : `${Math.max(0, Math.round(probe.heartbeatAgeMs / 1000))}s old`}; runtime ${probe.runtimeStatus ?? "unknown"})`,
+		);
+
+		const root = await detectRepositoryRoot(options.cwd, d);
+		const read = await readMarker(d, root);
+		if (read.status === "missing") {
+			d.out(
+				`auto-update: update marker is missing at ${read.path}; nothing to do (run \`alive update\` once to establish a baseline)`,
+			);
+			return 0;
+		}
+		if (read.status === "corrupt") {
+			d.out(`auto-update: update marker ${read.path} is corrupt (${read.reason}); nothing to do`);
+			return 0;
+		}
+		if (read.marker.outcome === "in-progress") {
+			d.out(
+				`auto-update: update marker ${read.path} says an update is in progress; nothing to do (inspect with \`alive update --status\`, recover with --rollback)`,
+			);
+			return 0;
+		}
+		d.out(`auto-update: guard update marker is readable (outcome ${read.marker.outcome})`);
+
+		const snapshot = await inspectRepository(options.cwd, d, true);
+		const target = selectTarget(options, snapshot);
+		if (!target) {
+			d.out("auto-update: no stable vX.Y.Z tags found on origin; nothing to do");
+			return 0;
+		}
+		const verdict = updateVerdict(snapshot, target, false);
+		if (!verdict.available) {
+			d.out(`auto-update: no newer stable tag (${verdict.reason}); nothing to do`);
+			return 0;
+		}
+		d.out(`auto-update: guard has a newer stable tag: ${target}`);
+
+		d.out(`auto-update: applying ${target} (current: ${currentLabel(snapshot.current)})...`);
+		await applyAndReport(options, d, { snapshot, target });
+		return AUTO_UPDATE_RESTART_EXIT_CODE;
+	} catch (error) {
+		d.err(`error: ${errorMessage(error)}`);
+		return 1;
+	}
+}
+
+/**
+ * Local-time `HH:MM-HH:MM` window. Empty means any time; a range that wraps
+ * past midnight (e.g. 23:00-02:00) is supported. A malformed or zero-length
+ * window keeps auto-updates off rather than guessing.
+ */
+export function isInsideUpdateWindow(window: string, now: Date): boolean {
+	const value = window.trim();
+	if (!value) return true;
+	const match = /^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$/.exec(value);
+	if (!match) return false;
+	const start = Number(match[1]) * 60 + Number(match[2]);
+	const end = Number(match[3]) * 60 + Number(match[4]);
+	if (start === end) return false;
+	const current = now.getHours() * 60 + now.getMinutes();
+	return start < end ? current >= start && current < end : current >= start || current < end;
+}
+
+/**
+ * The busy guard: a fresh heartbeat proves the process is alive, and
+ * `runtime.json` says whether a run is actually in progress. A fresh heartbeat
+ * with an unreadable runtime state is treated as busy, because we cannot prove
+ * the agent is idle. Returns a human-readable reason, or undefined when idle.
+ */
+export function autoBusyReason(probe: AutoUpdateContext): string | undefined {
+	const age = probe.heartbeatAgeMs;
+	if (age === undefined || age > AUTO_BUSY_HEARTBEAT_MS) return undefined;
+	const rounded = `${Math.max(0, Math.round(age / 1000))}s`;
+	if (probe.runtimeStatus === undefined) {
+		return `heartbeat is ${rounded} old but runtime.json is unreadable; treating it as busy`;
+	}
+	if (probe.runtimeStatus === "working") {
+		return `heartbeat is ${rounded} old and run ${probe.runtimeRunId ?? "(unknown)"} is in progress`;
+	}
+	if (probe.runtimeStatus === "starting") {
+		return `heartbeat is ${rounded} old and the runtime is still starting`;
+	}
+	return undefined;
+}
+
+function formatClock(now: Date): string {
+	return `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
 }
 
 export async function rollbackUpdate(options: UpdateOptions, deps: UpdateDeps): Promise<number> {
@@ -377,9 +558,14 @@ async function inspectAndReport(options: UpdateOptions, d: ResolvedDeps): Promis
 	await reportUpdateArtifacts(d, snapshot.root);
 }
 
-async function applyAndReport(options: UpdateOptions, d: ResolvedDeps): Promise<void> {
-	const snapshot = await inspectRepository(options.cwd, d, true);
-	const target = selectTarget(options, snapshot);
+interface PreparedApply {
+	snapshot: RepositorySnapshot;
+	target: string;
+}
+
+async function applyAndReport(options: UpdateOptions, d: ResolvedDeps, prepared?: PreparedApply): Promise<void> {
+	const snapshot = prepared?.snapshot ?? (await inspectRepository(options.cwd, d, true));
+	const target = prepared?.target ?? selectTarget(options, snapshot);
 
 	d.out(`repository: ${snapshot.root}`);
 	d.out(`current:    ${currentLabel(snapshot.current)}`);
@@ -456,7 +642,13 @@ async function applyAndReport(options: UpdateOptions, d: ResolvedDeps): Promise<
 	} catch (error) {
 		d.err(`error: ${errorMessage(error)}`);
 		const rollback = await rollbackTo(d, root, previous, checkoutDone, savedBuild);
-		await finalizeMarker(d, root, marker, rollback.ok ? "rolled-back" : "failed");
+		await finalizeMarker(
+			d,
+			root,
+			marker,
+			rollback.ok ? "rolled-back" : "failed",
+			options.auto ? { restartRequested: false } : undefined,
+		);
 		if (rollback.ok) {
 			throw new UpdateError(`update to ${target} failed; ${rollback.detail} (the running harness was not restarted)`);
 		}
@@ -465,11 +657,17 @@ async function applyAndReport(options: UpdateOptions, d: ResolvedDeps): Promise<
 		);
 	}
 
-	await finalizeMarker(d, root, marker, "success");
+	await finalizeMarker(d, root, marker, "success", options.auto ? { restartRequested: true } : undefined);
 	const updatedVersion = await d.readPackageVersion(root);
 	d.out(`updated: ${target} (package ${updatedVersion ?? "unknown"}; was ${previous.ref})`);
 	if (savedBuild) d.out(`previous build kept in ${DIST_PREV_DIR}/ for \`alive update --rollback\``);
-	d.out("restart required: the running harness still executes the old code; restart it yourself with `alive restart` (this command never restarts anything)");
+	if (options.auto) {
+		d.out(
+			`restart requested: ${UPDATE_MARKER_FILE} records restartRequested=true; exiting ${AUTO_UPDATE_RESTART_EXIT_CODE} so the external watchdog restarts the harness (this command never restarts anything)`,
+		);
+	} else {
+		d.out("restart required: the running harness still executes the old code; restart it yourself with `alive restart` (this command never restarts anything)");
+	}
 }
 
 async function rollbackAndReport(options: UpdateOptions, d: ResolvedDeps): Promise<void> {
@@ -516,7 +714,7 @@ async function rollbackAndReport(options: UpdateOptions, d: ResolvedDeps): Promi
 	}
 
 	const ok = problem === "";
-	await finalizeMarker(d, root, marker, ok ? "rolled-back" : "failed");
+	await finalizeMarker(d, root, marker, ok ? "rolled-back" : "failed", { restartRequested: false });
 	if (!ok) throw new UpdateError(`rollback to ${marker.previousRef} failed (${problem})`);
 
 	d.out(`rolled back to ${marker.previousRef}; ${restored}`);
@@ -671,9 +869,15 @@ async function writeMarker(d: ResolvedDeps, root: string, marker: UpdateMarker):
 	await d.fs.writeText(markerPath(root), `${JSON.stringify(marker, null, 2)}\n`);
 }
 
-async function finalizeMarker(d: ResolvedDeps, root: string, marker: UpdateMarker, outcome: UpdateOutcome): Promise<void> {
+async function finalizeMarker(
+	d: ResolvedDeps,
+	root: string,
+	marker: UpdateMarker,
+	outcome: UpdateOutcome,
+	extra?: Partial<UpdateMarker>,
+): Promise<void> {
 	try {
-		await writeMarker(d, root, { ...marker, outcome, finishedAt: d.now() });
+		await writeMarker(d, root, { ...marker, ...extra, outcome, finishedAt: d.now() });
 	} catch (error) {
 		d.err(`warning: could not update ${markerPath(root)}: ${oneLine(errorMessage(error))}`);
 	}
@@ -708,7 +912,8 @@ function validateMarker(value: unknown): UpdateMarker {
 	}
 	const previousTag = optionalString(record, "previousTag");
 	const finishedAt = optionalString(record, "finishedAt");
-	return { previousRef, previousTag, targetTag, startedAt, finishedAt, outcome };
+	const restartRequested = optionalBoolean(record, "restartRequested");
+	return { previousRef, previousTag, targetTag, startedAt, finishedAt, outcome, restartRequested };
 }
 
 function requiredString(record: Record<string, unknown>, key: string): string {
@@ -721,6 +926,13 @@ function optionalString(record: Record<string, unknown>, key: string): string | 
 	const value = record[key];
 	if (value === undefined) return undefined;
 	if (typeof value !== "string") throw new Error(`${key} must be a string`);
+	return value;
+}
+
+function optionalBoolean(record: Record<string, unknown>, key: string): boolean | undefined {
+	const value = record[key];
+	if (value === undefined) return undefined;
+	if (typeof value !== "boolean") throw new Error(`${key} must be a boolean`);
 	return value;
 }
 
@@ -739,6 +951,7 @@ async function reportUpdateArtifacts(d: ResolvedDeps, root: string): Promise<voi
 		d.out(`  target tag:   ${marker.targetTag}`);
 		d.out(`  started:      ${marker.startedAt}`);
 		d.out(`  finished:     ${marker.finishedAt ?? "not finished"}`);
+		d.out(`  restart:      ${marker.restartRequested ? "requested" : "not requested"}`);
 	}
 	d.out(`dist:      ${(await d.fs.exists(path.join(root, DIST_DIR))) ? "present" : "absent"}`);
 	d.out(`dist.prev: ${(await d.fs.exists(path.join(root, DIST_PREV_DIR))) ? "present" : "absent"}`);
@@ -856,6 +1069,7 @@ function resolveDeps(deps: UpdateDeps): ResolvedDeps {
 		err: deps.err ?? ((line) => void process.stderr.write(`${line}\n`)),
 		readPackageVersion: deps.readPackageVersion ?? defaultReadPackageVersion,
 		now: deps.now ?? (() => new Date().toISOString()),
+		auto: deps.auto,
 	};
 }
 
