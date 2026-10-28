@@ -29,7 +29,7 @@ import {
 	mimeForFile,
 } from "../../runtime/attachments.js";
 import { createTelegramTools, type TelegramToolHost } from "./tools.js";
-import { formatThread, parseThread } from "./threads.js";
+import { formatThread, isTelegramTarget, parseThread, resolveThreadRef } from "./threads.js";
 import type { TelegramChat, TelegramSentMessage, TelegramUpdate } from "./types.js";
 import { normalizeUpdate, type NormalizedInbound } from "./update.js";
 import { acceptBrowserPairing } from "../browser/operator.js";
@@ -107,7 +107,7 @@ export class TelegramModule implements AliveModule {
 	}
 
 	handles(message: OutgoingMessage): boolean {
-		return parseThread(message.thread) !== undefined;
+		return isTelegramTarget(message.thread);
 	}
 
 	async start(ctx: ModuleContext): Promise<void> {
@@ -608,8 +608,7 @@ export class TelegramModule implements AliveModule {
 	private async send(message: OutgoingMessage): Promise<TelegramSentMessage[]> {
 		const ctx = this.ctx;
 		if (!ctx) throw new Error("telegram module is not started");
-		const ref = parseThread(message.thread);
-		if (!ref) throw new Error(`not a telegram thread: ${message.thread}`);
+		const ref = resolveThreadRef(message.thread);
 		const api = this.requireApi();
 		const topicId = ref.topicId !== undefined ? Number(ref.topicId) : undefined;
 		const threadId = Number.isFinite(topicId) ? topicId : undefined;
