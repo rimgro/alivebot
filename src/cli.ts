@@ -124,21 +124,26 @@ export async function main(argv: string[]): Promise<number> {
 				return await restartCommand(cwd, flags);
 			}
 			case "update": {
-				const usage = "usage: alive update [--check] [--tag vX.Y.Z] [--force] | alive update --rollback [--force] | alive update --status";
+				const usage =
+					"usage: alive update [--check] [--tag vX.Y.Z] [--force] | alive update --rollback [--force] | alive update --status | alive update --auto";
 				if (flagBool(flags, "help") || flagBool(flags, "h")) {
 					process.stdout.write(
 						`${usage}\n\n` +
 							"  --check          report the current ref, latest stable tag, marker and dist/; change nothing\n" +
 							"  --rollback       restore previousRef from the marker and dist.prev/ (no network needed)\n" +
 							"  --status         report the current ref, marker contents and dist/dist.prev presence\n" +
+							"  --auto           unattended: run the guards and apply only if they all allow it\n" +
+							"                   (updates.auto, updates.window, an idle runtime, a newer tag)\n" +
 							"  --tag vX.Y.Z     target an explicit stable tag instead of the latest one\n" +
 							"  --force          allow apply/rollback with a dirty working tree (local changes are kept)\n\n" +
-							"The update is applied without --check. It never restarts the running harness;\n" +
-							"restart it yourself afterwards with `alive restart`.\n",
+							"Exit codes with --auto: 0 = nothing to do, 1 = failed and rolled back,\n" +
+							"10 = updated; restart me (the marker has restartRequested: true).\n" +
+							"The update is applied without --check. Neither mode restarts the running harness;\n" +
+							"with --auto an external watchdog restarts it after exit 10.\n",
 					);
 					return 0;
 				}
-				const known = new Set(["check", "dry-run", "apply", "rollback", "status", "tag", "force", "help", "h"]);
+				const known = new Set(["check", "dry-run", "apply", "rollback", "status", "auto", "tag", "force", "help", "h"]);
 				const unknown = Object.keys(flags).filter((key) => !known.has(key));
 				if (unknown.length > 0) throw new Error(`unknown flag${unknown.length === 1 ? "" : "s"}: --${unknown.join(", --")} (${usage})`);
 				if (positionals.length > 0) throw new Error(usage);
@@ -148,13 +153,34 @@ export async function main(argv: string[]): Promise<number> {
 				const apply = flagBool(flags, "apply");
 				const rollback = flagBool(flags, "rollback");
 				const status = flagBool(flags, "status");
-				if ([check, apply, rollback, status].filter(Boolean).length > 1) {
-					throw new Error("choose one of --check, --apply, --rollback, --status");
+				const auto = flagBool(flags, "auto");
+				if ([check, apply, rollback, status, auto].filter(Boolean).length > 1) {
+					throw new Error("choose one of --check, --apply, --rollback, --status, --auto");
 				}
-				if ((rollback || status) && flagString(flags, "tag") !== undefined) {
-					throw new Error("--tag cannot be combined with --rollback or --status");
+				if ((rollback || status || auto) && flagString(flags, "tag") !== undefined) {
+					throw new Error("--tag cannot be combined with --rollback, --status or --auto");
 				}
-				if (status && flagBool(flags, "force")) throw new Error("--force is only used with apply or --rollback");
+				if ((status || auto) && flagBool(flags, "force")) throw new Error("--force is only used with apply or --rollback");
+
+				if (auto) {
+					const config = loadForCli(flags);
+					const now = Date.now();
+					const heartbeat = readHeartbeatStatus(config.paths.stateDir, config.config.updates.heartbeatStaleMs, now);
+					const runtime = readRuntimeState(config.paths.stateDir);
+					return await runUpdate(
+						{ cwd, auto: true },
+						{
+							run: createExecRunner(),
+							auto: {
+								updates: config.config.updates,
+								heartbeatAgeMs: heartbeat.ageMs,
+								runtimeStatus: runtime?.status,
+								runtimeRunId: runtime?.runId,
+								now: new Date(now),
+							},
+						},
+					);
+				}
 
 				return await runUpdate(
 					{
@@ -1185,6 +1211,8 @@ usage:
   alive update [--check] [--tag vX.Y.Z] [--force]
                                               update the harness to the newest stable vX.Y.Z tag
                                               (--check: report only; --force: allow a dirty tree)
+  alive update --auto                         unattended: apply only if updates.auto, updates.window,
+                                              an idle runtime and a newer tag allow it; exit 10 = restart me
   alive update --rollback [--force]           restore previousRef and dist.prev/ from .alive-update.json
   alive update --status                       current ref, update marker, dist/ and dist.prev/
                                               (update never restarts the harness — restart it yourself)

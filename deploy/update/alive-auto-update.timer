@@ -1,0 +1,17 @@
+[Unit]
+Description=Daily Alive harness auto-update inside the maintenance window
+
+[Timer]
+# Pick the same local time as `updates.window` in alive.config.json (or a moment
+# strictly inside it). The service itself also enforces that window, so an
+# early or manual start still refuses to update outside it.
+OnCalendar=*-*-* 04:00:00
+# A missed run (machine asleep/off) is not lost.
+Persistent=true
+# Avoid hitting the network at the exact same second on many hosts.
+RandomizedDelaySec=15min
+AccuracySec=1min
+Unit=alive-auto-update.service
+
+[Install]
+WantedBy=timers.target
