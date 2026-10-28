@@ -25,7 +25,7 @@ import { GrafanaModule } from "../modules/grafana/module.js";
 import { TelegramApi, TelegramApiError, TelegramFileTooLargeError } from "../modules/telegram/client.js";
 import { resolveToken, TelegramModule } from "../modules/telegram/module.js";
 import { escapeHtml, isParseModeError, splitMessage } from "../modules/telegram/text.js";
-import { formatThread, parseThread, resolveChatTarget } from "../modules/telegram/threads.js";
+import { formatThread, isTelegramTarget, parseThread, resolveChatTarget, resolveThreadRef } from "../modules/telegram/threads.js";
 import { normalizeUpdate } from "../modules/telegram/update.js";
 import { TELEGRAM_IMAGE_MAX_BYTES, imageAnnotation, imageFileName, imageMime, imageRelativePath } from "../modules/telegram/images.js";
 import {
@@ -285,6 +285,12 @@ section("telegram threads");
 	check("targets accept a thread", resolveChatTarget("telegram:42") === "42");
 	check("targets accept a bare id", resolveChatTarget("-100123") === "-100123");
 	check("targets accept a username", resolveChatTarget("@alive_bot") === "@alive_bot");
+	check("a full thread is a telegram target", isTelegramTarget("telegram:-100123/7"));
+	check("a bare chat id is a telegram target", isTelegramTarget("-100123") && isTelegramTarget("42"));
+	check("a username or t.me link is a telegram target", isTelegramTarget("@alive_bot") && isTelegramTarget("https://t.me/alive_bot"));
+	check("console and internal threads are not telegram targets", !isTelegramTarget("console") && !isTelegramTarget("local:agent:main:agent:x") && !isTelegramTarget(""));
+	check("a bare chat id resolves to a chat", resolveThreadRef("42").chatId === "42" && resolveThreadRef("42").topicId === undefined);
+	check("a bare username resolves to a chat", resolveThreadRef("@alive_bot").chatId === "@alive_bot");
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,6 +1075,29 @@ section("telegram module end-to-end against a fake Bot API");
 		const sendCall = calls.filter((call) => call.method === "sendMessage").pop();
 		check("outbound reached the Bot API", sendCall?.params.text === "Yes, I am here.", sendCall?.params);
 		check("outbound was recorded in history", history.query({ thread: "telegram:42", direction: "outbound" }).length === 1);
+
+		// Regression: the model sometimes passes the bare chat id it saw in an older
+		// history record. The module must claim that thread; otherwise the message
+		// falls through to the transport taps and is reported as delivered while
+		// never reaching Telegram.
+		const sendsBefore = calls.filter((call) => call.method === "sendMessage").length;
+		await host.deliver({ id: "msg_bare", runId: "run", thread: "42", text: "bare chat id", ts: Date.now() });
+		const bareCall = calls.filter((call) => call.method === "sendMessage").pop();
+		check(
+			"a bare chat id is claimed and delivered",
+			calls.filter((call) => call.method === "sendMessage").length === sendsBefore + 1 &&
+				bareCall?.params.text === "bare chat id" &&
+				String(bareCall?.params.chat_id) === "42",
+			bareCall?.params,
+		);
+		await host.deliver({ id: "msg_username", runId: "run", thread: "@alice", text: "by username", ts: Date.now() });
+		const usernameCall = calls.filter((call) => call.method === "sendMessage").pop();
+		check(
+			"a username is claimed and delivered",
+			usernameCall?.params.text === "by username" && usernameCall?.params.chat_id === "@alice",
+			usernameCall?.params,
+		);
+		check("bare-thread deliveries are recorded in history", history.query({ direction: "outbound" }).some((record) => record.thread === "42"));
 
 		// send_file: guard the workspace, then upload as a document.
 		const workspace = config.paths.workspaceDir;

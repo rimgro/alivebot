@@ -41,6 +41,33 @@ export function parseThread(thread: string): TelegramThreadRef | undefined {
 	return { raw: thread, chatId, topicId: topicId || undefined };
 }
 
+/**
+ * True for anything the Telegram module can address: a full `telegram:` thread, a
+ * bare chat id, an `@username`, or a t.me link.
+ *
+ * `send_message` accepts all of these (the model routinely passes the bare chat id
+ * from an earlier history record), so the module must claim every one of them.
+ * A thread it does not claim falls through to the transport taps, where the
+ * message is reported as delivered while going nowhere.
+ */
+export function isTelegramTarget(thread: string | undefined): boolean {
+	if (!thread) return false;
+	const value = thread.trim();
+	if (!value) return false;
+	if (parseThread(value) !== undefined) return true;
+	return /^-?\d+$/.test(value) || value.startsWith("@") || value.startsWith("https://t.me/");
+}
+
+/**
+ * Turn any addressable thread into a Telegram destination. Only call this for a
+ * thread where `isTelegramTarget()` is true.
+ */
+export function resolveThreadRef(thread: string): TelegramThreadRef {
+	const parsed = parseThread(thread);
+	if (parsed) return parsed;
+	return { raw: thread, chatId: String(resolveChatTarget(thread)) };
+}
+
 export function isTelegramThread(thread: string | undefined): boolean {
 	return thread !== undefined && thread.startsWith(TELEGRAM_THREAD_PREFIX);
 }
