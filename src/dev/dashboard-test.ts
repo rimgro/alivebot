@@ -16,7 +16,22 @@ import {
 	MEMORY_MAX_TEXT_CHARS,
 	openMemoryDatabaseReadOnly,
 } from "../dashboard/memory.js";
-import { DEFAULT_SECRETS_CONFIG } from "../secrets.js";
+import {
+	CsrfTokenStore,
+	DASHBOARD_BACKUPS_DIR,
+	DASHBOARD_BACKUP_KEEP,
+	DASHBOARD_CSRF_TTL_MS,
+	DASHBOARD_MAX_BODY_BYTES,
+	SettingsEditError,
+	applySettingsEdit,
+	findSecretLikeValues,
+	isInsideDirectory,
+	listDashboardBackups,
+	loadSettingsView,
+	parseSettingsSubmission,
+	resolveWritableTarget,
+} from "../dashboard/settings.js";
+import { DEFAULT_SECRETS_CONFIG, createMaskContext, maskSecrets } from "../secrets.js";
 import { MemoryStore } from "../store/memory.js";
 import { formatDuration, localDay } from "../util.js";
 import {
@@ -36,7 +51,7 @@ import {
 	type DashboardProfile,
 	type RunView,
 } from "../dashboard/state.js";
-import { renderAgentPage, renderIndexPage, renderMemoryPage, renderRunPage } from "../dashboard/render.js";
+import { renderAgentPage, renderIndexPage, renderMemoryPage, renderRunPage, renderSettingsPage } from "../dashboard/render.js";
 import { createDashboardServer, resolveDashboardRoute, validateDashboardBind } from "../dashboard/server.js";
 
 let failures = 0;
@@ -414,6 +429,80 @@ writeJson(path.join(writerDir, "state", "runtime.json"), {
 
 const memoryDbPath = path.join(stateDir, "memory.sqlite");
 
+// Settings fixtures: a managed profile whose SOUL.md path is configured under
+// `prompts/` (so a hardcoded "SOUL.md" in the project root would be wrong), and
+// one whose soul path escapes its own directory so writes must be refused.
+const editorDir = path.join(stateDir, "agents", "editor");
+const escapedDir = path.join(stateDir, "agents", "escaped");
+const editorSoulFile = path.join(editorDir, "prompts", "SOUL.md");
+const editorContractFile = path.join(editorDir, "CONTRACT.md");
+const editorSummaryFile = path.join(editorDir, "summary.md");
+const escapedSoulFile = path.join(stateDir, "agents", "outside-SOUL.md");
+
+/** Created inside `main()` so the profiles fixture above keeps its two agents. */
+function createSettingsFixtures(): void {
+	writeJson(path.join(editorDir, "alive.config.json"), {
+		name: "Editor",
+		model: "openai/gpt-test",
+		stateDir: "state",
+		workspace: "workspace",
+		soulFile: "prompts/SOUL.md",
+		sandbox: { enabled: false },
+		tools: { bash: true, allowlist: ["read", "write", "edit", "bash", "idle"] },
+		workers: { enabled: false, permissions: { worktree: false, pullRequest: false } },
+	});
+	fs.mkdirSync(path.join(editorDir, "prompts"), { recursive: true });
+	fs.writeFileSync(editorSoulFile, "# Editor soul\n\nedit me.\n", "utf8");
+	fs.writeFileSync(editorContractFile, `# Role: editor\n\nnever leak ${GITHUB_TOKEN}\n`, "utf8");
+	fs.writeFileSync(editorSummaryFile, "# Summary\n\nold summary\n", "utf8");
+
+	writeJson(path.join(escapedDir, "alive.config.json"), {
+		name: "Escaped",
+		model: "openai/gpt-test",
+		stateDir: "state",
+		workspace: "workspace",
+		soulFile: "../outside-SOUL.md",
+		sandbox: { enabled: false },
+	});
+	fs.writeFileSync(escapedSoulFile, "# Outside soul\n\nmust not be written.\n", "utf8");
+	fs.writeFileSync(path.join(escapedDir, "CONTRACT.md"), "# Role: escaped\n", "utf8");
+	fs.writeFileSync(path.join(escapedDir, "summary.md"), "# Summary\n", "utf8");
+}
+
+function reloadProfile(id: string): DashboardProfile {
+	const profiles = loadDashboard(loadRootConfig({ rootDir: root }));
+	const profile = findProfile(profiles, id);
+	if (!profile) throw new Error(`test profile not found: ${id}`);
+	return profile;
+}
+
+function readText(file: string): string {
+	try {
+		return fs.readFileSync(file, "utf8");
+	} catch {
+		return "";
+	}
+}
+
+/** Assert that an edit throws the dashboard's typed rejection. */
+function expectSettingsError(
+	name: string,
+	run: () => unknown,
+	expect: { status?: number; includes?: string[] } = {},
+): void {
+	try {
+		run();
+		check(name, false, "no error was thrown");
+		return;
+	} catch (error) {
+		const status = error instanceof SettingsEditError ? error.status : undefined;
+		const message = error instanceof Error ? error.message : String(error);
+		const statusOk = expect.status === undefined || status === expect.status;
+		const textOk = (expect.includes ?? []).every((part) => message.includes(part));
+		check(name, statusOk && textOk, { status, message });
+	}
+}
+
 async function main(): Promise<void> {
 	await createMemoryFacts(memoryDbPath);
 
@@ -575,6 +664,246 @@ async function main(): Promise<void> {
 	check("reading memory did not modify the sqlite file", fs.readFileSync(memoryDbPath).equals(sqliteBefore));
 	check("the agent page links to the memory page", agentHtml.includes(`/agent/main/memory`), agentHtml.includes("/memory"));
 
+	// ------------------------------------------------------------------
+	// settings (the dashboard's only write path)
+	// ------------------------------------------------------------------
+	createSettingsFixtures();
+	let editor = reloadProfile("editor");
+	const escaped = reloadProfile("escaped");
+	const editorBackupDir = path.join(editorDir, "state", DASHBOARD_BACKUPS_DIR);
+
+	section("settings page");
+	const editorView = loadSettingsView(editor);
+	check("settings page shows the configured model", editorView.model === "openai/gpt-test", editorView.model);
+	check(
+		"settings page shows the tool allowlist",
+		editorView.allowlist.join(",") === "read,write,edit,bash,idle",
+		editorView.allowlist,
+	);
+	check(
+		"settings page shows workers/sandbox/browser permission flags",
+		editorView.flags.some((flag) => flag.path === "workers.permissions.pullRequest" && flag.value === false) &&
+			editorView.flags.some((flag) => flag.path === "sandbox.enabled" && flag.value === false) &&
+			editorView.flags.some((flag) => flag.path === "modules.browser.enabled" && flag.value === false) &&
+			editorView.flags.some((flag) => flag.path === "tools.bash" && flag.value === true),
+		editorView.flags,
+	);
+	check(
+		"prompt paths are resolved from the config, not hardcoded project-relative names",
+		editorView.prompts.find((prompt) => prompt.key === "soul")?.path === editorSoulFile &&
+			editorView.prompts.find((prompt) => prompt.key === "contract")?.path === editorContractFile &&
+			editorView.prompts.find((prompt) => prompt.key === "summary")?.path === editorSummaryFile,
+		editorView.prompts.map((prompt) => prompt.path),
+	);
+	check(
+		"the editable JSON textarea is prefilled with the effective config",
+		(JSON.parse(editorView.configJson) as { tools?: { allowlist?: string[] } }).tools?.allowlist?.includes("idle") === true,
+		editorView.configJson.slice(0, 80),
+	);
+	check("the backup directory is inside the profile state dir", editorView.backupsDir === editorBackupDir, editorView.backupsDir);
+	check(
+		"a soul path outside the profile is flagged, not silently edited",
+		loadSettingsView(escaped).prompts.find((prompt) => prompt.key === "soul")?.insideProfile === false,
+		escaped.config.paths.soulPath,
+	);
+	check("path containment helper rejects siblings and traversal", !isInsideDirectory(editorDir, escapedSoulFile) && isInsideDirectory(editorDir, editorSoulFile));
+	const escapedLocalConfig = path.join(escapedDir, "alive.config.local.json");
+	writeJson(escapedLocalConfig, { name: "Escaped local" });
+	check(
+		"a machine-local override disables the config textarea",
+		loadSettingsView(reloadProfile("escaped")).configDisabledReason?.includes("alive.config.local.json") === true,
+		loadSettingsView(reloadProfile("escaped")).configDisabledReason,
+	);
+	expectSettingsError(
+		"config edits are refused when alive.config.local.json overrides them",
+		() => applySettingsEdit(reloadProfile("escaped"), { configText: JSON.stringify({ model: "openai/other" }), prompts: {} }),
+		{ status: 400, includes: ["alive.config.local.json"] },
+	);
+	fs.rmSync(escapedLocalConfig);
+	expectSettingsError(
+		"a writable target outside the profile is refused",
+		() => resolveWritableTarget(editorDir, escapedSoulFile),
+		{ status: 400, includes: ["outside the profile directory"] },
+	);
+	const editorHtml = renderSettingsPage(editorView, renderContext, { csrfToken: "csrf-render-token" });
+	check("the settings form is a plain POST form to the settings route", editorHtml.includes('method="post"') && editorHtml.includes('action="/agent/editor/settings"'), editorHtml.includes("<form"));
+	check("the form carries the per-render CSRF token", editorHtml.includes('name="csrf" value="csrf-render-token"'));
+	check("the page renders current values", editorHtml.includes("openai/gpt-test") && editorHtml.includes("read, write, edit, bash, idle") && editorHtml.includes("edit me."));
+	check("the page names the real prompt paths", editorHtml.includes(editorSoulFile) && editorHtml.includes(editorSummaryFile));
+	check("the page shows where backups go", editorHtml.includes(editorBackupDir));
+	check("the page says secrets belong in .env", editorHtml.includes(".env") && editorHtml.toLowerCase().includes("secret"));
+	check("the page masks secrets in prompt files", !editorHtml.includes(GITHUB_TOKEN) && /\[github#\d+\]/.test(editorHtml));
+	check("the agent page links to the settings page", agentHtml.includes("/agent/main/settings"));
+
+	section("settings CSRF tokens");
+	const csrfStore = new CsrfTokenStore();
+	const issued = csrfStore.issue("editor");
+	check("a freshly issued token is accepted", csrfStore.consume("editor", issued) === true);
+	check("a token is single-use", csrfStore.consume("editor", issued) === false);
+	const bound = csrfStore.issue("editor");
+	check("a token is bound to its agent id", csrfStore.consume("writer", bound) === false);
+	check("a missing token is rejected", csrfStore.consume("editor", "") === false);
+	const expired = csrfStore.issue("editor", 1_000);
+	check("an expired token is rejected", csrfStore.consume("editor", expired, 1_000 + DASHBOARD_CSRF_TTL_MS + 1) === false);
+
+	section("settings form parsing");
+	const parsedForm = parseSettingsSubmission(
+		new URLSearchParams("config=%7B%7D&prompt%3Asoul=hello%0D%0Aworld"),
+	);
+	check("textareas are normalised from CRLF to LF", parsedForm.prompts.soul === "hello\nworld", parsedForm.prompts.soul);
+	check("an absent prompt field stays absent", parsedForm.prompts.contract === undefined);
+	expectSettingsError(
+		"unknown form fields are rejected",
+		() => parseSettingsSubmission(new URLSearchParams("config=%7B%7D&evil=1")),
+		{ status: 400, includes: ["unknown form field"] },
+	);
+	expectSettingsError(
+		"duplicated form fields are rejected",
+		() => parseSettingsSubmission(new URLSearchParams("config=%7B%7D&config=%7B%7D")),
+		{ status: 400, includes: ["more than once"] },
+	);
+	expectSettingsError(
+		"an empty submission is rejected",
+		() => parseSettingsSubmission(new URLSearchParams("")),
+		{ status: 400, includes: ["no settings"] },
+	);
+
+	section("settings validation (no write on rejection)");
+	const untouchedTree = snapshotTree(editorDir);
+	expectSettingsError(
+		"invalid JSON is rejected",
+		() => applySettingsEdit(editor, { configText: "{not json", prompts: {} }),
+		{ status: 400, includes: ["not valid JSON"] },
+	);
+	expectSettingsError(
+		"an unknown top-level config field is rejected",
+		() => applySettingsEdit(editor, { configText: JSON.stringify({ surprise: true }), prompts: {} }),
+		{ status: 400, includes: ["unknown config field: surprise"] },
+	);
+	expectSettingsError(
+		"an unknown nested config field is rejected",
+		() => applySettingsEdit(editor, { configText: JSON.stringify({ tools: { allowlist: ["read"], typo: 1 } }), prompts: {} }),
+		{ status: 400, includes: ["unknown config field: tools.typo"] },
+	);
+	expectSettingsError(
+		"a wrong value type is rejected",
+		() => applySettingsEdit(editor, { configText: JSON.stringify({ sandbox: { enabled: "yes" } }), prompts: {} }),
+		{ status: 400, includes: ["sandbox.enabled"] },
+	);
+	expectSettingsError(
+		"the project's workers validator runs before writing",
+		() => applySettingsEdit(editor, {
+			configText: JSON.stringify({ workers: { enabled: true, models: ["openai/gpt-test"], permissions: { pullRequest: true } } }),
+			prompts: {},
+		}),
+		{ status: 400, includes: ["pullRequest requires"] },
+	);
+	expectSettingsError(
+		"the project's sandbox validator runs before writing",
+		() => applySettingsEdit(editor, { configText: JSON.stringify({ sandbox: { networkAccess: "everything" } }), prompts: {} }),
+		{ status: 400, includes: ["networkAccess"] },
+	);
+	expectSettingsError(
+		"a secret-looking value is refused and .env is named",
+		() => applySettingsEdit(editor, { configText: JSON.stringify({ model: OPENAI_KEY }), prompts: {} }),
+		{ status: 400, includes: ["looks like a secret", ".env", "model"] },
+	);
+	expectSettingsError(
+		"an unchanged config is not an edit",
+		() => applySettingsEdit(editor, { configText: editorView.configJson, prompts: {} }),
+		{ status: 400, includes: ["nothing to save"] },
+	);
+	expectSettingsError(
+		"a write outside the profile directory is refused",
+		() => applySettingsEdit(escaped, { prompts: { soul: "# Escaped edit\n" } }),
+		{ status: 400, includes: ["outside the profile directory"] },
+	);
+	check("rejected edits left every file untouched", snapshotTree(editorDir) === untouchedTree);
+	check("the outside file was not written", readText(escapedSoulFile) === "# Outside soul\n\nmust not be written.\n", readText(escapedSoulFile));
+	check("the current contract still holds its secret", readText(editorContractFile).includes(GITHUB_TOKEN));
+	const maskedContract = maskSecrets(readText(editorContractFile), DEFAULT_SECRETS_CONFIG, {}, createMaskContext());
+	expectSettingsError(
+		"a renderer-masked secret is not written back over the real value",
+		() => applySettingsEdit(editor, { prompts: { contract: maskedContract } }),
+		{ status: 400, includes: ["mask placeholder"] },
+	);
+	check("the masked round-trip wrote nothing", readText(editorContractFile) === `# Role: editor\n\nnever leak ${GITHUB_TOKEN}\n`);
+	check(
+		"secret detection reuses the project's masker",
+		findSecretLikeValues({ model: OPENAI_KEY }, DEFAULT_SECRETS_CONFIG).join(",") === "model",
+		findSecretLikeValues({ model: OPENAI_KEY }, DEFAULT_SECRETS_CONFIG),
+	);
+
+	section("settings edit: config");
+	const configFile = path.join(editorDir, "alive.config.json");
+	const originalConfigText = readText(configFile);
+	const configEdit = applySettingsEdit(editor, {
+		configText: JSON.stringify(
+			{
+				model: "anthropic/claude-edited",
+				tools: { allowlist: ["read", "write", "idle"], bash: false },
+				sandbox: { networkAccess: "unrestricted" },
+				workers: { permissions: { worktree: true } },
+			},
+			null,
+			2,
+		),
+		prompts: {},
+	});
+	const savedConfig = JSON.parse(readText(configFile)) as {
+		model?: string;
+		name?: string;
+		stateDir?: string;
+		tools?: { allowlist?: string[]; bash?: boolean };
+		sandbox?: { networkAccess?: string };
+		workers?: { permissions?: { worktree?: boolean } };
+	};
+	check("a valid config edit is written", configEdit.changed.some((change) => change.kind === "config"));
+	check("the model is updated", savedConfig.model === "anthropic/claude-edited", savedConfig.model);
+	check("the tool allowlist and bash flag are updated", savedConfig.tools?.allowlist?.join(",") === "read,write,idle" && savedConfig.tools?.bash === false, savedConfig.tools);
+	check("nested sandbox/workers flags are updated", savedConfig.sandbox?.networkAccess === "unrestricted" && savedConfig.workers?.permissions?.worktree === true, { sandbox: savedConfig.sandbox, workers: savedConfig.workers });
+	check("unrelated config fields are preserved", savedConfig.name === "Editor" && savedConfig.stateDir === "state", { name: savedConfig.name, stateDir: savedConfig.stateDir });
+	const configBackups = listDashboardBackups(editor, configFile);
+	check("the config edit made one backup", configBackups.length === 1, configBackups.map((backup) => backup.name));
+	check("the config backup holds the previous version", readText(configBackups[0]!.path) === originalConfigText);
+	check("the config backup path is under <profile>/state/dashboard-backups", path.dirname(configBackups[0]!.path) === editorBackupDir, configBackups[0]!.path);
+	editor = reloadProfile("editor");
+	check("the edited model is effective after reload", editor.config.config.model === "anthropic/claude-edited", editor.config.config.model);
+
+	section("settings edit: prompt files");
+	const previousSoul = readText(editorSoulFile);
+	const promptEdit = applySettingsEdit(editor, { prompts: { soul: "# Editor soul\n\nedited by the dashboard.\n" } });
+	check("a valid prompt edit is written", readText(editorSoulFile) === "# Editor soul\n\nedited by the dashboard.\n", readText(editorSoulFile));
+	check("the edit reports the prompt it changed", promptEdit.changed.length === 1 && promptEdit.changed[0]!.kind === "soul", promptEdit.changed);
+	const soulBackups = listDashboardBackups(editor, editorSoulFile);
+	check("the prompt edit made one backup", soulBackups.length === 1, soulBackups.map((backup) => backup.name));
+	check("the backup holds the previous content", readText(soulBackups[0]!.path) === previousSoul);
+	check("the backup is named after the original file", soulBackups[0]!.originalName === "SOUL.md" && soulBackups[0]!.path.startsWith(editorBackupDir), soulBackups[0]);
+	const afterEditView = loadSettingsView(editor);
+	const afterEditHtml = renderSettingsPage(afterEditView, renderContext, { csrfToken: "t" });
+	check("after an edit the page shows the new value", afterEditHtml.includes("edited by the dashboard."));
+	check("the previous version is still in the backup", readText(soulBackups[0]!.path).includes("edit me."));
+	check("the page lists the backup", afterEditHtml.includes(soulBackups[0]!.name), soulBackups[0]!.name);
+
+	section("settings backups: cap");
+	const capBase = base + 1_000_000;
+	for (let index = 0; index < DASHBOARD_BACKUP_KEEP + 5; index += 1) {
+		applySettingsEdit(
+			reloadProfile("editor"),
+			{ prompts: { summary: `# Summary\n\nrevision ${index}\n` } },
+			{ now: capBase + index * 1_000 },
+		);
+	}
+	const cappedBackups = listDashboardBackups(reloadProfile("editor"), editorSummaryFile);
+	check(`backups are capped at ${DASHBOARD_BACKUP_KEEP}`, cappedBackups.length === DASHBOARD_BACKUP_KEEP, cappedBackups.length);
+	check("the cap drops the oldest backup", !cappedBackups.some((backup) => readText(backup.path).includes("old summary")), cappedBackups.map((backup) => backup.name));
+	check(
+		"the newest backup holds the version before the last edit",
+		readText(cappedBackups[cappedBackups.length - 1]!.path).includes(`revision ${DASHBOARD_BACKUP_KEEP + 3}`),
+		readText(cappedBackups[cappedBackups.length - 1]!.path),
+	);
+	check("the profile kept editing after the cap", readText(editorSummaryFile).includes(`revision ${DASHBOARD_BACKUP_KEEP + 4}`));
+
 	section("bind validation");
 	check("accepts 127.0.0.1:7777", JSON.stringify(validateDashboardBind("127.0.0.1", 7777)) === JSON.stringify({ host: "127.0.0.1", port: 7777 }));
 	check("normalises localhost to 127.0.0.1", validateDashboardBind("localhost", 1234).host === "127.0.0.1");
@@ -611,6 +940,7 @@ async function main(): Promise<void> {
 	const before = snapshotTree(stateDir);
 	const dashboard = createDashboardServer({ rootDir: root, port: 0, allowEphemeralPort: true, now: () => now });
 	const address = await dashboard.listen();
+	let afterReadOnlyServing = "";
 	try {
 		const baseUrl = `http://${address.host}:${address.port}`;
 		const indexResponse = await fetch(`${baseUrl}/`);
@@ -633,14 +963,142 @@ async function main(): Promise<void> {
 		const missing = await fetch(`${baseUrl}/agent/nobody`);
 		check("unknown agent is 404", missing.status === 404, missing.status);
 		const post = await fetch(`${baseUrl}/`, { method: "POST" });
-		check("POST is refused (read-only)", post.status === 405, post.status);
+		check("POST is refused outside the settings route", post.status === 405, post.status);
 		const head = await fetch(`${baseUrl}/`, { method: "HEAD" });
 		check("HEAD works without a body", head.status === 200 && (await head.text()) === "", head.status);
+
+		// Read-only pages above must not have touched the profile tree.
+		afterReadOnlyServing = snapshotTree(stateDir);
+
+		section("settings over HTTP");
+		const settingsUrl = `${baseUrl}/agent/editor/settings`;
+		const tokenFrom = (html: string): string => /name="csrf" value="([^"]+)"/.exec(html)?.[1] ?? "";
+		const csrfFromPage = async (url = settingsUrl): Promise<string> => tokenFrom(await (await fetch(url)).text());
+		const postSettings = (fields: Record<string, string>, url = settingsUrl): Promise<Response> =>
+			fetch(url, {
+				method: "POST",
+				headers: { "content-type": "application/x-www-form-urlencoded" },
+				body: new URLSearchParams(fields).toString(),
+				redirect: "manual",
+			});
+
+		const settingsPage = await fetch(settingsUrl);
+		const settingsPageBody = await settingsPage.text();
+		check(
+			"GET /agent/editor/settings is 200 with a form",
+			settingsPage.status === 200 && settingsPageBody.includes('method="post"') && settingsPageBody.includes("save settings"),
+			settingsPage.status,
+		);
+		check("the rendered settings page carries a per-render CSRF token", tokenFrom(settingsPageBody).length >= 32, tokenFrom(settingsPageBody).length);
+		check(
+			"the settings page CSP allows a same-origin form",
+			(settingsPage.headers.get("content-security-policy") ?? "").includes("form-action 'self'"),
+			settingsPage.headers.get("content-security-policy"),
+		);
+		check(
+			"read-only pages still forbid form actions",
+			(agentResponse.headers.get("content-security-policy") ?? "").includes("form-action 'none'"),
+			agentResponse.headers.get("content-security-policy"),
+		);
+		const rootSettingsPage = await fetch(`${baseUrl}/agent/main/settings`);
+		const rootSettingsBody = await rootSettingsPage.text();
+		check(
+			"the root profile has an editable settings page too",
+			rootSettingsPage.status === 200 && rootSettingsBody.includes("save settings") && !rootSettingsBody.includes("config is read-only here"),
+			rootSettingsPage.status,
+		);
+		check(
+			"each render gets a different CSRF token",
+			tokenFrom(settingsPageBody) !== (await csrfFromPage()),
+		);
+
+		const beforeRejected = snapshotTree(editorDir);
+		const soulBeforeRejected = readText(editorSoulFile);
+		const noToken = await postSettings({ "prompt:soul": "# hijack\n" });
+		check("POST without a CSRF token is 403", noToken.status === 403, noToken.status);
+		const wrongToken = await postSettings({ csrf: "not-the-token", "prompt:soul": "# hijack\n" });
+		const wrongTokenBody = await wrongToken.text();
+		check("POST with a wrong CSRF token is 403", wrongToken.status === 403, wrongToken.status);
+		check("the 403 page explains the CSRF problem", wrongTokenBody.includes("CSRF"), wrongTokenBody.slice(0, 120));
+		const invalidJson = await postSettings({ csrf: await csrfFromPage(), config: "{not json", "prompt:soul": "# hijack\n" });
+		const invalidJsonBody = await invalidJson.text();
+		check("POST with invalid JSON is 400", invalidJson.status === 400 && invalidJsonBody.includes("not valid JSON"), invalidJson.status);
+		const unknownField = await postSettings({ csrf: await csrfFromPage(), config: "{}", evil: "1" });
+		check("POST with an unknown form field is 400", unknownField.status === 400 && (await unknownField.text()).includes("unknown form field"), unknownField.status);
+		const unknownConfig = await postSettings({ csrf: await csrfFromPage(), config: JSON.stringify({ tools: { allowlist: ["read"], typo: true } }) });
+		check("POST with an unknown config field is 400", unknownConfig.status === 400 && (await unknownConfig.text()).includes("unknown config field"), unknownConfig.status);
+		const secretPost = await postSettings({ csrf: await csrfFromPage(), config: JSON.stringify({ model: OPENAI_KEY }) });
+		const secretBody = await secretPost.text();
+		check("POST with a secret-looking value is 400 and names .env", secretPost.status === 400 && secretBody.includes(".env"), secretPost.status);
+		check("the rejected secret is never rendered back", !secretBody.includes(OPENAI_KEY));
+		const escapedUrl = `${baseUrl}/agent/escaped/settings`;
+		const outsidePost = await postSettings({ csrf: await csrfFromPage(escapedUrl), "prompt:soul": "# Escaped edit\n" }, escapedUrl);
+		check(
+			"POST editing a prompt outside the profile is 400",
+			outsidePost.status === 400 && (await outsidePost.text()).includes("outside the profile directory"),
+			outsidePost.status,
+		);
+		check("every rejected POST left the profile untouched", snapshotTree(editorDir) === beforeRejected);
+		check("every rejected POST left the prompt file untouched", readText(editorSoulFile) === soulBeforeRejected);
+		check("the outside file was not written over HTTP either", readText(escapedSoulFile) === "# Outside soul\n\nmust not be written.\n");
+
+		const contractBefore = readText(editorContractFile);
+		const okPost = await postSettings({
+			csrf: await csrfFromPage(),
+			config: JSON.stringify({ sandbox: { network: false } }),
+			"prompt:contract": "# Role: editor\n\nwritten over HTTP.\n",
+		});
+		check(
+			"a valid POST redirects back to the settings page",
+			okPost.status === 303 && (okPost.headers.get("location") ?? "").includes("/agent/editor/settings"),
+			{ status: okPost.status, location: okPost.headers.get("location") },
+		);
+		await okPost.text();
+		check("the valid POST wrote the prompt file", readText(editorContractFile) === "# Role: editor\n\nwritten over HTTP.\n", readText(editorContractFile));
+		const contractBackups = listDashboardBackups(reloadProfile("editor"), editorContractFile);
+		check(
+			"the valid POST backed up the previous prompt",
+			readText(contractBackups[contractBackups.length - 1]?.path ?? "") === contractBefore,
+			contractBackups.map((backup) => backup.name),
+		);
+		const savedPage = await fetch(`${settingsUrl}?saved=1`);
+		const savedBody = await savedPage.text();
+		check("after the edit the page shows the new value", savedBody.includes("written over HTTP."));
+		check("the page shows the saved banner", savedBody.includes("saved."));
+		const httpConfig = JSON.parse(readText(path.join(editorDir, "alive.config.json"))) as { sandbox?: { enabled?: boolean; network?: boolean } };
+		check("the valid POST wrote the config change", httpConfig.sandbox?.network === false && httpConfig.sandbox?.enabled === false, httpConfig.sandbox);
+		check("the page reflects the edited config JSON", savedBody.includes("&quot;network&quot;: false"), savedBody.includes("network"));
+
+		const wrongType = await fetch(settingsUrl, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+		check("POST with the wrong content type is 415", wrongType.status === 415, wrongType.status);
+		const oversized = await postSettings({ csrf: await csrfFromPage(), config: JSON.stringify({ model: "a".repeat(DASHBOARD_MAX_BODY_BYTES + 100) }) });
+		check("an oversized POST body is 413", oversized.status === 413, oversized.status);
+		const postMemory = await fetch(`${baseUrl}/agent/editor/memory`, { method: "POST" });
+		check(
+			"POST to a non-settings route is 405 with GET in Allow",
+			postMemory.status === 405 && (postMemory.headers.get("allow") ?? "").includes("GET"),
+			{ status: postMemory.status, allow: postMemory.headers.get("allow") },
+		);
+		await postMemory.text();
+		const putSettings = await fetch(settingsUrl, { method: "PUT" });
+		check(
+			"PUT on settings is 405 with POST in Allow",
+			putSettings.status === 405 && (putSettings.headers.get("allow") ?? "").includes("POST"),
+			{ status: putSettings.status, allow: putSettings.headers.get("allow") },
+		);
+		await putSettings.text();
+		const missingSettingsAgent = await fetch(`${baseUrl}/agent/nobody/settings`);
+		check("unknown agent settings page is 404", missingSettingsAgent.status === 404, missingSettingsAgent.status);
+		const missingSettingsPost = await fetch(`${baseUrl}/agent/nobody/settings`, {
+			method: "POST",
+			headers: { "content-type": "application/x-www-form-urlencoded" },
+			body: "csrf=x",
+		});
+		check("POST to an unknown agent settings route is 404", missingSettingsPost.status === 404, missingSettingsPost.status);
 	} finally {
 		await dashboard.close();
 	}
-	const after = snapshotTree(stateDir);
-	check("serving pages wrote nothing to the state dir", before === after);
+	check("serving the read-only pages wrote nothing to the state dir", before === afterReadOnlyServing);
 
 	section("summary");
 	if (failures > 0) {

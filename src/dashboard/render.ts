@@ -1,8 +1,9 @@
 /**
- * Inline HTML rendering for the read-only dashboard.
+ * Inline HTML rendering for the dashboard.
  *
  * There is no build step and no client JavaScript: every page is a template
- * string with plain CSS. Every value that reaches the page goes through
+ * string with plain CSS (the settings page is a plain HTML form). Every value
+ * that reaches a page goes through
  * `Masker.text()`, which applies the existing secret masking
  * (`src/secrets.ts`) and then HTML-escapes it. The finished document is masked
  * once more as a safety net, so a forgotten interpolation cannot leak a token.
@@ -29,6 +30,7 @@ import {
 	type TimelineItem,
 	type ToolCallView,
 } from "./state.js";
+import type { SettingsView } from "./settings.js";
 
 export interface RenderContext {
 	secrets: SecretsConfig;
@@ -187,6 +189,36 @@ code { font-family: var(--mono); font-size: 12px; }
 .revision .fact-text { color: var(--text); }
 .search { border: 1px solid var(--line); background: var(--panel); padding: 10px 14px; margin: 0 0 14px; }
 .search .term { font-family: var(--mono); color: var(--link); }
+form.settings { border: 1px solid var(--line); background: var(--panel); padding: 14px 16px; margin: 0 0 18px; }
+form.settings fieldset { border: none; margin: 0 0 18px; padding: 0; }
+form.settings legend { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; padding: 0 0 8px; }
+label.field { display: block; margin: 0 0 14px; }
+label.field .label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+label.field .path { display: block; color: var(--muted); font-family: var(--mono); font-size: 11px; margin-top: 3px; word-break: break-all; }
+textarea, input[type=text] {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 8px 10px;
+}
+textarea { min-height: 140px; resize: vertical; }
+textarea:disabled, input:disabled { opacity: .55; }
+button {
+  background: var(--bg);
+  color: var(--link);
+  border: 1px solid #5a564c;
+  padding: 6px 18px;
+  font: inherit;
+  cursor: pointer;
+}
+button:hover { color: #f2ead6; border-color: var(--link); }
+button:disabled { color: var(--muted); border-color: var(--line); cursor: not-allowed; }
+.saved { border: 1px solid #3d5340; color: #a9cfa9; padding: 8px 12px; margin: 0 0 16px; }
+.disabled { border: 1px solid #5a3f3f; color: var(--error); padding: 8px 12px; margin: 0 0 16px; }
 `;
 
 function layout(masker: Masker, title: string, body: string, nav: string[] = []): string {
@@ -204,12 +236,12 @@ function layout(masker: Masker, title: string, body: string, nav: string[] = [])
 <header>
 <span class="brand">alive</span>
 ${navHtml}
-<span class="tag">read-only · 127.0.0.1</span>
+<span class="tag">127.0.0.1 · read-only unless settings</span>
 </header>
 <main>
 ${body}
 </main>
-<footer>read-only snapshot of on-disk agent state — no actions are exposed, every route is a GET.</footer>
+<footer>read-only snapshot of on-disk agent state — the only write route is /agent/[id]/settings (loopback, CSRF-protected, backups kept).</footer>
 </body>
 </html>`);
 }
@@ -225,6 +257,10 @@ function agentHref(id: string, masker: Masker): string {
 
 function memoryHref(id: string, masker: Masker): string {
 	return `${agentHref(id, masker)}/memory`;
+}
+
+function settingsHref(id: string, masker: Masker): string {
+	return `${agentHref(id, masker)}/settings`;
 }
 
 function renderStatus(summary: AgentSummary, masker: Masker): string {
@@ -288,7 +324,7 @@ export function renderAgentPage(detail: AgentDetail, context: RenderContext): st
 </tr>`).join("\n");
 	const body = `<h1>${masker.text(summary.name)}</h1>
 <p class="sub mono">${masker.text(summary.id)} · ${masker.text(summary.stateDir)}</p>
-<p class="sub"><a href="${memoryHref(summary.id, masker)}">memory, notes, journal and summary →</a></p>
+<p class="sub"><a href="${memoryHref(summary.id, masker)}">memory, notes, journal and summary →</a> · <a href="${settingsHref(summary.id, masker)}">settings →</a> (the only page that can write)</p>
 
 <h2>status</h2>
 <table class="kv">
@@ -538,6 +574,149 @@ ${renderTextSection(view.journal, "journal entry", "journal entries", view.query
 		`<a href="${agentHref(view.agent.id, masker)}">${masker.text(view.agent.name)}</a>`,
 		`<span class="mono">memory</span>`,
 	]);
+}
+
+export interface SettingsRenderOptions {
+	/** Per-render CSRF token, stored in the server's in-memory table. */
+	csrfToken: string;
+	/** Set after a successful POST redirect (`?saved=1`). */
+	saved?: boolean;
+}
+
+function renderBackupList(view: SettingsView, masker: Masker): string {
+	if (view.backups.length === 0) {
+		return `<p class="empty">No backups yet — one is written before every save.</p>`;
+	}
+	const rows = view.backups.map((backup) => `<tr>
+<td class="mono">${masker.text(backup.name)}</td>
+<td>${masker.text(backup.originalName)}</td>
+<td class="num">${masker.num(backup.size)}</td>
+<td class="mono">${masker.text(formatTimestamp(backup.mtimeMs))}</td>
+</tr>`);
+	return `<table>
+<thead><tr><th>backup</th><th>file</th><th class="num">bytes</th><th>written</th></tr></thead>
+<tbody>
+${rows.join("\n")}
+</tbody>
+</table>`;
+}
+
+/**
+ * The settings page: a plain HTML form, no client JavaScript.
+ *
+ * Every value (current config, prompt bodies, paths, the CSRF token) goes
+ * through the masker, and the finished document is masked once more by
+ * `layout`. Prompt files that hold a secret therefore render as `[label#n]`;
+ * the page says so, because saving that text would write the placeholder.
+ */
+export function renderSettingsPage(
+	view: SettingsView,
+	context: RenderContext,
+	options: SettingsRenderOptions,
+): string {
+	const masker = new Masker(context.secrets, context.env);
+	const disabled = view.disabledReason !== undefined;
+	const disabledNote = view.disabledReason
+		? `<p class="disabled">editing is disabled: ${masker.text(view.disabledReason)}</p>`
+		: "";
+	const configDisabled = disabled || view.configDisabledReason !== undefined;
+	const configNote = view.configDisabledReason
+		? `<p class="note">config is read-only here: ${masker.text(view.configDisabledReason)}</p>`
+		: "";
+	const savedNote = options.saved
+		? `<p class="saved">saved. The previous version of every changed file was copied to <span class="mono">${masker.text(view.backupsDir)}</span> (the newest 20 per file are kept).</p>`
+		: "";
+	const flags = view.flags.map((flag) => `<tr>
+<th class="mono">${masker.text(flag.path)}</th>
+<td>${masker.text(flag.label)}</td>
+<td class="mono">${masker.text(flag.value ? "on" : "off")}</td>
+</tr>`).join("\n");
+	const promptFields = view.prompts.map((prompt) => {
+		const missing = prompt.exists ? "" : `<div class="note">this file does not exist yet; saving creates it</div>`;
+		const outside = prompt.insideProfile
+			? ""
+			: `<div class="note">this path is outside the profile directory, so saving it is refused</div>`;
+		const truncated = prompt.truncated
+			? `<div class="note">showing the first ${masker.num(prompt.content.length)} of ${masker.num(prompt.originalChars)} characters; saving this text would truncate the file</div>`
+			: "";
+		const rows = Math.min(Math.max(prompt.content.split("\n").length + 2, 8), 30);
+		return `<label class="field">
+<span class="label">${masker.text(prompt.label)}</span>
+<textarea name="${masker.text(prompt.field)}" rows="${rows}" spellcheck="false"${disabled ? " disabled" : ""}>${masker.text(prompt.content)}</textarea>
+<span class="path">${masker.text(prompt.path)}</span>
+${missing}${outside}${truncated}
+</label>`;
+	}).join("\n");
+	const body = `<h1>${masker.text(view.agent.name)} · settings</h1>
+<p class="sub mono">${masker.text(view.agent.id)} · ${masker.text(view.agent.profileDir)}</p>
+<p class="sub"><a href="${agentHref(view.agent.id, masker)}">← back to agent</a> · this is the dashboard's only write path</p>
+${savedNote}${disabledNote}
+
+<h2>effective permissions</h2>
+<table class="kv">
+<tr><th>model</th><td class="mono">${masker.text(view.model || "(default from pi settings)")}</td></tr>
+<tr><th>tool allowlist</th><td class="mono">${masker.text(view.allowlist.join(", ") || "(empty)")}</td></tr>
+</table>
+<table class="mini">
+${flags}
+</table>
+
+<h2>config</h2>
+<p class="note">the JSON below is the editable subset of <span class="mono">${masker.text(view.agent.configPath)}</span>: only fields that differ from the effective config are written. Unknown fields are rejected. Secrets (tokens, API keys) are never editable here — keep them in <span class="mono">.env</span> next to the config and reference them with <span class="mono">*Env</span> field names.</p>
+
+<h2>prompt files</h2>
+<p class="note">paths are resolved from the profile config; a file outside the profile directory is refused. Values that look like secrets are shown masked (<span class="mono">[label#n]</span>) — do not paste secrets into these files.</p>
+
+<form class="settings" method="post" action="${settingsHref(view.agent.id, masker)}">
+<input type="hidden" name="csrf" value="${masker.text(options.csrfToken)}">
+<fieldset>
+<legend>config · ${masker.text(baseName(view.agent.configPath))}</legend>
+<label class="field">
+<span class="label">editable config (JSON): model, tools, workers, sandbox, modules.browser</span>
+<textarea name="config" rows="24" spellcheck="false"${configDisabled ? " disabled" : ""}>${masker.text(view.configJson)}</textarea>
+${configNote}
+</label>
+</fieldset>
+<fieldset>
+<legend>prompt files</legend>
+${promptFields}
+</fieldset>
+<button type="submit"${disabled ? " disabled" : ""}>save settings</button>
+</form>
+
+<h2>backups</h2>
+<p class="note">before every write the previous version is copied to <span class="mono">${masker.text(view.backupsDir)}</span>; the newest 20 backups per file are kept. The newest 10 are listed here.</p>
+${renderBackupList(view, masker)}`;
+	return layout(masker, `${view.agent.name} settings`, body, [
+		`<a href="/">agents</a>`,
+		`<a href="${agentHref(view.agent.id, masker)}">${masker.text(view.agent.name)}</a>`,
+		`<span class="mono">settings</span>`,
+	]);
+}
+
+/** A rejected edit: what went wrong, and that nothing was written. */
+export function renderSettingsErrorPage(
+	agent: { id: string; name: string },
+	status: number,
+	messages: string[],
+	context: RenderContext,
+): string {
+	const masker = new Masker(context.secrets, context.env);
+	const body = `<h1>settings not saved (${masker.num(status)})</h1>
+<ul class="errors">${messages.map((message) => `<li>${masker.text(message)}</li>`).join("")}</ul>
+<p>No file was changed. Fix the problem and submit the form again.</p>
+<p><a href="${settingsHref(agent.id, masker)}">← back to settings</a> · <a href="${agentHref(agent.id, masker)}">agent</a></p>`;
+	return layout(masker, `settings error ${status}`, body, [
+		`<a href="/">agents</a>`,
+		`<a href="${agentHref(agent.id, masker)}">${masker.text(agent.name)}</a>`,
+		`<span class="mono">settings</span>`,
+	]);
+}
+
+/** Local, masked basename: the renderer must not import `node:path` just for this. */
+function baseName(file: string): string {
+	const index = Math.max(file.lastIndexOf("/"), file.lastIndexOf("\\"));
+	return index >= 0 ? file.slice(index + 1) : file;
 }
 
 export function renderErrorPage(status: number, message: string, context: RenderContext): string {

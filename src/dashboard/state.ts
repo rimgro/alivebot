@@ -1,9 +1,10 @@
 /**
  * Read-only view over an alive profile's on-disk state.
  *
- * Nothing here writes: the dashboard is a pure GET surface, so the state layer
- * only ever reads `runs/runs.jsonl`, `reminders.json`, `usage.json`,
+ * Nothing here writes: this layer is a pure read model over
+ * `runs/runs.jsonl`, `reminders.json`, `usage.json`,
  * `runtime.json`, `inbox/events.jsonl` and the pi `sessions/*.jsonl` transcripts.
+ * The dashboard's single write path lives in `settings.ts`.
  *
  * The shapes below mirror the files that exist today (see `src/store/*` and
  * `src/runtime/agent.ts`); when a file is missing the view degrades to an
