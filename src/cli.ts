@@ -341,6 +341,9 @@ export async function main(argv: string[], options: CliOptions = {}): Promise<nu
 			case "thoughts": {
 				return thoughtsCommand(cwd, flags);
 			}
+			case "dashboard": {
+				return await dashboardCommand(cwd, flags);
+			}
 			default: {
 				printHelp();
 				return command === "help" || command === "--help" || command === "-h" ? 0 : 1;
@@ -1367,6 +1370,46 @@ function runningHint(config: LoadedConfig): string {
 	return " — no runtime running; it will be processed on next start";
 }
 
+const DASHBOARD_USAGE =
+	"usage: alive dashboard [--port 7777] [--host 127.0.0.1] [--config CONFIG]\n" +
+	"\n" +
+	"  --port PORT     TCP port (default 7777)\n" +
+	"  --host HOST     127.0.0.1 or localhost; any other host is refused\n" +
+	"  --config FILE   profile config (default ./alive.config.json)\n" +
+	"\n" +
+	"Serves a read-only HTML view of the agents' on-disk state: agents list,\n" +
+	"timeline, run details and prompts. It binds to loopback only, writes nothing\n" +
+	"and exposes no actions. Stop with Ctrl+C.\n";
+
+async function dashboardCommand(cwd: string, flags: Record<string, string | boolean>): Promise<number> {
+	if (flagBool(flags, "help") || flagBool(flags, "h")) {
+		process.stdout.write(DASHBOARD_USAGE);
+		return 0;
+	}
+	const known = new Set(["port", "host", "config", "help", "h"]);
+	const unknown = Object.keys(flags).filter((key) => !known.has(key));
+	if (unknown.length > 0) {
+		throw new Error(`unknown flag${unknown.length === 1 ? "" : "s"}: --${unknown.join(", --")} (${DASHBOARD_USAGE.split("\n")[0]})`);
+	}
+	if (flags.port === true) throw new Error("--port requires a value (e.g. --port 7777)");
+	if (flags.host === true) throw new Error("--host requires a value (127.0.0.1 or localhost)");
+	const { DEFAULT_DASHBOARD_HOST, DEFAULT_DASHBOARD_PORT, runDashboard, validateDashboardBind } =
+		await import("./dashboard/server.js");
+	const host = flagString(flags, "host") ?? DEFAULT_DASHBOARD_HOST;
+	const portText = flagString(flags, "port");
+	const port = portText === undefined ? DEFAULT_DASHBOARD_PORT : Number(portText);
+	const bind = validateDashboardBind(host, port);
+	// Read-only: never migrate config secrets, that path writes .env.
+	const config = loadForCli(flags, { migrateSecrets: false });
+	await runDashboard({
+		rootDir: config.paths.rootDir,
+		configPath: config.paths.configPath,
+		host: bind.host,
+		port: bind.port,
+	});
+	return 0;
+}
+
 function printHelp(): void {
 	process.stdout.write(`alive — a long-lived agent runtime on top of pi
 
@@ -1436,5 +1479,8 @@ usage:
   alive browser host-status | host-stop | migrate-shared
                                               one private browser host for isolated agent connections
   alive thoughts [-n 20]                      the agent's private monologue
+  alive dashboard [--port 7777] [--host 127.0.0.1] [--config CONFIG]
+                                              read-only local dashboard: agents, timeline,
+                                              run details and prompts (loopback only)
 `);
 }
