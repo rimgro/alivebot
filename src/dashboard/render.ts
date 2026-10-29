@@ -10,6 +10,14 @@
 import { createMaskContext, maskSecrets, type MaskContext, type SecretsConfig } from "../secrets.js";
 import { formatDuration, oneLine } from "../util.js";
 import {
+	MEMORY_MAX_TEXT_CHARS,
+	type MemoryFactGroup,
+	type MemoryFactView,
+	type MemoryTextItem,
+	type MemoryTextSection,
+	type MemoryView,
+} from "./memory.js";
+import {
 	formatCost,
 	formatTimestamp,
 	type AgentDetail,
@@ -166,6 +174,19 @@ ul.errors { margin: 0 0 14px; padding-left: 18px; }
 ul.errors li { color: var(--error); font-family: var(--mono); font-size: 12px; margin-bottom: 4px; }
 footer { border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; padding: 14px 22px; }
 code { font-family: var(--mono); font-size: 12px; }
+.memory-item { border: 1px solid var(--line); background: var(--panel); padding: 12px 14px; margin: 0 0 14px; }
+.memory-item .memory-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin-bottom: 6px; }
+.memory-item .memory-title { font-weight: 600; }
+.memory-item pre { margin: 8px 0 0; border: none; background: transparent; padding: 0; }
+.fact.current { border-color: #3a362e; }
+.fact.historical { opacity: .82; }
+.fact .fact-text { white-space: pre-wrap; word-break: break-word; margin: 6px 0 8px; }
+.scopes { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
+.scope { font-family: var(--mono); font-size: 11px; color: var(--link); border: 1px solid var(--line); padding: 1px 6px; }
+.revision { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 10px; color: var(--muted); }
+.revision .fact-text { color: var(--text); }
+.search { border: 1px solid var(--line); background: var(--panel); padding: 10px 14px; margin: 0 0 14px; }
+.search .term { font-family: var(--mono); color: var(--link); }
 `;
 
 function layout(masker: Masker, title: string, body: string, nav: string[] = []): string {
@@ -200,6 +221,10 @@ function statusLabel(status: AgentStatus): string {
 /** Ids come from disk, so they go through masking and escaping like every other string. */
 function agentHref(id: string, masker: Masker): string {
 	return `/agent/${masker.text(encodeURIComponent(id))}`;
+}
+
+function memoryHref(id: string, masker: Masker): string {
+	return `${agentHref(id, masker)}/memory`;
 }
 
 function renderStatus(summary: AgentSummary, masker: Masker): string {
@@ -263,6 +288,7 @@ export function renderAgentPage(detail: AgentDetail, context: RenderContext): st
 </tr>`).join("\n");
 	const body = `<h1>${masker.text(summary.name)}</h1>
 <p class="sub mono">${masker.text(summary.id)} · ${masker.text(summary.stateDir)}</p>
+<p class="sub"><a href="${memoryHref(summary.id, masker)}">memory, notes, journal and summary →</a></p>
 
 <h2>status</h2>
 <table class="kv">
@@ -394,6 +420,123 @@ ${transcript}`;
 		`<a href="/">agents</a>`,
 		`<a href="${agentHref(detail.agent.id, masker)}">${masker.text(detail.agent.name)}</a>`,
 		`<span class="mono">run #${masker.num(run.index)}</span>`,
+	]);
+}
+
+// ---------------------------------------------------------------------------
+// memory page
+// ---------------------------------------------------------------------------
+
+function memoryTimestamp(value: string | undefined): string {
+	if (!value) return "—";
+	return formatTimestamp(Date.parse(value));
+}
+
+function renderTruncation(item: { truncated: boolean; originalChars: number }, masker: Masker): string {
+	if (!item.truncated) return "";
+	return `<p class="note">truncated: showing the first ${masker.num(MEMORY_MAX_TEXT_CHARS)} of ${masker.num(item.originalChars)} characters</p>`;
+}
+
+function renderScopes(scopes: string[], masker: Masker): string {
+	if (scopes.length === 0) return `<span class="sub">no scopes</span>`;
+	return `<div class="scopes">${scopes.map((scope) => `<span class="scope">${masker.text(scope)}</span>`).join("")}</div>`;
+}
+
+function renderFactText(fact: MemoryFactView, masker: Masker): string {
+	const validTo = fact.validTo ? ` → ${memoryTimestamp(fact.validTo)}` : " → present";
+	return `<div class="fact-text">${masker.text(fact.text)}</div>
+${renderScopes(fact.scopes, masker)}
+<div class="sub mono">created ${masker.text(memoryTimestamp(fact.createdAt))} · valid ${masker.text(memoryTimestamp(fact.validFrom))}${masker.text(validTo)} · id ${masker.text(fact.id)}</div>
+${renderTruncation(fact, masker)}`;
+}
+
+function renderFactGroup(group: MemoryFactGroup, masker: Masker): string {
+	if (!group.current) {
+		const fact = group.revisions[0];
+		if (!fact) return "";
+		return `<article class="memory-item fact historical">
+<div class="memory-head"><span class="badge">superseded</span><span class="sub">current revision not in this result</span></div>
+${renderFactText(fact, masker)}
+</article>`;
+	}
+	const revisions = group.revisions.length === 0
+		? ""
+		: `<details class="revisions">
+<summary>${masker.num(group.revisions.length)} older revision${group.revisions.length === 1 ? "" : "s"} (superseded)</summary>
+${group.revisions.map((revision) => `<div class="revision">${renderFactText(revision, masker)}</div>`).join("\n")}
+</details>`;
+	return `<article class="memory-item fact current">
+<div class="memory-head"><span class="badge">current</span><span class="sub">${masker.num(1 + group.revisions.length)} revision${group.revisions.length === 0 ? "" : "s"} in this chain</span></div>
+${renderFactText(group.current, masker)}
+</article>
+${revisions}`;
+}
+
+function renderTextSection(
+	section: MemoryTextSection,
+	one: string,
+	many: string,
+	query: string,
+	emptyText: string,
+	masker: Masker,
+): string {
+	const label = section.total === 1 ? one : many;
+	const counts = `<p class="sub">showing ${masker.num(section.shown)} of ${masker.num(section.total)} ${label}</p>`;
+	const note = section.note ? `<p class="note">${masker.text(section.note)}</p>` : "";
+	if (section.items.length === 0) {
+		return `${counts}${note}<p class="empty">${masker.text(query ? `no ${many} match the search term` : emptyText)}</p>`;
+	}
+	const items = section.items.map((item: MemoryTextItem) => `<article class="memory-item">
+<div class="memory-head"><span class="memory-title">${masker.text(item.title)}</span>${item.meta ? `<span class="sub">${masker.text(item.meta)}</span>` : ""}${item.source ? `<span class="sub mono">${masker.text(item.source)}</span>` : ""}</div>
+<pre>${masker.text(item.text)}</pre>
+${renderTruncation(item, masker)}
+</article>`).join("\n");
+	return `${counts}${note}\n${items}`;
+}
+
+export function renderMemoryPage(view: MemoryView, context: RenderContext): string {
+	const masker = new Masker(context.secrets, context.env);
+	const search = view.query
+		? `<div class="search">
+<p>search <span class="term">${masker.text(view.query)}</span> — case-insensitive substring over facts, notes, journal and summary</p>
+<p class="sub">matches: facts ${masker.num(view.facts.matches)} · notes ${masker.num(view.notes.matches)} · journal ${masker.num(view.journal.matches)} · summary ${masker.num(view.summary.matches)}</p>
+</div>`
+		: `<p class="note">search: append <code>?q=term</code> to this page's URL (case-insensitive substring). Only GET is supported.</p>`;
+	const currentFacts = view.facts.groups.filter((group) => group.current).length;
+	const factsCounts = `<p class="sub">showing ${masker.num(view.facts.shown)} of ${masker.num(view.facts.total)} fact revision${view.facts.total === 1 ? "" : "s"} · ${masker.num(currentFacts)} current fact${currentFacts === 1 ? "" : "s"}</p>`;
+	const factsNote = view.facts.note ? `<p class="note">${masker.text(view.facts.note)}</p>` : "";
+	const facts = view.facts.groups.length === 0
+		? `${factsCounts}${factsNote}<p class="empty">${masker.text(view.query ? "no facts match the search term" : "no facts retained yet")}</p>`
+		: `${factsCounts}${factsNote}<p class="note">revisioned facts: the current revision is shown first, superseded revisions are collapsed. search matches individual revisions.</p>\n${view.facts.groups.map((group) => renderFactGroup(group, masker)).join("\n")}`;
+	const summary = view.summary.item
+		? `<article class="memory-item">
+<div class="memory-head"><span class="memory-title">summary.md</span><span class="sub mono">${masker.text(view.summary.item.source ?? "")}</span></div>
+<pre>${masker.text(view.summary.item.text)}</pre>
+${renderTruncation(view.summary.item, masker)}
+</article>`
+		: `<p class="empty">${masker.text(view.summary.note ?? "no summary.md")}</p>`;
+
+	const body = `<h1>${masker.text(view.agent.name)} · memory</h1>
+<p class="sub mono">${masker.text(view.agent.id)} · ${masker.text(view.databasePath)}</p>
+<p class="sub"><a href="${agentHref(view.agent.id, masker)}">← back to agent</a> · read-only: this page never writes to memory</p>
+
+${search}
+
+<h2>facts</h2>
+${facts}
+
+<h2>summary</h2>
+${summary}
+
+<h2>notes</h2>
+${renderTextSection(view.notes, "note", "notes", view.query, "no notes", masker)}
+
+<h2>journal (newest first)</h2>
+${renderTextSection(view.journal, "journal entry", "journal entries", view.query, "the journal is empty", masker)}`;
+	return layout(masker, `${view.agent.name} memory`, body, [
+		`<a href="/">agents</a>`,
+		`<a href="${agentHref(view.agent.id, masker)}">${masker.text(view.agent.name)}</a>`,
+		`<span class="mono">memory</span>`,
 	]);
 }
 

@@ -10,7 +10,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { loadConfig } from "../config.js";
+import {
+	loadMemoryPage,
+	MEMORY_MAX_ITEMS,
+	MEMORY_MAX_TEXT_CHARS,
+	openMemoryDatabaseReadOnly,
+} from "../dashboard/memory.js";
 import { DEFAULT_SECRETS_CONFIG } from "../secrets.js";
+import { MemoryStore } from "../store/memory.js";
 import { formatDuration, localDay } from "../util.js";
 import {
 	buildTimeline,
@@ -29,7 +36,7 @@ import {
 	type DashboardProfile,
 	type RunView,
 } from "../dashboard/state.js";
-import { renderAgentPage, renderIndexPage, renderRunPage } from "../dashboard/render.js";
+import { renderAgentPage, renderIndexPage, renderMemoryPage, renderRunPage } from "../dashboard/render.js";
 import { createDashboardServer, resolveDashboardRoute, validateDashboardBind } from "../dashboard/server.js";
 
 let failures = 0;
@@ -201,6 +208,50 @@ appendJsonl(path.join(stateDir, "inbox", "events.jsonl"), [
 	{ seq: 4, id: "evt_4", ts: base + 50_000, kind: "reminder", source: "scheduler", priority: "high", title: "reminder fired", text: "check deploy" },
 ]);
 
+// Memory fixtures: summary.md, notes.json + notes/, and a journal with enough
+// entries to exercise the section cap. The sqlite facts are created with the
+// project's own MemoryStore (stubbed embeddings) inside main().
+fs.writeFileSync(path.join(root, "summary.md"), "# Summary\n\ndeploy plan lives here.\n", "utf8");
+writeJson(path.join(stateDir, "notes.json"), {
+	status: "waiting on deploy",
+	secret: `notes token ${GITHUB_TOKEN}`,
+	huge: `huge note ${'x'.repeat(MEMORY_MAX_TEXT_CHARS + 50)}`,
+});
+fs.mkdirSync(path.join(stateDir, "notes"), { recursive: true });
+fs.writeFileSync(path.join(stateDir, "notes", "plan.md"), "# Plan\n\nfinish the memory page.\n", "utf8");
+fs.mkdirSync(path.join(stateDir, "journal"), { recursive: true });
+fs.writeFileSync(
+	path.join(stateDir, "journal", "2026-02-01.md"),
+	`# Journal 2026-02-01\n\n${
+		Array.from({ length: 205 }, (_, index) => `## 00:${String(index % 60).padStart(2, "0")} — filler item ${index}`).join("\n\n")
+	}\n\n## 23:58 — token ${TELEGRAM_TOKEN}\n\n## 23:59 — check deploy\n`,
+	"utf8",
+);
+
+async function createMemoryFacts(databasePath: string): Promise<void> {
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => new Response(JSON.stringify({ result: { data: [[1, 0, 0]] } }), { status: 200 });
+	try {
+		const store = new MemoryStore({
+			databasePath,
+			embeddingProvider: "cloudflare",
+			embeddingBaseUrl: "https://memory.invalid/embeddings",
+			embeddingApiKey: "test-token",
+			embeddingModel: "test-model",
+			embeddingDimensions: 3,
+			revisionThreshold: 0.82,
+		});
+		await store.init();
+		await store.retain(["deploy window is Friday 14:00"], ["project:shared"]);
+		await store.retain(["deploy window is Friday 15:30"], ["project:shared"]);
+		await store.retain([`api key ${OPENAI_KEY}`], ["agent:main"]);
+		await store.retain(["unrelated coffee fact"], ["agent:other"]);
+		await store.close();
+	} finally {
+		globalThis.fetch = originalFetch;
+	}
+}
+
 const sessionFile = path.join(stateDir, "sessions", `2026-01-01T00-00-00-000Z_session1.jsonl`);
 const sessionEntries: unknown[] = [
 	{ type: "session", version: 3, id: "session1", timestamp: new Date(base - 1_000).toISOString(), cwd: root },
@@ -361,7 +412,11 @@ writeJson(path.join(writerDir, "state", "runtime.json"), {
 	sleeps: 1,
 });
 
+const memoryDbPath = path.join(stateDir, "memory.sqlite");
+
 async function main(): Promise<void> {
+	await createMemoryFacts(memoryDbPath);
+
 	section("profiles");
 	const rootConfig = loadRootConfig({ rootDir: root });
 	const profiles = loadDashboard(rootConfig);
@@ -467,6 +522,59 @@ async function main(): Promise<void> {
 	check("masking keeps the prompt readable around the placeholder", runHtml.includes("AWAKE #3") && runHtml.includes("You are the root test agent."));
 	check("run page states when the exact system prompt is unavailable", runHtml.includes("not persisted") && runHtml.includes("reconstructed"));
 
+	section("memory page");
+	const memory = loadMemoryPage(main);
+	check("memory path resolves to the profile's sqlite", memory.databasePath === memoryDbPath, memory.databasePath);
+	check("facts are grouped into current + revision chains", memory.facts.groups.length === 3 && memory.facts.total === 4, { groups: memory.facts.groups.length, total: memory.facts.total });
+	const deployGroup = memory.facts.groups.find((group) => group.current?.text.includes("15:30"));
+	check("the current revision is the active fact", deployGroup?.current?.active === true, deployGroup?.current);
+	check("the older revision is kept under the current one", deployGroup?.revisions.length === 1 && deployGroup.revisions[0]!.text.includes("14:00"), deployGroup?.revisions.map((fact) => fact.text));
+	check("fact scopes and timestamps are preserved", deployGroup?.current?.scopes.includes("project:shared") === true && deployGroup.current.validFrom.length > 0 && deployGroup.current.createdAt.length > 0, deployGroup?.current);
+	check("summary.md is read", memory.summary.item?.text.includes("deploy plan") === true, memory.summary);
+	check("notes.json keys become notes", memory.notes.items.some((item) => item.title === "status" && item.text.includes("waiting on deploy")), memory.notes.items.map((item) => item.title));
+	check("notes/ files are read too", memory.notes.items.some((item) => item.title === "plan.md" && item.text.includes("finish the memory page")), memory.notes.items.map((item) => item.title));
+	check("journal entries are read newest first with dates", memory.journal.items[0]?.title.startsWith("2026-02-01") === true && memory.journal.items[0]!.text.includes("check deploy"), memory.journal.items.slice(0, 3));
+	check("journal item cap reports showing X of Y", memory.journal.total === 207 && memory.journal.shown === MEMORY_MAX_ITEMS, { total: memory.journal.total, shown: memory.journal.shown });
+	check("oversized note text is truncated", memory.notes.items.some((item) => item.title === "huge" && item.truncated && item.originalChars > MEMORY_MAX_TEXT_CHARS), memory.notes.items.find((item) => item.title === "huge"));
+
+	const lower = loadMemoryPage(main, { query: "deploy" });
+	const upper = loadMemoryPage(main, { query: "DEPLOY" });
+	check("search filters facts case-insensitively", lower.facts.matches === 2 && upper.facts.matches === 2, { lower: lower.facts.matches, upper: upper.facts.matches });
+	check("search keeps the matching current revision and its older revision", lower.facts.groups.length === 1 && lower.facts.groups[0]!.current?.text.includes("15:30") === true && lower.facts.groups[0]!.revisions.some((fact) => fact.text.includes("14:00")), lower.facts.groups);
+	check("search filters notes", lower.notes.matches === 1 && lower.notes.items.length === 1 && lower.notes.items[0]!.title === "status", { matches: lower.notes.matches, items: lower.notes.items.map((item) => item.title) });
+	check("search filters journal entries", lower.journal.matches === 1 && lower.journal.items.length === 1 && lower.journal.items[0]!.text.includes("check deploy"), { matches: lower.journal.matches, items: lower.journal.items });
+	check("search counts summary occurrences", lower.summary.matches === 1, lower.summary.matches);
+	const noMatch = loadMemoryPage(main, { query: "no-such-memory-term-xyz" });
+	check("a miss returns empty sections", noMatch.facts.groups.length === 0 && noMatch.notes.items.length === 0 && noMatch.journal.items.length === 0 && noMatch.summary.item === undefined, { facts: noMatch.facts, notes: noMatch.notes.items.length });
+	check("search terms are length-capped before reaching sqlite", loadMemoryPage(main, { query: "x".repeat(500) }).query.length === 200);
+
+	const sqliteBefore = fs.readFileSync(memoryDbPath);
+	const memoryHtml = renderMemoryPage(memory, renderContext);
+	const searchHtml = renderMemoryPage(lower, renderContext);
+	check("memory page renders the current fact prominently", memoryHtml.includes("deploy window is Friday 15:30") && memoryHtml.includes("current"), memoryHtml.includes("deploy window is Friday 15:30"));
+	check("memory page renders older revisions collapsed in details", memoryHtml.includes("deploy window is Friday 14:00") && memoryHtml.includes("older revision") && memoryHtml.includes("<details"), memoryHtml.includes("older revision"));
+	check("memory page renders summary, notes and journal", memoryHtml.includes("deploy plan lives here") && memoryHtml.includes("waiting on deploy") && memoryHtml.includes("finish the memory page") && memoryHtml.includes("check deploy"));
+	check("memory page shows truncation notes", memoryHtml.includes("truncated: showing the first"));
+	check("memory page shows the section cap", memoryHtml.includes(`showing ${MEMORY_MAX_ITEMS} of 207`), memoryHtml.match(/showing \d+ of \d+ journal/));
+	check("search page shows match counts", searchHtml.includes("matches:") && searchHtml.includes("facts 2") && searchHtml.includes("journal 1"), searchHtml.match(/matches:[^<]+/));
+	check("search page hides non-matching facts", !searchHtml.includes("unrelated coffee fact"), searchHtml.includes("unrelated coffee fact"));
+	check("memory page masks a secret in a fact", !memoryHtml.includes(OPENAI_KEY) && /\[openai#\d+\]/.test(memoryHtml), /\[openai#\d+\]/.test(memoryHtml));
+	check("memory page masks a secret in a note", !memoryHtml.includes(GITHUB_TOKEN) && /\[github#\d+\]/.test(memoryHtml), /\[github#\d+\]/.test(memoryHtml));
+	check("memory page masks a secret in the journal", !memoryHtml.includes(TELEGRAM_TOKEN) && /\[telegram-bot#\d+\]/.test(memoryHtml), /\[telegram-bot#\d+\]/.test(memoryHtml));
+
+	const readOnly = openMemoryDatabaseReadOnly(memoryDbPath);
+	let writeRefused = false;
+	try {
+		readOnly.exec("INSERT INTO alive_memories (id, text, embedding, scopes, created_at, valid_from, active, supersedes) VALUES ('x', 'x', '[]', '[]', 'x', 'x', 1, '[]')");
+	} catch {
+		writeRefused = true;
+	} finally {
+		readOnly.close();
+	}
+	check("the memory sqlite handle refuses writes", writeRefused);
+	check("reading memory did not modify the sqlite file", fs.readFileSync(memoryDbPath).equals(sqliteBefore));
+	check("the agent page links to the memory page", agentHtml.includes(`/agent/main/memory`), agentHtml.includes("/memory"));
+
 	section("bind validation");
 	check("accepts 127.0.0.1:7777", JSON.stringify(validateDashboardBind("127.0.0.1", 7777)) === JSON.stringify({ host: "127.0.0.1", port: 7777 }));
 	check("normalises localhost to 127.0.0.1", validateDashboardBind("localhost", 1234).host === "127.0.0.1");
@@ -494,6 +602,8 @@ async function main(): Promise<void> {
 	check("index route", resolveDashboardRoute("/").kind === "index");
 	check("agent route", JSON.stringify(resolveDashboardRoute("/agent/writer")) === JSON.stringify({ kind: "agent", agentId: "writer" }));
 	check("run route", JSON.stringify(resolveDashboardRoute("/run/main/run_c")) === JSON.stringify({ kind: "run", agentId: "main", runId: "run_c" }));
+	check("memory route", JSON.stringify(resolveDashboardRoute("/agent/main/memory")) === JSON.stringify({ kind: "memory", agentId: "main" }));
+	check("traversal-ish memory agent id is 404", resolveDashboardRoute("/agent/..%2fsecret/memory").kind === "not-found");
 	check("unknown route is 404", resolveDashboardRoute("/nope").kind === "not-found");
 	check("traversal-ish agent id is 404", resolveDashboardRoute("/agent/..%2fsecret").kind === "not-found");
 
@@ -512,6 +622,14 @@ async function main(): Promise<void> {
 		const runResponse = await fetch(`${baseUrl}/run/main/run_c`);
 		const runBody = await runResponse.text();
 		check("GET /run/main/run_c is 200 with the prompt section", runResponse.status === 200 && runBody.includes("system prompt"), runResponse.status);
+		const memoryResponse = await fetch(`${baseUrl}/agent/main/memory`);
+		const memoryBody = await memoryResponse.text();
+		check("GET /agent/main/memory is 200 with facts and revisions", memoryResponse.status === 200 && memoryBody.includes("deploy window is Friday 15:30") && memoryBody.includes("deploy window is Friday 14:00"), memoryResponse.status);
+		const searchResponse = await fetch(`${baseUrl}/agent/main/memory?q=DEPLOY`);
+		const searchBody = await searchResponse.text();
+		check("GET /agent/main/memory?q= filters case-insensitively", searchResponse.status === 200 && searchBody.includes("deploy window is Friday 15:30") && !searchBody.includes("unrelated coffee fact"), searchResponse.status);
+		const missingMemory = await fetch(`${baseUrl}/agent/nobody/memory`);
+		check("unknown agent memory page is 404", missingMemory.status === 404, missingMemory.status);
 		const missing = await fetch(`${baseUrl}/agent/nobody`);
 		check("unknown agent is 404", missing.status === 404, missing.status);
 		const post = await fetch(`${baseUrl}/`, { method: "POST" });
