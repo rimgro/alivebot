@@ -7,6 +7,7 @@ import type { AliveModule, ModuleContext } from "../../events/api.js";
 import type { HistoryAttachment } from "../../store/history.js";
 import type { OutgoingMessage } from "../../store/outbox.js";
 import { ensureDir, sleep } from "../../util.js";
+import { MaskContext, maskSecrets } from "../../secrets.js";
 import { TelegramApi, TelegramApiError, TelegramFileTooLargeError, type SendMessageParams } from "./client.js";
 import {
 	TELEGRAM_IMAGE_MAX_BYTES,
@@ -608,6 +609,10 @@ export class TelegramModule implements AliveModule {
 	private async send(message: OutgoingMessage): Promise<TelegramSentMessage[]> {
 		const ctx = this.ctx;
 		if (!ctx) throw new Error("telegram module is not started");
+		// One masking context per message: repeated secrets share an id across text,
+		// caption and the follow-up remainder.
+		const context = new MaskContext();
+		const text = maskSecrets(message.text, ctx.config.secrets, process.env, context);
 		const ref = resolveThreadRef(message.thread);
 		const api = this.requireApi();
 		const topicId = ref.topicId !== undefined ? Number(ref.topicId) : undefined;
@@ -624,7 +629,7 @@ export class TelegramModule implements AliveModule {
 			// Telegram captions are limited to 1024 characters; the remainder becomes
 			// ordinary text messages so no part of the reply is lost. Only the first
 			// attachment carries the caption (one file per `send_message` today).
-			const captions = splitMessage(message.text, TELEGRAM_CAPTION_MAX_CHARS);
+			const captions = splitMessage(text, TELEGRAM_CAPTION_MAX_CHARS);
 			for (const [index, upload] of uploads.entries()) {
 				const caption = index === 0 ? captions[0] ?? "" : "";
 				const params = {
@@ -652,7 +657,7 @@ export class TelegramModule implements AliveModule {
 				sent.push({ result: await this.sendTextChunk(ctx, api, ref.chatId, threadId, text, nextReplyTo()), text });
 			}
 		} else {
-			const chunks = splitMessage(message.text, this.config.maxMessageChars);
+			const chunks = splitMessage(text, this.config.maxMessageChars);
 			for (const text of chunks) {
 				sent.push({ result: await this.sendTextChunk(ctx, api, ref.chatId, threadId, text, nextReplyTo()), text });
 			}
@@ -691,7 +696,7 @@ export class TelegramModule implements AliveModule {
 		ctx.log.info("telegram message sent", {
 			thread: message.thread,
 			parts: sent.length,
-			chars: message.text.length,
+			chars: text.length,
 			attachments: uploads.map((upload) => `${upload.kind}:${upload.name}`),
 		});
 		return sent.map((entry) => entry.result);
@@ -817,11 +822,14 @@ export class TelegramModule implements AliveModule {
 		const name = filePaths.basename(resolved);
 		const field = input.as ?? guessFileField(name);
 		const replyTo = input.replyTo;
+		const caption = input.caption === undefined
+			? undefined
+			: maskSecrets(input.caption, ctx.config.secrets, process.env, new MaskContext());
 		const sent = await api.sendFile({
 			chat_id: ref.chatId,
 			file: { data, name, mime: mimeForFile(name) },
 			field,
-			caption: input.caption,
+			caption,
 			parse_mode: this.config.parseMode || undefined,
 			message_thread_id: ref.topicId !== undefined ? Number(ref.topicId) : undefined,
 			reply_to_message_id: replyTo,
@@ -834,7 +842,7 @@ export class TelegramModule implements AliveModule {
 			direction: "outbound",
 			ts: Date.now(),
 			author: this.botName ?? "agent",
-			text: input.caption ? `${input.caption} [file: ${name}]` : `[file: ${name}]`,
+			text: caption ? `${caption} [file: ${name}]` : `[file: ${name}]`,
 			messageId: String(sent.message_id),
 			replyTo: replyTo !== undefined ? String(replyTo) : undefined,
 			attachments: [{ kind: field, name, mime: mimeForFile(name), size: data.length }],

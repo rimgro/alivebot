@@ -37,6 +37,7 @@ import { requestAgentTelegram } from "../modules/telegram/managed-request.js";
 import { renderWorkerList, renderWorkerRecord, type WorkerManager } from "../workers/manager.js";
 import { formatDuration, iso, parseTimeSpec, parseTimestamp, sleep, truncate } from "../util.js";
 import { renderIdleEvents, renderSleepOffer } from "./prompt.js"
+import { maskSecrets, maskValue } from "../secrets.js";
 
 /**
  * Mutable per-run bookkeeping shared between the run runner and the tools.
@@ -403,7 +404,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 					const note = record.status === "idle" || record.status === "failed" || record.status === "stopped" || record.status === "interrupted"
 						? ""
 						: "\n\nThe worker is running in the background. A `worker` event will arrive when it finishes; use worker({action:\"diff\",id}) to review changes.";
-					return ok(`${renderWorkerRecord(record)}${note}`, { worker: record });
+					return ok(maskSecrets(`${renderWorkerRecord(record)}${note}`, deps.config.config.secrets), { worker: record });
 				}
 				case "send": {
 					requireRun(deps, "worker");
@@ -414,16 +415,16 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 						notify: params.notify,
 					});
 					const pending = record.status === "starting" || record.status === "running";
-					return ok(`${renderWorkerRecord(record)}${pending ? "\n\nThe worker is running; its completion event will arrive later." : ""}`, { worker: record });
+					return ok(maskSecrets(`${renderWorkerRecord(record)}${pending ? "\n\nThe worker is running; its completion event will arrive later." : ""}`, deps.config.config.secrets), { worker: record });
 				}
 				case "wait": {
 					const record = await workers.wait(requireId(), waitTimeout);
 					const pending = record.status === "starting" || record.status === "running";
-					return ok(`${renderWorkerRecord(record)}${pending ? "\n\nStill running; the completion event will arrive later." : ""}`, { worker: record });
+					return ok(maskSecrets(`${renderWorkerRecord(record)}${pending ? "\n\nStill running; the completion event will arrive later." : ""}`, deps.config.config.secrets), { worker: record });
 				}
 				case "list": {
 					const records = workers.list({ includeFinished: params.include_finished, limit: params.limit });
-					return ok(renderWorkerList(records), {
+					return ok(maskSecrets(renderWorkerList(records), deps.config.config.secrets), {
 						count: records.length,
 						workers: records.map((record) => ({
 							id: record.id,
@@ -438,12 +439,12 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 				}
 				case "status": {
 					const view = await workers.status(requireId());
-					return ok(renderWorkerRecord(view.record, { activity: view.activity, git: view.git }), { worker: view.record, git: view.git });
+					return ok(maskSecrets(renderWorkerRecord(view.record, { activity: view.activity, git: view.git }), deps.config.config.secrets), { worker: view.record, git: view.git });
 				}
 				case "stop": {
 					requireRun(deps, "worker");
 					const record = await workers.stop(requireId());
-					return ok(renderWorkerRecord(record), { worker: record });
+					return ok(maskSecrets(renderWorkerRecord(record), deps.config.config.secrets), { worker: record });
 				}
 				case "remove": {
 					requireRun(deps, "worker");
@@ -609,7 +610,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 							}
 						}
 						log.info("idle returned", { events: events.length, seqs: events.map((e) => e.seq) });
-						return ok(renderIdleEvents(events), { events: events.length, seqs: events.map((e) => e.seq) });
+						return ok(renderIdleEvents(events, deps.config.config.secrets), { events: events.length, seqs: events.map((e) => e.seq) });
 					}
 					const waited = Date.now() - startedAt;
 					if (until !== undefined && Date.now() >= until) {
@@ -1041,7 +1042,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		description: "Inspect your own runtime: pending events, open threads, budget, last run, session.",
 		parameters: Type.Object({}),
 		execute: async (): Promise<ToolResult> => {
-			const value = deps.runtimeStatus();
+			const value = maskValue(deps.runtimeStatus(), deps.config.config.secrets);
 			return ok(JSON.stringify(value, null, 2), { status: value });
 		},
 	});

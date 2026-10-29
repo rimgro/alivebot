@@ -267,6 +267,7 @@ function makeLogger(config: LoadedConfig, quiet = true): Logger {
 		level: config.config.verbose ? "debug" : "info",
 		console: !quiet,
 		scope: "alive",
+		secrets: config.config.secrets,
 	});
 }
 
