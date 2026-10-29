@@ -716,6 +716,18 @@ alive workers diff <worker-id> [--full]
 alive workers models
 ```
 
+Один worker-run ограничен двумя лимитами. `workers.idleTimeoutMs` (по умолчанию
+10 минут) — лимит бездействия: таймер сбрасывается на каждом событии сессии
+(`turn_start`, `tool_execution_start`, `turn_end`, `agent_end`), поэтому активно
+работающий worker не прерывается, а зависший абортится с `lastError: "worker run
+idle for 600000 ms and was aborted"`. `workers.maxRuntimeMs` (по умолчанию 2 часа)
+— абсолютный потолок по настенным часам, который активность не сбрасывает; это
+страховка от бесконечного цикла. `maxRuntimeMs` обязан быть строго больше
+`idleTimeoutMs`. `worker status` и `alive workers status` показывают поле
+`abort_reason` (`idle` | `runtime` | `stop` | `shutdown`) — какой лимит завершил
+последний run; оно же упоминается в completion-событии. Подробности — в
+[WORKERS.md](./WORKERS.md).
+
 Конфиг, workflow (start → событие → send → diff → pr → remove), состояние и границы
 описаны в [WORKERS.md](./WORKERS.md).
 

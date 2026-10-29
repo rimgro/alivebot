@@ -5,6 +5,8 @@ import { appendJsonl, ensureDir, readJson, readJsonl } from "../util.js";
 
 export type WorkerStatus = "starting" | "running" | "idle" | "failed" | "stopped" | "interrupted";
 export type WorkerIsolation = "shared" | "worktree";
+/** Why the last worker run was aborted (absent when the run ended on its own). */
+export type WorkerAbortReason = "idle" | "runtime" | "stop" | "shutdown";
 
 /**
  * Durable description of one worker. It intentionally contains no memory,
@@ -44,6 +46,8 @@ export interface WorkerRecord {
 	lastRunFinishedAt?: number;
 	lastResult?: string;
 	lastError?: string;
+	/** Set by the last run that was aborted: which limit or command ended it. */
+	abortReason?: WorkerAbortReason;
 	tokens?: { input: number; output: number; total: number };
 	costUsd?: number;
 	lastRunCostUsd?: number;

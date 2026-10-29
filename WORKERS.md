@@ -43,7 +43,8 @@ Workers — отдельное операторское разрешение. О
     "defaultModel": "anthropic/claude-sonnet-4-5:high",
     "tools": ["read", "write", "edit", "bash", "grep", "find", "ls"],
     "maxConcurrent": 2,
-    "maxRuntimeMs": 1800000,
+    "idleTimeoutMs": 600000,
+    "maxRuntimeMs": 7200000,
     "repository": ".",
     "worktreesDirectory": "",
     "baseRef": "origin/main",
@@ -166,9 +167,30 @@ run, при следующем старте запись помечается `i
 `remove` — очистит.
 
 `maxConcurrent` ограничивает одновременно выполняющиеся runs (idle-сессии не
-считаются). `maxRuntimeMs` — жёсткий лимит одного run: по истечении сессия
-абортится, запись получает `failed`. Стоимость worker-run входит в дневной
-`budget.maxDailyCostUsd`; при исчерпанном бюджете новые `start`/`send` отклоняются.
+считаются).
+
+Run ограничен двумя независимыми лимитами:
+
+- `idleTimeoutMs` (по умолчанию 600000, 10 минут) — лимит **бездействия**. Таймер
+  сбрасывается на каждом событии сессии (`turn_start`, `tool_execution_start`,
+  `turn_end`, `agent_end`). Если сессия молчит дольше лимита (зависший провайдер,
+  бесконечное ожидание), run абортится, запись получает `failed` и
+  `lastError: "worker run idle for 600000 ms and was aborted"`. Активно работающий
+  worker под этот лимит не попадает.
+- `maxRuntimeMs` (по умолчанию 7200000, 2 часа) — **абсолютный потолок** одного
+  run по настенным часам. Он не сбрасывается активностью и остаётся страховкой от
+  бесконечного цикла; по истечении run абортится с `failed` и
+  `lastError: "worker run exceeded … ms and was aborted"`.
+
+`maxRuntimeMs` обязан быть строго больше `idleTimeoutMs`, оба значения —
+положительные; иначе конфигурация не проходит валидацию (если профиль задаёт
+короткий `maxRuntimeMs`, уменьши и `idleTimeoutMs`). В записи и в выводе
+`worker status`/CLI есть поле `abort_reason` (`idle` | `runtime` | `stop` |
+`shutdown`), которое показывает, какой именно лимит (или команда) завершил
+последний run; то же значение попадает в текст completion-события.
+
+Стоимость worker-run входит в дневной `budget.maxDailyCostUsd`; при исчерпанном
+бюджете новые `start`/`send` отклоняются.
 
 ## CLI оператора
 

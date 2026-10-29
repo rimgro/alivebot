@@ -48,7 +48,12 @@ export interface WorkersConfig {
 	tools: string[];
 	/** Concurrent worker runs. Finished sessions do not count. */
 	maxConcurrent: number;
-	/** Hard per-run wall-clock limit; the session is aborted when exceeded. */
+	/**
+	 * Per-run inactivity limit: the session is aborted when no session event
+	 * (turn start/end, tool execution, agent end) arrives for this long.
+	 */
+	idleTimeoutMs: number;
+	/** Absolute per-run wall-clock ceiling; the session is aborted when exceeded. */
 	maxRuntimeMs: number;
 	/** Repository workers operate on, relative to the worker environment root. */
 	repository: string;
@@ -76,7 +81,8 @@ export const DEFAULT_WORKERS_CONFIG: WorkersConfig = {
 	defaultModel: "",
 	tools: [...WORKER_BUILTIN_TOOLS],
 	maxConcurrent: 2,
-	maxRuntimeMs: 30 * 60_000,
+	idleTimeoutMs: 10 * 60_000,
+	maxRuntimeMs: 2 * 60 * 60_000,
 	repository: ".",
 	worktreesDirectory: "",
 	baseRef: "",
@@ -122,9 +128,16 @@ export function validateWorkersConfig(value: WorkersConfig): WorkersConfig {
 	if (!Number.isInteger(maxConcurrent) || maxConcurrent < 1 || maxConcurrent > 16) {
 		throw new Error("workers.maxConcurrent must be an integer between 1 and 16");
 	}
+	const idleTimeoutMs = Number(value.idleTimeoutMs);
+	if (!Number.isInteger(idleTimeoutMs) || idleTimeoutMs < 1) {
+		throw new Error("workers.idleTimeoutMs must be a positive integer (milliseconds)");
+	}
 	const maxRuntimeMs = Number(value.maxRuntimeMs);
 	if (!Number.isFinite(maxRuntimeMs) || maxRuntimeMs < 10_000 || maxRuntimeMs > 24 * 60 * 60_000) {
 		throw new Error("workers.maxRuntimeMs must be between 10000 and 86400000");
+	}
+	if (maxRuntimeMs <= idleTimeoutMs) {
+		throw new Error("workers.maxRuntimeMs must be strictly greater than workers.idleTimeoutMs");
 	}
 	if (typeof value.repository !== "string" || !value.repository.trim()) throw new Error("workers.repository must be a non-empty path");
 	if (typeof value.worktreesDirectory !== "string") throw new Error("workers.worktreesDirectory must be a string");
@@ -142,6 +155,7 @@ export function validateWorkersConfig(value: WorkersConfig): WorkersConfig {
 		defaultModel,
 		tools: [...new Set(tools)],
 		maxConcurrent,
+		idleTimeoutMs,
 		maxRuntimeMs,
 		repository: value.repository.trim(),
 		worktreesDirectory: value.worktreesDirectory.trim(),
