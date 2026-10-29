@@ -9,7 +9,7 @@ import { NoteStore } from "../store/notes.js";
 import { MemoryStore } from "../store/memory.js";
 import { Outbox, type OutgoingMessage } from "../store/outbox.js";
 import { PolicyStore } from "../store/policy.js";
-import { ReminderStore } from "../store/reminders.js";
+import { dispatchDueReminders, ReminderStore } from "../store/reminders.js";
 import { AgentRunner, describeRunRecord } from "./agent.js";
 import {
 	readRuntimeState,
@@ -26,12 +26,13 @@ import { WorkerManager } from "../workers/manager.js";
 import type { RunHandle, ToolDeps } from "./tools.js";
 import { ConsoleTransport, NullTransport } from "../transports/console.js";
 import { HttpTransport } from "../transports/http.js";
+import { redeliverLocalAgentMessage } from "./agent-messaging.js";
 import type { ChatTransport } from "../transports/types.js";
 import { ModuleHost } from "../events/host.js";
 import { loadModules } from "../events/loader.js";
 import type { AliveModule } from "../events/api.js";
 import { term } from "../term.js";
-import { formatDuration, isProcessAlive, nextMidnight, oneLine, sleep } from "../util.js";
+import { formatDuration, isProcessAlive, nextMidnight, sleep } from "../util.js";
 
 export interface AliveRuntimeOptions {
 	config: LoadedConfig;
@@ -247,6 +248,13 @@ export class AliveRuntime {
 		// per run. A failure is logged and ignored — it must not stop the boot.
 		this.writeHeartbeat();
 
+		// Overdue reminders are ordinary due reminders: dispatch them before the
+		// first run so a reminder that came due while the process was down wakes
+		// the agent once on this startup. Appending first and marking fired second
+		// (plus the durable `reminder:<id>` dedupe key) makes a crash in between
+		// replay-safe.
+		this.fireDueReminders();
+
 		const crashRange = this.store.recoverAfterCrash();
 		if (crashRange) {
 			this.redeliveryRange = crashRange;
@@ -278,6 +286,22 @@ export class AliveRuntime {
 		// hand the agent their tools, and the session is built once right after.
 		await this.host.init();
 		this.toolDeps.moduleTools = this.host.contributedTools();
+		// Queue records are written before the first send attempt, so an
+		// interrupted delivery leaves a message with no success record. Retry it
+		// now that modules and transports can receive again. Delivery handlers are
+		// idempotent on `message.deliveryKey`, which keeps send-then-crash from
+		// duplicating in the sink.
+		try {
+			const recovered = await this.outbox.recoverPending({
+				deliver: (message) => this.deliver(message),
+				log: (level, message, details) => this.log[level](message, details),
+			});
+			if (recovered.delivered > 0 || recovered.failed > 0 || recovered.skippedStale > 0 || recovered.skippedExhausted > 0) {
+				this.log.info("outbox recovery finished", { ...recovered });
+			}
+		} catch (error) {
+			this.log.error("outbox recovery failed", { error: error instanceof Error ? error.message : String(error) });
+		}
 		await this.runner.init();
 
 		this.schedulerTimer = setInterval(() => this.schedulerTick(), this.config.config.loop.pollIntervalMs);
@@ -425,21 +449,9 @@ export class AliveRuntime {
 	}
 
 	private fireDueReminders(): void {
-		const due = this.reminders.fireDue(Date.now());
-		for (const reminder of due) {
-			this.store.append({
-				kind: "reminder",
-				source: "scheduler",
-				priority: "normal",
-				title: oneLine(reminder.text, 80),
-				text: reminder.text,
-				thread: reminder.thread,
-				expectsReply: Boolean(reminder.thread),
-				dedupeKey: `reminder:${reminder.id}`,
-				meta: { reminderId: reminder.id, dueAt: reminder.dueAt, createdAt: reminder.createdAt },
-			});
+		dispatchDueReminders(this.reminders, this.store, Date.now(), (reminder) => {
 			this.log.info("reminder fired", { id: reminder.id, dueAt: new Date(reminder.dueAt).toISOString() });
-		}
+		});
 	}
 
 	// ---------------------------------------------------------------------
@@ -580,6 +592,14 @@ export class AliveRuntime {
 	}
 
 	private async deliver(message: OutgoingMessage): Promise<void> {
+		// Local agent-to-agent messages are not chat-module traffic: replaying one
+		// through the transport taps would mark it delivered without ever reaching
+		// the recipient's durable inbox. Both the inbox append (dedupe key) and the
+		// history append (record id) are idempotent, so recovery is safe.
+		if (message.recipientAgentId) {
+			redeliverLocalAgentMessage(this.config, message);
+			return;
+		}
 		await this.host.deliver(message);
 	}
 
