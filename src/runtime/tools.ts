@@ -12,7 +12,6 @@ import {
 	disableManagedAgent,
 	findManagedAgent,
 	getAgentEnabled,
-	listAgents,
 	NO_AGENT_MANAGEMENT,
 	enableManagedAgent,
 	startManagedAgent,
@@ -30,7 +29,7 @@ import type { ReminderStore } from "../store/reminders.js";
 import type { ThreadStore } from "../store/threads.js";
 import type { Logger } from "../log.js";
 import { canReadMemoryFact, retainedMemoryScopes, searchableMemoryScopes } from "./memory-access.js";
-import { recordOperatorAgentReply, sendLocalAgentMessage } from "./agent-messaging.js";
+import { managedAgentId, recordOperatorAgentReply, sendLocalAgentMessage } from "./agent-messaging.js";
 import { resolveOutgoingAttachment, toOutgoingAttachment } from "./attachments.js";
 import { snapshotRuntime } from "./daemon.js";
 import { requestAgentTelegram } from "../modules/telegram/managed-request.js";
@@ -224,7 +223,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		}),
 		execute: async (_toolCallId, params): Promise<ToolResult> => {
 			requireRun(deps, "manage_agents");
-			const actorId = managedAgentIdForConfig(deps.config);
+			const actorId = managedAgentId(deps.config);
 			const action = params.action;
 			const capability = action === "create" ? "create" : action === "edit" ? "edit" :
 				action === "start" ? "start" : action === "stop" ? "stop" :
@@ -300,23 +299,36 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 	const messageAgent = defineTool({
 		name: "message_agent",
 		label: "Message another agent",
-		description: "Send a durable local message to a managed agent. The recipient is the explicit agent id; thread ids only group conversations. Messages are recorded in the sender outbox and both agents' local history before the recipient inbox is woken on its next poll.",
+		description: "Send a durable local message to an agent profile: a managed agent id or `main` for the root profile. The recipient is the explicit agent id; thread ids only group conversations. The message is recorded in the sender outbox and both agents' local history, and lands in the recipient inbox so an idle recipient wakes on its next poll. Delivery is reported only after the recipient inbox actually stored the event; an unknown or unresolvable recipient is an error.",
 		parameters: Type.Object({
-			to: Type.String({ description: "Managed recipient agent id (not a thread id)." }),
+			to: Type.String({ description: "Recipient agent id, or main for the root profile (not a thread id)." }),
 			text: Type.String({ description: "Message body." }),
 		}),
 		execute: async (_toolCallId, params): Promise<ToolResult> => {
 			const run = requireRun(deps, "message_agent");
-			const message = await sendLocalAgentMessage({
-				config: deps.config,
-				outbox: deps.outbox,
-				to: params.to,
-				text: params.text,
-				runId: run.id,
-			});
+			let message: OutgoingMessage;
+			try {
+				message = await sendLocalAgentMessage({
+					config: deps.config,
+					outbox: deps.outbox,
+					to: params.to,
+					text: params.text,
+					runId: run.id,
+				});
+			} catch (error) {
+				const reason = error instanceof Error ? error.message : String(error);
+				log.warn("message_agent delivery failed", { to: params.to, reason });
+				throw new Error(`message_agent could not deliver to ${params.to}: ${reason}`);
+			}
+			if (message.delivered !== true) {
+				const reason = message.deliveryError ?? "the recipient inbox did not confirm the append";
+				log.warn("message_agent delivery failed", { to: params.to, reason });
+				throw new Error(`message_agent could not deliver to ${params.to}: ${reason}`);
+			}
 			run.outbound.push({ thread: message.thread, text: message.text, delivered: true });
 			deps.threads.recordOutbound(message.thread, message.ts);
-			return ok(`Message ${message.id} delivered to managed agent ${message.recipientAgentId}.`, {
+			return ok(`Message ${message.id} delivered to agent ${message.recipientAgentId}.`, {
+				delivered: true,
 				messageId: message.id,
 				recipientAgentId: message.recipientAgentId,
 				thread: message.thread,
@@ -1070,11 +1082,6 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		status,
 		...deps.moduleTools,
 	].filter(tool => deps.config.config.memory.enabled !== false || tool.name !== "memory") as ToolDefinition[];
-}
-
-function managedAgentIdForConfig(config: LoadedConfig): string | undefined {
-	const configPath = path.resolve(config.paths.configPath);
-	return listAgents(config).find((agent) => path.resolve(agent.configPath) === configPath)?.id;
 }
 
 function loadManagedConfig(base: LoadedConfig, agent: { configPath: string }): LoadedConfig {
