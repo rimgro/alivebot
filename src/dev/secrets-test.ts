@@ -3,9 +3,9 @@
  *
  *   npx tsx src/dev/secrets-test.ts
  *
- * Covers every built-in pattern, environment-value fallback, config extra
- * patterns, the structured logger, agent-visible event rendering and the
- * Telegram outbound boundary against a fake Bot API.
+ * Covers every built-in pattern, per-context stable ids, environment-value
+ * fallback, config extra patterns, the structured logger, agent-visible event
+ * rendering and the Telegram outbound boundary against a fake Bot API.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -14,7 +14,7 @@ import { loadConfig, validateSecretsConfig } from "../config.js";
 import { ModuleHost } from "../events/host.js";
 import { Logger } from "../log.js";
 import { TelegramModule } from "../modules/telegram/module.js";
-import { maskSecrets, maskValue } from "../secrets.js";
+import { DEFAULT_SECRETS_CONFIG, MaskContext, maskSecrets, maskValue } from "../secrets.js";
 import type { AliveEvent } from "../store/events.js";
 import { EventStore } from "../store/events.js";
 import { HistoryStore } from "../store/history.js";
@@ -40,10 +40,27 @@ function jsonResponse(value: unknown, status = 200): Response {
 	return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 }
 
+interface MaskOccurrence {
+	label: string;
+	id: number;
+}
+
+function masksIn(text: string): MaskOccurrence[] {
+	return [...text.matchAll(/\[([^\]#]+)#(\d+)\]/g)].map((match) => ({ label: match[1]!, id: Number(match[2]) }));
+}
+
+function keepsNoCharacters(masked: string, secret: string): boolean {
+	// Labels are type names, not retained secret characters; check the rest of
+	// the output for any substring of the value.
+	const withoutMasks = masked.replace(/\[[^\]#]+#\d+\]/g, "");
+	return !masked.includes(secret) && !withoutMasks.includes(secret.slice(0, 3)) && !withoutMasks.includes(secret.slice(-2));
+}
+
 const telegramToken = `123456789:${"A".repeat(35)}`;
 const githubToken = `ghp_${"a".repeat(36)}`;
+const otherGithubToken = `ghp_${"b".repeat(36)}`;
 const githubPat = `github_pat_${"A1".repeat(12)}`;
-const openaiKey = `sk-proj-${"a".repeat(24)}`;
+const openaiKey = "sk-proj-Zx9Qw7Lm2Pv5Rt8Yb3Nc6Hd1";
 const anthropicKey = `sk-ant-api03-${"a".repeat(24)}`;
 const groqKey = `gsk_${"a".repeat(24)}`;
 const awsKey = "AKIAIOSFODNN7EXAMPLE";
@@ -53,7 +70,7 @@ const urlPassword = "s3cr3t-password";
 const privateKey = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAfakefakefake\n-----END RSA PRIVATE KEY-----";
 
 const positiveCases: Array<{ name: string; label: string; secret: string; text?: string }> = [
-	{ name: "Telegram bot token", label: "telegram", secret: telegramToken },
+	{ name: "Telegram bot token", label: "telegram-bot", secret: telegramToken },
 	{ name: "GitHub token", label: "github", secret: githubToken },
 	{ name: "GitHub fine-grained PAT", label: "github", secret: githubPat },
 	{ name: "OpenAI-style key", label: "openai", secret: openaiKey },
@@ -71,7 +88,7 @@ const positiveCases: Array<{ name: string; label: string; secret: string; text?:
 	{ name: "PEM private key block", label: "pem", secret: privateKey },
 	{
 		name: "URL credentials",
-		label: "url",
+		label: "url-credentials",
 		secret: urlPassword,
 		text: `clone https://alice:${urlPassword}@example.com/repo`,
 	},
@@ -84,7 +101,8 @@ section("built-in patterns: positives and negatives");
 		const text = entry.text ?? `before ${entry.secret} after`;
 		const masked = maskSecrets(text);
 		check(`${entry.name} is masked`, !masked.includes(entry.secret), masked);
-		check(`${entry.name} keeps a type label`, masked.includes(`[${entry.label}:`), masked);
+		check(`${entry.name} uses the ${entry.label} label`, masksIn(masked).some((occurrence) => occurrence.label === entry.label), masked);
+		check(`${entry.name} keeps no characters`, keepsNoCharacters(masked, entry.secret), masked);
 	}
 
 	const unchanged = [
@@ -99,14 +117,31 @@ section("built-in patterns: positives and negatives");
 		"-----BEGIN PUBLIC KEY-----\nnot a private key\n-----END PUBLIC KEY-----",
 	];
 	for (const text of unchanged) check(`unchanged: ${JSON.stringify(text)}`, maskSecrets(text) === text, maskSecrets(text));
+}
 
-	// Never keep more than the first 3 + last 2 characters of a value.
-	const maskedGithub = maskSecrets(`token=${githubToken}`);
-	const head = githubToken.slice(0, 3);
-	const tail = githubToken.slice(-2);
-	const middle = githubToken.slice(3, -2);
-	check("the mask keeps the first 3 and last 2 characters", maskedGithub.includes(`${head}…${tail}`), maskedGithub);
-	check("the middle of the secret is gone", !maskedGithub.includes(middle), maskedGithub);
+// ---------------------------------------------------------------------------
+section("per-context ids");
+{
+	const context = new MaskContext();
+	const masked = maskSecrets(
+		`${githubToken} then ${githubToken} then ${awsKey} then ${otherGithubToken}`,
+		DEFAULT_SECRETS_CONFIG,
+		process.env,
+		context,
+	);
+	const githubIds = masksIn(masked).filter((occurrence) => occurrence.label === "github").map((occurrence) => occurrence.id);
+	check("repeated occurrences share one id", githubIds.length === 3 && githubIds[0] === githubIds[1], githubIds);
+	check("different values get different ids", githubIds[1] !== githubIds[2], githubIds);
+	check("ids follow first appearance", githubIds[0] === 1 && masksIn(masked).find((occurrence) => occurrence.label === "aws")?.id === 2, masksIn(masked));
+
+	const reused = new MaskContext();
+	const first = maskSecrets(`${awsKey} ${githubToken}`, DEFAULT_SECRETS_CONFIG, process.env, reused);
+	const second = maskSecrets(`again ${githubToken}`, DEFAULT_SECRETS_CONFIG, process.env, reused);
+	const firstGithubId = masksIn(first).find((occurrence) => occurrence.label === "github")?.id;
+	const secondGithubId = masksIn(second).find((occurrence) => occurrence.label === "github")?.id;
+	check("a reusable context keeps ids stable across calls", firstGithubId !== undefined && firstGithubId === secondGithubId, { first, second });
+	const freshGithubId = masksIn(maskSecrets(`again ${githubToken}`)).find((occurrence) => occurrence.label === "github")?.id;
+	check("a new context starts ids over", freshGithubId === 1, freshGithubId);
 }
 
 // ---------------------------------------------------------------------------
@@ -114,22 +149,35 @@ section("environment-value masking");
 {
 	const previousToken = process.env.ALIVE_SECRETS_TEST_TOKEN;
 	const previousPassword = process.env.ALIVE_SECRETS_TEST_PASSWORD;
-	process.env.ALIVE_SECRETS_TEST_TOKEN = "env-secret-value-123";
-	process.env.ALIVE_SECRETS_TEST_PASSWORD = "abc123";
+	const longEnvSecret = "supersecret-value-123";
+	const shortEnvSecret = "abc123";
+	process.env.ALIVE_SECRETS_TEST_TOKEN = longEnvSecret;
+	process.env.ALIVE_SECRETS_TEST_PASSWORD = shortEnvSecret;
 	try {
-		const masked = maskSecrets("prefix env-secret-value-123 suffix");
-		check("an env value under a secret-looking name is masked", !masked.includes("env-secret-value-123"), masked);
-		check("the env mask keeps a label", masked.includes("[env:"), masked);
-		check("a short env value is not masked", maskSecrets("value abc123 here") === "value abc123 here");
+		const masked = maskSecrets(`prefix ${longEnvSecret} suffix`);
+		check("an env value under a secret-looking name is masked", !masked.includes(longEnvSecret), masked);
+		check("the env mask names the variable", masked.includes("[env:ALIVE_SECRETS_TEST_TOKEN#"), masked);
+		check("an env value keeps no characters", keepsNoCharacters(masked, longEnvSecret), masked);
+
+		check("a short env value is left alone (env threshold unchanged)", maskSecrets(`value ${shortEnvSecret} here`) === `value ${shortEnvSecret} here`);
+
 		check(
 			"maskEnv: false disables the env fallback",
-			maskSecrets("prefix env-secret-value-123 suffix", { maskEnv: false, extraPatterns: [] }).includes("env-secret-value-123"),
+			maskSecrets(`prefix ${longEnvSecret} suffix`, { maskEnv: false, extraPatterns: [] }).includes(longEnvSecret),
 		);
-		const structured = maskValue({ value: "env-secret-value-123", nested: { value: "env-secret-value-123" } }) as {
+		const structured = maskValue({ value: longEnvSecret, nested: { value: longEnvSecret } }) as {
 			value: string;
 			nested: { value: string };
 		};
-		check("maskValue masks nested env values", !structured.value.includes("env-secret-value-123") && !structured.nested.value.includes("env-secret-value-123"), structured);
+		check("maskValue masks nested env values", !structured.value.includes(longEnvSecret) && !structured.nested.value.includes(longEnvSecret), structured);
+		check(
+			"maskValue keeps env ids stable inside one value tree",
+			(() => {
+				const ids = masksIn(JSON.stringify(structured)).filter((occurrence) => occurrence.label === "env:ALIVE_SECRETS_TEST_TOKEN");
+				return ids.length === 2 && ids[0]?.id === ids[1]?.id;
+			})(),
+			structured,
+		);
 	} finally {
 		if (previousToken === undefined) delete process.env.ALIVE_SECRETS_TEST_TOKEN;
 		else process.env.ALIVE_SECRETS_TEST_TOKEN = previousToken;
@@ -144,7 +192,14 @@ section("config extra patterns");
 	const config = validateSecretsConfig({ maskEnv: false, extraPatterns: ["acme_[A-Za-z0-9]{16,}"] });
 	const secret = `acme_${"Z".repeat(20)}`;
 	const masked = maskSecrets(`project key ${secret}`, config);
-	check("an extra pattern is applied", !masked.includes(secret) && masked.includes("[custom:") && masked.includes("…"), masked);
+	check("an extra pattern is applied", !masked.includes(secret) && masked.includes("[custom#"), masked);
+	check("an extra pattern keeps no characters", keepsNoCharacters(masked, secret), masked);
+
+	const shortConfig = validateSecretsConfig({ maskEnv: false, extraPatterns: ["x_[a-z]{2}"] });
+	const shortSecret = "x_ab";
+	const shortMasked = maskSecrets(`short ${shortSecret}`, shortConfig);
+	check("a short custom match is masked with a generic label", !shortMasked.includes(shortSecret) && shortMasked.includes("[custom#"), shortMasked);
+	check("a short custom match keeps no characters", keepsNoCharacters(shortMasked, shortSecret), shortMasked);
 
 	let rejected: Error | undefined;
 	try {
@@ -187,12 +242,14 @@ section("structured values");
 {
 	const masked = maskValue({
 		token: githubToken,
+		repeated: githubToken,
 		nested: { keys: [openaiKey, { aws: awsKey }] },
 		error: new Error(`failed with ${telegramToken}`),
 		plain: 42,
 		flag: true,
 	}) as {
 		token: string;
+		repeated: string;
 		nested: { keys: Array<string | { aws: string }> };
 		error: { message: string; stack?: string };
 		plain: number;
@@ -201,6 +258,7 @@ section("structured values");
 	check("maskValue masks top-level strings", !masked.token.includes(githubToken), masked.token);
 	check("maskValue masks nested arrays", !masked.nested.keys.some((entry) => JSON.stringify(entry).includes(openaiKey)), masked.nested);
 	check("maskValue masks Error messages", !masked.error.message.includes(telegramToken), masked.error.message);
+	check("maskValue keeps repeated ids stable", masked.token === masked.repeated, { token: masked.token, repeated: masked.repeated });
 	check("maskValue leaves numbers and booleans alone", masked.plain === 42 && masked.flag === true);
 }
 
@@ -211,7 +269,7 @@ section("logger integration");
 	const file = path.join(root, "alive.jsonl");
 	const logger = new Logger({ file, console: false, level: "debug" });
 	const error = new Error(`provider rejected ${githubToken}`);
-	logger.info(`login with ${telegramToken}`, {
+	logger.info(`login with ${telegramToken} and ${githubToken}`, {
 		token: githubToken,
 		nested: { aws: awsKey, list: [openaiKey], error },
 		short: "not-a-secret",
@@ -222,11 +280,15 @@ section("logger integration");
 		msg: string;
 		data: { token: string; nested: { aws: string; list: string[]; error: { message: string } }; short: string };
 	};
+	const occurrences = masksIn(line);
+	const githubIds = occurrences.filter((occurrence) => occurrence.label === "github").map((occurrence) => occurrence.id);
 	check("the log line carries no raw secret", !line.includes(telegramToken) && !line.includes(githubToken) && !line.includes(openaiKey) && !line.includes(awsKey), line);
-	check("the log message is masked", record.msg.includes("[telegram:"), record.msg);
-	check("the top-level field is masked", record.data.token.includes("[github:") && !record.data.token.includes(githubToken), record.data.token);
-	check("nested fields are masked", record.data.nested.aws.includes("[aws:") && record.data.nested.list[0]?.includes("[openai:"), record.data.nested);
-	check("the nested Error message is masked", record.data.nested.error.message.includes("[github:"), record.data.nested.error.message);
+	check("the log message is masked", record.msg.includes("[telegram-bot#"), record.msg);
+	check("the top-level field is masked", record.data.token.includes("[github#") && !record.data.token.includes(githubToken), record.data.token);
+	check("nested fields are masked", record.data.nested.aws.includes("[aws#") && record.data.nested.list[0]?.includes("[openai#"), record.data.nested);
+	check("the nested Error message is masked", record.data.nested.error.message.includes("[github#"), record.data.nested.error.message);
+	check("one log call keeps ids stable across msg and data", githubIds.length >= 3 && githubIds.every((id) => id === githubIds[0]), githubIds);
+	check("log masks keep no characters", keepsNoCharacters(line, githubToken) && keepsNoCharacters(line, telegramToken), line);
 	check("unrelated short text survives", record.data.short === "not-a-secret", record.data.short);
 
 	fs.rmSync(root, { recursive: true, force: true });
@@ -243,13 +305,16 @@ section("agent-visible event text");
 		source: "test",
 		priority: "high",
 		title: `alert with ${githubToken}`,
-		text: `body contains ${telegramToken}`,
-		payload: { nested: { key: openaiKey, error: `bad ${awsKey}` } },
+		text: `body contains ${githubToken} and ${telegramToken}`,
+		payload: { nested: { key: openaiKey, token: githubToken, error: `bad ${awsKey}` } },
 	};
 	const rendered = renderIdleEvents([event]);
-	check("agent-visible event title is masked", !rendered.includes(githubToken) && rendered.includes("[github:"), rendered);
-	check("agent-visible event text is masked", !rendered.includes(telegramToken) && rendered.includes("[telegram:"), rendered);
-	check("agent-visible event payload is masked", !rendered.includes(openaiKey) && !rendered.includes(awsKey) && rendered.includes("[openai:"), rendered);
+	const githubIds = masksIn(rendered).filter((occurrence) => occurrence.label === "github").map((occurrence) => occurrence.id);
+	check("agent-visible event title is masked", !rendered.includes(githubToken) && rendered.includes("[github#"), rendered);
+	check("agent-visible event text is masked", !rendered.includes(telegramToken) && rendered.includes("[telegram-bot#"), rendered);
+	check("agent-visible event payload is masked", !rendered.includes(openaiKey) && !rendered.includes(awsKey) && rendered.includes("[openai#"), rendered);
+	check("one rendered prompt keeps ids stable", githubIds.length === 3 && githubIds.every((id) => id === githubIds[0]), githubIds);
+	check("agent-visible masks keep no characters", keepsNoCharacters(rendered, githubToken) && keepsNoCharacters(rendered, telegramToken), rendered);
 }
 
 // ---------------------------------------------------------------------------
@@ -355,21 +420,26 @@ section("telegram outbound against a fake Bot API");
 				...(attachments ? { attachments } : {}),
 			});
 
-		await deliver("secret_text", `here is the token ${githubToken}`);
+		await deliver("secret_text", `here is the token ${githubToken} and again ${githubToken}`);
 		const textCall = calls.filter((call) => call.method === "sendMessage").at(-1);
 		const sentText = textCall?.params.text;
-		check("send_message text arrives masked", typeof sentText === "string" && !sentText.includes(githubToken) && sentText.includes("[github:"), sentText);
+		const sentIds = masksIn(String(sentText)).filter((occurrence) => occurrence.label === "github").map((occurrence) => occurrence.id);
+		check("send_message text arrives masked", typeof sentText === "string" && !sentText.includes(githubToken) && sentText.includes("[github#"), sentText);
+		check("send_message keeps repeated ids stable", sentIds.length === 2 && sentIds[0] === sentIds[1], sentIds);
+		check("send_message keeps no characters", typeof sentText === "string" && keepsNoCharacters(sentText, githubToken), sentText);
 
 		await deliver("secret_caption", `caption ${telegramToken}`, [{ path: "report.txt" }]);
 		const captionCall = calls.filter((call) => call.method === "sendDocument").at(-1);
 		const sentCaption = captionCall?.form?.caption;
-		check("an attachment caption arrives masked", typeof sentCaption === "string" && !sentCaption.includes(telegramToken) && sentCaption.includes("[telegram:"), sentCaption);
+		check("an attachment caption arrives masked", typeof sentCaption === "string" && !sentCaption.includes(telegramToken) && sentCaption.includes("[telegram-bot#"), sentCaption);
+		check("an attachment caption keeps no characters", typeof sentCaption === "string" && keepsNoCharacters(sentCaption, telegramToken), sentCaption);
 
 		const beforeFollowUp = calls.length;
 		await deliver("secret_followup", `${"a".repeat(1200)} ${openaiKey}`, [{ path: "report.txt" }]);
 		const followUps = calls.slice(beforeFollowUp).filter((call) => call.method === "sendMessage");
 		const followUpText = followUps.map((call) => String(call.params.text ?? "")).join("\n");
-		check("the caption follow-up text arrives masked", !followUpText.includes(openaiKey) && followUpText.includes("[openai:"), followUpText);
+		check("the caption follow-up text arrives masked", !followUpText.includes(openaiKey) && followUpText.includes("[openai#"), followUpText);
+		check("the caption follow-up keeps no characters", keepsNoCharacters(followUpText, openaiKey), followUpText);
 	} finally {
 		await host?.stop();
 		globalThis.fetch = realFetch;

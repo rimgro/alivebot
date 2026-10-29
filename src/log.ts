@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { DEFAULT_SECRETS_CONFIG, maskSecrets, maskValue, type SecretsConfig } from "./secrets.js";
+import { DEFAULT_SECRETS_CONFIG, MaskContext, maskSecrets, maskValue, type SecretsConfig } from "./secrets.js";
 import { appendJsonl, ensureDir } from "./util.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -66,14 +66,15 @@ export class Logger {
 	/** Raw block output (message bodies, prompts). Never goes to the JSONL log by itself. */
 	raw(text: string): void {
 		if (this.printToConsole) {
-			const safe = maskSecrets(text, this.secrets);
+			const safe = maskSecrets(text, this.secrets, process.env, new MaskContext());
 			process.stderr.write(safe.endsWith("\n") ? safe : `${safe}\n`);
 		}
 	}
 
 	private write(level: LogLevel, msg: string, data?: unknown): void {
-		const safeMessage = maskSecrets(msg, this.secrets);
-		const safeValue = data === undefined ? undefined : maskValue(safeData(data), this.secrets);
+		const context = new MaskContext();
+		const safeMessage = maskSecrets(msg, this.secrets, process.env, context);
+		const safeValue = data === undefined ? undefined : maskValue(safeData(data), this.secrets, process.env, context);
 		const record = {
 			ts: Date.now(),
 			level,

@@ -5,7 +5,7 @@ import type { RunRecord } from "../store/runs.js";
 import type { ThreadState } from "../store/threads.js";
 import { formatDuration, iso, localTime, oneLine, truncate } from "../util.js";
 import { DEFAULT_CONTRACT } from "../config.js";
-import { DEFAULT_SECRETS_CONFIG, maskSecrets, maskValue, type SecretsConfig } from "../secrets.js";
+import { DEFAULT_SECRETS_CONFIG, MaskContext, maskSecrets, maskValue, type SecretsConfig } from "../secrets.js";
 
 export interface SystemPromptInput {
 	name: string;
@@ -257,7 +257,7 @@ export interface AwakePromptInput {
 	}>;
 }
 
-function carriedOver(input: AwakePromptInput): string[] {
+function carriedOver(input: AwakePromptInput, context: MaskContext): string[] {
 	const sections: string[] = [];
 	if (input.threads.length > 0) {
 		sections.push(
@@ -315,11 +315,11 @@ function carriedOver(input: AwakePromptInput): string[] {
 					.map((worker) => {
 						const secrets = input.secrets ?? DEFAULT_SECRETS_CONFIG;
 						const extra = worker.result
-							? ` — result: ${oneLine(maskSecrets(worker.result, secrets), 180)}`
+							? ` — result: ${oneLine(maskSecrets(worker.result, secrets, process.env, context), 180)}`
 							: worker.error
-								? ` — error: ${oneLine(maskSecrets(worker.error, secrets), 180)}`
+								? ` — error: ${oneLine(maskSecrets(worker.error, secrets, process.env, context), 180)}`
 								: "";
-						return `- ${worker.id} [${worker.status}] model=${worker.model} isolation=${worker.isolation}${worker.branch ? ` branch=${worker.branch}` : ""} — ${oneLine(maskSecrets(worker.task, secrets), 160)}${extra}`;
+						return `- ${worker.id} [${worker.status}] model=${worker.model} isolation=${worker.isolation}${worker.branch ? ` branch=${worker.branch}` : ""} — ${oneLine(maskSecrets(worker.task, secrets, process.env, context), 160)}${extra}`;
 					})
 					.join("\n"),
 		);
@@ -331,6 +331,7 @@ function carriedOver(input: AwakePromptInput): string[] {
 export function renderAwakePrompt(input: AwakePromptInput): string {
 	const redelivered = new Set(input.redeliveredSeqs);
 	const sections: string[] = [];
+	const context = new MaskContext();
 
 	sections.push(
 		`## ${input.resumed ? "RESUMED" : "AWAKE"} #${input.runIndex} — ${iso(input.now)}\n` +
@@ -341,7 +342,7 @@ export function renderAwakePrompt(input: AwakePromptInput): string {
 	);
 
 	const eventLines = input.events.map((event) =>
-		eventLine(event, { redelivered: redelivered.has(event.seq) }, input.secrets),
+		eventLine(event, { redelivered: redelivered.has(event.seq) }, input.secrets, context),
 	);
 	if (input.events.length > 0) {
 		sections.push(
@@ -357,7 +358,7 @@ export function renderAwakePrompt(input: AwakePromptInput): string {
 		);
 	}
 
-	sections.push(`### Carried over\n\n${carriedOver(input).join("\n\n")}`);
+	sections.push(`### Carried over\n\n${carriedOver(input, context).join("\n\n")}`);
 	sections.push(renderBudgetSection(input));
 
 	return sections.join("\n\n");
@@ -370,6 +371,7 @@ export interface NudgePromptInput extends AwakePromptInput {
 export function renderNudgePrompt(input: NudgePromptInput): string {
 	const redelivered = new Set(input.redeliveredSeqs);
 	const sections: string[] = [];
+	const context = new MaskContext();
 	sections.push(
 		`## YOU STOPPED WITHOUT IDLING (nudge ${input.nudge}) — ${iso(input.now)}\n` +
 			`Your last turn ended with plain text and no tool call. Private thought is not an action and nothing was sent. ` +
@@ -378,7 +380,7 @@ export function renderNudgePrompt(input: NudgePromptInput): string {
 	if (input.events.length > 0) {
 		sections.push(
 			`### New events (${input.events.length})\n\n${input.events
-				.map((event) => eventLine(event, { redelivered: redelivered.has(event.seq) }, input.secrets))
+				.map((event) => eventLine(event, { redelivered: redelivered.has(event.seq) }, input.secrets, context))
 				.join("\n\n")}`,
 		);
 	}
@@ -426,6 +428,7 @@ function eventLine(
 	event: AliveEvent,
 	options: { redelivered: boolean },
 	secrets: SecretsConfig = DEFAULT_SECRETS_CONFIG,
+	context: MaskContext = new MaskContext(),
 ): string {
 	const flags: string[] = [event.kind, `source=${event.source}`];
 	if (event.priority !== "normal") flags.push(`priority=${event.priority}`);
@@ -440,8 +443,8 @@ function eventLine(
 	const payload =
 		event.payload === undefined
 			? ""
-			: `\n   payload: ${truncate(JSON.stringify(maskValue(event.payload, secrets), null, 2), 1200)}`;
-	return `[${event.seq}] ${flags.join(" | ")} @ ${iso(event.ts)}\n   ${maskSecrets(event.title, secrets)}\n${indent(truncate(maskSecrets(event.text, secrets), 4000))}${payload}`;
+			: `\n   payload: ${truncate(JSON.stringify(maskValue(event.payload, secrets, process.env, context), null, 2), 1200)}`;
+	return `[${event.seq}] ${flags.join(" | ")} @ ${iso(event.ts)}\n   ${maskSecrets(event.title, secrets, process.env, context)}\n${indent(truncate(maskSecrets(event.text, secrets, process.env, context), 4000))}${payload}`;
 }
 
 /**
@@ -449,7 +452,8 @@ function eventLine(
  * "stdout of a very long command".
  */
 export function renderIdleEvents(events: AliveEvent[], secrets: SecretsConfig = DEFAULT_SECRETS_CONFIG): string {
-	const body = events.map((event) => eventLine(event, { redelivered: false }, secrets)).join("\n\n");
+	const context = new MaskContext();
+	const body = events.map((event) => eventLine(event, { redelivered: false }, secrets, context)).join("\n\n");
 	return `idle returned: ${events.length} event${events.length === 1 ? "" : "s"} arrived.\n\n${body}`;
 }
 
@@ -465,6 +469,7 @@ export function renderSleepOffer(waitedMs: number): string {
 }
 
 export function renderInterruptPrompt(events: AliveEvent[], secrets: SecretsConfig = DEFAULT_SECRETS_CONFIG): string {
-	const body = events.map((event) => eventLine(event, { redelivered: false }, secrets)).join("\n\n");
+	const context = new MaskContext();
+	const body = events.map((event) => eventLine(event, { redelivered: false }, secrets, context)).join("\n\n");
 	return `## NOTIFICATION — new ${events.length === 1 ? "event" : "events"} arrived and your policy let ${events.length === 1 ? "it" : "them"} through\n\n${body}\n\nFold this in without abandoning what you were doing, then continue. Reply via send_message if a human is waiting.`;
 }

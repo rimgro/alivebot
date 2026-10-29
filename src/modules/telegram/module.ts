@@ -7,7 +7,7 @@ import type { AliveModule, ModuleContext } from "../../events/api.js";
 import type { HistoryAttachment } from "../../store/history.js";
 import type { OutgoingMessage } from "../../store/outbox.js";
 import { ensureDir, sleep } from "../../util.js";
-import { maskSecrets } from "../../secrets.js";
+import { MaskContext, maskSecrets } from "../../secrets.js";
 import { TelegramApi, TelegramApiError, TelegramFileTooLargeError, type SendMessageParams } from "./client.js";
 import {
 	TELEGRAM_IMAGE_MAX_BYTES,
@@ -609,8 +609,10 @@ export class TelegramModule implements AliveModule {
 	private async send(message: OutgoingMessage): Promise<TelegramSentMessage[]> {
 		const ctx = this.ctx;
 		if (!ctx) throw new Error("telegram module is not started");
-		// Mask before splitting: captions and the follow-up remainder must all be safe.
-		const text = maskSecrets(message.text, ctx.config.secrets);
+		// One masking context per message: repeated secrets share an id across text,
+		// caption and the follow-up remainder.
+		const context = new MaskContext();
+		const text = maskSecrets(message.text, ctx.config.secrets, process.env, context);
 		const ref = resolveThreadRef(message.thread);
 		const api = this.requireApi();
 		const topicId = ref.topicId !== undefined ? Number(ref.topicId) : undefined;
@@ -820,7 +822,9 @@ export class TelegramModule implements AliveModule {
 		const name = filePaths.basename(resolved);
 		const field = input.as ?? guessFileField(name);
 		const replyTo = input.replyTo;
-		const caption = input.caption === undefined ? undefined : maskSecrets(input.caption, ctx.config.secrets);
+		const caption = input.caption === undefined
+			? undefined
+			: maskSecrets(input.caption, ctx.config.secrets, process.env, new MaskContext());
 		const sent = await api.sendFile({
 			chat_id: ref.chatId,
 			file: { data, name, mime: mimeForFile(name) },
