@@ -15,7 +15,13 @@ import { listLocalMessages, operatorAgentThread, sendLocalAgentMessage } from ".
 import { runAgentConsole } from "./tui/agent-console.js";
 import { describeModules } from "./events/loader.js";
 import { TelegramApi } from "./modules/telegram/client.js";
-import { requestAgentTelegram } from "./modules/telegram/managed-request.js";
+import {
+	cancelAgentTelegram,
+	formatManagedBotStatus,
+	managedBotScope,
+	managedBotStatus,
+	requestAgentTelegram,
+} from "./modules/telegram/managed-request.js";
 import { resolveToken } from "./modules/telegram/module.js";
 import { browserCommand } from "./modules/browser/cli.js";
 import { TelegramAllowlistStore } from "./modules/telegram/state.js";
@@ -723,8 +729,11 @@ async function agentsCommand(cwd: string, flags: Record<string, string | boolean
 		const agent = findManagedAgent(base, positionals[1]);
 		const chatValue = flagString(flags, "chat");
 		if (!chatValue) throw new Error("usage: alive agents request-telegram <id> --chat <private-chat-id>");
-		await requestAgentTelegram(base, agent, chatValue);
-		process.stdout.write(`Managed Bot creation request sent for ${agent.id}; approve it in Telegram. The master bot will attach its token when Telegram returns the created bot.\n`);
+		const request = await requestAgentTelegram(base, agent, chatValue);
+		process.stdout.write(
+			`Managed Bot request for ${agent.id}: ${request.status}, expires ${iso(request.expiresAt)} (chat ${request.chatId}). ` +
+				"Approve it in Telegram; the master bot will attach the token when Telegram returns the created bot.\n",
+		);
 		return 0;
 	}
 	if (action === "telegram") {
@@ -1211,6 +1220,31 @@ async function telegramCommand(
 	const sub = positionals[0] ?? "me";
 	const moduleConfig = config.config.modules.telegram;
 
+	if (sub === "managed") {
+		const action = positionals[1] ?? "status";
+		const scope = managedBotScope(config);
+		const agentInput = positionals[2];
+		if (action === "status") {
+			const views = managedBotStatus(scope, agentInput);
+			if (flagBool(flags, "json")) process.stdout.write(`${JSON.stringify(views, null, 2)}\n`);
+			else process.stdout.write(`${formatManagedBotStatus(views)}\n`);
+			return 0;
+		}
+		if (action === "cancel") {
+			if (!agentInput) throw new Error("usage: alive telegram managed cancel <agent>");
+			const token = resolveToken(moduleConfig);
+			const api = token ? new TelegramApi({ token, apiBase: moduleConfig.apiBase }) : undefined;
+			const cancelled = await cancelAgentTelegram(scope, api, agentInput);
+			process.stdout.write(
+				cancelled
+					? `cancelled pending managed-bot request for ${cancelled.agentId} (chat ${cancelled.chatId})\n`
+					: `no pending managed-bot request for ${agentInput}\n`,
+			);
+			return 0;
+		}
+		throw new Error("unknown managed action: " + action + " (use status [agent], cancel <agent>)");
+	}
+
 	if (sub === "whitelist") {
 		const allowlist = new TelegramAllowlistStore(path.join(config.paths.modulesDir, "telegram"));
 		const action = positionals[1] ?? "list";
@@ -1301,7 +1335,7 @@ async function telegramCommand(
 		process.stdout.write(`sent ${sent.length} message(s): ${sent.map((m) => m.message_id).join(", ")}\n`);
 		return 0;
 	}
-	throw new Error(`unknown telegram subcommand: ${sub} (use me, chats, chat, send)`);
+	throw new Error(`unknown telegram subcommand: ${sub} (use me, chats, chat, send, managed)`);
 }
 
 function thoughtsCommand(_cwd: string, flags: Record<string, string | boolean>): number {
@@ -1393,6 +1427,8 @@ usage:
   alive telegram me | chats | chat <id|@name> | send <id|@name> <text> | ping
   alive telegram whitelist [list | add <user-id> | remove <user-id>]
                                               manage Telegram user access without restart
+  alive telegram managed status [agent] [--json] | cancel <agent>
+                                              inspect or cancel a pending Managed Bot request
   alive browser setup [--engine chrome|fortress] [--shared-url PRIVATE_ORIGIN | --cdp-env ENV_NAME | --executable-env ENV_NAME] [--launch-mode auto|driver|native] [--public-url HTTPS_ORIGIN] [--headless true|false] [--sign-origins ORIGIN,...]
   alive browser activate | doctor [--online] | diagnose | pair | serve [--local] [--url URL]
                                               configure, diagnose and test phone handoff without an LLM

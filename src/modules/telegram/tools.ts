@@ -24,6 +24,8 @@ export interface TelegramToolHost {
 	typing(thread: string): void;
 	botIdentity(): { id?: number; username?: string; name?: string };
 	snapshot(): Record<string, unknown>;
+	managedStatus?(agentId?: string): string;
+	cancelManagedRequest?(agentId: string): Promise<string>;
 }
 
 type ToolResult = AgentToolResult<Record<string, unknown>>;
@@ -55,6 +57,8 @@ const ACTION = Type.Union([
 	Type.Literal("download_file"),
 	Type.Literal("pdf_text"),
 	Type.Literal("set_commands"),
+	Type.Literal("managed_status"),
+	Type.Literal("managed_cancel"),
 ]);
 
 /**
@@ -78,6 +82,7 @@ export function createTelegramTools(host: TelegramToolHost): ToolDefinition[] {
 			"Use `action:\"list_chats\"` first to discover conversations, then `history` with a chat or thread.\n" +
 			"`send_file` uploads a file from the workspace as a document/photo/audio/video with an optional caption. " +
 			"`pdf_text` reads text from a PDF already saved by `download_file`; pass its local `path` and page through the text with `offset`/`limit`. " +
+			"`managed_status`/`managed_cancel` show or cancel pending managed-bot requests (optional `agent`). " +
 			"To answer a human, prefer `send_message` (it routes to Telegram automatically); `send`/`send_file` are for reaching a chat you were not addressed in.",
 		parameters: Type.Object({
 			action: ACTION,
@@ -111,6 +116,7 @@ export function createTelegramTools(host: TelegramToolHost): ToolDefinition[] {
 			order: Type.Optional(Type.Union([Type.Literal("asc"), Type.Literal("desc")], { description: "History order, default desc." })),
 			from_chat: Type.Optional(Type.String({ description: "Source chat for `forward`." })),
 			to_chat: Type.Optional(Type.String({ description: "Destination chat for `forward`." })),
+			agent: Type.Optional(Type.String({ description: "Agent id for managed_status/managed_cancel." })),
 			commands: Type.Optional(
 				Type.Array(Type.Object({ command: Type.String(), description: Type.String() }), {
 					description: "Bot commands for `set_commands`.",
@@ -119,6 +125,15 @@ export function createTelegramTools(host: TelegramToolHost): ToolDefinition[] {
 		}),
 		execute: async (_toolCallId, params): Promise<ToolResult> => {
 			switch (params.action) {
+				case "managed_status": {
+					if (!host.managedStatus) return ok("Managed-bot requests are unavailable: the Telegram module is not running.");
+					return ok(host.managedStatus(params.agent), { managed: true });
+				}
+				case "managed_cancel": {
+					if (!params.agent) throw new Error("managed_cancel requires agent");
+					if (!host.cancelManagedRequest) return ok("Managed-bot requests are unavailable: the Telegram module is not running.");
+					return ok(await host.cancelManagedRequest(params.agent), { managed: true });
+				}
 				case "me": {
 					const identity = host.botIdentity();
 					return ok(
