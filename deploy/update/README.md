@@ -109,13 +109,78 @@ Rules:
 
 - Quote the whole command as **one** argument in `ExecStart=`:
   `ExecStart=.../alive-auto-update.sh /opt/alive /opt/alive/.alive "alive restart"`.
-- Use an absolute binary if systemd's `PATH` does not contain `alive`; the
-  watchdog also honours `ALIVE_BIN=/usr/local/bin/alive` in an
-  `Environment=` line.
+- Use an absolute binary if systemd's `PATH` does not contain `alive`; see
+  [Making `alive` reachable from the watchdog unit](#making-alive-reachable-from-the-watchdog-unit)
+  for the wrapper/symlink and the `ALIVE_BIN` forms.
+- `alive restart` refuses to run *inside* the harness (it would kill the run that
+  issued it). The watchdog is a separate unit, so its `alive restart` is allowed:
+  the guard compares systemd's `SYSTEMD_EXEC_PID` with the pid recorded in
+  `runtime.json` and only refuses when they are the same unit. If your systemd is
+  older than 232 (no `SYSTEMD_EXEC_PID`) the guard cannot prove that and refuses;
+  then either add `--yes` to the restart command (`"alive restart --yes"`) or use
+  `"systemctl restart alive.service"` here.
 - The command must not require interactivity and must not print secrets; its
   output is appended to the log.
 - `alive restart` from the same checkout is usually right: it stops the old
   process and starts the newly built `dist/`.
+
+## Making `alive` reachable from the watchdog unit
+
+The watchdog calls the CLI by name:
+
+- `alive update --auto` / `alive update --rollback` (via `$ALIVE_BIN`, default `alive`);
+- the restart command from `ExecStart=` (e.g. `alive restart`).
+
+systemd starts the unit with a minimal `PATH`, so `alive` is often not found
+there even though it works in your login shell. Pick **one** of these two forms.
+
+**1. Put the CLI on the unit's `PATH` — wrapper or symlink.**
+
+```bash
+# dist/index.js already carries the #!/usr/bin/env node shebang; make it runnable
+chmod +x /opt/alive/dist/index.js
+
+# a) symlink (what the reporter of issue #82 used)
+mkdir -p ~/.local/bin
+ln -sf /opt/alive/dist/index.js ~/.local/bin/alive
+
+# b) or an equivalent wrapper that pins the node binary
+cat > ~/.local/bin/alive <<'EOF'
+#!/bin/sh
+exec /usr/bin/node /opt/alive/dist/index.js "$@"
+EOF
+chmod +x ~/.local/bin/alive
+
+~/.local/bin/alive status          # sanity check in a shell
+```
+
+systemd does not read `~/.profile`, so name the directory in the unit (or put
+the symlink in `/usr/local/bin`, which most units already have on `PATH`):
+
+```ini
+[Service]
+Environment=PATH=/home/alive/.local/bin:/usr/local/bin:/usr/bin:/bin
+```
+
+**2. Point the watchdog at the binary explicitly with `ALIVE_BIN`.**
+
+```ini
+[Service]
+Environment=ALIVE_BIN=/opt/alive/dist/index.js
+# only if `node` itself is not on the unit's PATH:
+# Environment=NODE_BIN=/usr/bin/node
+```
+
+`ALIVE_BIN` is what the watchdog invokes for `update --auto` and `--rollback`.
+The restart command is the third `ExecStart=` argument, so use the same absolute
+path there:
+
+```ini
+ExecStart=/opt/alive/deploy/update/alive-auto-update.sh /opt/alive /opt/alive/.alive "/opt/alive/dist/index.js restart"
+```
+
+Either form works; `ALIVE_BIN` needs no `PATH` edits and no home-directory
+layout, while the symlink keeps `alive …` typable for the operator as well.
 
 Tuning (add `Environment=` lines to the service):
 

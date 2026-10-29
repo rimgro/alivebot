@@ -21,7 +21,13 @@ import { browserCommand } from "./modules/browser/cli.js";
 import { TelegramAllowlistStore } from "./modules/telegram/state.js";
 import { AliveRuntime } from "./runtime/loop.js";
 import { readHeartbeatStatus } from "./heartbeat.js";
-import { snapshotRuntime, spawnBackground, stdoutLogPath, stopRuntime, waitForRuntime } from "./runtime/daemon.js";
+import { snapshotRuntime, spawnBackground, stdoutLogPath, stopRuntime, waitForRuntime, type StopResult } from "./runtime/daemon.js";
+import {
+	HARNESS_ENV_MARKER,
+	detectHarnessEnvironment,
+	interruptWarningLine,
+	restartRefusalText,
+} from "./runtime/harness-guard.js";
 import { LOG_SOURCES, followFile, readLogTail, renderLogLine, resolveLogSource } from "./logs.js";
 import { WorkerStore, validateWorkerId, workerLabel } from "./workers/store.js";
 import { gitDiff, gitState, isGitRepository } from "./workers/worktree.js";
@@ -45,6 +51,23 @@ interface ParsedArgs {
 	command: string;
 	positionals: string[];
 	flags: Record<string, string | boolean>;
+}
+
+/**
+ * The start/stop side of `alive restart`, behind a seam so CLI tests can drive
+ * the command with a fake service control instead of real processes.
+ */
+export interface ServiceControl {
+	stop(config: LoadedConfig, flags: Record<string, string | boolean>): Promise<StopResult>;
+	/** Returns the exit code of the start (0 = the runtime came up). */
+	start(config: LoadedConfig, flags: Record<string, string | boolean>): Promise<number>;
+}
+
+export interface CliOptions {
+	/** Environment the harness guard inspects; defaults to `process.env`. */
+	env?: NodeJS.ProcessEnv;
+	/** Service start/stop seam; defaults to the real background runtime control. */
+	service?: ServiceControl;
 }
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -83,7 +106,71 @@ function flagBool(flags: Record<string, string | boolean>, key: string): boolean
 	return flags[key] === true || flags[key] === "true" || flags[key] === "1";
 }
 
-export async function main(argv: string[]): Promise<number> {
+/**
+ * Usage for the service commands. `--help` on `alive stop|restart|status` must
+ * print this and touch nothing: the commands act on the running harness, and an
+ * agent asking for help must never stop the run that asked.
+ */
+const SERVICE_USAGE: Record<"stop" | "restart" | "status", string> = {
+	stop:
+		"usage: alive stop [--timeout DURATION] [--force] [--config CONFIG]\n" +
+		"\n" +
+		"  --timeout DURATION  graceful SIGTERM window before SIGKILL (default 15s)\n" +
+		"  --force, --kill     skip SIGTERM and kill immediately\n" +
+		"  --config CONFIG     config file (default ./alive.config.json)\n" +
+		"\n" +
+		"Stops the background runtime of the current project. One warning line always\n" +
+		"states that the run in progress is interrupted; stop is never refused, so it\n" +
+		"remains the way to shut the harness down from inside.\n",
+	restart:
+		"usage: alive restart [--yes] [--timeout DURATION] [--force] [--config CONFIG] [--model MODEL] [--verbose]\n" +
+		"\n" +
+		"  --yes, -y           restart even from inside the harness (ends this run)\n" +
+		"  --timeout DURATION  graceful SIGTERM window before SIGKILL (default 15s)\n" +
+		"  --force, --kill     skip SIGTERM and kill the old runtime immediately\n" +
+		"  --config CONFIG     config file (default ./alive.config.json)\n" +
+		"  --model MODEL       model for the restarted runtime\n" +
+		"  --verbose           verbose logging for the restarted runtime\n" +
+		"\n" +
+		"Stops the running instance, then starts a fresh one in the background. Refused\n" +
+		"when this process runs inside the harness (ALIVE_RUNTIME, or systemd's\n" +
+		"INVOCATION_ID/SYSTEMD_EXEC_PID/JOURNAL_STREAM when they belong to the harness\n" +
+		"unit), because the restart would kill the run that issued it. Safe forms from\n" +
+		"outside:\n" +
+		"  systemd-run --on-active=5 --unit=alive-restart /path/to/alive restart\n" +
+		"  sudo systemctl restart alive.service\n",
+	status:
+		"usage: alive status [--json] [--config CONFIG]\n" +
+		"\n" +
+		"  --json           machine-readable snapshot\n" +
+		"  --config CONFIG  config file (default ./alive.config.json)\n" +
+		"\n" +
+		"Reads state only: it never starts, stops or restarts anything.\n",
+};
+
+/** Print the usage and report true when `--help`/`-h` was given; does nothing else. */
+function printServiceHelp(command: "stop" | "restart" | "status", flags: Record<string, string | boolean>): boolean {
+	// Presence, not truthiness: `alive restart --help` must never restart, even
+	// if a stray token made the flag parser read `--help` as taking a value.
+	if (flags.help === undefined && flags.h === undefined) return false;
+	process.stdout.write(`${SERVICE_USAGE[command]}\n`);
+	return true;
+}
+
+export function createServiceControl(): ServiceControl {
+	return {
+		stop: (config, flags) => {
+			const timeoutFlag = flagString(flags, "timeout");
+			return stopRuntime(config.paths.stateDir, {
+				timeoutMs: timeoutFlag ? parseDurationMs(timeoutFlag) : undefined,
+				force: flagBool(flags, "force") || flagBool(flags, "kill"),
+			});
+		},
+		start: (config, flags) => startBackground(config, flags),
+	};
+}
+
+export async function main(argv: string[], options: CliOptions = {}): Promise<number> {
 	const { command, positionals, flags } = parseArgs(argv);
 	const cwd = process.cwd();
 
@@ -118,10 +205,14 @@ export async function main(argv: string[]): Promise<number> {
 				return 0;
 			}
 			case "stop": {
-				return await stopCommand(cwd, flags);
+				if (printServiceHelp("stop", flags)) return 0;
+				process.stderr.write(`${interruptWarningLine("stop")}\n`);
+				return await stopCommand(cwd, flags, options);
 			}
 			case "restart": {
-				return await restartCommand(cwd, flags);
+				if (printServiceHelp("restart", flags)) return 0;
+				process.stderr.write(`${interruptWarningLine("restart")}\n`);
+				return await restartCommand(cwd, flags, options);
 			}
 			case "update": {
 				const usage =
@@ -211,6 +302,7 @@ export async function main(argv: string[]): Promise<number> {
 				return remindersCommand(cwd, flags);
 			}
 			case "status": {
+				if (printServiceHelp("status", flags)) return 0;
 				return statusCommand(cwd, flags);
 			}
 			case "heartbeat": {
@@ -272,6 +364,9 @@ function makeLogger(config: LoadedConfig, quiet = true): Logger {
 }
 
 async function runCommand(cwd: string, flags: Record<string, string | boolean>): Promise<number> {
+	// Every child of this process (agent tools, workers, the TUI) inherits the
+	// marker, which is how `alive restart` notices it would kill its own run.
+	process.env[HARNESS_ENV_MARKER] = "1";
 	const config = loadForCli(flags);
 	if (!config.config.enabled) {
 		process.stderr.write(`${term.red("agent is disabled:")} ${config.config.name}; enable it before starting\n`);
@@ -374,13 +469,17 @@ async function startBackground(config: LoadedConfig, flags: Record<string, strin
 	return 0;
 }
 
-async function stopCommand(cwd: string, flags: Record<string, string | boolean>): Promise<number> {
-	const config = loadForCli(flags);
-	const timeoutFlag = flagString(flags, "timeout");
-	const result = await stopRuntime(config.paths.stateDir, {
-		timeoutMs: timeoutFlag ? parseDurationMs(timeoutFlag) : undefined,
-		force: flagBool(flags, "force") || flagBool(flags, "kill"),
-	});
+async function stopCommand(cwd: string, flags: Record<string, string | boolean>, options: CliOptions = {}): Promise<number> {
+	return await stopWithConfig(loadForCli(flags), flags, options);
+}
+
+async function stopWithConfig(
+	config: LoadedConfig,
+	flags: Record<string, string | boolean>,
+	options: CliOptions = {},
+): Promise<number> {
+	const service = options.service ?? createServiceControl();
+	const result = await service.stop(config, flags);
 
 	if (result.alreadyStopped) {
 		process.stdout.write(`not running${result.pid ? term.gray(` (last pid ${result.pid})`) : ""}\n`);
@@ -396,11 +495,29 @@ async function stopCommand(cwd: string, flags: Record<string, string | boolean>)
 	return 0;
 }
 
-async function restartCommand(cwd: string, flags: Record<string, string | boolean>): Promise<number> {
+async function restartCommand(cwd: string, flags: Record<string, string | boolean>, options: CliOptions = {}): Promise<number> {
 	const config = loadForCli(flags);
-	const stopped = await stopCommand(cwd, flags);
+	const env = options.env ?? process.env;
+	const harnessPid = snapshotRuntime(config.paths.stateDir)?.pid;
+	const detection = detectHarnessEnvironment(env, { harnessPid });
+
+	if (detection.inside) {
+		if (!flagBool(flags, "yes") && !flagBool(flags, "y")) {
+			process.stderr.write(restartRefusalText(detection));
+			return 1;
+		}
+		process.stderr.write(
+			`${term.yellow("warning:")} --yes given — restarting from inside the harness ends this run\n`,
+		);
+	} else if (detection.outsideReason) {
+		// e.g. the update watchdog unit, or the recommended systemd-run form.
+		process.stderr.write(`${term.gray(`note: ${detection.outsideReason}`)}\n`);
+	}
+
+	const service = options.service ?? createServiceControl();
+	const stopped = await stopWithConfig(config, flags, options);
 	if (stopped !== 0) return stopped;
-	return startBackground(config, flags);
+	return service.start(config, flags);
 }
 
 async function logsCommand(cwd: string, flags: Record<string, string | boolean>): Promise<number> {
@@ -1208,7 +1325,8 @@ usage:
   alive workers models                        show the worker model/permission allowlist
   alive stop [--force] [--timeout 30s]        stop the running instance
                                               (--force: SIGKILL immediately)
-  alive restart [--verbose]                   stop, then start in the background again
+  alive restart [--yes] [--verbose]           stop, then start in the background again
+                                              (refused when run inside the harness unless --yes)
   alive update [--check] [--tag vX.Y.Z] [--force]
                                               update the harness to the newest stable vX.Y.Z tag
                                               (--check: report only; --force: allow a dirty tree)
