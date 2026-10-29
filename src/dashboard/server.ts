@@ -8,7 +8,8 @@
 import * as http from "node:http";
 import type { AddressInfo } from "node:net";
 import { DEFAULT_SECRETS_CONFIG } from "../secrets.js";
-import { renderAgentPage, renderErrorPage, renderIndexPage, renderRunPage } from "./render.js";
+import { loadMemoryPage } from "./memory.js";
+import { renderAgentPage, renderErrorPage, renderIndexPage, renderMemoryPage, renderRunPage } from "./render.js";
 import {
 	findProfile,
 	isValidAgentId,
@@ -88,7 +89,12 @@ interface RunRoute {
 	runId: string;
 }
 
-type Route = ResolvedRoute | AgentRoute | RunRoute | { kind: "not-found"; message: string };
+interface MemoryRoute {
+	kind: "memory";
+	agentId: string;
+}
+
+type Route = ResolvedRoute | AgentRoute | RunRoute | MemoryRoute | { kind: "not-found"; message: string };
 
 function decodeSegment(segment: string): string {
 	try {
@@ -111,6 +117,11 @@ export function resolveDashboardRoute(rawUrl: string | undefined): Route {
 		const agentId = segments[1]!;
 		if (!isValidAgentId(agentId)) return { kind: "not-found", message: `invalid agent id: ${agentId}` };
 		return { kind: "agent", agentId };
+	}
+	if (segments.length === 3 && segments[0] === "agent" && segments[2] === "memory") {
+		const agentId = segments[1]!;
+		if (!isValidAgentId(agentId)) return { kind: "not-found", message: `invalid agent id: ${agentId}` };
+		return { kind: "memory", agentId };
 	}
 	if (segments.length === 3 && segments[0] === "run") {
 		const agentId = segments[1]!;
@@ -197,6 +208,21 @@ export function createDashboardServer(options: DashboardServerOptions): Dashboar
 					}
 					const detail = loadAgentDetail(profile, { now: now() });
 					send(res, 200, renderAgentPage(detail, {
+						secrets: profile.config.config.secrets,
+						env,
+						now: now(),
+					}), headOnly);
+					return;
+				}
+				case "memory": {
+					const profile = profileOrNull(profiles, route.agentId);
+					if (!profile) {
+						send(res, 404, renderErrorPage(404, `unknown agent: ${route.agentId}`, renderContext), headOnly);
+						return;
+					}
+					const searchParams = new URL(req.url ?? "/", "http://127.0.0.1").searchParams;
+					const view = loadMemoryPage(profile, { query: searchParams.get("q") ?? "" });
+					send(res, 200, renderMemoryPage(view, {
 						secrets: profile.config.config.secrets,
 						env,
 						now: now(),
