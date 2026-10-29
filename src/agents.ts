@@ -73,6 +73,11 @@ export function createAgent(base: LoadedConfig, idInput: string, name?: string, 
 	config.name = name?.trim() || id;
 	config.stateDir = path.join(directory, "state");
 	config.agentsDirectory = agentsRoot(base);
+	// Keep the root profile addressable from any depth: a managed profile created by
+	// another managed profile still points at the original root config.
+	config.rootConfigPath = base.config.rootConfigPath.trim()
+		? path.resolve(base.paths.rootDir, base.config.rootConfigPath)
+		: base.paths.configPath;
 	config.enabled = true;
 	config.agentManagement = validateAgentManagementPermissions(options.management ?? NO_AGENT_MANAGEMENT);
 	// Workers are a host-side operator grant. Persistent profiles never inherit

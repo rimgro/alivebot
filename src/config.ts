@@ -248,6 +248,12 @@ export interface AliveConfig {
 	stateDir: string;
 	/** Shared filesystem registry for persistent managed agents; empty uses stateDir/agents. */
 	agentsDirectory: string;
+	/**
+	 * Absolute path of the root profile config. Set on managed profiles so a
+	 * managed agent can address the root profile (`main`) without guessing the
+	 * root state directory from the shared agents registry.
+	 */
+	rootConfigPath: string;
 	/** Disabled managed profiles cannot be started, even by another authorized agent. */
 	enabled: boolean;
 	/** Fine-grained authority this profile may exercise over managed agents. */
@@ -319,6 +325,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 	thinkingLevel: "",
 	stateDir: ".alive",
 	agentsDirectory: "",
+	rootConfigPath: "",
 	enabled: true,
 	agentManagement: {
 		create: false,
