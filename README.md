@@ -725,7 +725,11 @@ idle for 600000 ms and was aborted"`. `workers.maxRuntimeMs` (по умолча�
 страховка от бесконечного цикла. `maxRuntimeMs` обязан быть строго больше
 `idleTimeoutMs`. `worker status` и `alive workers status` показывают поле
 `abort_reason` (`idle` | `runtime` | `stop` | `shutdown`) — какой лимит завершил
-последний run; оно же упоминается в completion-событии. Подробности — в
+последний run; оно же упоминается в completion-событии. Транзиентные сбои
+провайдера (timeout, `ECONNRESET`, `429`, `5xx`) повторяются внутри того же run:
+`workers.providerRetries` (по умолчанию 2) и `workers.providerRetryDelayMs`
+(по умолчанию 5000, линейный backoff до 60s). Повтор невозможен после tool call
+или потраченных токенов, а также после `stop`/shutdown. Подробности — в
 [WORKERS.md](./WORKERS.md).
 
 Конфиг, workflow (start → событие → send → diff → pr → remove), состояние и границы

@@ -42,6 +42,11 @@ export interface WorkerRecord {
 	sessionFile?: string;
 	sessionId?: string;
 	runs: number;
+	/**
+	 * Session prompts spent by the last run, including provider retries. `runs`
+	 * counts user-visible runs; this counts the attempts behind them.
+	 */
+	attempts?: number;
 	lastRunStartedAt?: number;
 	lastRunFinishedAt?: number;
 	lastResult?: string;

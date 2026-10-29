@@ -21,6 +21,7 @@ import {
 	validateWorkersConfig,
 } from "../workers/config.js";
 import { WorkerManager, renderWorkerRecord } from "../workers/manager.js";
+import { MAX_PROVIDER_RETRY_DELAY_MS, isTransientProviderError, providerRetryDelayMs } from "../workers/retry.js";
 import type { WorkerSession, WorkerSessionFactory } from "../workers/session.js";
 import { WorkerStore } from "../workers/store.js";
 import { baseBranchName, createWorktree, gitDiff, removeWorktree } from "../workers/worktree.js";
@@ -61,10 +62,17 @@ class FakeSession implements WorkerSession {
 	silent = false;
 	/** Simulate an assistant turn that ended with stopReason "error". */
 	errorMessage?: string;
+	/** Provider errors to emit for the next prompts, then succeed (retry tests). */
+	failureQueue: string[] = [];
+	/** Emit one tool execution before failing (a failed run that already did work). */
+	toolCallBeforeError = false;
+	/** Tool executions emitted by this session, over all prompts. */
+	toolExecutions = 0;
 	/** While hanging, emit a tool event every N ms (a run that keeps working). */
 	heartbeatMs?: number;
 	private heartbeat?: NodeJS.Timeout;
 	private lastText: string | undefined;
+	private successfulPrompts = 0;
 	private listeners: Array<(event: { type: string; toolName?: string; [key: string]: unknown }) => void> = [];
 	private abortReject?: (error: Error) => void;
 
@@ -80,18 +88,19 @@ class FakeSession implements WorkerSession {
 				await new Promise<void>((_resolve, reject) => {
 					this.abortReject = reject;
 					if (this.heartbeatMs) {
-						this.heartbeat = setInterval(() => {
-							for (const listener of this.listeners) listener({ type: "tool_execution_start", toolName: "bash" });
-						}, this.heartbeatMs);
+						this.heartbeat = setInterval(() => this.emitTool(), this.heartbeatMs);
 					}
 				});
 			}
-			if (this.errorMessage) {
-				const message = { role: "assistant", stopReason: "error", errorMessage: this.errorMessage };
+			const failure = this.failureQueue.shift() ?? this.errorMessage;
+			if (failure) {
+				if (this.toolCallBeforeError) this.emitTool();
+				const message = { role: "assistant", stopReason: "error", errorMessage: failure };
 				for (const listener of this.listeners) listener({ type: "turn_end", message, toolResults: [] });
 				return;
 			}
 			if (this.silent) return;
+			this.successfulPrompts += 1;
 			this.lastText = `completed: ${text.split("\n")[0] ?? "task"}`;
 			for (const listener of this.listeners) listener({ type: "turn_start" });
 		} finally {
@@ -100,6 +109,11 @@ class FakeSession implements WorkerSession {
 			this.isStreaming = false;
 			this.abortReject = undefined;
 		}
+	}
+
+	private emitTool(): void {
+		this.toolExecutions += 1;
+		for (const listener of this.listeners) listener({ type: "tool_execution_start", toolName: "bash" });
 	}
 
 	subscribe(listener: (event: { type: string; toolName?: string; [key: string]: unknown }) => void): () => void {
@@ -123,8 +137,12 @@ class FakeSession implements WorkerSession {
 	}
 
 	getSessionStats() {
-		if (this.silent || this.errorMessage) return { tokens: { input: 0, output: 0, total: 0 }, cost: 0 };
-		return { tokens: { input: 11, output: 22, total: 33 }, cost: 0.001 };
+		if (this.silent) return { tokens: { input: 0, output: 0, total: 0 }, cost: 0 };
+		return {
+			tokens: { input: 11 * this.successfulPrompts, output: 22 * this.successfulPrompts, total: 33 * this.successfulPrompts },
+			// Cost is cumulative and flat: a failed prompt (no tokens) costs nothing.
+			cost: this.successfulPrompts > 0 ? 0.001 : 0,
+		};
 	}
 }
 
@@ -142,6 +160,8 @@ function makeConfig(root: string, overrides: Record<string, unknown> = {}): Load
 				maxConcurrent: 2,
 				idleTimeoutMs: 20_000,
 				maxRuntimeMs: 30_000,
+				providerRetries: 2,
+				providerRetryDelayMs: 1,
 				repository: ".",
 				worktreesDirectory: "",
 				baseRef: "",
@@ -564,6 +584,195 @@ section("standalone worktree helpers");
 	await removeWorktree(env, helperRepo, worktree, { force: true });
 	check("helper removed worktree", !fs.existsSync(worktree));
 	fs.rmSync(helperRepo, { recursive: true, force: true });
+}
+
+section("provider failure classification");
+{
+	const transient = [
+		"Request timed out",
+		"request timeout after 30s",
+		"connect ETIMEDOUT 10.0.0.1:443",
+		"read ECONNRESET",
+		"Connection error",
+		"connect ECONNREFUSED 127.0.0.1:8443",
+		"socket hang up",
+		"fetch failed",
+		"HTTP 429 Too Many Requests",
+		"rate_limit_error: retry later",
+		"provider overloaded",
+		"HTTP 503 Service Unavailable",
+		"500 Internal Server Error",
+		"upstream returned 502 after a timeout",
+		"gateway timeout",
+	];
+	for (const message of transient) check(`transient: ${message}`, isTransientProviderError(message));
+	const permanent = [
+		"401 Unauthorized",
+		"invalid api key provided",
+		"400 invalid_request_error: messages is required",
+		"403 forbidden",
+		"model not found: fake/gone",
+		"404 model_not_found",
+		"context_length_exceeded",
+		"invalid request: temperature must be a number",
+		"429 insufficient_quota: exceeded your current quota",
+	];
+	for (const message of permanent) check(`not retried: ${message}`, !isTransientProviderError(message));
+	check("empty error text is not retried", !isTransientProviderError(""));
+	check("a millisecond duration is not a 4xx status", isTransientProviderError("Request timed out after 400 ms"));
+	check("a millisecond duration is not a 429", !isTransientProviderError("request finished in 429 ms"));
+}
+
+section("provider retry config");
+{
+	check("default provider retries is 2", DEFAULT_WORKERS_CONFIG.providerRetries === 2, DEFAULT_WORKERS_CONFIG.providerRetries);
+	check(
+		"default provider retry delay is 5s",
+		DEFAULT_WORKERS_CONFIG.providerRetryDelayMs === 5_000,
+		DEFAULT_WORKERS_CONFIG.providerRetryDelayMs,
+	);
+	const validateRetries = (patch: Record<string, unknown>): unknown => validateWorkersConfig({
+		...DEFAULT_WORKERS_CONFIG,
+		enabled: true,
+		models: ["fake/model"],
+		...patch,
+	});
+	let defaultsValid = true;
+	try {
+		validateRetries({});
+	} catch {
+		defaultsValid = false;
+	}
+	check("default provider retry config is valid", defaultsValid);
+	const rejects = (name: string, patch: Record<string, unknown>): void => {
+		try {
+			validateRetries(patch);
+			check(name, false, "expected rejection");
+		} catch {
+			check(name, true);
+		}
+	};
+	rejects("negative provider retries rejected", { providerRetries: -1 });
+	rejects("fractional provider retries rejected", { providerRetries: 1.5 });
+	rejects("non-numeric provider retries rejected", { providerRetries: Number.NaN });
+	rejects("negative provider retry delay rejected", { providerRetryDelayMs: -1 });
+	rejects("non-finite provider retry delay rejected", { providerRetryDelayMs: Number.POSITIVE_INFINITY });
+	rejects("provider retries above the safety cap rejected", { providerRetries: 11 });
+	check("linear backoff grows with the attempt", providerRetryDelayMs(5_000, 1) === 5_000 && providerRetryDelayMs(5_000, 2) === 10_000);
+	check("backoff is capped at 60s", providerRetryDelayMs(5_000, 100) === MAX_PROVIDER_RETRY_DELAY_MS, providerRetryDelayMs(5_000, 100));
+	check("zero base delay stays zero", providerRetryDelayMs(0, 3) === 0);
+}
+
+section("provider retries: transient failures then success");
+{
+	const config = makeConfig(root);
+	const sessions: FakeSession[] = [];
+	const manager = makeManager(config, sessions, false, undefined, undefined, (session) => {
+		session.failureQueue.push("Request timed out", "Connection error: read ECONNRESET");
+	});
+	await manager.init();
+	const record = await manager.start({ task: "retry the provider", isolation: "shared", wait: true, waitTimeoutMs: 5_000 });
+	check("run recovered after retries", record.status === "idle", record.status);
+	check("retries do not add runs", record.runs === 1, record.runs);
+	check("attempts count the retries", record.attempts === 3, record.attempts);
+	check("recovered run keeps the result", record.lastResult?.includes("completed") === true, record.lastResult);
+	check("recovered run has no error", record.lastError === undefined, record.lastError);
+	check("each attempt sent the prompt once", sessions[0]?.prompts.length === 3, sessions[0]?.prompts.length);
+	check("retries did not execute tools", sessions[0]?.toolExecutions === 0, sessions[0]?.toolExecutions);
+	check("status text mentions attempts", renderWorkerRecord(record).includes("attempts: 3"), renderWorkerRecord(record));
+	await sleep(100);
+	const events = EventStore.open(config.paths.stateDir).peekPending(50);
+	const completion = events.find((event) => {
+		const payload = event.payload as { workerId?: string } | undefined;
+		return event.kind === "worker" && payload?.workerId === record.id;
+	});
+	check("completion event mentions attempts", completion?.text.includes("attempts=3") === true, completion?.text);
+	await manager.close();
+}
+
+section("provider retries: every attempt fails");
+{
+	const config = makeConfig(root);
+	const sessions: FakeSession[] = [];
+	const manager = makeManager(config, sessions, false, undefined, undefined, (session) => {
+		session.errorMessage = "HTTP 503 Service Unavailable";
+	});
+	await manager.init();
+	const record = await manager.start({ task: "fail forever", isolation: "shared", wait: true, waitTimeoutMs: 5_000 });
+	check("exhausted retries end failed", record.status === "failed", record.status);
+	check("last provider error is kept", record.lastError?.includes("503 Service Unavailable") === true, record.lastError);
+	check("failure reports how many attempts were made", record.lastError?.includes("3 attempts") === true, record.lastError);
+	check("failed retries are still one run", record.runs === 1, record.runs);
+	check("attempts are recorded on failure", record.attempts === 3, record.attempts);
+	check("three prompts were spent", sessions[0]?.prompts.length === 3, sessions[0]?.prompts.length);
+	await manager.close();
+}
+
+section("provider retries: side effects and permanent errors are never retried");
+{
+	const config = makeConfig(root);
+	const afterToolSessions: FakeSession[] = [];
+	const afterTool = makeManager(config, afterToolSessions, false, undefined, undefined, (session) => {
+		session.errorMessage = "Request timed out";
+		session.toolCallBeforeError = true;
+	});
+	await afterTool.init();
+	const afterToolRecord = await afterTool.start({ task: "work then time out", isolation: "shared", wait: true, waitTimeoutMs: 5_000 });
+	check("failure after a tool call is not retried", afterToolRecord.attempts === 1, afterToolRecord.attempts);
+	check("failure after a tool call sent one prompt", afterToolSessions[0]?.prompts.length === 1, afterToolSessions[0]?.prompts.length);
+	check("failure after a tool call ends failed", afterToolRecord.status === "failed", afterToolRecord.status);
+	check("tool-call failure keeps the provider text", afterToolRecord.lastError === "Request timed out", afterToolRecord.lastError);
+	await afterTool.close();
+
+	const authSessions: FakeSession[] = [];
+	const auth = makeManager(config, authSessions, false, undefined, undefined, (session) => {
+		session.errorMessage = "401 invalid api key";
+	});
+	await auth.init();
+	const authRecord = await auth.start({ task: "call the model", isolation: "shared", wait: true, waitTimeoutMs: 5_000 });
+	check("non-transient error is not retried", authRecord.attempts === 1, authRecord.attempts);
+	check("non-transient error sent one prompt", authSessions[0]?.prompts.length === 1, authSessions[0]?.prompts.length);
+	check("auth error text is kept", authRecord.lastError?.includes("401 invalid api key") === true, authRecord.lastError);
+	check("auth failure has no retry suffix", authRecord.lastError === "401 invalid api key", authRecord.lastError);
+	await auth.close();
+}
+
+section("provider retries: disabled and stopped");
+{
+	const config = makeConfig(root, { providerRetries: 0 });
+	const sessions: FakeSession[] = [];
+	const manager = makeManager(config, sessions, false, undefined, undefined, (session) => {
+		session.errorMessage = "Request timed out";
+	});
+	await manager.init();
+	const record = await manager.start({ task: "no retries configured", isolation: "shared", wait: true, waitTimeoutMs: 5_000 });
+	check("providerRetries 0 disables retries", record.attempts === 1 && sessions[0]?.prompts.length === 1, record.attempts);
+	check("disabled retry still fails", record.status === "failed", record.status);
+	await manager.close();
+}
+{
+	// A long backoff makes the stop land while the run is waiting to retry.
+	const config = makeConfig(root, { providerRetryDelayMs: 30_000 });
+	const sessions: FakeSession[] = [];
+	const manager = makeManager(config, sessions, false, undefined, undefined, (session) => {
+		session.failureQueue.push("Request timed out");
+	});
+	await manager.init();
+	const record = await manager.start({ task: "back off for a while", isolation: "shared" });
+	// Wait until the first attempt failed; the run is then parked in its backoff.
+	const deadline = Date.now() + 2_000;
+	while ((sessions[0]?.prompts.length ?? 0) === 0 && Date.now() < deadline) await sleep(10);
+	await sleep(50);
+	check("run is waiting to retry", sessions[0]?.prompts.length === 1, sessions[0]?.prompts.length);
+	const stopStartedAt = Date.now();
+	const stopped = await manager.stop(record.id);
+	const stopElapsed = Date.now() - stopStartedAt;
+	check("stop during backoff returns immediately", stopElapsed < 2_000, stopElapsed);
+	check("stop during backoff marks the worker stopped", stopped.status === "stopped", stopped.status);
+	check("stop during backoff records the abort reason", stopped.abortReason === "stop", stopped.abortReason);
+	check("stop during backoff never retries", sessions[0]?.prompts.length === 1, sessions[0]?.prompts.length);
+	check("stopped run reports one attempt", stopped.attempts === 1, stopped.attempts);
+	await manager.close();
 }
 
 fs.rmSync(root, { recursive: true, force: true });

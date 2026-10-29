@@ -55,6 +55,14 @@ export interface WorkersConfig {
 	idleTimeoutMs: number;
 	/** Absolute per-run wall-clock ceiling; the session is aborted when exceeded. */
 	maxRuntimeMs: number;
+	/**
+	 * Automatic retries of a transient provider failure (timeout, connection
+	 * reset, 429, 5xx) inside one run. Only attempted while the run has no side
+	 * effects yet: no tool executions and no new tokens.
+	 */
+	providerRetries: number;
+	/** Base delay of the linear retry backoff (delay × attempt, capped at 60s). */
+	providerRetryDelayMs: number;
 	/** Repository workers operate on, relative to the worker environment root. */
 	repository: string;
 	/** Worktree parent inside the worker environment. Empty = environment default. */
@@ -83,6 +91,8 @@ export const DEFAULT_WORKERS_CONFIG: WorkersConfig = {
 	maxConcurrent: 2,
 	idleTimeoutMs: 10 * 60_000,
 	maxRuntimeMs: 2 * 60 * 60_000,
+	providerRetries: 2,
+	providerRetryDelayMs: 5_000,
 	repository: ".",
 	worktreesDirectory: "",
 	baseRef: "",
@@ -139,6 +149,14 @@ export function validateWorkersConfig(value: WorkersConfig): WorkersConfig {
 	if (maxRuntimeMs <= idleTimeoutMs) {
 		throw new Error("workers.maxRuntimeMs must be strictly greater than workers.idleTimeoutMs");
 	}
+	const providerRetries = Number(value.providerRetries);
+	if (!Number.isInteger(providerRetries) || providerRetries < 0 || providerRetries > 10) {
+		throw new Error("workers.providerRetries must be an integer between 0 and 10");
+	}
+	const providerRetryDelayMs = Number(value.providerRetryDelayMs);
+	if (!Number.isFinite(providerRetryDelayMs) || providerRetryDelayMs < 0 || providerRetryDelayMs > 60_000) {
+		throw new Error("workers.providerRetryDelayMs must be between 0 and 60000");
+	}
 	if (typeof value.repository !== "string" || !value.repository.trim()) throw new Error("workers.repository must be a non-empty path");
 	if (typeof value.worktreesDirectory !== "string") throw new Error("workers.worktreesDirectory must be a string");
 	if (typeof value.baseRef !== "string") throw new Error("workers.baseRef must be a string");
@@ -157,6 +175,8 @@ export function validateWorkersConfig(value: WorkersConfig): WorkersConfig {
 		maxConcurrent,
 		idleTimeoutMs,
 		maxRuntimeMs,
+		providerRetries,
+		providerRetryDelayMs,
 		repository: value.repository.trim(),
 		worktreesDirectory: value.worktreesDirectory.trim(),
 		baseRef,

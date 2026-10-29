@@ -33,6 +33,7 @@ import {
 	repositoryHead,
 	runGit,
 } from "./worktree.js";
+import { isTransientProviderError, providerRetryDelayMs } from "./retry.js";
 import { createWorkerEnvironment, type WorkerEnvironment } from "./environment.js";
 import {
 	validateWorkerId,
@@ -69,6 +70,8 @@ interface WorkerHandle {
 	sessionError?: string;
 	/** Tool executions started during the current run. */
 	toolCalls: number;
+	/** Resolves an in-flight provider-retry backoff (stop, shutdown, run limits). */
+	wakeRetryDelay?: () => void;
 	/** Timers bounding the current run; absent when no run is active. */
 	runTimers?: RunTimers;
 }
@@ -114,6 +117,7 @@ const MAX_PROMPT_CHARS = 100_000;
 const MAX_RESULT_CHARS = 20_000;
 const MAX_ERROR_CHARS = 4_000;
 const MAX_WAIT_MS = 10 * 60_000;
+const EMPTY_RUN_ERROR = "worker produced no output: the model returned no text, no tool calls and no new tokens";
 
 export class WorkerManager {
 	private readonly config: LoadedConfig;
@@ -183,6 +187,7 @@ export class WorkerManager {
 		const active = [...this.handles.values()].filter((handle) => handle.record.status === "running" || handle.record.status === "starting");
 		await Promise.all(active.map(async (handle) => {
 			handle.abortReason = "shutdown";
+			this.wakeRetryDelay(handle);
 			try {
 				await handle.session?.abort();
 			} catch {
@@ -432,6 +437,7 @@ export class WorkerManager {
 		const record = handle.record;
 		if (record.status === "running" || record.status === "starting") {
 			handle.abortReason = "stop";
+			this.wakeRetryDelay(handle);
 			try {
 				await handle.session?.abort();
 			} catch {
@@ -647,6 +653,7 @@ export class WorkerManager {
 		}
 		record.status = "running";
 		record.runs += 1;
+		record.attempts = 0;
 		record.lastRunStartedAt = Date.now();
 		record.lastRunFinishedAt = undefined;
 		record.lastResult = undefined;
@@ -665,30 +672,48 @@ export class WorkerManager {
 
 		let status: WorkerStatus = "idle";
 		let error: string | undefined;
+		let attempt = 0;
 		try {
-			await session.prompt(prompt, { expandPromptTemplates: false, source: "extension" });
-			const aborted = this.abortOutcome(handle, previousAbortReason);
-			if (aborted) {
-				status = aborted.status;
-				error = aborted.error;
-			} else if (handle.sessionError) {
-				status = "failed";
-				error = handle.sessionError;
-			} else if (!this.runProducedOutput(handle, session, tokensBefore, textBefore)) {
-				status = "failed";
-				error = "worker produced no output: the model returned no text, no tool calls and no new tokens";
-			} else {
-				status = "idle";
+			// One user-visible run may spend several prompts on transient provider
+			// failures. Every attempt is counted, but `runs` counts the run once.
+			// Defensive: a config object built without validation must not loop.
+			const retries = Number.isInteger(this.cfg.providerRetries) && this.cfg.providerRetries > 0 ? this.cfg.providerRetries : 0;
+			const maxAttempts = 1 + retries;
+			for (;;) {
+				attempt += 1;
+				record.attempts = attempt;
+				handle.sessionError = undefined;
+				const outcome = await this.attemptPrompt(handle, prompt, { tokensBefore, textBefore, previousAbortReason });
+				status = outcome.status;
+				error = outcome.error;
+				if (!outcome.retryable || attempt >= maxAttempts) break;
+				// A retry delay is still activity: do not let the inactivity timer
+				// mistake a scheduled backoff for a stuck provider.
+				this.touchRunActivity(handle);
+				const delayMs = providerRetryDelayMs(this.cfg.providerRetryDelayMs, attempt);
+				this.log.warn("worker provider failure; retrying the prompt", {
+					id: record.id,
+					attempt,
+					maxAttempts,
+					delayMs,
+					error: oneLine(error ?? "", 200),
+				});
+				await this.waitRetryDelay(handle, delayMs);
+				// A stopped or shutting-down run never retries, and neither does one
+				// whose run limits fired while it was backing off.
+				if (this.closing || handle.abortReason) {
+					const aborted = this.abortOutcome(handle, previousAbortReason);
+					if (aborted) {
+						status = aborted.status;
+						error = aborted.error;
+					}
+					break;
+				}
 			}
-		} catch (caught) {
-			const message = caught instanceof Error ? caught.message : String(caught);
-			const aborted = this.abortOutcome(handle, previousAbortReason);
-			if (aborted) {
-				status = aborted.status;
-				error = aborted.error;
-			} else {
-				status = "failed";
-				error = message;
+			// Only a genuine provider failure gets the retry summary; a run killed by
+			// a limit or a command keeps the message of that abort.
+			if (status === "failed" && attempt > 1 && this.abortOutcome(handle, previousAbortReason) === undefined) {
+				error = `${error ?? "worker run failed"} (gave up after ${attempt} attempts)`;
 			}
 		} finally {
 			this.clearRunTimers(handle);
@@ -731,12 +756,86 @@ export class WorkerManager {
 			this.log.info("worker run finished", {
 				id: record.id,
 				status,
+				attempts: record.attempts,
 				durationMs: record.lastRunFinishedAt - startedAt,
 				error,
 			});
 			if (status !== "stopped") void this.notifyCompletion(record, record.lastRunFinishedAt - startedAt);
 			this.notifyWaiters(handle);
 		}
+	}
+
+	/**
+	 * One prompt inside a run: send the prompt, then classify how it ended.
+	 *
+	 * `retryable` is only true for a transient provider failure that left no side
+	 * effects behind: at least one tool execution means a retry could duplicate
+	 * work, and new tokens mean the provider already did (and billed) something.
+	 */
+	private async attemptPrompt(
+		handle: WorkerHandle,
+		prompt: string,
+		context: { tokensBefore: number; textBefore?: string; previousAbortReason?: WorkerAbortReason },
+	): Promise<{ status: WorkerStatus; error?: string; retryable: boolean }> {
+		const session = handle.session;
+		if (!session) return { status: "failed", error: "worker session was not created", retryable: false };
+		const { tokensBefore, textBefore, previousAbortReason } = context;
+		let status: WorkerStatus;
+		let error: string | undefined;
+		try {
+			await session.prompt(prompt, { expandPromptTemplates: false, source: "extension" });
+			const aborted = this.abortOutcome(handle, previousAbortReason);
+			if (aborted) {
+				status = aborted.status;
+				error = aborted.error;
+			} else if (handle.sessionError) {
+				status = "failed";
+				error = handle.sessionError;
+			} else if (!this.runProducedOutput(handle, session, tokensBefore, textBefore)) {
+				status = "failed";
+				error = EMPTY_RUN_ERROR;
+			} else {
+				status = "idle";
+			}
+		} catch (caught) {
+			const aborted = this.abortOutcome(handle, previousAbortReason);
+			if (aborted) {
+				status = aborted.status;
+				error = aborted.error;
+			} else {
+				status = "failed";
+				error = errorDetail(caught);
+			}
+		}
+		const retryable =
+			status === "failed" &&
+			this.abortOutcome(handle, previousAbortReason) === undefined &&
+			handle.toolCalls === 0 &&
+			this.tokenTotal(session) <= tokensBefore &&
+			isTransientProviderError(error);
+		return { status, error, retryable };
+	}
+
+	/** Sleep between provider attempts; `stop`/`close` and the run limits resolve it early. */
+	private waitRetryDelay(handle: WorkerHandle, delayMs: number): Promise<void> {
+		if (!(delayMs > 0)) return Promise.resolve();
+		return new Promise<void>((resolve) => {
+			let settled = false;
+			let timer: NodeJS.Timeout | undefined;
+			const done = (): void => {
+				if (settled) return;
+				settled = true;
+				if (timer) clearTimeout(timer);
+				if (handle.wakeRetryDelay === done) handle.wakeRetryDelay = undefined;
+				resolve();
+			};
+			timer = setTimeout(done, delayMs);
+			handle.wakeRetryDelay = done;
+		});
+	}
+
+	private wakeRetryDelay(handle: WorkerHandle): void {
+		handle.wakeRetryDelay?.();
 	}
 
 	/**
@@ -753,6 +852,7 @@ export class WorkerManager {
 				maxRuntimeMs: this.cfg.maxRuntimeMs,
 				elapsedMs: Date.now() - timers.lastActivityAt,
 			});
+			this.wakeRetryDelay(handle);
 			void handle.session?.abort().catch(() => undefined);
 		}, this.cfg.maxRuntimeMs);
 		handle.runTimers = timers;
@@ -772,6 +872,7 @@ export class WorkerManager {
 				idleTimeoutMs: this.cfg.idleTimeoutMs,
 				silentMs: Date.now() - timers.lastActivityAt,
 			});
+			this.wakeRetryDelay(handle);
 			void handle.session?.abort().catch(() => undefined);
 		}, this.cfg.idleTimeoutMs);
 	}
@@ -822,6 +923,8 @@ export class WorkerManager {
 	private finishWithoutRun(handle: WorkerHandle): void {
 		const record = handle.record;
 		const reason = handle.abortReason;
+		// No prompt was spent, so no attempt is reported.
+		record.attempts = 0;
 		record.status = reason === "stop" ? "stopped" : "interrupted";
 		record.lastError = reason === "shutdown" ? "the alive process stopped before this worker run started" : undefined;
 		record.abortReason = reason;
@@ -834,6 +937,8 @@ export class WorkerManager {
 
 	private fail(handle: WorkerHandle, message: string): void {
 		const record = handle.record;
+		// A launch/prepare failure spends no prompt, so it reports no attempts.
+		record.attempts = 0;
 		record.status = handle.abortReason === "stop" ? "stopped" : handle.abortReason === "shutdown" ? "interrupted" : "failed";
 		record.abortReason = handle.abortReason ?? record.abortReason;
 		record.lastError = truncate(message, MAX_ERROR_CHARS);
@@ -863,7 +968,9 @@ export class WorkerManager {
 			`Worker ${record.id}${record.name ? ` "${record.name}"` : ""} is ${record.status}.`,
 			`model=${record.model} isolation=${record.isolation}${record.branch ? ` branch=${record.branch}` : ""}${record.pullRequest ? ` pr=#${record.pullRequest}` : ""}`,
 			record.abortReason ? `abort_reason: ${record.abortReason}` : undefined,
-			`duration=${Math.max(0, Math.round(durationMs / 1000))}s runs=${record.runs} workspace=${record.workspacePath}`,
+			`duration=${Math.max(0, Math.round(durationMs / 1000))}s runs=${record.runs}${
+				record.attempts && record.attempts > 1 ? ` attempts=${record.attempts}` : ""
+			} workspace=${record.workspacePath}`,
 			changed.length > 0 ? `changed (${changed.length}): ${changed.slice(0, 12).join(", ")}${changed.length > 12 ? ", …" : ""}` : "changed: none",
 		].filter((line): line is string => Boolean(line));
 		const body = record.lastResult?.trim() || record.lastError?.trim() || "(no result reported)";
@@ -884,6 +991,7 @@ export class WorkerManager {
 					workspacePath: record.workspacePath,
 					branch: record.branch,
 					pullRequest: record.pullRequest,
+					attempts: record.attempts,
 					changed: changed.slice(0, 50),
 					result: record.lastResult ? truncate(record.lastResult, 2000) : undefined,
 					error: record.lastError ? truncate(record.lastError, 2000) : undefined,
@@ -1000,6 +1108,26 @@ export class WorkerManager {
 	}
 }
 
+/** Human-readable error chain, including an errno buried in `cause` (`fetch failed <- read ECONNRESET`). */
+function errorDetail(error: unknown): string {
+	const parts: string[] = [];
+	let current: unknown = error;
+	for (let depth = 0; depth < 4 && current !== undefined && current !== null; depth += 1) {
+		if (current instanceof Error) {
+			const code = (current as { code?: unknown }).code;
+			const message = current.message || current.name;
+			const text = typeof code === "string" && code.length > 0 && !message.includes(code) ? `${message} [${code}]` : message;
+			if (text && !parts.includes(text)) parts.push(text);
+			current = (current as { cause?: unknown }).cause;
+		} else {
+			const text = String(current);
+			if (text && !parts.includes(text)) parts.push(text);
+			break;
+		}
+	}
+	return parts.join(" <- ") || "worker run failed";
+}
+
 /** Await a settle promise with a bounded timeout; clears the timer on early completion. */
 function waitForSettle(promise: Promise<void> | undefined, timeoutMs: number): Promise<void> {
 	if (!promise) return Promise.resolve();
@@ -1026,6 +1154,7 @@ export function renderWorkerRecord(record: WorkerRecord, extra: { activity?: str
 		record.lastRunStartedAt ? `last_run_started: ${new Date(record.lastRunStartedAt).toISOString()}` : undefined,
 		record.lastRunFinishedAt ? `last_run_finished: ${new Date(record.lastRunFinishedAt).toISOString()}` : undefined,
 		record.runs ? `runs: ${record.runs}` : undefined,
+		record.attempts && record.attempts > 1 ? `attempts: ${record.attempts}` : undefined,
 		record.abortReason ? `abort_reason: ${record.abortReason}` : undefined,
 		record.tokens ? `tokens: ${record.tokens.total}` : undefined,
 		typeof record.costUsd === "number" ? `cost_usd: ${record.costUsd.toFixed(4)}` : undefined,
