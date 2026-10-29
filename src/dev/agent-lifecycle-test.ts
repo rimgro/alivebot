@@ -132,8 +132,11 @@ try {
 		assert.equal(sent.length, 1);
 		assert.equal(sent[0].chat_id, 123);
 		assert.ok(sent[0].reply_markup.keyboard[0][0].request_managed_bot);
-		assert.equal(findManagedBotRequest(requestRoot, 123)?.agentId, "analyst");
-		await assert.rejects(() => requestBot("123"), /already pending/);
+		const firstRequest = findManagedBotRequest(requestRoot, 123);
+		assert.equal(firstRequest?.agentId, "analyst");
+		const repeat = await requestBot("123");
+		assert.ok(repeat.content?.[0]?.type === "text" && repeat.content[0].text.includes("pending"), JSON.stringify(repeat));
+		assert.equal(findManagedBotRequest(requestRoot, 123)?.requestedAt, firstRequest?.requestedAt, "a repeat request returns the active request");
 		assert.equal(sent.length, 1, "duplicate requests are not sent");
 		clearManagedBotRequest(requestRoot, findManagedBotRequest(requestRoot, 123)!);
 		failSend = true;

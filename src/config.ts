@@ -162,6 +162,8 @@ export interface TelegramConfig {
 	token: string;
 	/** Environment variable holding the bot token. Wins over `token` when set. */
 	tokenEnv: string;
+	/** How long a user-confirmed managed-bot request stays pending. */
+	managedBotTtlMs: number;
 	/** Bot API base URL. Override for a local bot-api server. */
 	apiBase: string;
 	/** Chat allowlist (chat ids). Empty = every chat the bot can see. */
@@ -192,6 +194,26 @@ export interface TelegramConfig {
 	maxMessageChars: number;
 	/** Voice-note transcription settings. */
 	transcription: TelegramTranscriptionConfig;
+}
+
+/** Managed bots need the operator to confirm inside the Telegram client. */
+export const MANAGED_BOT_TTL_MIN_MS = 10 * 60_000;
+export const MANAGED_BOT_TTL_MAX_MS = 15 * 60_000;
+export const DEFAULT_MANAGED_BOT_TTL_MS = 12 * 60_000;
+
+/** Validate Telegram settings whose bad values must fail loudly, not silently. */
+export function validateTelegramConfig(value: TelegramConfig): TelegramConfig {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("modules.telegram must be an object");
+	if (
+		!Number.isSafeInteger(value.managedBotTtlMs) ||
+		value.managedBotTtlMs < MANAGED_BOT_TTL_MIN_MS ||
+		value.managedBotTtlMs > MANAGED_BOT_TTL_MAX_MS
+	) {
+		throw new Error(
+			`modules.telegram.managedBotTtlMs must be an integer between ${MANAGED_BOT_TTL_MIN_MS} and ${MANAGED_BOT_TTL_MAX_MS} ms`,
+		);
+	}
+	return value;
 }
 
 /** Grafana-compatible inbound webhook module (alerts and annotations → events). */
@@ -417,6 +439,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 			enabled: false,
 			token: "",
 			tokenEnv: "ALIVE_TELEGRAM_TOKEN",
+			managedBotTtlMs: DEFAULT_MANAGED_BOT_TTL_MS,
 			apiBase: "https://api.telegram.org",
 			allowedChatIds: [],
 			allowedUserIds: [],
@@ -556,6 +579,7 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	merged.workers = validateWorkersConfig(merged.workers);
 	merged.updates = validateUpdatesConfig(merged.updates);
 	merged.secrets = validateSecretsConfig(merged.secrets);
+	merged.modules.telegram = validateTelegramConfig(merged.modules.telegram);
 	merged.piAgentDir = expandHome(merged.piAgentDir);
 	const paths = resolvePaths(path.dirname(configPath), merged);
 	return { config: merged, paths };

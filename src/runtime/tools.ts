@@ -249,8 +249,12 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 			}
 			if (action === "request-telegram") {
 				if (!params.chat) throw new Error("request-telegram requires the operator's private Telegram chat ID in chat");
-				await requestAgentTelegram(deps.config, target, params.chat);
-				return ok(`Telegram bot creation request sent for ${target.id}; the operator must approve it in Telegram. The master bot must be running to attach the token.`, { agentId: target.id, awaitingApproval: true });
+				const request = await requestAgentTelegram(deps.config, target, params.chat);
+				return ok(
+					`Telegram bot request for ${target.id}: ${request.status}, expires ${iso(request.expiresAt)} (chat ${request.chatId}). ` +
+						"The operator must approve it in Telegram; the master bot must be running to attach the token.",
+					{ agentId: target.id, awaitingApproval: request.status === "pending", status: request.status, expiresAt: request.expiresAt, chatId: request.chatId },
+				);
 			}
 			if (action === "status") {
 				if (!deps.config.config.agentManagement.targets.includes("*") && !deps.config.config.agentManagement.targets.includes(target.id)) throw new Error(`agent ${target.id} is outside your target allowlist`);

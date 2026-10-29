@@ -2,7 +2,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TelegramConfig, TelegramTranscriptionConfig } from "../../config.js";
-import { attachManagedBotToken, clearManagedBotRequest, findManagedBotRequest, validateAgentId, type ManagedAgent } from "../../agents.js";
+import { findManagedBotRequest, managedBotRequestStatus, validateAgentId, type ManagedAgent } from "../../agents.js";
+import {
+	cancelAgentTelegram,
+	expireManagedBotRequests,
+	finalizeManagedBotRequest,
+	formatManagedBotStatus,
+	managedBotScope,
+	managedBotStatus,
+} from "./managed-request.js";
 import type { AliveModule, ModuleContext } from "../../events/api.js";
 import type { HistoryAttachment } from "../../store/history.js";
 import type { OutgoingMessage } from "../../store/outbox.js";
@@ -97,6 +105,7 @@ export class TelegramModule implements AliveModule {
 	private botUsername?: string;
 	private botName?: string;
 	private readonly typing = new Map<string, { interval: NodeJS.Timeout; deadline: NodeJS.Timeout }>();
+	private managedSweep?: NodeJS.Timeout;
 	private typingMaxMsValue = 5 * 60_000;
 	private readonly counters = { updates: 0, inbound: 0, outbound: 0, errors: 0 };
 	private consecutiveFailures = 0;
@@ -143,6 +152,9 @@ export class TelegramModule implements AliveModule {
 		this.deliveryLedger = new TelegramDeliveryLedger(moduleDir);
 		this.allowlist = new TelegramAllowlistStore(moduleDir);
 		this.api = new TelegramApi({ token, apiBase: this.config.apiBase });
+		this.managedSweep = setInterval(() => void this.sweepManagedRequests(), 15_000);
+		this.managedSweep.unref?.();
+		void this.sweepManagedRequests();
 
 		// Polling must never depend on the identity handshake: a single network blip
 		// during getMe/deleteWebhook used to leave the bot silently deaf until a
@@ -174,6 +186,8 @@ export class TelegramModule implements AliveModule {
 	async stop(): Promise<void> {
 		this.stopped = true;
 		this.abort.abort();
+		if (this.managedSweep) clearInterval(this.managedSweep);
+		this.managedSweep = undefined;
 		for (const thread of [...this.typing.keys()]) this.stopTyping(thread);
 		await this.pollPromise?.catch(() => undefined);
 		this.pollPromise = undefined;
@@ -314,14 +328,11 @@ export class TelegramModule implements AliveModule {
 		// Managed-bot creation must be approved by the same private user who
 		// initiated the local request. Never accept a bot shared in a group.
 		if (messageUpdate.chat.type !== "private" || !messageUpdate.from || messageUpdate.chat.id !== messageUpdate.from.id) return;
-		const requestRoot = ctx.moduleDir();
-		const request = findManagedBotRequest(requestRoot, messageUpdate.chat.id);
-		if (!request) return;
-		if (Date.now() - request.requestedAt > 24 * 60 * 60 * 1000) {
-			clearManagedBotRequest(requestRoot, request);
-			await api.sendMessage({ chat_id: messageUpdate.chat.id, text: "That agent's bot request expired. Start a new request from the alive CLI." });
-			return;
-		}
+		const scope = managedBotScope({ paths: ctx.paths, config: { modules: { telegram: this.config } } });
+		// A late confirmation after the TTL is expired, not attached.
+		await this.sweepManagedRequests();
+		const request = findManagedBotRequest(scope.root, messageUpdate.chat.id);
+		if (!request || managedBotRequestStatus(request, scope.ttlMs) !== "pending") return;
 		const agentId = validateAgentId(request.agentId);
 		const agentDirectory = path.join(ctx.paths.stateDir, "agents", agentId);
 		const agent: ManagedAgent = {
@@ -329,15 +340,33 @@ export class TelegramModule implements AliveModule {
 			directory: agentDirectory,
 			configPath: path.join(agentDirectory, "alive.config.json"),
 		};
-		if (!fs.existsSync(agent.configPath)) throw new Error(`requested agent no longer exists: ${agentId}`);
-		const token = await api.getManagedBotToken(created.id);
-		attachManagedBotToken(agent, token, { id: created.id, username: created.username });
-		clearManagedBotRequest(requestRoot, request);
-		await api.sendMessage({
-			chat_id: messageUpdate.chat.id,
-			text: `Managed bot @${created.username ?? created.id} is now attached to agent “${agentId}”. Start it with: alive agents start ${agentId}`,
+		const view = await finalizeManagedBotRequest({
+			scope,
+			api,
+			request,
+			agent: fs.existsSync(agent.configPath) ? agent : undefined,
+			bot: { id: created.id, username: created.username },
 		});
-		ctx.log.info("managed Telegram bot attached to agent", { agentId, botId: created.id, username: created.username });
+		if (view.status === "created") {
+			ctx.log.info("managed Telegram bot attached to agent", { agentId, botId: created.id, username: created.username });
+		} else {
+			ctx.log.warn("managed Telegram bot was not attached", { agentId, botId: created.id, error: view.error });
+		}
+	}
+
+	/** Expire overdue managed-bot requests and remove their stale keyboards. */
+	private async sweepManagedRequests(): Promise<void> {
+		const ctx = this.ctx;
+		const api = this.api;
+		if (!ctx || !api) return;
+		try {
+			const expired = await expireManagedBotRequests(managedBotScope({ paths: ctx.paths, config: { modules: { telegram: this.config } } }), api, {
+				log: (error, request) => ctx.log.warn("managed-bot expiry message failed", { agentId: request.agentId, error: message(error) }),
+			});
+			if (expired.length > 0) ctx.log.info("managed-bot requests expired", { agents: expired.map((view) => view.agentId) });
+		} catch (error) {
+			ctx.log.warn("managed-bot expiry sweep failed", { error: message(error) });
+		}
 	}
 
 	private async handleUpdate(update: TelegramUpdate): Promise<void> {
@@ -998,6 +1027,13 @@ export class TelegramModule implements AliveModule {
 			typing: (thread: string) => this.startTyping(thread),
 			botIdentity: () => ({ id: this.botId, username: this.botUsername, name: this.botName }),
 			snapshot: () => this.status(),
+			managedStatus: (agentId) => formatManagedBotStatus(managedBotStatus(managedBotScope({ paths: ctx.paths, config: { modules: { telegram: this.config } } }), agentId)),
+			cancelManagedRequest: async (agentId) => {
+				const view = await cancelAgentTelegram(managedBotScope({ paths: ctx.paths, config: { modules: { telegram: this.config } } }), this.requireApi(), agentId);
+				return view
+					? `Cancelled pending managed-bot request for ${view.agentId} in chat ${view.chatId}.`
+					: `No pending managed-bot request for ${agentId}.`;
+			},
 		};
 	}
 

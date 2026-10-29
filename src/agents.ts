@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { DEFAULT_CONTRACT, loadConfig, resolveMemoryDatabasePath, type AgentManagementPermissions, type LoadedConfig } from "./config.js";
+import { DEFAULT_CONFIG, DEFAULT_CONTRACT, loadConfig, resolveMemoryDatabasePath, type AgentManagementPermissions, type LoadedConfig } from "./config.js";
+import { migrateConfigSecrets, readEnvFileValues } from "./config-secrets.js";
 import { snapshotRuntime, spawnBackground, stopRuntime, waitForRuntime } from "./runtime/daemon.js";
 import { sleep } from "./util.js";
 import { mergeSandboxConfig, type SandboxConfig } from "./sandbox/config.js";
@@ -379,42 +380,144 @@ function writeTextPrivate(file: string, value: string): void {
 	fs.chmodSync(file, 0o600);
 }
 
+/** A request is pending until Telegram confirms, the operator cancels, or the TTL passes. */
+export type ManagedBotRequestStatus = "pending" | "created" | "expired" | "failed";
+type ManagedBotTerminalStatus = Exclude<ManagedBotRequestStatus, "pending">;
+
 export interface ManagedBotRequest {
 	agentId: string;
 	chatId: number;
 	requestedAt: number;
+	/** Absent while the request is pending; terminal states remain for the status view. */
+	status?: ManagedBotTerminalStatus;
+	statusAt?: number;
+	/** Failure reason; never contains a bot token. */
+	error?: string;
+	botUsername?: string;
 }
 
-export function queueManagedBotRequest(root: string, request: ManagedBotRequest): void {
-	const file = path.join(root, "managed-bot-requests.json");
-	const requests = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) as ManagedBotRequest[] : [];
-	if (requests.some((item) => item.chatId === request.chatId)) throw new Error(`a managed-bot request is already pending for chat ${request.chatId}`);
-	requests.push(request);
+function managedBotRequestFile(root: string): string {
+	return path.join(root, "managed-bot-requests.json");
+}
+
+export function listManagedBotRequests(root: string): ManagedBotRequest[] {
+	const file = managedBotRequestFile(root);
+	if (!fs.existsSync(file)) return [];
+	const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as ManagedBotRequest[];
+	return Array.isArray(parsed) ? parsed : [];
+}
+
+function writeManagedBotRequests(root: string, requests: ManagedBotRequest[]): void {
 	fs.mkdirSync(root, { recursive: true });
-	fs.writeFileSync(file, `${JSON.stringify(requests, null, 2)}\n`, { mode: 0o600 });
+	const file = managedBotRequestFile(root);
+	const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+	fs.writeFileSync(temporary, `${JSON.stringify(requests, null, 2)}\n`, { mode: 0o600 });
+	fs.renameSync(temporary, file);
+	fs.chmodSync(file, 0o600);
 }
 
+export function managedBotRequestStatus(request: ManagedBotRequest, ttlMs: number, now = Date.now()): ManagedBotRequestStatus {
+	if (request.status) return request.status;
+	return now - request.requestedAt >= ttlMs ? "expired" : "pending";
+}
+
+/** Store a fresh pending request, keeping at most one row per agent and chat. */
+export function queueManagedBotRequest(root: string, request: ManagedBotRequest): void {
+	const requests = listManagedBotRequests(root).filter((item) => item.agentId !== request.agentId && item.chatId !== request.chatId);
+	requests.push(request);
+	writeManagedBotRequests(root, requests);
+}
+
+/** Latest request for a chat that has not reached a terminal state yet. */
 export function findManagedBotRequest(root: string, chatId: number): ManagedBotRequest | undefined {
-	const file = path.join(root, "managed-bot-requests.json");
-	if (!fs.existsSync(file)) return undefined;
-	return (JSON.parse(fs.readFileSync(file, "utf8")) as ManagedBotRequest[]).find((item) => item.chatId === chatId);
+	return listManagedBotRequests(root).filter((item) => item.chatId === chatId && !item.status).at(-1);
+}
+
+export function markManagedBotRequest(
+	root: string,
+	request: ManagedBotRequest,
+	status: ManagedBotTerminalStatus,
+	details: { error?: string; botUsername?: string } = {},
+): void {
+	const requests = listManagedBotRequests(root);
+	const match = requests.find((item) => item.agentId === request.agentId && item.chatId === request.chatId && item.requestedAt === request.requestedAt);
+	if (!match) return;
+	match.status = status;
+	match.statusAt = Date.now();
+	if (details.error !== undefined) match.error = details.error;
+	if (details.botUsername !== undefined) match.botUsername = details.botUsername;
+	writeManagedBotRequests(root, requests);
 }
 
 export function clearManagedBotRequest(root: string, request: ManagedBotRequest): void {
-	const file = path.join(root, "managed-bot-requests.json");
-	if (!fs.existsSync(file)) return;
-	const requests = JSON.parse(fs.readFileSync(file, "utf8")) as ManagedBotRequest[];
-	fs.writeFileSync(file, `${JSON.stringify(requests.filter((item) => item.agentId !== request.agentId || item.chatId !== request.chatId || item.requestedAt !== request.requestedAt), null, 2)}\n`, { mode: 0o600 });
+	const requests = listManagedBotRequests(root).filter(
+		(item) => item.agentId !== request.agentId || item.chatId !== request.chatId || item.requestedAt !== request.requestedAt,
+	);
+	writeManagedBotRequests(root, requests);
 }
 
+/** Remove every not-yet-terminal request for one agent and return what was removed. */
+export function cancelManagedBotRequests(root: string, agentId: string): ManagedBotRequest[] {
+	const requests = listManagedBotRequests(root);
+	const removed = requests.filter((item) => item.agentId === agentId && !item.status);
+	if (removed.length > 0) writeManagedBotRequests(root, requests.filter((item) => !removed.includes(item)));
+	return removed;
+}
+
+function removePlaintextManagedToken(agent: ManagedAgent, envName: string): void {
+	try {
+		const current = readAgentConfig(agent);
+		current.modules ??= {};
+		current.modules.telegram ??= {};
+		current.modules.telegram.token = "";
+		current.modules.telegram.tokenEnv = envName;
+		writeJsonPrivate(agent.configPath, current);
+	} catch {
+		// A read-only config cannot be cleaned; surface the original error instead.
+	}
+}
+
+/** Keep the bot token in `.env` (0600) and only its variable name in the config. */
 export function attachManagedBotToken(agent: ManagedAgent, token: string, bot: { id: number; username?: string }): void {
-	const raw = JSON.parse(fs.readFileSync(agent.configPath, "utf8"));
+	if (!token.trim()) throw new Error("Telegram returned an empty managed-bot token");
+	const envName = `ALIVE_TELEGRAM_${agent.id.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "").toUpperCase()}_${bot.id}_TOKEN`;
+	const raw = readAgentConfig(agent);
+	raw.modules ??= {};
+	raw.modules.telegram ??= {};
 	raw.modules.telegram.enabled = true;
 	raw.modules.telegram.token = token;
-	raw.modules.telegram.tokenEnv = "";
-	fs.writeFileSync(agent.configPath, `${JSON.stringify(raw, null, 2)}\n`, { mode: 0o600 });
-	fs.chmodSync(agent.configPath, 0o600);
-	fs.writeFileSync(path.join(agent.directory, "telegram-managed-bot.json"), `${JSON.stringify(bot, null, 2)}\n`, { mode: 0o600 });
+	raw.modules.telegram.tokenEnv = envName;
+	// Persist through the one migration path that owns `.env` formatting and permissions.
+	writeJsonPrivate(agent.configPath, raw);
+	try {
+		migrateConfigSecrets({
+			configPaths: [agent.configPath],
+			envPath: path.join(agent.directory, ".env"),
+			env: {},
+			defaults: DEFAULT_CONFIG,
+			log: () => undefined,
+			warn: () => undefined,
+		});
+	} catch (error) {
+		removePlaintextManagedToken(agent, envName);
+		throw error;
+	}
+	const stored = readAgentConfig(agent);
+	if (typeof stored.modules?.telegram?.token === "string" && stored.modules.telegram.token) {
+		// Never leave a plaintext token behind, even if the helper could not finish.
+		removePlaintextManagedToken(agent, envName);
+		throw new Error("could not move the Telegram bot token into .env; the token was removed from the agent config");
+	}
+	if (stored.modules?.telegram?.tokenEnv !== envName) {
+		stored.modules ??= {};
+		stored.modules.telegram ??= {};
+		stored.modules.telegram.tokenEnv = envName;
+		writeJsonPrivate(agent.configPath, stored);
+	}
+	if (readEnvFileValues(path.join(agent.directory, ".env"))[envName] !== token) {
+		throw new Error(`the Telegram bot token was not stored in .env as ${envName}`);
+	}
+	writeTextPrivate(path.join(agent.directory, "telegram-managed-bot.json"), `${JSON.stringify(bot, null, 2)}\n`);
 }
 
 export function configureAgentTelegram(agent: ManagedAgent, tokenEnv: string): void {
