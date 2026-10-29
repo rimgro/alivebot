@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { configureAgentTelegram, createAgent, disableManagedAgent, enableManagedAgent, ensureAdminAgent, getAgentEnabled, listAgents, restartManagedAgent, startManagedAgent, stopManagedAgent, updateManagedAgentProfile, validateAgentId } from "./agents.js";
 import type { AliveConfig, LoadedConfig } from "./config.js";
-import { loadConfig, writeDefaultConfig } from "./config.js";
+import { DEFAULT_CONFIG, loadConfig, redactSecretFields, writeDefaultConfig, migrateConfigSecrets } from "./config.js";
 import { Logger } from "./log.js";
 import { EventStore, type EventPriority } from "./store/events.js";
 import { ReminderStore } from "./store/reminders.js";
@@ -176,6 +176,9 @@ export async function main(argv: string[], options: CliOptions = {}): Promise<nu
 
 	try {
 		switch (command) {
+			case "config": {
+				return configCommand(cwd, flags, positionals);
+			}
 			case "init": {
 				const { configPath, soulPath } = writeDefaultConfig(cwd);
 				const admin = ensureAdminAgent(loadConfig({ cwd, configPath }));
@@ -343,14 +346,49 @@ export async function main(argv: string[], options: CliOptions = {}): Promise<nu
 	}
 }
 
-function loadForCli(flags: Record<string, string | boolean>): LoadedConfig {
+function loadForCli(
+	flags: Record<string, string | boolean>,
+	options: { migrateSecrets?: boolean } = {},
+): LoadedConfig {
 	const overrides: Partial<AliveConfig> = {};
 	const model = flagString(flags, "model");
 	if (model) overrides.model = model;
 	const thinking = flagString(flags, "thinking");
 	if (thinking) overrides.thinkingLevel = thinking;
 	if (flagBool(flags, "verbose")) overrides.verbose = true;
-	return loadConfig({ cwd: process.cwd(), configPath: flagString(flags, "config"), overrides });
+	return loadConfig({
+		cwd: process.cwd(),
+		configPath: flagString(flags, "config"),
+		overrides,
+		migrateSecrets: options.migrateSecrets,
+	});
+}
+
+function configCommand(cwd: string, flags: Record<string, string | boolean>, positionals: string[]): number {
+	const action = positionals[0] ?? "show";
+	const configPath = flagString(flags, "config")
+		? path.resolve(flagString(flags, "config")!)
+		: path.join(cwd, "alive.config.json");
+	if (action === "migrate-secrets") {
+		if (!fs.existsSync(configPath)) throw new Error(`config not found: ${configPath}`);
+		const localConfigPath = path.join(path.dirname(configPath), "alive.config.local.json");
+		const json = flagBool(flags, "json");
+		const dryRun = flagBool(flags, "dry-run");
+		const report = migrateConfigSecrets({
+			configPaths: [configPath, localConfigPath],
+			defaults: DEFAULT_CONFIG,
+			dryRun,
+			log: json ? () => undefined : (line) => process.stdout.write(`${line}\n`),
+			warn: json ? () => undefined : (line) => process.stderr.write(`${line}\n`),
+		});
+		if (json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+		return 0;
+	}
+	if (action !== "show") throw new Error("usage: alive config [show [--json]] | alive config migrate-secrets [--dry-run] [--json] [--config CONFIG]");
+	const loaded = loadForCli(flags, { migrateSecrets: false });
+	const safe = redactSecretFields(loaded.config);
+	process.stdout.write(`${JSON.stringify(safe, null, 2)}\n`);
+	return 0;
 }
 
 function makeLogger(config: LoadedConfig, quiet = true): Logger {
@@ -967,11 +1005,7 @@ function heartbeatCommand(flags: Record<string, string | boolean>, positionals: 
 }
 
 function redactSecrets(config: AliveConfig): AliveConfig {
-	const safe = structuredClone(config);
-	safe.modules.telegram.token = safe.modules.telegram.token ? "[redacted]" : "";
-	safe.modules.grafana.token = safe.modules.grafana.token ? "[redacted]" : "";
-	safe.chat.http.token = safe.chat.http.token ? "[redacted]" : "";
-	return safe;
+	return redactSecretFields(config);
 }
 
 async function workersCommand(cwd: string, flags: Record<string, string | boolean>, positionals: string[]): Promise<number> {
@@ -1303,6 +1337,9 @@ function printHelp(): void {
 	process.stdout.write(`alive — a long-lived agent runtime on top of pi
 
 usage:
+  alive config [show] [--json]                 effective config with secrets redacted
+  alive config migrate-secrets [--dry-run] [--json]
+                                              move plaintext config secrets into .env
   alive init                                  create alive.config.json + SOUL.md
   alive run [--foreground|--once] [--force] [--verbose]
                                               start the default agent in the background

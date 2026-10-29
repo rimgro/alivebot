@@ -4,6 +4,53 @@ import type { WorkerEnvironment } from "./environment.js";
 const GIT_TIMEOUT_MS = 120_000;
 const PR_TIMEOUT_MS = 180_000;
 
+/**
+ * Files a worker never sees in an isolated worktree: the project config,
+ * machine-local config, runtime state, and local secrets. `.env.example` and
+ * `.env.sample` stay visible because they carry no values.
+ */
+export const WORKER_WORKTREE_EXCLUDES = [
+	"/*",
+	"!/alive.config.json",
+	"!/alive.config.local.json",
+	"!/.alive/",
+	"!/.env",
+	"!/.env.*",
+	"/.env.example",
+	"/.env.sample",
+] as const;
+
+/** Root entries that must never be readable inside a worker worktree. */
+export const WORKER_FORBIDDEN_ENTRIES = ["alive.config.json", "alive.config.local.json", ".alive", ".env"] as const;
+
+/**
+ * Check out a worktree with a per-worktree sparse pattern that omits private
+ * runtime data. The pattern is written into `.git/worktrees/<name>/`, so it
+ * does not affect the main checkout or other workers.
+ */
+export async function configureWorkerWorktree(env: WorkerEnvironment, worktreePath: string): Promise<void> {
+	await runGit(env, worktreePath, ["sparse-checkout", "set", "--no-cone", ...WORKER_WORKTREE_EXCLUDES]);
+	await runGit(env, worktreePath, ["checkout", "--quiet"]);
+}
+
+/**
+ * Explicit last-line guard. Sparse checkout is best-effort git plumbing; a
+ * hand-made or pre-existing worktree must still never hand config/state to a
+ * worker. Refusing to start is safer than exposing the project's secrets.
+ */
+export async function assertWorkerWorktreeIsSecretFree(env: WorkerEnvironment, worktreePath: string): Promise<void> {
+	const present: string[] = [];
+	for (const entry of WORKER_FORBIDDEN_ENTRIES) {
+		if (await env.exists(env.join(worktreePath, entry))) present.push(entry);
+	}
+	if (present.length > 0) {
+		throw new Error(
+			`worker worktree contains private runtime data (${present.join(", ")}); refusing to start. ` +
+				"Recreate the worktree with `alive workers` or remove those paths before retrying",
+		);
+	}
+}
+
 export interface GitState {
 	/** Current branch name, or undefined for a detached HEAD. */
 	branch?: string;
@@ -88,7 +135,8 @@ export async function attachWorktree(
 ): Promise<void> {
 	if (await env.exists(worktreePath)) throw new Error(`worktree path already exists: ${worktreePath}`);
 	await env.mkdirp(env.dirname(worktreePath));
-	await runGit(env, repositoryPath, ["worktree", "add", worktreePath, validateWorkerBranch(branch)]);
+	await runGit(env, repositoryPath, ["worktree", "add", "--no-checkout", worktreePath, validateWorkerBranch(branch)]);
+	await configureWorkerWorktree(env, worktreePath);
 }
 
 export async function createWorktree(env: WorkerEnvironment, options: WorktreeOptions): Promise<void> {
@@ -98,8 +146,9 @@ export async function createWorktree(env: WorkerEnvironment, options: WorktreeOp
 	// --no-track: a worker branch must not accidentally push back to the base
 	// branch. The worker PR flow pushes explicitly with --set-upstream.
 	await runGit(env, options.repositoryPath, [
-		"worktree", "add", "--no-track", "-b", branch, options.worktreePath, options.baseRef?.trim() || "HEAD",
+		"worktree", "add", "--no-checkout", "--no-track", "-b", branch, options.worktreePath, options.baseRef?.trim() || "HEAD",
 	]);
+	await configureWorkerWorktree(env, options.worktreePath);
 }
 
 export async function createPullRequestWorktree(env: WorkerEnvironment, options: PullRequestWorktreeOptions): Promise<void> {
@@ -110,7 +159,8 @@ export async function createPullRequestWorktree(env: WorkerEnvironment, options:
 	// Read-only checkout of a PR head. The worker's own commits will live on a
 	// local branch and can be pushed only by the explicit `pr` action.
 	await runGit(env, options.repositoryPath, ["fetch", options.remote, `refs/pull/${options.number}/head:refs/heads/${branch}`]);
-	await runGit(env, options.repositoryPath, ["worktree", "add", options.worktreePath, branch]);
+	await runGit(env, options.repositoryPath, ["worktree", "add", "--no-checkout", options.worktreePath, branch]);
+	await configureWorkerWorktree(env, options.worktreePath);
 }
 
 export async function listWorktrees(env: WorkerEnvironment, repositoryPath: string): Promise<Array<{ path: string; branch?: string }>> {

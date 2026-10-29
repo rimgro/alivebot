@@ -18,6 +18,7 @@ import {
 	type WorkerSessionFactory,
 } from "./session.js";
 import {
+	assertWorkerWorktreeIsSecretFree,
 	attachWorktree,
 	baseBranchName,
 	branchExists,
@@ -560,6 +561,9 @@ export class WorkerManager {
 					baseRef: record.baseRef,
 				});
 			}
+		}
+		if (record.isolation === "worktree") {
+			await assertWorkerWorktreeIsSecretFree(this.environment, record.workspacePath);
 		}
 		record.baseCommit = record.baseCommit ?? await repositoryHead(this.environment, record.workspacePath);
 		record.updatedAt = Date.now();
