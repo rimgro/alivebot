@@ -49,7 +49,9 @@ Add this configuration to the gitignored `alive.config.local.json`:
       "actionTimeoutMs": 15000,
       "maxPageTextChars": 200000,
       "maxPagePreviewChars": 8000,
-      "maxSnapshotNodes": 2000
+      "maxSnapshotNodes": 2000,
+      "maxDownloadBytes": 52428800,
+      "downloadTimeoutMs": 60000
     }
   }
 }
@@ -63,7 +65,7 @@ For a local desktop trial, omit `publicUrl` and `notifyChatId`. The handoff tool
 
 Run `alive browser host --background` once on the browser machine after configuring and activating Fortress. It owns one browser container independently of the agent runtime. Connect the local agent with `alive browser setup --shared-url http://127.0.0.1:4330`, then restart that agent. For agents in other containers, use the host's private address and mount its private token read-only; see the deployment guide for the complete configuration and systemd example. `host-status` and `host-stop` manage only this service, independently of `alive stop`.
 
-In shared mode the agent's navigation, snapshots, reading, waits, screenshots and input run through **agent-browser 0.27.0**, not SDK action replacements. Snapshots return native `@eN` refs for subsequent click/fill calls. Each conversation runs a separate daemon with a private temporary HOME/socket directory and no inherited agent-browser config, provider, profile or credentials. Its only connection is a random-capability loopback CDP facade; it cannot launch a replacement browser. The facade implements virtual Target/session IDs from conversation-owned SDK pages and forwards an exact allowlist of page commands over the authenticated SDK protocol. The host independently checks that allowlist. There is no raw engine-wide CDP endpoint. SDK objects remain responsible for lifecycle, storage checkpoints, verification detection, signed API requests and the Telegram pult; both human and agent act on the same pages through the existing input queue. Arbitrary CLI argv, upload/download, global cookie operations, global browser settings and nested/OOPIF target attachment are not exposed by this adapter. `request` remains the separate signed read-only API client. Dedicated mode (`sharedUrl: ""`) retains its existing SDK implementation.
+In shared mode the agent's navigation, snapshots, reading, waits, screenshots and input run through **agent-browser 0.27.0**, not SDK action replacements. Snapshots return native `@eN` refs for subsequent click/fill calls. Each conversation runs a separate daemon with a private temporary HOME/socket directory and no inherited agent-browser config, provider, profile or credentials. Its only connection is a random-capability loopback CDP facade; it cannot launch a replacement browser. The facade implements virtual Target/session IDs from conversation-owned SDK pages and forwards an exact allowlist of page commands over the authenticated SDK protocol. The host independently checks that allowlist. There is no raw engine-wide CDP endpoint. SDK objects remain responsible for lifecycle, storage checkpoints, verification detection, signed API requests and the Telegram pult; both human and agent act on the same pages through the existing input queue. Arbitrary CLI argv, browser download events, uploads, global cookie operations, global browser settings and nested/OOPIF target attachment are not exposed by this adapter. The `download` action does not use browser download events: it requests the URL with the session cookies and stores the response body. `request` remains the separate signed read-only API client. Dedicated mode (`sharedUrl: ""`) retains its existing SDK implementation.
 
 Each SDK connection owns one isolated BrowserContext with separate tabs, cookies, localStorage and IndexedDB. It cannot enumerate other clients' contexts, close their browser or use browser-global CDP. The same Mini App tools, private-entry pause, explicit return/revoke and adaptive JPEG stream operate on that context. Restarting or disconnecting one agent closes only its context. A host/browser failure disconnects every client; agent actions fail instead of silently launching dedicated Chrome instances.
 
@@ -75,7 +77,7 @@ Port 4330 is a private machine API authenticated with `ALIVE_BROWSER_SHARED_TOKE
 
 `status` on a conversation that has never opened a browser does not create a listener or consume a capacity slot. Failed opens release empty router sessions; they do not permanently block other conversations after a host outage.
 
-The protocol bridge deliberately pins Playwright/Patchright **1.63.0** and refuses unsupported internal adapters; update both drivers and rerun shared E2E tests together. It permits scoped page capture/input and read-only context HTTP requests, and disables downloads, host file upload, tracing, auxiliary browser launch and global CDP. It never returns a raw browser-wide CDP address to clients.
+The protocol bridge deliberately pins Playwright/Patchright **1.63.0** and refuses unsupported internal adapters; update both drivers and rerun shared E2E tests together. It permits scoped page capture/input and read-only context HTTP requests, and disables Playwright download events, host file upload, tracing, auxiliary browser launch and global CDP. The `download` action's bytes never cross the scoped Playwright protocol: the host runs the request with the client's session cookies and returns the capped body over the authenticated HTTP channel. It never returns a raw browser-wide CDP address or host filesystem path to clients.
 
 ## Browser compatibility and access
 
@@ -132,6 +134,8 @@ browser({ action: "click", selector: "button[type=submit]" })
 browser({ action: "fill", selector: "input[name=query]", text: "example" })
 browser({ action: "press", key: "Enter" })
 browser({ action: "scroll", delta: 500 })
+browser({ action: "download", url: "https://example.com/export.csv" })
+browser({ action: "download", url: "https://example.com/attachment", name: "report.pdf" })
 browser_share({ reason: "Please complete the permitted sign-in step" })
 // Compatible existing action:
 browser({ action: "handoff", reason: "Please complete the permitted sign-in step" })
@@ -140,6 +144,18 @@ browser({ action: "close" })
 ```
 
 Clicks move the native pointer along a short curved path before a locator-checked click. Fill selects the current value and emits individual native key events with bounded delays; text is limited to 4096 characters. Scrolls use small wheel steps. Delays are configurable (0–2000 ms, with ordered minimum/maximum values), and cancellation/HTTP denial interrupts pending paced input. The action timeout bounds the sequence; choose a longer timeout for long input rather than removing cancellation.
+
+### Downloads
+
+`download` performs a `GET` for an `http`/`https` URL **inside the active browser session**, so the current context's cookies apply. It also sends the active page as `Referer` and its `User-Agent`. The request is made with Playwright's `context.request` API, not a separate Node `fetch`. Redirects are followed up to 10 hops; every hop is re-checked as HTTP(S) and a signed request is re-signed only for an explicitly authorized origin.
+
+The response body is written to `<workspace>/browser-downloads/<name>`, for example `browser-downloads/report.pdf`. The result is `{ path, filename, bytes, mime, url, hint }`; `path` is workspace-relative. The name is chosen in this order: RFC 6266 `Content-Disposition` (`filename*` first, including RFC 5987 UTF-8, then `filename`), the optional `name` argument, the URL basename, then `download-<UTC timestamp>`. Names are sanitized to one path segment: separators and `..` are removed, control/bidi characters and Windows-reserved characters are replaced, and the result is capped at 120 characters. An existing file is never overwritten; `-1`, `-2`, ... is added before the extension instead.
+
+`maxDownloadBytes` (default 50 MiB, integer 1 024–1 073 741 824) is a hard cap. A declared `Content-Length` over the cap is rejected before reading; the body is also checked while it is written. An oversized download writes no file and fails with an error naming the limit. `downloadTimeoutMs` (default 60 000, integer 100–600 000) bounds the whole operation, including redirects and writing; the module's stop signal also aborts it. A timeout, HTTP error, oversized body or write failure returns an error and **keeps the browser session usable**. Only `http`/`https` URLs are accepted; `file:`, `data:`, credentials in the URL and non-HTTP redirects are refused.
+
+The sandbox workspace writer receives one already-capped buffer, so a sandboxed session cannot stream directly to disk. A local workspace streams to a temporary sibling and renames it only after the whole body succeeds; an existing file is never replaced. Playwright's `APIRequestContext` buffers the response body before it can be inspected, so the cap is enforced before any workspace file is created: a declared oversized `Content-Length` is refused before the body is read, and the actual body length is checked again before the write. The host-to-client transfer is streamed and capped again on the client side.
+
+In shared-host mode the scoped Playwright protocol cannot carry a large binary response. The host therefore runs the same request in a temporary Playwright request context seeded with the client's cookies, signs it with the host identity when authorized, enforces the same cap and timeout, and streams the bytes back over the authenticated `/v1/download` channel. The client still writes only a complete file. The fallback replays the context's cookies and the browser-like headers (`Referer`, `User-Agent`, `Accept`, `Accept-Language`); it does not reproduce the browser's TLS/HTTP2 fingerprint or page JavaScript state, and it does not follow a redirect across a signed origin with the original signature. Downloads are not browser download-event captures: `Content-Disposition` is used for naming, but the file is not also added to Chrome's download shelf/history. A download cannot resume a partial transfer, cannot overwrite an existing file, cannot use a different identity, and does not bypass a site's own authentication or authorization. It only supports `http`/`https`; `file:`, `data:`, credentials embedded in the URL and non-HTTP redirects are refused.
 
 ### Page extraction limits
 

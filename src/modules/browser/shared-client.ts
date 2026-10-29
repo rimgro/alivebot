@@ -31,6 +31,78 @@ export function sharedToken(config: Pick<BrowserConfig, "sharedTokenFileEnv" | "
 	return token;
 }
 
+export interface SharedDownloadInput {
+	url: string;
+	headers?: Record<string, string>;
+	/** The client context's cookies; the host replays them in a temporary API request context. */
+	cookies?: Array<Record<string, unknown>>;
+}
+
+export interface SharedDownload {
+	status: number;
+	headers: Record<string, string>;
+	finalUrl: string;
+	body: AsyncIterable<Uint8Array>;
+	/** Cancel an unread body and release the transport. */
+	dispose(): Promise<void>;
+}
+
+/** A binary download cannot cross the scoped Playwright protocol above its
+ * bounded WebSocket message size, so the host runs the request with the
+ * client's session cookies and streams the bytes back over authenticated HTTP.
+ * This keeps the current session's authentication without exposing a raw
+ * browser-wide CDP endpoint or host filesystem path.
+ */
+export async function sharedDownload(config: BrowserConfig, input: SharedDownloadInput, signal?: AbortSignal): Promise<SharedDownload> {
+	let response: Response;
+	try {
+		response = await fetch(`${sharedOrigin(config.sharedUrl)}/v1/download`, {
+			method: "POST", redirect: "error",
+			headers: { Authorization: `Bearer ${sharedToken(config)}`, "content-type": "application/json" },
+			body: JSON.stringify(input),
+			signal: AbortSignal.any([AbortSignal.timeout(config.downloadTimeoutMs), ...(signal ? [signal] : [])]),
+		});
+	} catch (error) {
+		if (signal?.aborted) throw error;
+		if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) throw new Error(`Download did not finish within ${config.downloadTimeoutMs} ms; the browser session was kept`);
+		throw new Error("Shared browser host is unavailable for the download");
+	}
+	if (!response.ok) {
+		const detail = await response.json().then(value => typeof value === "object" && value && typeof (value as { error?: unknown }).error === "string" ? (value as { error: string }).error : "", () => "");
+		await response.body?.cancel().catch(() => {});
+		throw new Error(`Shared browser host refused the download${detail ? `: ${detail}` : ` (HTTP ${response.status})`}`);
+	}
+	const headers: Record<string, string> = {};
+	const mime = response.headers.get("x-alive-mime"), disposition = response.headers.get("x-alive-content-disposition"), final = response.headers.get("x-alive-url");
+	if (mime) headers["content-type"] = safeDecode(mime);
+	if (disposition) headers["content-disposition"] = safeDecode(disposition);
+	const declared = response.headers.get("content-length");
+	if (declared !== null) headers["content-length"] = declared;
+	const status = Number(response.headers.get("x-alive-status") || "0");
+	const body = response.body ? responseBody(response.body) : emptyBody();
+	return { status: Number.isFinite(status) ? status : 0, headers, finalUrl: final ? safeDecode(final) : input.url, body, dispose: async () => { await response.body?.cancel().catch(() => {}); } };
+}
+
+function safeDecode(value: string): string {
+	try { return decodeURIComponent(value); } catch { return value; }
+}
+
+async function* responseBody(stream: ReadableStream<Uint8Array>): AsyncGenerator<Uint8Array> {
+	const reader = stream.getReader();
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) return;
+			if (value) yield value;
+		}
+	} finally {
+		await reader.cancel().catch(() => {});
+		reader.releaseLock();
+	}
+}
+
+async function* emptyBody(): AsyncGenerator<Uint8Array> {}
+
 export async function sharedMetadata(config: BrowserConfig, signal?: AbortSignal): Promise<SharedMetadata> {
 	try {
 		const response = await fetch(`${sharedOrigin(config.sharedUrl)}/v1/status`, { headers: { Authorization: `Bearer ${sharedToken(config)}` }, redirect: "error", signal: AbortSignal.any([AbortSignal.timeout(config.actionTimeoutMs), ...(signal ? [signal] : [])]) });

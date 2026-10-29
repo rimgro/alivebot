@@ -6,13 +6,14 @@ import * as path from "node:path";
 import { createRequire } from "node:module";
 import type { Browser, BrowserType } from "playwright";
 import { WebSocket, WebSocketServer } from "ws";
-import type { BrowserConfig } from "./config.js";
+import { validateDownloadLimits, type BrowserConfig } from "./config.js";
 import { launchManagedFortress, type ManagedFortress } from "./fortress.js";
 import { BrowserIdentity } from "./identity.js";
 import { BrowserSigningTransport } from "./transport.js";
 import { checkCanvas, type CanvasReport } from "./diagnostics.js";
 import type { SharedMetadata } from "./shared-client.js";
 import { SharedProtocol } from "./shared-protocol.js";
+import { DownloadTooLargeError, fetchWithBrowserRequest } from "./download.js";
 
 interface ProtocolServer { listen(port: number, host: string): Promise<string>; close(): Promise<void> }
 interface Options { config: BrowserConfig; directory: string; token: string; host?: string; port?: number; maxClients?: number; failure?(): void }
@@ -61,6 +62,7 @@ export class SharedBrowserHost {
 
 	async start(): Promise<void> {
 		if (this.server) throw new Error("Shared browser host is already started");
+		validateDownloadLimits(this.options.config);
 		// The kernel releases this directory-specific loopback lock after a crash.
 		// Unlike a PID file it also excludes simultaneous starts with ephemeral API ports.
 		const lockPort = 20_000 + createHash("sha256").update(path.resolve(this.options.directory)).digest().readUInt32BE(0) % 10_000;
@@ -72,6 +74,7 @@ export class SharedBrowserHost {
 			response.setHeader("Cache-Control", "no-store"); response.setHeader("Content-Type", "application/json");
 			if (!this.authorized(request)) { response.writeHead(401); response.end('{"error":"Unauthorized"}'); return; }
 			if (request.method === "GET" && request.url === "/v1/identity-directory" && this.identity && this.metadata) { response.end(JSON.stringify(this.identity.directory())); return; }
+			if (request.method === "POST" && request.url === "/v1/download") { void this.download(request, response); return; }
 			if (request.method !== "GET" || request.url !== "/v1/status") { response.writeHead(404); response.end("{}"); return; }
 			response.writeHead(this.metadata ? 200 : 503); response.end(JSON.stringify(this.status()));
 		});
@@ -117,6 +120,51 @@ export class SharedBrowserHost {
 			this.metadata = { protocol: 1, engine: config.engine, browserVersion: this.browser.version(), fortressImage: this.fortress?.image, fortressCanvas, ...(identity ? { signing: { agentUrl: identity.agentUrl, keyId: identity.keyId, origins: [...config.signing.origins] } } : {}) };
 			this.browser.on("disconnected", () => { this.metadata = undefined; if (!this.stopping) this.options.failure?.(); });
 		} catch (error) { await this.close(); throw error; }
+	}
+
+	/** The client's scoped protocol cannot carry a large binary body; replay its
+	 * session cookies in a temporary host-side request context and stream the
+	 * capped response over authenticated HTTP. No host path or raw CDP is exposed.
+	 */
+	private async download(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
+		const fail = (status: number, message: string) => {
+			if (response.destroyed || response.writableEnded) return;
+			try {
+				if (!response.headersSent) { response.writeHead(status, { "Content-Type": "application/json" }); response.end(JSON.stringify({ error: message })); }
+				else response.destroy();
+			} catch { response.destroy(); }
+		};
+		const controller = new AbortController();
+		const timer = setTimeout(() => controller.abort(new Error("Download timed out")), this.options.config.downloadTimeoutMs);
+		response.on("close", () => { if (!response.writableEnded) controller.abort(); });
+		let api: Awaited<ReturnType<typeof requestContext>> | undefined;
+		try {
+			const input = await readJson(request, 32_768);
+			const url = new URL(typeof input.url === "string" ? input.url : "");
+			if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error("Use an HTTP(S) URL without embedded credentials");
+			const headers = downloadHeaders(input.headers);
+			const cookies = downloadCookies(input.cookies);
+			api = await requestContext(this.options.config.driver, cookies);
+			const result = await fetchWithBrowserRequest(api, url.href, {
+				headers, maxBytes: this.options.config.maxDownloadBytes, timeoutMs: this.options.config.downloadTimeoutMs, signal: controller.signal,
+				sign: this.identity ? target => this.identity!.authorizes(target) ? this.identity!.requestHeaders(target) : {} : undefined,
+			});
+			const responseHeaders: Record<string, string | number> = {
+				"Content-Type": "application/octet-stream", "Content-Length": result.body.length, "Cache-Control": "no-store",
+				"X-Alive-Status": result.status, "X-Alive-Mime": encodeURIComponent(result.headers["content-type"] || "application/octet-stream").slice(0, 4096),
+				"X-Alive-Url": encodeURIComponent(result.finalUrl).slice(0, 8192),
+			};
+			if (result.headers["content-disposition"]) responseHeaders["X-Alive-Content-Disposition"] = encodeURIComponent(result.headers["content-disposition"]).slice(0, 8192);
+			response.writeHead(200, responseHeaders);
+			response.end(result.body);
+		} catch (error) {
+			if (controller.signal.aborted) fail(504, `Download did not finish within ${this.options.config.downloadTimeoutMs} ms`);
+			else if (error instanceof DownloadTooLargeError) fail(413, error.message);
+			else fail(502, error instanceof Error ? error.message.replace(/\s+/g, " ").slice(0, 300) : "Download failed");
+		} finally {
+			clearTimeout(timer);
+			await api?.dispose().catch(() => {});
+		}
 	}
 
 	private authorized(request: http.IncomingMessage): boolean {
@@ -185,4 +233,64 @@ export class SharedBrowserHost {
 			}
 		}
 	}
+}
+
+async function requestContext(driver: BrowserConfig["driver"], cookies: Array<Record<string, unknown>>) {
+	const engine = driver === "patchright" ? await import("patchright") : await import("playwright");
+	return engine.request.newContext({ storageState: { cookies: cookies as never, origins: [] } });
+}
+
+function readJson(request: http.IncomingMessage, limit: number): Promise<Record<string, unknown>> {
+	return new Promise((resolve, reject) => {
+		const chunks: Buffer[] = [];
+		let bytes = 0, settled = false;
+		const fail = (error: Error) => { if (!settled) { settled = true; chunks.length = 0; reject(error); } };
+		request.on("data", (chunk: Buffer) => {
+			if (settled) return;
+			bytes += chunk.length;
+			if (bytes > limit) fail(new Error("Download request is too large"));
+			else chunks.push(chunk);
+		});
+		request.once("error", fail);
+		request.once("aborted", () => fail(new Error("Download request was aborted")));
+		request.once("end", () => {
+			if (settled) return;
+			try {
+				const parsed: unknown = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
+				settled = true; resolve(parsed as Record<string, unknown>);
+			} catch { fail(new Error("Invalid download request")); }
+		});
+	});
+}
+
+/** Only browser-like headers are replayed; credentials and CRLF never cross. */
+function downloadHeaders(value: unknown): Record<string, string> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	const allowed = new Set(["referer", "user-agent", "accept", "accept-language"]), headers: Record<string, string> = {};
+	for (const [name, raw] of Object.entries(value as Record<string, unknown>)) {
+		const key = name.toLowerCase();
+		if (!allowed.has(key) || typeof raw !== "string" || raw.length > 4096 || /[\r\n]/.test(raw)) continue;
+		headers[key] = raw;
+	}
+	return headers;
+}
+
+function downloadCookies(value: unknown): Array<Record<string, unknown>> {
+	if (!Array.isArray(value)) return [];
+	const cookies: Array<Record<string, unknown>> = [];
+	for (const raw of value.slice(0, 500)) {
+		if (!raw || typeof raw !== "object") continue;
+		const cookie = raw as Record<string, unknown>;
+		if (typeof cookie.name !== "string" || typeof cookie.value !== "string" || typeof cookie.domain !== "string" || typeof cookie.path !== "string") continue;
+		const out: Record<string, unknown> = {
+			name: cookie.name.slice(0, 4096), value: cookie.value.slice(0, 16384),
+			domain: cookie.domain.slice(0, 255), path: cookie.path.slice(0, 1024),
+			expires: typeof cookie.expires === "number" && Number.isFinite(cookie.expires) ? cookie.expires : -1,
+			httpOnly: cookie.httpOnly === true, secure: cookie.secure === true,
+		};
+		if (cookie.sameSite === "Strict" || cookie.sameSite === "Lax" || cookie.sameSite === "None") out.sameSite = cookie.sameSite;
+		cookies.push(out);
+	}
+	return cookies;
 }

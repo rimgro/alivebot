@@ -200,6 +200,7 @@ export class AliveRuntime {
 			workspaceFiles: this.sandbox ? {
 				rootDir: this.sandbox.workspaceDir,
 				readFile: (file) => this.sandbox!.exclusive(async () => (await this.sandbox!.files()).read(workspacePath(file))),
+				exists: (file) => this.sandbox!.exclusive(async () => { try { await (await this.sandbox!.files()).stat(workspacePath(file)); return true; } catch { return false; } }),
 				writeFile: (file, data) => this.sandbox!.exclusive(async () => {
 					const p = workspacePath(file);
 					await (await this.sandbox!.files()).write(p, data);
