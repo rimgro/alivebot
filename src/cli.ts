@@ -1377,9 +1377,10 @@ const DASHBOARD_USAGE =
 	"  --host HOST     127.0.0.1 or localhost; any other host is refused\n" +
 	"  --config FILE   profile config (default ./alive.config.json)\n" +
 	"\n" +
-	"Serves a read-only HTML view of the agents' on-disk state: agents list,\n" +
-	"timeline, run details and prompts. It binds to loopback only, writes nothing\n" +
-	"and exposes no actions. Stop with Ctrl+C.\n";
+	"Serves an HTML view of the agents' on-disk state: agents list, timeline,\n" +
+	"run details, prompts and memory. /agent/<id>/settings is the single write\n" +
+	"path (CSRF-protected form for config and prompt files, with backups).\n" +
+	"It binds to loopback only and never runs commands. Stop with Ctrl+C.\n";
 
 async function dashboardCommand(cwd: string, flags: Record<string, string | boolean>): Promise<number> {
 	if (flagBool(flags, "help") || flagBool(flags, "h")) {
@@ -1399,7 +1400,8 @@ async function dashboardCommand(cwd: string, flags: Record<string, string | bool
 	const portText = flagString(flags, "port");
 	const port = portText === undefined ? DEFAULT_DASHBOARD_PORT : Number(portText);
 	const bind = validateDashboardBind(host, port);
-	// Read-only: never migrate config secrets, that path writes .env.
+	// Never migrate config secrets here, that path writes .env: the dashboard's
+	// only write path is the explicit settings form.
 	const config = loadForCli(flags, { migrateSecrets: false });
 	await runDashboard({
 		rootDir: config.paths.rootDir,
