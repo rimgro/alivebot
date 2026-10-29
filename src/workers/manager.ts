@@ -37,6 +37,7 @@ import { createWorkerEnvironment, type WorkerEnvironment } from "./environment.j
 import {
 	validateWorkerId,
 	workerLabel,
+	type WorkerAbortReason,
 	type WorkerIsolation,
 	type WorkerRecord,
 	type WorkerStatus,
@@ -61,13 +62,25 @@ interface WorkerHandle {
 	record: WorkerRecord;
 	session?: WorkerSession;
 	runPromise?: Promise<void>;
-	abortReason?: "stop" | "shutdown" | "timeout";
+	abortReason?: WorkerAbortReason;
 	waiters: Set<() => void>;
 	activity?: string;
 	/** Last assistant turn that ended with stopReason "error" or "aborted" in this run. */
 	sessionError?: string;
 	/** Tool executions started during the current run. */
 	toolCalls: number;
+	/** Timers bounding the current run; absent when no run is active. */
+	runTimers?: RunTimers;
+}
+
+/**
+ * One run is bounded by two independent timers: an inactivity timer that is
+ * reset by every session event, and an absolute wall-clock ceiling.
+ */
+interface RunTimers {
+	idle?: NodeJS.Timeout;
+	ceiling?: NodeJS.Timeout;
+	lastActivityAt: number;
 }
 
 export interface StartWorkerOptions {
@@ -501,6 +514,7 @@ export class WorkerManager {
 	// ---------------------------------------------------------------------
 
 	private async launch(handle: WorkerHandle, prompt: string): Promise<void> {
+		handle.record.abortReason = undefined;
 		try {
 			await this.prepare(handle);
 			if (handle.abortReason) {
@@ -579,15 +593,24 @@ export class WorkerManager {
 		});
 		session.subscribe((event) => {
 			const handle = this.handles.get(record.id);
+			if (!handle) return;
+			// Every event the manager already reacts to is an activity signal: it
+			// resets the run's inactivity timer.
+			if (
+				event.type === "turn_start" ||
+				event.type === "tool_execution_start" ||
+				event.type === "turn_end" ||
+				event.type === "agent_end"
+			) {
+				this.touchRunActivity(handle);
+			}
 			if (event.type === "tool_execution_start" && typeof event.toolName === "string") {
-				if (handle) {
-					handle.activity = `tool: ${event.toolName}`;
-					handle.toolCalls += 1;
-				}
+				handle.activity = `tool: ${event.toolName}`;
+				handle.toolCalls += 1;
 			} else if (event.type === "turn_start") {
-				if (handle) handle.activity = "thinking";
+				handle.activity = "thinking";
 			} else if (event.type === "turn_end" || event.type === "agent_end") {
-				if (handle) this.captureSessionError(handle, event);
+				this.captureSessionError(handle, event);
 			}
 		});
 		return session;
@@ -635,25 +658,19 @@ export class WorkerManager {
 		handle.toolCalls = 0;
 		const tokensBefore = this.tokenTotal(session);
 		const textBefore = session.getLastAssistantText()?.trim();
-		let timedOut = false;
-		const timer = setTimeout(() => {
-			timedOut = true;
-			handle.abortReason = "timeout";
-			this.log.warn("worker run exceeded its runtime limit; aborting", { id: record.id, maxRuntimeMs: this.cfg.maxRuntimeMs });
-			void session.abort().catch(() => undefined);
-		}, this.cfg.maxRuntimeMs);
-
 		const previousAbortReason = handle.abortReason;
 		handle.abortReason = undefined;
+		record.abortReason = undefined;
+		this.startRunTimers(handle);
+
 		let status: WorkerStatus = "idle";
 		let error: string | undefined;
 		try {
 			await session.prompt(prompt, { expandPromptTemplates: false, source: "extension" });
-			if (previousAbortReason === "stop" || handle.abortReason === "stop") status = "stopped";
-			else if (previousAbortReason === "shutdown" || handle.abortReason === "shutdown") status = "interrupted";
-			else if (timedOut || handle.abortReason === "timeout") {
-				status = "failed";
-				error = `worker run exceeded ${this.cfg.maxRuntimeMs} ms and was aborted`;
+			const aborted = this.abortOutcome(handle, previousAbortReason);
+			if (aborted) {
+				status = aborted.status;
+				error = aborted.error;
 			} else if (handle.sessionError) {
 				status = "failed";
 				error = handle.sessionError;
@@ -665,20 +682,16 @@ export class WorkerManager {
 			}
 		} catch (caught) {
 			const message = caught instanceof Error ? caught.message : String(caught);
-			if (previousAbortReason === "stop" || handle.abortReason === "stop") {
-				status = "stopped";
-			} else if (previousAbortReason === "shutdown" || handle.abortReason === "shutdown") {
-				status = "interrupted";
-				error = "the alive process stopped while this worker was running";
-			} else if (timedOut || handle.abortReason === "timeout") {
-				status = "failed";
-				error = `worker run exceeded ${this.cfg.maxRuntimeMs} ms and was aborted`;
+			const aborted = this.abortOutcome(handle, previousAbortReason);
+			if (aborted) {
+				status = aborted.status;
+				error = aborted.error;
 			} else {
 				status = "failed";
 				error = message;
 			}
 		} finally {
-			clearTimeout(timer);
+			this.clearRunTimers(handle);
 			try {
 				const stats = session.getSessionStats();
 				if (stats.tokens) {
@@ -702,6 +715,7 @@ export class WorkerManager {
 			record.lastError = error ? truncate(error, MAX_ERROR_CHARS) : undefined;
 			record.lastRunFinishedAt = Date.now();
 			record.updatedAt = record.lastRunFinishedAt;
+			record.abortReason = handle.abortReason ?? previousAbortReason;
 			handle.abortReason = undefined;
 			handle.activity = undefined;
 			if (status !== "idle") this.disposeSession(handle);
@@ -725,6 +739,70 @@ export class WorkerManager {
 		}
 	}
 
+	/**
+	 * Arm both run limits: the inactivity timer (reset by every session event)
+	 * and the absolute wall-clock ceiling. Whichever fires first aborts the
+	 * session; the first reason wins so a later timer cannot relabel the run.
+	 */
+	private startRunTimers(handle: WorkerHandle): void {
+		const timers: RunTimers = { lastActivityAt: Date.now() };
+		timers.ceiling = setTimeout(() => {
+			if (!handle.abortReason) handle.abortReason = "runtime";
+			this.log.warn("worker run reached its runtime ceiling; aborting", {
+				id: handle.record.id,
+				maxRuntimeMs: this.cfg.maxRuntimeMs,
+				elapsedMs: Date.now() - timers.lastActivityAt,
+			});
+			void handle.session?.abort().catch(() => undefined);
+		}, this.cfg.maxRuntimeMs);
+		handle.runTimers = timers;
+		this.touchRunActivity(handle);
+	}
+
+	/** Activity signal for the current run: restart the inactivity timer. */
+	private touchRunActivity(handle: WorkerHandle): void {
+		const timers = handle.runTimers;
+		if (!timers) return;
+		timers.lastActivityAt = Date.now();
+		if (timers.idle) clearTimeout(timers.idle);
+		timers.idle = setTimeout(() => {
+			if (!handle.abortReason) handle.abortReason = "idle";
+			this.log.warn("worker run idle for too long; aborting", {
+				id: handle.record.id,
+				idleTimeoutMs: this.cfg.idleTimeoutMs,
+				silentMs: Date.now() - timers.lastActivityAt,
+			});
+			void handle.session?.abort().catch(() => undefined);
+		}, this.cfg.idleTimeoutMs);
+	}
+
+	private clearRunTimers(handle: WorkerHandle): void {
+		const timers = handle.runTimers;
+		if (!timers) return;
+		if (timers.idle) clearTimeout(timers.idle);
+		if (timers.ceiling) clearTimeout(timers.ceiling);
+		handle.runTimers = undefined;
+	}
+
+	/** Map the run's abort reason to a final status; undefined when not aborted. */
+	private abortOutcome(
+		handle: WorkerHandle,
+		previous: WorkerAbortReason | undefined,
+	): { status: WorkerStatus; error?: string } | undefined {
+		const reason = handle.abortReason ?? previous;
+		if (reason === "stop") return { status: "stopped" };
+		if (reason === "shutdown") {
+			return { status: "interrupted", error: "the alive process stopped while this worker was running" };
+		}
+		if (reason === "idle") {
+			return { status: "failed", error: `worker run idle for ${this.cfg.idleTimeoutMs} ms and was aborted` };
+		}
+		if (reason === "runtime") {
+			return { status: "failed", error: `worker run exceeded ${this.cfg.maxRuntimeMs} ms and was aborted` };
+		}
+		return undefined;
+	}
+
 	private tokenTotal(session: WorkerSession): number {
 		try {
 			return session.getSessionStats().tokens?.total ?? 0;
@@ -746,6 +824,7 @@ export class WorkerManager {
 		const reason = handle.abortReason;
 		record.status = reason === "stop" ? "stopped" : "interrupted";
 		record.lastError = reason === "shutdown" ? "the alive process stopped before this worker run started" : undefined;
+		record.abortReason = reason;
 		record.lastRunFinishedAt = Date.now();
 		record.updatedAt = record.lastRunFinishedAt;
 		this.store.save(record);
@@ -756,6 +835,7 @@ export class WorkerManager {
 	private fail(handle: WorkerHandle, message: string): void {
 		const record = handle.record;
 		record.status = handle.abortReason === "stop" ? "stopped" : handle.abortReason === "shutdown" ? "interrupted" : "failed";
+		record.abortReason = handle.abortReason ?? record.abortReason;
 		record.lastError = truncate(message, MAX_ERROR_CHARS);
 		record.lastResult = undefined;
 		record.lastRunFinishedAt = Date.now();
@@ -782,9 +862,10 @@ export class WorkerManager {
 		const header = [
 			`Worker ${record.id}${record.name ? ` "${record.name}"` : ""} is ${record.status}.`,
 			`model=${record.model} isolation=${record.isolation}${record.branch ? ` branch=${record.branch}` : ""}${record.pullRequest ? ` pr=#${record.pullRequest}` : ""}`,
+			record.abortReason ? `abort_reason: ${record.abortReason}` : undefined,
 			`duration=${Math.max(0, Math.round(durationMs / 1000))}s runs=${record.runs} workspace=${record.workspacePath}`,
 			changed.length > 0 ? `changed (${changed.length}): ${changed.slice(0, 12).join(", ")}${changed.length > 12 ? ", …" : ""}` : "changed: none",
-		];
+		].filter((line): line is string => Boolean(line));
 		const body = record.lastResult?.trim() || record.lastError?.trim() || "(no result reported)";
 		const text = `${header.join("\n")}\n\n${truncate(body, 2000)}`;
 		try {
@@ -797,6 +878,7 @@ export class WorkerManager {
 				payload: {
 					workerId: record.id,
 					status: record.status,
+					abortReason: record.abortReason,
 					model: record.model,
 					isolation: record.isolation,
 					workspacePath: record.workspacePath,
@@ -944,6 +1026,7 @@ export function renderWorkerRecord(record: WorkerRecord, extra: { activity?: str
 		record.lastRunStartedAt ? `last_run_started: ${new Date(record.lastRunStartedAt).toISOString()}` : undefined,
 		record.lastRunFinishedAt ? `last_run_finished: ${new Date(record.lastRunFinishedAt).toISOString()}` : undefined,
 		record.runs ? `runs: ${record.runs}` : undefined,
+		record.abortReason ? `abort_reason: ${record.abortReason}` : undefined,
 		record.tokens ? `tokens: ${record.tokens.total}` : undefined,
 		typeof record.costUsd === "number" ? `cost_usd: ${record.costUsd.toFixed(4)}` : undefined,
 		typeof record.lastRunCostUsd === "number" ? `last_run_cost_usd: ${record.lastRunCostUsd.toFixed(4)}` : undefined,

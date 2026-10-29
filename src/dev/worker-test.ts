@@ -20,7 +20,7 @@ import {
 	validateWorkerBranch,
 	validateWorkersConfig,
 } from "../workers/config.js";
-import { WorkerManager } from "../workers/manager.js";
+import { WorkerManager, renderWorkerRecord } from "../workers/manager.js";
 import type { WorkerSession, WorkerSessionFactory } from "../workers/session.js";
 import { WorkerStore } from "../workers/store.js";
 import { baseBranchName, createWorktree, gitDiff, removeWorktree } from "../workers/worktree.js";
@@ -61,6 +61,9 @@ class FakeSession implements WorkerSession {
 	silent = false;
 	/** Simulate an assistant turn that ended with stopReason "error". */
 	errorMessage?: string;
+	/** While hanging, emit a tool event every N ms (a run that keeps working). */
+	heartbeatMs?: number;
+	private heartbeat?: NodeJS.Timeout;
 	private lastText: string | undefined;
 	private listeners: Array<(event: { type: string; toolName?: string; [key: string]: unknown }) => void> = [];
 	private abortReject?: (error: Error) => void;
@@ -76,6 +79,11 @@ class FakeSession implements WorkerSession {
 			if (this.hang) {
 				await new Promise<void>((_resolve, reject) => {
 					this.abortReject = reject;
+					if (this.heartbeatMs) {
+						this.heartbeat = setInterval(() => {
+							for (const listener of this.listeners) listener({ type: "tool_execution_start", toolName: "bash" });
+						}, this.heartbeatMs);
+					}
 				});
 			}
 			if (this.errorMessage) {
@@ -87,6 +95,8 @@ class FakeSession implements WorkerSession {
 			this.lastText = `completed: ${text.split("\n")[0] ?? "task"}`;
 			for (const listener of this.listeners) listener({ type: "turn_start" });
 		} finally {
+			if (this.heartbeat) clearInterval(this.heartbeat);
+			this.heartbeat = undefined;
 			this.isStreaming = false;
 			this.abortReject = undefined;
 		}
@@ -130,6 +140,7 @@ function makeConfig(root: string, overrides: Record<string, unknown> = {}): Load
 				defaultModel: "fake/model",
 				tools: ["read", "write", "edit", "bash", "grep", "find", "ls"],
 				maxConcurrent: 2,
+				idleTimeoutMs: 20_000,
 				maxRuntimeMs: 30_000,
 				repository: ".",
 				worktreesDirectory: "",
@@ -180,6 +191,8 @@ git(root, ["commit", "-m", "initial"]);
 
 section("worker config and model allowlist");
 check("workers are disabled by default", DEFAULT_WORKERS_CONFIG.enabled === false);
+check("default idle timeout is 10 minutes", DEFAULT_WORKERS_CONFIG.idleTimeoutMs === 10 * 60_000, DEFAULT_WORKERS_CONFIG.idleTimeoutMs);
+check("default runtime ceiling is 2 hours", DEFAULT_WORKERS_CONFIG.maxRuntimeMs === 2 * 60 * 60_000, DEFAULT_WORKERS_CONFIG.maxRuntimeMs);
 try {
 	validateWorkersConfig({ ...DEFAULT_WORKERS_CONFIG, enabled: true, models: [] });
 	check("enabled workers require models", false);
@@ -199,6 +212,36 @@ try {
 }
 check("base ref strips remote", baseBranchName("origin/main") === "main");
 check("HEAD base ref is omitted", baseBranchName("HEAD") === undefined);
+{
+	const validateTimeouts = (patch: Record<string, unknown>): unknown => validateWorkersConfig({
+		...DEFAULT_WORKERS_CONFIG,
+		enabled: true,
+		models: ["fake/model"],
+		...patch,
+	});
+	const rejects = (name: string, patch: Record<string, unknown>): void => {
+		try {
+			validateTimeouts(patch);
+			check(name, false, "expected rejection");
+		} catch {
+			check(name, true);
+		}
+	};
+	let defaultTimeoutsValid = true;
+	try {
+		validateTimeouts({});
+	} catch {
+		defaultTimeoutsValid = false;
+	}
+	check("default timeout config is valid", defaultTimeoutsValid);
+	rejects("runtime ceiling must exceed the idle timeout", { idleTimeoutMs: 600_000, maxRuntimeMs: 600_000 });
+	rejects("runtime ceiling below the idle timeout is rejected", { idleTimeoutMs: 60_000, maxRuntimeMs: 30_000 });
+	rejects("idle timeout must be positive", { idleTimeoutMs: 0 });
+	rejects("idle timeout must be an integer", { idleTimeoutMs: 1_500.5 });
+	rejects("negative idle timeout is rejected", { idleTimeoutMs: -1 });
+	rejects("runtime ceiling must be positive", { idleTimeoutMs: 10_000, maxRuntimeMs: 0 });
+	rejects("negative runtime ceiling is rejected", { idleTimeoutMs: 10_000, maxRuntimeMs: -5_000 });
+}
 
 section("empty runs surface as failures instead of idle");
 {
@@ -332,13 +375,29 @@ section("permission and concurrency gates");
 	check("first worker is running", manager.list().find((record) => record.id === first.id)?.status === "running");
 	const stopped = await manager.stop(first.id);
 	check("stop marks the worker stopped", stopped.status === "stopped", stopped.status);
+	check("stop records the abort reason", stopped.abortReason === "stop", stopped.abortReason);
 	check("stop disposed the session", sessions[0]?.disposed === true);
 	await manager.close();
 }
 
-section("timeout aborts a stuck worker");
+section("shutdown records the abort reason");
 {
 	const config = makeConfig(root);
+	const sessions: FakeSession[] = [];
+	const manager = makeManager(config, sessions, true);
+	await manager.init();
+	const record = await manager.start({ task: "run until shutdown", isolation: "shared" });
+	await sleep(50);
+	await manager.close();
+	const stored = new WorkerStore(config.paths).load(record.id)!;
+	check("shutdown interrupts the run", stored.status === "interrupted", stored.status);
+	check("shutdown recorded as abort reason", stored.abortReason === "shutdown", stored.abortReason);
+}
+
+section("runtime ceiling aborts a stuck worker");
+{
+	const config = makeConfig(root);
+	config.config.workers.idleTimeoutMs = 5_000;
 	config.config.workers.maxRuntimeMs = 80;
 	const sessions: FakeSession[] = [];
 	const manager = makeManager(config, sessions, true);
@@ -346,7 +405,52 @@ section("timeout aborts a stuck worker");
 	const record = await manager.start({ task: "hang forever", isolation: "shared", wait: true, waitTimeoutMs: 2_000 });
 	check("timeout marks the worker failed", record.status === "failed", record.status);
 	check("timeout reason is stored", record.lastError?.includes("exceeded") === true, record.lastError);
+	check("runtime ceiling recorded as abort reason", record.abortReason === "runtime", record.abortReason);
+	check("status text reports the runtime ceiling", renderWorkerRecord(record).includes("abort_reason: runtime"), renderWorkerRecord(record));
 	check("timed out session was disposed", sessions[0]?.disposed === true);
+	await manager.close();
+}
+
+section("inactivity timeout aborts a silent worker");
+{
+	const config = makeConfig(root);
+	config.config.workers.idleTimeoutMs = 120;
+	config.config.workers.maxRuntimeMs = 60_000;
+	const sessions: FakeSession[] = [];
+	const manager = makeManager(config, sessions, true);
+	await manager.init();
+	const record = await manager.start({ task: "go silent", isolation: "shared", wait: true, waitTimeoutMs: 5_000 });
+	check("silent run is failed", record.status === "failed", record.status);
+	check("silent run names the inactivity limit", record.lastError?.includes("idle for 120 ms and was aborted") === true, record.lastError);
+	check("idle abort reason recorded", record.abortReason === "idle", record.abortReason);
+	check("status text reports the idle abort", renderWorkerRecord(record).includes("abort_reason: idle"), renderWorkerRecord(record));
+	check("idle session was disposed", sessions[0]?.disposed === true);
+	await sleep(100);
+	const events = EventStore.open(config.paths.stateDir).peekPending(500);
+	const completion = events.find((event) => {
+		const payload = event.payload as { workerId?: string } | undefined;
+		return event.kind === "worker" && payload?.workerId === record.id;
+	});
+	check("completion event mentions the abort reason", completion?.text.includes("abort_reason: idle") === true, completion?.text);
+	await manager.close();
+}
+
+section("an active worker survives past the idle timeout");
+{
+	const config = makeConfig(root);
+	config.config.workers.idleTimeoutMs = 120;
+	config.config.workers.maxRuntimeMs = 500;
+	const sessions: FakeSession[] = [];
+	const manager = makeManager(config, sessions, true, undefined, undefined, (session) => {
+		session.heartbeatMs = 40;
+	});
+	await manager.init();
+	const startedAt = Date.now();
+	const record = await manager.start({ task: "work steadily", isolation: "shared", wait: true, waitTimeoutMs: 5_000 });
+	const elapsed = Date.now() - startedAt;
+	check("active run outlives the idle timeout", elapsed >= 400, elapsed);
+	check("active run is stopped by the runtime ceiling", record.abortReason === "runtime", record.abortReason);
+	check("active run reports the ceiling message", record.lastError?.includes("exceeded 500 ms") === true, record.lastError);
 	await manager.close();
 }
 
