@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { DEFAULT_SECRETS_CONFIG, maskSecrets, maskValue, type SecretsConfig } from "./secrets.js";
 import { appendJsonl, ensureDir } from "./util.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -13,6 +14,8 @@ export interface LoggerOptions {
 	/** Lowest level printed to console. File always receives everything. */
 	level?: LogLevel;
 	scope?: string;
+	/** Secret rules for messages and structured data. Defaults to masking env values. */
+	secrets?: SecretsConfig;
 }
 
 /**
@@ -25,12 +28,14 @@ export class Logger {
 	readonly file?: string;
 	readonly level: LogLevel;
 	readonly scope?: string;
+	readonly secrets: SecretsConfig;
 	private readonly printToConsole: boolean;
 
 	constructor(options: LoggerOptions = {}) {
 		this.file = options.file;
 		this.level = options.level ?? "info";
 		this.scope = options.scope;
+		this.secrets = options.secrets ?? DEFAULT_SECRETS_CONFIG;
 		this.printToConsole = options.console ?? true;
 		if (this.file) ensureDir(path.dirname(this.file));
 	}
@@ -41,6 +46,7 @@ export class Logger {
 			console: this.printToConsole,
 			level: this.level,
 			scope: this.scope ? `${this.scope}:${scope}` : scope,
+			secrets: this.secrets,
 		});
 	}
 
@@ -59,23 +65,28 @@ export class Logger {
 
 	/** Raw block output (message bodies, prompts). Never goes to the JSONL log by itself. */
 	raw(text: string): void {
-		if (this.printToConsole) process.stderr.write(text.endsWith("\n") ? text : `${text}\n`);
+		if (this.printToConsole) {
+			const safe = maskSecrets(text, this.secrets);
+			process.stderr.write(safe.endsWith("\n") ? safe : `${safe}\n`);
+		}
 	}
 
 	private write(level: LogLevel, msg: string, data?: unknown): void {
+		const safeMessage = maskSecrets(msg, this.secrets);
+		const safeValue = data === undefined ? undefined : maskValue(safeData(data), this.secrets);
 		const record = {
 			ts: Date.now(),
 			level,
 			scope: this.scope,
-			msg,
-			...(data === undefined ? {} : { data: safeData(data) }),
+			msg: safeMessage,
+			...(safeValue === undefined ? {} : { data: safeValue }),
 		};
 		if (this.file) appendJsonl(this.file, record);
 		if (!this.printToConsole || LEVEL_ORDER[level] < LEVEL_ORDER[this.level]) return;
 		const time = new Date(record.ts).toISOString().slice(11, 19);
 		const scope = this.scope ? ` ${this.scope}` : "";
-		const suffix = data === undefined ? "" : ` ${compact(data)}`;
-		process.stderr.write(`${time} ${level.toUpperCase().padEnd(5)}${scope} ${msg}${suffix}\n`);
+		const suffix = safeValue === undefined ? "" : ` ${compact(safeValue)}`;
+		process.stderr.write(`${time} ${level.toUpperCase().padEnd(5)}${scope} ${safeMessage}${suffix}\n`);
 	}
 }
 

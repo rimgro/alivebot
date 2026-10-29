@@ -5,6 +5,7 @@ import type { RunRecord } from "../store/runs.js";
 import type { ThreadState } from "../store/threads.js";
 import { formatDuration, iso, localTime, oneLine, truncate } from "../util.js";
 import { DEFAULT_CONTRACT } from "../config.js";
+import { DEFAULT_SECRETS_CONFIG, maskSecrets, maskValue, type SecretsConfig } from "../secrets.js";
 
 export interface SystemPromptInput {
 	name: string;
@@ -242,6 +243,8 @@ export interface AwakePromptInput {
 	costTodayUsd: number;
 	maxDailyCostUsd: number;
 	pendingAfterClaim: number;
+	/** Secret rules for agent-visible event text and runtime errors. */
+	secrets?: SecretsConfig;
 	workers?: Array<{
 		id: string;
 		status: string;
@@ -310,12 +313,13 @@ function carriedOver(input: AwakePromptInput): string[] {
 			"Your coding workers:\n" +
 				input.workers
 					.map((worker) => {
+						const secrets = input.secrets ?? DEFAULT_SECRETS_CONFIG;
 						const extra = worker.result
-							? ` — result: ${oneLine(worker.result, 180)}`
+							? ` — result: ${oneLine(maskSecrets(worker.result, secrets), 180)}`
 							: worker.error
-								? ` — error: ${oneLine(worker.error, 180)}`
+								? ` — error: ${oneLine(maskSecrets(worker.error, secrets), 180)}`
 								: "";
-						return `- ${worker.id} [${worker.status}] model=${worker.model} isolation=${worker.isolation}${worker.branch ? ` branch=${worker.branch}` : ""} — ${oneLine(worker.task, 160)}${extra}`;
+						return `- ${worker.id} [${worker.status}] model=${worker.model} isolation=${worker.isolation}${worker.branch ? ` branch=${worker.branch}` : ""} — ${oneLine(maskSecrets(worker.task, secrets), 160)}${extra}`;
 					})
 					.join("\n"),
 		);
@@ -337,7 +341,7 @@ export function renderAwakePrompt(input: AwakePromptInput): string {
 	);
 
 	const eventLines = input.events.map((event) =>
-		eventLine(event, { redelivered: redelivered.has(event.seq) }),
+		eventLine(event, { redelivered: redelivered.has(event.seq) }, input.secrets),
 	);
 	if (input.events.length > 0) {
 		sections.push(
@@ -374,7 +378,7 @@ export function renderNudgePrompt(input: NudgePromptInput): string {
 	if (input.events.length > 0) {
 		sections.push(
 			`### New events (${input.events.length})\n\n${input.events
-				.map((event) => eventLine(event, { redelivered: redelivered.has(event.seq) }))
+				.map((event) => eventLine(event, { redelivered: redelivered.has(event.seq) }, input.secrets))
 				.join("\n\n")}`,
 		);
 	}
@@ -418,7 +422,11 @@ function renderPolicySection(policy: NotifyPolicyFile): string {
 	return `### Notification policy (edit with \`notifications\`)\n\n${lines.join("\n")}`;
 }
 
-function eventLine(event: AliveEvent, options: { redelivered: boolean }): string {
+function eventLine(
+	event: AliveEvent,
+	options: { redelivered: boolean },
+	secrets: SecretsConfig = DEFAULT_SECRETS_CONFIG,
+): string {
 	const flags: string[] = [event.kind, `source=${event.source}`];
 	if (event.priority !== "normal") flags.push(`priority=${event.priority}`);
 	if (event.thread) flags.push(`thread=${event.thread}`);
@@ -430,16 +438,18 @@ function eventLine(event: AliveEvent, options: { redelivered: boolean }): string
 			.map((line) => `   ${line}`)
 			.join("\n");
 	const payload =
-		event.payload === undefined ? "" : `\n   payload: ${truncate(JSON.stringify(event.payload, null, 2), 1200)}`;
-	return `[${event.seq}] ${flags.join(" | ")} @ ${iso(event.ts)}\n   ${event.title}\n${indent(truncate(event.text, 4000))}${payload}`;
+		event.payload === undefined
+			? ""
+			: `\n   payload: ${truncate(JSON.stringify(maskValue(event.payload, secrets), null, 2), 1200)}`;
+	return `[${event.seq}] ${flags.join(" | ")} @ ${iso(event.ts)}\n   ${maskSecrets(event.title, secrets)}\n${indent(truncate(maskSecrets(event.text, secrets), 4000))}${payload}`;
 }
 
 /**
  * Output of a blocking `idle` call: the events that woke the agent. This is the
  * "stdout of a very long command".
  */
-export function renderIdleEvents(events: AliveEvent[]): string {
-	const body = events.map((event) => eventLine(event, { redelivered: false })).join("\n\n");
+export function renderIdleEvents(events: AliveEvent[], secrets: SecretsConfig = DEFAULT_SECRETS_CONFIG): string {
+	const body = events.map((event) => eventLine(event, { redelivered: false }, secrets)).join("\n\n");
 	return `idle returned: ${events.length} event${events.length === 1 ? "" : "s"} arrived.\n\n${body}`;
 }
 
@@ -454,7 +464,7 @@ export function renderSleepOffer(waitedMs: number): string {
 	);
 }
 
-export function renderInterruptPrompt(events: AliveEvent[]): string {
-	const body = events.map((event) => eventLine(event, { redelivered: false })).join("\n\n");
+export function renderInterruptPrompt(events: AliveEvent[], secrets: SecretsConfig = DEFAULT_SECRETS_CONFIG): string {
+	const body = events.map((event) => eventLine(event, { redelivered: false }, secrets)).join("\n\n");
 	return `## NOTIFICATION — new ${events.length === 1 ? "event" : "events"} arrived and your policy let ${events.length === 1 ? "it" : "them"} through\n\n${body}\n\nFold this in without abandoning what you were doing, then continue. Reply via send_message if a human is waiting.`;
 }

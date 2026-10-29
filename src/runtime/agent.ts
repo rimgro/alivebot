@@ -10,6 +10,7 @@ import type { PolicyStore } from "../store/policy.js";
 import type { RunLog, RunRecord, RunStopReason } from "../store/runs.js";
 import type { ThreadStore } from "../store/threads.js";
 import { renderAwakePrompt, renderInterruptPrompt, renderNudgePrompt } from "./prompt.js";
+import { maskSecrets } from "../secrets.js";
 import { privateMemoryScope } from "./memory-access.js";
 import type { RunHandle, ToolDeps } from "./tools.js";
 
@@ -178,7 +179,7 @@ export class AgentRunner {
 				run.promptChars += prompt.length;
 				await this.session.prompt(prompt, { expandPromptTemplates: false, source: "extension" });
 			} catch (err) {
-				error = err instanceof Error ? err.message : String(err);
+				error = maskSecrets(err instanceof Error ? err.message : String(err), this.deps.config.config.secrets);
 				log.error(`run #${run.index} session error`, { error });
 				stopReason = "error";
 				break;
@@ -364,6 +365,7 @@ export class AgentRunner {
 			costTodayUsd: runs.usageToday().cost + (this.deps.toolDeps.workers?.usageToday() ?? 0),
 			maxDailyCostUsd: config.config.budget.maxDailyCostUsd,
 			pendingAfterClaim: store.pendingCount(),
+			secrets: config.config.secrets,
 			workers: this.deps.toolDeps.workers?.overview(6).map((worker) => ({
 				id: worker.id,
 				status: worker.status,
@@ -405,7 +407,9 @@ export class AgentRunner {
 					const stopReason = (event.message as { stopReason?: string }).stopReason;
 					if (stopReason) run.lastStopReason = stopReason;
 					const errorMessage = (event.message as { errorMessage?: string }).errorMessage;
-					if (errorMessage) run.lastError = errorMessage;
+					if (errorMessage) {
+						run.lastError = maskSecrets(errorMessage, this.deps.config.config.secrets);
+					}
 				}
 				if (!run) break;
 				const text = assistantText(event.message);
@@ -476,7 +480,7 @@ export class AgentRunner {
 			run.interruptDeliveries += 1;
 			this.trackEvents(run, pending);
 			this.deps.log.info(`run #${run.index} notification interrupt`, { seqs: pending.map((e) => e.seq) });
-			await this.session.steer(renderInterruptPrompt(pending));
+			await this.session.steer(renderInterruptPrompt(pending, this.deps.config.config.secrets));
 		} catch (err) {
 			this.deps.log.warn("interrupt delivery failed", { error: err instanceof Error ? err.message : String(err) });
 		} finally {

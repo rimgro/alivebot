@@ -9,7 +9,10 @@ import {
 	TELEGRAM_VOICE_MAX_BYTES,
 } from "./modules/telegram/voice-transcription.js";
 import { DEFAULT_SANDBOX_CONFIG, validateSandboxConfig, type SandboxConfig } from "./sandbox/config.js";
+import { DEFAULT_SECRETS_CONFIG, validateSecretsConfig, type SecretsConfig } from "./secrets.js";
 import { DEFAULT_WORKERS_CONFIG, validateWorkersConfig, type WorkersConfig } from "./workers/config.js";
+
+export { DEFAULT_SECRETS_CONFIG, validateSecretsConfig, type SecretsConfig } from "./secrets.js";
 
 export interface LoopConfig {
 	/**
@@ -267,6 +270,8 @@ export interface AliveConfig {
 	budget: BudgetConfig;
 	/** Harness updates: off by default, including the restart watchdog. */
 	updates: UpdatesConfig;
+	/** Secret masking for logs and outgoing text. */
+	secrets: SecretsConfig;
 	chat: ChatConfig;
 	/** Event modules: inbound events, outbound delivery, extra agent tools. */
 	modules: ModulesConfig;
@@ -364,6 +369,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		maxWakesPerHour: 0,
 	},
 	updates: DEFAULT_UPDATES_CONFIG,
+	secrets: DEFAULT_SECRETS_CONFIG,
 	chat: {
 		console: true,
 		http: {
@@ -488,6 +494,7 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	merged.sandbox = validateSandboxConfig(merged.sandbox);
 	merged.workers = validateWorkersConfig(merged.workers);
 	merged.updates = validateUpdatesConfig(merged.updates);
+	merged.secrets = validateSecretsConfig(merged.secrets);
 	merged.piAgentDir = expandHome(merged.piAgentDir);
 	const paths = resolvePaths(path.dirname(configPath), merged);
 	return { config: merged, paths };
