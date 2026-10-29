@@ -45,6 +45,8 @@ Workers — отдельное операторское разрешение. О
     "maxConcurrent": 2,
     "idleTimeoutMs": 600000,
     "maxRuntimeMs": 7200000,
+    "providerRetries": 2,
+    "providerRetryDelayMs": 5000,
     "repository": ".",
     "worktreesDirectory": "",
     "baseRef": "origin/main",
@@ -155,7 +157,7 @@ starting → running → idle → running → ...
 Файлы:
 
 ```text
-.alive/workers/<worker-id>/worker.json    durable-запись (статус, модель, ветка, usage)
+.alive/workers/<worker-id>/worker.json    durable-запись (статус, модель, ветка, usage, attempts)
 .alive/workers/<worker-id>/sessions/      jsonl-сессии pi для follow-up
 .alive/workers/worktrees/<worker-id>/     git worktree host-профиля (в sandbox — внутри guest)
 .alive/workers/usage.jsonl                расход worker-run'ов для дневного бюджета
@@ -191,6 +193,55 @@ Run ограничен двумя независимыми лимитами:
 
 Стоимость worker-run входит в дневной `budget.maxDailyCostUsd`; при исчерпанном
 бюджете новые `start`/`send` отклоняются.
+
+## Ретраи провайдера
+
+Иногда worker-run умирает до начала работы из-за временного сбоя провайдера:
+`Request timed out`, обрыв соединения, `429` или `5xx`. Такой сбой не должен
+стоить ручного перезапуска: `execute()` повторяет **тот же prompt внутри того же
+run**.
+
+Повторяются только транзиентные ошибки:
+
+- таймауты: `timed out`, `timeout`, `ETIMEDOUT`, `deadline exceeded`;
+- обрыв или отказ соединения: `ECONNRESET`, `ECONNREFUSED`, `EPIPE`, `EAI_AGAIN`,
+  `socket hang up`, `fetch failed`, `connection reset/refused/closed`;
+- HTTP 429 и маркеры `rate_limit` / `overloaded` / `529`;
+- HTTP 5xx (`500`/`502`/`503`/`504`, `Internal Server Error`, `Bad Gateway`,
+  `Service Unavailable`, `Gateway Timeout`).
+
+Никогда не повторяются:
+
+- ошибки авторизации и самого запроса: `400/401/403/404/422`, `invalid api key`,
+  `invalid request`, `model not found`, `context_length_exceeded`, `content policy`,
+  `insufficient_quota` и другие billing-ограничения;
+- run, завершившийся без вывода (`worker produced no output: ...`);
+- run, в котором уже был **хотя бы один tool execution** — повтор мог бы
+  задублировать работу (записать файл, сделать commit, запустить команду);
+- run, который уже потратил токены: провайдер что-то посчитал, повтор не бесплатен;
+- `stop`, shutdown и сработавшие лимиты `idleTimeoutMs`/`maxRuntimeMs` —
+  остановленный или завершаемый run не повторяется;
+- профиль с `workers.providerRetries: 0`.
+
+Backoff линейный: `providerRetryDelayMs × attempt`, но не больше 60 секунд
+(при базе 5s это 5s, 10s, 15s, …). Ожидание между попытками считается
+активностью: idle-таймер на это время сбрасывается, а `stop`/shutdown прерывают
+его немедленно.
+
+| ключ | по умолчанию | смысл |
+|---|---|---|
+| `providerRetries` | `2` | дополнительные попытки внутри одного run (0 — выключить) |
+| `providerRetryDelayMs` | `5000` | база линейного backoff, мс |
+
+Оба значения валидируются: `providerRetries` — целое от 0 до 10,
+`providerRetryDelayMs` — от 0 до 60000.
+
+Учёт попыток: `runs` считает **пользовательские** runs (start/send) и при ретраях
+не растёт; число фактических prompt'ов последнего run хранится в записи
+(`attempts`). Оно видно в `worker status`/`alive workers status` и упоминается в
+completion-событии как `attempts=N` — только когда N > 1. Если все попытки
+провалились, run получает `failed` с текстом последней ошибки и пометкой
+`(gave up after N attempts)`.
 
 ## CLI оператора
 
