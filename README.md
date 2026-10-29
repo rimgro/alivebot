@@ -177,6 +177,8 @@ alive telegram whitelist remove 123456789
 | Команда | Что делает |
 |---|---|
 | `alive init` | создаёт `alive.config.json` + `SOUL.md` |
+| `alive config [show] [--json]` | эффективный конфиг; секреты заменены на `[redacted]` |
+| `alive config migrate-secrets [--dry-run] [--json]` | переносит plaintext-секреты из конфига в `.env` (или показывает, что перенеслось бы) |
 | `alive run [--foreground] [--once] [--force] [--verbose]` | запускает агента **в фоне** (детач, переживает закрытие терминала); `--foreground` — остаться в терминале, `--once` — один run и выход |
 | `alive stop [--force] [--timeout 30s]` | останавливает инстанс: SIGTERM, при игноре — SIGKILL; `--force` — сразу SIGKILL |
 | `alive restart [--verbose]` | `stop` + `run` в фоне |
@@ -515,7 +517,59 @@ deploy/update/alive-auto-update.sh <repo-dir> <state-dir> <restart-command>
 
 Каждый шаблон в `extraPatterns` проверяется при загрузке конфига и должен
 компилироваться как `RegExp`. Маскирование — не замена безопасному хранению:
-держите токены в `.env`/`alive.config.local.json`, не в репозитории и не в промптах.
+держите токены в `.env`, не в репозитории и не в промптах.
+
+## Секреты живут в .env
+
+`alive.config.json` не является хранилищем секретов: его читают люди, диффят, копируют
+и открывают кодинг-агенты. Секреты живут в `.env` рядом с конфигом (файл уже в
+`.gitignore`) или в окружении процесса. `.env` создаётся с правами `0600`; `alive`
+никогда не переписывает чужие строки в нём, только дописывает новые.
+
+При загрузке конфига (в том числе при `alive run`) runtime сам находит plaintext-секреты
+и переносит их:
+
+- `modules.telegram.token` → переменная из `modules.telegram.tokenEnv`
+  (`ALIVE_TELEGRAM_TOKEN` по умолчанию);
+- `modules.grafana.token` → `ALIVE_GRAFANA_TOKEN`;
+- `chat.http.token` → `ALIVE_CHAT_HTTP_TOKEN`;
+- секретные поля внешних модулей (`modules.external[].options.token`, `apiKey`,
+  `secret`, `password`, …) → `ALIVE_<ИМЯ_МОДУЛЯ>_<ПОЛЕ>`;
+- секретные ключи в `sandbox.env` (`*_TOKEN`, `*_API_KEY`, `*_SECRET`, …) →
+  переменная с тем же именем, что и ключ.
+
+Правила миграции:
+
+- в `.env` дописывается `NAME=value`, конфиг атомарно перезаписывается без этого поля
+  (форматирование и режим файла сохраняются);
+- если переменная уже есть с тем же значением — дубликат не создаётся;
+- если переменная уже есть с другим значением — остаётся существующая, выводится
+  предупреждение, а plaintext-поле из конфига удаляется; окружение всегда выигрывает
+  у значения в файле;
+- на каждый перенесённый секрет выводится ровно одна строка с именем переменной и
+  без значения;
+- после миграции runtime читает значение из `.env`/окружения, поэтому модулям не
+  нужно ничего знать о переезде.
+
+Если `alive.config.json` недоступен для записи, `alive` не падает: он предупреждает,
+что секрет всё ещё лежит на диске, и печатает точную ручную инструкцию. Исправьте
+права (`chmod u+w alive.config.json`) и повторите:
+
+```bash
+alive config migrate-secrets
+alive config migrate-secrets --dry-run   # показать, что переедет, ничего не меняя
+alive config migrate-secrets --json      # машинный отчёт: файлы, имена переменных, предупреждения
+alive config                             # эффективный конфиг; секреты заменены на [redacted]
+```
+
+`alive config` и `alive status --json` не печатают значения секретов. Токены
+браузера и GitHub App уже хранятся только в env/отдельных приватных файлах, а ключи
+моделей — в окружении или `~/.pi`.
+
+Изолированный git-worktree воркера не содержит `alive.config.json`,
+`alive.config.local.json`, `.alive/**` и `.env`: worktree создаётся со sparse-checkout,
+а перед запуском сессии стоит явная проверка, которая отказывается стартовать, если
+эти пути всё-таки оказались внутри.
 
 ## Модули и Events API
 
@@ -536,12 +590,20 @@ deploy/update/alive-auto-update.sh <repo-dir> <state-dir> <restart-command>
 }
 ```
 
-Секреты (токены) лучше держать в `alive.config.local.json` — он читается поверх
-`alive.config.json` и уже в `.gitignore`:
+Секреты (токены) держите в `.env` рядом с конфигом:
+
+```bash
+ALIVE_TELEGRAM_TOKEN=123:ABC…
+```
+
+В `alive.config.json` остаётся только имя переменной:
 
 ```json
-{ "modules": { "telegram": { "enabled": true, "token": "123:ABC…" } } }
+{ "modules": { "telegram": { "enabled": true, "tokenEnv": "ALIVE_TELEGRAM_TOKEN" } } }
 ```
+
+Если plaintext `token` всё же попал в конфиг, `alive` перенесёт его при следующем
+запуске (или по команде `alive config migrate-secrets`) и удалит поле из файла.
 
 - **Telegram** — полноценная интеграция: бот принимает и отправляет сообщения,
   читает историю чатов, реакции, файлы, участники. Голосовые распознаются, если в

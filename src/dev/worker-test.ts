@@ -24,7 +24,7 @@ import { WorkerManager, renderWorkerRecord } from "../workers/manager.js";
 import { MAX_PROVIDER_RETRY_DELAY_MS, isTransientProviderError, providerRetryDelayMs } from "../workers/retry.js";
 import type { WorkerSession, WorkerSessionFactory } from "../workers/session.js";
 import { WorkerStore } from "../workers/store.js";
-import { baseBranchName, createWorktree, gitDiff, removeWorktree } from "../workers/worktree.js";
+import { assertWorkerWorktreeIsSecretFree, baseBranchName, createWorktree, gitDiff, removeWorktree } from "../workers/worktree.js";
 import { createHostWorkerEnvironment } from "../workers/environment.js";
 import type { SandboxManager } from "../sandbox/manager.js";
 import { createSandboxTools } from "../sandbox/tools.js";
@@ -204,9 +204,17 @@ const git = (cwd: string, args: string[]): string =>
 git(root, ["init"]);
 git(root, ["config", "user.email", "worker-test@example.com"]);
 git(root, ["config", "user.name", "Worker Test"]);
-fs.writeFileSync(path.join(root, ".gitignore"), ".alive/\n");
+fs.writeFileSync(path.join(root, ".gitignore"), ".alive/\n.env\n");
 fs.writeFileSync(path.join(root, "README.md"), "hello\n");
-git(root, ["add", ".gitignore", "README.md"]);
+// Track the worst case on purpose: a project that committed its config and
+// local secret files. Worker worktrees must still not expose them.
+fs.mkdirSync(path.join(root, ".alive"), { recursive: true });
+fs.writeFileSync(path.join(root, ".alive", "state.txt"), "private runtime state\n");
+fs.writeFileSync(path.join(root, "alive.config.json"), JSON.stringify({ name: "Worker Test Fixture" }, null, 2) + "\n");
+fs.writeFileSync(path.join(root, ".env"), "WORKER_TEST_SECRET=fixture-only\n");
+fs.writeFileSync(path.join(root, ".env.example"), "WORKER_TEST_SECRET=\n");
+git(root, ["add", ".gitignore", "README.md", "alive.config.json", ".env.example"]);
+git(root, ["add", "-f", ".env", ".alive/state.txt"]);
 git(root, ["commit", "-m", "initial"]);
 
 section("worker config and model allowlist");
@@ -522,6 +530,34 @@ section("git worktree lifecycle");
 	await manager.remove(record.id, { force: true });
 	check("worktree removed", !fs.existsSync(record.workspacePath));
 	check("branch kept after worktree removal", git(root, ["branch", "--list", record.branch!]).includes(record.branch!));
+	await manager.close();
+}
+
+section("worker worktrees exclude config and state");
+{
+	const config = makeConfig(root, { maxConcurrent: 2 });
+	const manager = makeManager(config, []);
+	await manager.init();
+	const record = await manager.start({ task: "inspect the repository", isolation: "worktree", wait: true, waitTimeoutMs: 5_000 });
+	check("worktree worker idle", record.status === "idle", record.status);
+	check("worktree has no alive.config.json", !fs.existsSync(path.join(record.workspacePath, "alive.config.json")));
+	check("worktree has no alive.config.local.json", !fs.existsSync(path.join(record.workspacePath, "alive.config.local.json")));
+	check("worktree has no .alive state", !fs.existsSync(path.join(record.workspacePath, ".alive")));
+	check("worktree has no .env", !fs.existsSync(path.join(record.workspacePath, ".env")));
+	check("worktree still has the code", fs.existsSync(path.join(record.workspacePath, "README.md")));
+	check("worktree keeps the value-free .env.example", fs.existsSync(path.join(record.workspacePath, ".env.example")));
+	const env = createHostWorkerEnvironment(root);
+	const unsafe = path.join(root, ".worktrees", "unsafe-probe");
+	await createWorktree(env, { repositoryPath: root, worktreePath: unsafe, branch: "unsafe-probe", baseRef: "HEAD" });
+	// Simulate an old/hand-made worktree: put the private files back.
+	fs.writeFileSync(path.join(unsafe, "alive.config.json"), "{}\n");
+	await expectReject(
+		"guard refuses a worktree containing private runtime data",
+		() => assertWorkerWorktreeIsSecretFree(env, unsafe),
+		"private runtime data",
+	);
+	await removeWorktree(env, root, unsafe, { force: true });
+	await manager.remove(record.id, { force: true });
 	await manager.close();
 }
 

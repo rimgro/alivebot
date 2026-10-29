@@ -2,6 +2,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { readJson } from "./util.js";
+import {
+	applySecretEnv,
+	collectSecretEnv,
+	migrateConfigSecrets,
+} from "./config-secrets.js";
 import { DEFAULT_BROWSER_CONFIG, type BrowserConfig } from "./modules/browser/config.js";
 import {
 	GROQ_TRANSCRIPTION_MODEL,
@@ -13,6 +18,22 @@ import { DEFAULT_SECRETS_CONFIG, validateSecretsConfig, type SecretsConfig } fro
 import { DEFAULT_WORKERS_CONFIG, validateWorkersConfig, type WorkersConfig } from "./workers/config.js";
 
 export { DEFAULT_SECRETS_CONFIG, validateSecretsConfig, type SecretsConfig } from "./secrets.js";
+export {
+	applySecretEnv,
+	collectSecretEnv,
+	findSecretFields,
+	formatFieldPath,
+	formatSecretMigrationLine,
+	isSecretKey,
+	migrateConfigSecrets,
+	readEnvFileValues,
+	redactSecretFields,
+	stripSecretField,
+	type MigrateSecretsOptions,
+	type SecretMigrationAction,
+	type SecretMigrationEntry,
+	type SecretMigrationReport,
+} from "./config-secrets.js";
 
 export interface LoopConfig {
 	/**
@@ -102,6 +123,8 @@ export interface HttpConfig {
 	port: number;
 	/** Optional bearer token. Empty = no auth (bind to loopback only). */
 	token: string;
+	/** Environment variable holding the bearer token. Wins over `token` when set. */
+	tokenEnv?: string;
 }
 
 export interface ChatConfig {
@@ -179,6 +202,8 @@ export interface GrafanaConfig {
 	path: string;
 	/** Optional bearer token required on incoming requests. Empty = no auth. */
 	token: string;
+	/** Environment variable holding the bearer token. Wins over `token` when set. */
+	tokenEnv?: string;
 	/** Priority used for `firing` alerts. */
 	firingPriority: "low" | "normal" | "high" | "interrupt";
 	/** Priority used for `resolved` alerts. */
@@ -384,6 +409,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 			host: "127.0.0.1",
 			port: 4321,
 			token: "",
+			tokenEnv: "ALIVE_CHAT_HTTP_TOKEN",
 		},
 	},
 	modules: {
@@ -425,6 +451,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 			port: 4322,
 			path: "/grafana",
 			token: "",
+			tokenEnv: "ALIVE_GRAFANA_TOKEN",
 			firingPriority: "high",
 			resolvedPriority: "low",
 		},
@@ -487,16 +514,43 @@ export interface LoadConfigOptions {
 	cwd: string;
 	configPath?: string;
 	overrides?: Partial<AliveConfig>;
+	/**
+	 * Move plaintext secrets in the config files to `.env` before reading them.
+	 * Default true: a runtime start must never keep the secret in the config.
+	 */
+	migrateSecrets?: boolean;
+	/** Diagnostics sink for automatic migration. Defaults to stderr. */
+	secretLog?: (line: string) => void;
+	/** Warning sink for automatic migration. Defaults to stderr. */
+	secretWarn?: (line: string) => void;
 }
 
 export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	const rootDir = path.resolve(options.cwd);
 	const configPath = options.configPath ? path.resolve(options.configPath) : path.join(rootDir, "alive.config.json");
-	const fileConfig = fs.existsSync(configPath) ? readJson<Partial<AliveConfig>>(configPath, {}) : {};
-	// Machine-local, gitignored overrides (secrets, ports, tokens).
+	// Machine-local, gitignored overrides (ports, non-secret settings).
 	const localConfigPath = path.join(path.dirname(configPath), "alive.config.local.json");
+	const envPath = path.join(path.dirname(configPath), ".env");
+	if (options.migrateSecrets !== false) {
+		try {
+			migrateConfigSecrets({
+				configPaths: [configPath, localConfigPath],
+				envPath,
+				env: process.env,
+				defaults: DEFAULT_CONFIG,
+				log: options.secretLog,
+				warn: options.secretWarn,
+			});
+		} catch (err) {
+			const warn = options.secretWarn ?? ((line: string) => process.stderr.write(`${line}\n`));
+			warn(`warning: automatic secret migration failed: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+	const fileConfig = fs.existsSync(configPath) ? readJson<Partial<AliveConfig>>(configPath, {}) : {};
 	const localConfig = fs.existsSync(localConfigPath) ? readJson<Partial<AliveConfig>>(localConfigPath, {}) : {};
 	const merged = deepMerge(deepMerge(deepMerge(DEFAULT_CONFIG, fileConfig), localConfig), options.overrides);
+	// Env wins over the config value, and lets the file stop carrying it entirely.
+	applySecretEnv(merged, collectSecretEnv(envPath, process.env));
 	migrateLoopConfig(merged.loop as unknown as Record<string, unknown>);
 	merged.sandbox = validateSandboxConfig(merged.sandbox);
 	merged.workers = validateWorkersConfig(merged.workers);
