@@ -53,8 +53,6 @@ export async function sendLocalAgentMessage(input: LocalMessageInput): Promise<O
 	if (!text) throw new Error("message text cannot be empty");
 	const sender = resolveLocalSender(input.config, input.senderId, input.senderName);
 	const recipient = resolveLocalRecipient(input.config, to);
-	const senderStateDir = path.resolve(input.config.paths.stateDir);
-	const recipientStateDir = path.resolve(recipient.config.paths.stateDir);
 	// Operator conversations keep their historical thread shape so the operator
 	// console and existing local history stay addressable.
 	const thread = sender.ref === "operator"
@@ -69,71 +67,109 @@ export async function sendLocalAgentMessage(input: LocalMessageInput): Promise<O
 		senderId: sender.id,
 		senderName: sender.name,
 	}, async (message) => {
-		const meta = {
-			channel: "local",
-			senderId: sender.id,
-			senderName: sender.name,
-			recipientAgentId: recipient.id,
-			messageId: message.id,
-		};
-		// The append to the recipient inbox is the delivery point: everything else
-		// is bookkeeping, and no success is reported unless this stores the event.
-		const inbox = EventStore.open(recipientStateDir);
-		const stored = inbox.append({
-			id: message.id,
-			kind: "user_message",
-			source: "local-messenger",
-			priority: "normal",
-			title: `message from ${sender.name}`,
-			text,
-			thread,
-			expectsReply: true,
-			dedupeKey: `local-message:${message.id}`,
-			meta,
-		});
-		if (stored.id !== message.id) throw new Error(`recipient inbox ${recipientStateDir} did not store message ${message.id}`);
+		deliverLocalMessage({ config: input.config, message, senderId: sender.id, senderName: sender.name, recipient });
+	});
+}
 
-		HistoryStore.open(recipientStateDir).append({
-			id: message.id,
-			thread,
-			module: "local",
-			direction: "inbound",
-			ts: message.ts,
-			author: sender.name,
-			authorId: sender.id,
-			text,
-			messageId: message.id,
-			meta,
-		});
-		HistoryStore.open(recipientStateDir).upsertThread({
-			thread,
-			module: "local",
-			title: `${sender.name} ↔ ${recipient.name}`,
-			participants: [sender.id, recipient.id],
-			meta: { recipientAgentId: recipient.id },
-		});
-		// A profile messaging itself has one history: writing both directions into
-		// the same file would misrepresent who said what.
-		if (senderStateDir === recipientStateDir) return;
-		HistoryStore.open(senderStateDir).append({
-			id: message.id,
-			thread,
-			module: "local",
-			direction: "outbound",
-			ts: message.ts,
-			author: sender.name,
-			authorId: sender.id,
-			text,
-			messageId: message.id,
-			meta,
-		});
-		HistoryStore.open(senderStateDir).upsertThread({
-			thread,
-			module: "local",
-			title: `${sender.name} ↔ ${recipient.name}`,
-			participants: [sender.id, recipient.id],
-			meta: { recipientAgentId: recipient.id },
-		});
+/**
+ * Replay a queued local message after a restart.
+ *
+ * The outbox delivery handler receives the original record, including the
+ * sender and recipient ids, so replay needs no session state. Both writes are
+ * idempotent: the recipient inbox dedupes on `local-message:<id>` and history
+ * dedupes on the record id. A crash between the two leaves no duplicate.
+ */
+export function redeliverLocalAgentMessage(config: LoadedConfig, message: OutgoingMessage): void {
+	const recipientId = message.recipientAgentId;
+	if (!recipientId) throw new Error(`message ${message.id} has no recipientAgentId`);
+	if (!message.senderId) throw new Error(`message ${message.id} has no senderId`);
+	const senderId = validateAgentId(message.senderId);
+	const senderName = message.senderName?.trim() || (senderId === "operator" ? "Operator" : config.config.name);
+	const recipient = resolveLocalRecipient(config, recipientId);
+	deliverLocalMessage({ config, message, senderId, senderName, recipient });
+}
+
+/**
+ * Append a local message to the recipient inbox and both histories.
+ *
+ * The inbox append is the delivery point: everything else is bookkeeping, and
+ * no success is reported unless this stores the event. All appends are
+ * idempotent on `message.id` so retries after a crash cannot duplicate.
+ */
+function deliverLocalMessage(input: {
+	config: LoadedConfig;
+	message: OutgoingMessage;
+	senderId: string;
+	senderName: string;
+	recipient: LocalAgentProfile;
+}): void {
+	const { config, message, senderId, senderName, recipient } = input;
+	const senderStateDir = path.resolve(config.paths.stateDir);
+	const recipientStateDir = path.resolve(recipient.config.paths.stateDir);
+	const thread = message.thread;
+	const meta = {
+		channel: "local",
+		senderId,
+		senderName,
+		recipientAgentId: recipient.id,
+		messageId: message.id,
+	};
+	const inbox = EventStore.open(recipientStateDir);
+	const stored = inbox.append({
+		id: message.id,
+		ts: message.ts,
+		kind: "user_message",
+		source: "local-messenger",
+		priority: "normal",
+		title: `message from ${senderName}`,
+		text: message.text,
+		thread,
+		expectsReply: true,
+		dedupeKey: `local-message:${message.id}`,
+		meta,
+	});
+	if (stored.id !== message.id) throw new Error(`recipient inbox ${recipientStateDir} did not store message ${message.id}`);
+
+	HistoryStore.open(recipientStateDir).append({
+		id: message.id,
+		thread,
+		module: "local",
+		direction: "inbound",
+		ts: message.ts,
+		author: senderName,
+		authorId: senderId,
+		text: message.text,
+		messageId: message.id,
+		meta,
+	});
+	HistoryStore.open(recipientStateDir).upsertThread({
+		thread,
+		module: "local",
+		title: `${senderName} ↔ ${recipient.name}`,
+		participants: [senderId, recipient.id],
+		meta: { recipientAgentId: recipient.id },
+	});
+	// A profile messaging itself has one history: writing both directions into
+	// the same file would misrepresent who said what.
+	if (senderStateDir === recipientStateDir) return;
+	HistoryStore.open(senderStateDir).append({
+		id: message.id,
+		thread,
+		module: "local",
+		direction: "outbound",
+		ts: message.ts,
+		author: senderName,
+		authorId: senderId,
+		text: message.text,
+		messageId: message.id,
+		meta,
+	});
+	HistoryStore.open(senderStateDir).upsertThread({
+		thread,
+		module: "local",
+		title: `${senderName} ↔ ${recipient.name}`,
+		participants: [senderId, recipient.id],
+		meta: { recipientAgentId: recipient.id },
 	});
 }
 

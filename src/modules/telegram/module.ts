@@ -6,7 +6,7 @@ import { attachManagedBotToken, clearManagedBotRequest, findManagedBotRequest, v
 import type { AliveModule, ModuleContext } from "../../events/api.js";
 import type { HistoryAttachment } from "../../store/history.js";
 import type { OutgoingMessage } from "../../store/outbox.js";
-import { ensureDir, sleep } from "../../util.js";
+import { ensureDir, newId, sleep } from "../../util.js";
 import { MaskContext, maskSecrets } from "../../secrets.js";
 import { TelegramApi, TelegramApiError, TelegramFileTooLargeError, type SendMessageParams } from "./client.js";
 import {
@@ -18,7 +18,7 @@ import {
 	imageRelativePath,
 	type InboundImageResult,
 } from "./images.js";
-import { TelegramAllowlistStore, TelegramStateStore, type TelegramState } from "./state.js";
+import { TelegramAllowlistStore, TelegramDeliveryLedger, TelegramStateStore, type TelegramState } from "./state.js";
 import { chatLabel, isParseModeError, splitMessage } from "./text.js";
 import {
 	TELEGRAM_CAPTION_MAX_CHARS,
@@ -88,6 +88,7 @@ export class TelegramModule implements AliveModule {
 	private api?: TelegramApi;
 	private state?: TelegramStateStore;
 	private allowlist?: TelegramAllowlistStore;
+	private deliveryLedger?: TelegramDeliveryLedger;
 	private readonly abort = new AbortController();
 	private pollPromise?: Promise<void>;
 	private stopped = false;
@@ -139,6 +140,7 @@ export class TelegramModule implements AliveModule {
 
 		const moduleDir = ctx.moduleDir();
 		this.state = new TelegramStateStore(moduleDir);
+		this.deliveryLedger = new TelegramDeliveryLedger(moduleDir);
 		this.allowlist = new TelegramAllowlistStore(moduleDir);
 		this.api = new TelegramApi({ token, apiBase: this.config.apiBase });
 
@@ -624,6 +626,10 @@ export class TelegramModule implements AliveModule {
 		const sent: Array<{ result: TelegramSentMessage; text: string; attachment?: PreparedUpload }> = [];
 		let replyUsed = false;
 		const nextReplyTo = () => (replyUsed ? undefined : ((replyUsed = true), replyTo));
+		// One stable idempotency key per outbox message part. Recovery of a message
+		// whose first attempt crashed must not send an already-accepted part again.
+		const idempotencyBase = message.deliveryKey ?? message.id ?? `${message.runId}:${message.ts}`;
+		const partKey = (index: number) => `${idempotencyBase}:${index}`;
 
 		if (uploads.length > 0) {
 			// Telegram captions are limited to 1024 characters; the remainder becomes
@@ -640,26 +646,32 @@ export class TelegramModule implements AliveModule {
 					message_thread_id: threadId,
 					reply_to_message_id: nextReplyTo(),
 				};
-				let result: TelegramSentMessage;
-				try {
-					result = await api.sendFile({ ...params, parse_mode: this.config.parseMode || undefined });
-				} catch (err) {
-					if (this.config.parseMode && isParseModeError(err)) {
-						ctx.log.warn("telegram rejected the caption markup; resending as plain text", { thread: message.thread });
-						result = await api.sendFile({ ...params, parse_mode: undefined });
-					} else {
+				const result = await this.sendPart(partKey(index), ref.chatId, message.thread, async () => {
+					try {
+						return await api.sendFile({ ...params, parse_mode: this.config.parseMode || undefined });
+					} catch (err) {
+						if (this.config.parseMode && isParseModeError(err)) {
+							ctx.log.warn("telegram rejected the caption markup; resending as plain text", { thread: message.thread });
+							return api.sendFile({ ...params, parse_mode: undefined });
+						}
 						throw err;
 					}
-				}
-				sent.push({ result, text: caption || `[${upload.kind}: ${upload.name}]`, attachment: upload });
+				});
+				if (result) sent.push({ result, text: caption || `[${upload.kind}: ${upload.name}]`, attachment: upload });
 			}
-			for (const text of captions.slice(1)) {
-				sent.push({ result: await this.sendTextChunk(ctx, api, ref.chatId, threadId, text, nextReplyTo()), text });
+			for (const [index, text] of captions.slice(1).entries()) {
+				const result = await this.sendPart(partKey(uploads.length + index), ref.chatId, message.thread, () =>
+					this.sendTextChunk(ctx, api, ref.chatId, threadId, text, nextReplyTo()),
+				);
+				if (result) sent.push({ result, text });
 			}
 		} else {
 			const chunks = splitMessage(text, this.config.maxMessageChars);
-			for (const text of chunks) {
-				sent.push({ result: await this.sendTextChunk(ctx, api, ref.chatId, threadId, text, nextReplyTo()), text });
+			for (const [index, text] of chunks.entries()) {
+				const result = await this.sendPart(partKey(index), ref.chatId, message.thread, () =>
+					this.sendTextChunk(ctx, api, ref.chatId, threadId, text, nextReplyTo()),
+				);
+				if (result) sent.push({ result, text });
 			}
 		}
 
@@ -700,6 +712,46 @@ export class TelegramModule implements AliveModule {
 			attachments: uploads.map((upload) => `${upload.kind}:${upload.name}`),
 		});
 		return sent.map((entry) => entry.result);
+	}
+
+	/**
+	 * Send one message part at most once across a crash.
+	 *
+	 * The Bot API offers no idempotency key, so `sending` is persisted before the
+	 * call. A crash leaves the part `sending`; recovery logs and skips it instead
+	 * of risking a duplicate in the chat. Definite API rejections and network
+	 * failures that never reached Telegram are marked `failed` and stay retryable.
+	 */
+	private async sendPart(
+		key: string,
+		chatId: string,
+		thread: string,
+		send: () => Promise<TelegramSentMessage>,
+	): Promise<TelegramSentMessage | undefined> {
+		const ledger = this.deliveryLedger;
+		const prior = ledger?.shouldSkip(key);
+		if (prior) {
+			this.ctx?.log.warn("telegram suppressed a duplicate message part after an interrupted delivery", {
+				thread,
+				part: key,
+				state: prior.state,
+				messageId: prior.messageId,
+			});
+			return undefined;
+		}
+		ledger?.markSending(key, chatId);
+		try {
+			const sent = await send();
+			ledger?.markSent(key, chatId, sent.message_id);
+			return sent;
+		} catch (err) {
+			const network = err instanceof TelegramApiError && err.network;
+			const rejected = err instanceof TelegramApiError && !err.network && err.errorCode !== undefined && err.errorCode < 500;
+			// Anything else is ambiguous (e.g. a 5xx after the write): leaving it
+			// `sending` chooses no duplicate over possible loss.
+			if (network || rejected) ledger?.markFailed(key, chatId, message(err));
+			throw err;
+		}
 	}
 
 	/** One text chunk of an outbound message, with the plain-text fallback for broken markup. */
@@ -776,8 +828,10 @@ export class TelegramModule implements AliveModule {
 
 	/** Send used by the `telegram` tool (proactive messages to any chat). */
 	private async sendText(input: { thread: string; text: string; replyTo?: number }): Promise<TelegramSentMessage[]> {
+		const id = newId("msg");
 		const message: OutgoingMessage = {
-			id: `tool_${Date.now().toString(36)}`,
+			id,
+			deliveryKey: id,
 			runId: "tool",
 			thread: input.thread,
 			text: input.text,
