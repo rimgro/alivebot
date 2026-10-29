@@ -76,6 +76,8 @@ export interface WorkspaceFiles {
 	readonly rootDir: string;
 	readFile(file: string): Promise<Buffer>;
 	writeFile(file: string, data: Buffer): Promise<string>;
+	/** Avoid reading a large existing file just to refuse an overwrite. */
+	exists?(file: string): Promise<boolean>;
 }
 
 /** Everything a module gets when it starts. */

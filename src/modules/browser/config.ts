@@ -51,6 +51,10 @@ export interface BrowserConfig {
 	maxPagePreviewChars: number;
 	/** Hard cap on snapshot nodes kept in a result; the dropped nodes are counted, not returned. */
 	maxSnapshotNodes: number;
+	/** Hard cap on one downloaded response; oversized downloads write no file. */
+	maxDownloadBytes: number;
+	/** Total budget for one download, including redirects and writing the file. */
+	downloadTimeoutMs: number;
 	humanization: HumanizationConfig;
 	signing: BrowserSigningConfig;
 }
@@ -73,6 +77,12 @@ export function validateExtractionLimits(config: Pick<BrowserConfig, "maxPageTex
 	if (!Number.isInteger(config.maxPageTextChars) || config.maxPageTextChars < 1_000 || config.maxPageTextChars > 1_000_000) throw new Error("browser.maxPageTextChars must be an integer between 1000 and 1000000");
 	if (!Number.isInteger(config.maxPagePreviewChars) || config.maxPagePreviewChars < 500 || config.maxPagePreviewChars > 50_000) throw new Error("browser.maxPagePreviewChars must be an integer between 500 and 50000");
 	if (!Number.isInteger(config.maxSnapshotNodes) || config.maxSnapshotNodes < 50 || config.maxSnapshotNodes > 50_000) throw new Error("browser.maxSnapshotNodes must be an integer between 50 and 50000");
+}
+
+/** Validated in `BrowserModule.start`; downloads are bounded operator policy. */
+export function validateDownloadLimits(config: Pick<BrowserConfig, "maxDownloadBytes" | "downloadTimeoutMs">): void {
+	if (!Number.isInteger(config.maxDownloadBytes) || config.maxDownloadBytes < 1_024 || config.maxDownloadBytes > 1_073_741_824) throw new Error("browser.maxDownloadBytes must be an integer between 1024 and 1073741824");
+	if (!Number.isInteger(config.downloadTimeoutMs) || config.downloadTimeoutMs < 100 || config.downloadTimeoutMs > 600_000) throw new Error("browser.downloadTimeoutMs must be an integer between 100 and 600000");
 }
 
 export const DEFAULT_BROWSER_CONFIG: BrowserConfig = {
@@ -103,6 +113,8 @@ export const DEFAULT_BROWSER_CONFIG: BrowserConfig = {
 	maxPageTextChars: 200_000,
 	maxPagePreviewChars: 8_000,
 	maxSnapshotNodes: 2_000,
+	maxDownloadBytes: 50 * 1024 * 1024,
+	downloadTimeoutMs: 60_000,
 	humanization: DEFAULT_HUMANIZATION,
 	signing: { enabled: false, agentUrl: "", keyFileEnv: "ALIVE_BROWSER_SIGNING_KEY_FILE", origins: [] },
 };
