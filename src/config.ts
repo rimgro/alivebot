@@ -223,6 +223,36 @@ export function validateTelegramConfig(value: TelegramConfig): TelegramConfig {
 	return value;
 }
 
+/**
+ * Runtime `dashboard` tool settings.
+ *
+ * The tool is a host-side service: the agent runs in a sandbox, cannot bind a
+ * host port, and still needs to hand the operator a dashboard link. Access is
+ * restricted to the owner's private chats unless a thread is listed here.
+ */
+export interface DashboardConfig {
+	/** Loopback port for the background dashboard. Only 127.0.0.1 is ever used. */
+	port: number;
+	/**
+	 * Extra threads (for example an allowlisted work group) allowed to call the
+	 * dashboard tool. Empty means only the owner's private chats (and the local
+	 * console) may use it. Group links require an explicit `mode: "tunnel"`.
+	 */
+	allowedThreads: string[];
+}
+
+/** Reject settings the runtime tool would fail on later. */
+export function validateDashboardConfig(value: DashboardConfig): DashboardConfig {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("dashboard must be an object");
+	if (!Number.isInteger(value.port) || value.port < 1 || value.port > 65535) {
+		throw new Error(`dashboard.port must be an integer between 1 and 65535, got "${String(value.port)}"`);
+	}
+	if (!Array.isArray(value.allowedThreads) || value.allowedThreads.some((thread) => typeof thread !== "string" || !thread.trim())) {
+		throw new Error("dashboard.allowedThreads must be an array of non-empty thread ids");
+	}
+	return { port: value.port, allowedThreads: value.allowedThreads.map((thread) => thread.trim()) };
+}
+
 /** Grafana-compatible inbound webhook module (alerts and annotations → events). */
 export interface GrafanaConfig {
 	enabled: boolean;
@@ -332,6 +362,8 @@ export interface AliveConfig {
 	updates: UpdatesConfig;
 	/** Secret masking for logs and outgoing text. */
 	secrets: SecretsConfig;
+	/** Runtime `dashboard` tool: loopback port and the thread allowlist for external links. */
+	dashboard: DashboardConfig;
 	chat: ChatConfig;
 	/** Event modules: inbound events, outbound delivery, extra agent tools. */
 	modules: ModulesConfig;
@@ -402,7 +434,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		allowlist: [
 			"read", "write", "edit", "bash", "grep", "find", "ls", "file", "sandbox_control", "browser", "web_search",
 			"send_message", "message_agent", "idle", "sleep", "notifications", "remind", "list_reminders", "cancel_reminder",
-			"note", "retain", "memory", "journal", "history", "close_thread", "status",
+			"note", "retain", "memory", "journal", "history", "close_thread", "status", "dashboard",
 		],
 	},
 	memory: {
@@ -431,6 +463,12 @@ export const DEFAULT_CONFIG: AliveConfig = {
 	},
 	updates: DEFAULT_UPDATES_CONFIG,
 	secrets: DEFAULT_SECRETS_CONFIG,
+	dashboard: {
+		// Same default as `DEFAULT_DASHBOARD_PORT` in dashboard/server.ts; duplicated
+		// here so config stays free of an import cycle through the render layer.
+		port: 7777,
+		allowedThreads: [],
+	},
 	chat: {
 		console: true,
 		http: {
@@ -646,6 +684,7 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	merged.workers = validateWorkersConfig(merged.workers);
 	merged.updates = validateUpdatesConfig(merged.updates);
 	merged.secrets = validateSecretsConfig(merged.secrets);
+	merged.dashboard = validateDashboardConfig(merged.dashboard);
 	merged.modules.telegram = validateTelegramConfig(merged.modules.telegram);
 	merged.piAgentDir = expandHome(merged.piAgentDir);
 	const paths = resolvePaths(path.dirname(configPath), merged);

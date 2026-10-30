@@ -23,6 +23,7 @@ import { ThreadStore } from "../store/threads.js";
 import { buildAgent, readSoul } from "./session.js";
 import { SandboxManager } from "../sandbox/manager.js";
 import { WorkerManager } from "../workers/manager.js";
+import { DashboardTool } from "../dashboard/tool.js";
 import type { RunHandle, ToolDeps } from "./tools.js";
 import { ConsoleTransport, NullTransport } from "../transports/console.js";
 import { HttpTransport } from "../transports/http.js";
@@ -153,6 +154,16 @@ export class AliveRuntime {
 			history: this.history,
 			moduleTools: [],
 			workers: this.workers,
+			// Host-side: the agent may be sandboxed, but the dashboard server binds a
+			// host loopback port in a detached child. Access is gated per thread inside.
+			dashboard: new DashboardTool({
+				rootDir: paths.rootDir,
+				configPath: paths.configPath,
+				stateDir: paths.stateDir,
+				port: this.config.config.dashboard.port,
+				allowedThreads: this.config.config.dashboard.allowedThreads,
+				log: (line) => this.log.info(line),
+			}),
 			deliver: (message) => this.deliver(message),
 			getRun: () => this.currentRun,
 			runtimeStatus: () => this.status(),

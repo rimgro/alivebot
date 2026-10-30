@@ -34,6 +34,7 @@ import { resolveOutgoingAttachment, toOutgoingAttachment } from "./attachments.j
 import { snapshotRuntime } from "./daemon.js";
 import { requestAgentTelegram } from "../modules/telegram/managed-request.js";
 import { renderWorkerList, renderWorkerRecord, type WorkerManager } from "../workers/manager.js";
+import type { DashboardTool } from "../dashboard/tool.js";
 import { formatDuration, iso, parseTimeSpec, parseTimestamp, sleep, truncate } from "../util.js";
 import { renderIdleEvents, renderSleepOffer } from "./prompt.js"
 import { maskSecrets, maskValue } from "../secrets.js";
@@ -97,6 +98,8 @@ export interface ToolDeps {
 	moduleTools: ToolDefinition[];
 	/** Ephemeral coding workers; undefined when workers are disabled. */
 	workers?: WorkerManager;
+	/** Host-side dashboard tool; undefined in tests and embedders that do not need it. */
+	dashboard?: DashboardTool;
 	deliver: (message: OutgoingMessage) => Promise<void>;
 	getRun: () => RunHandle | undefined;
 	runtimeStatus: () => Record<string, unknown>;
@@ -121,6 +124,7 @@ export const ALIVE_TOOL_NAMES = [
 	"history",
 	"close_thread",
 	"status",
+	"dashboard",
 	"create_agent",
 	"manage_agents",
 	"message_agent",
@@ -485,6 +489,136 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 				}
 				default:
 					throw new Error(`unsupported worker action ${String(action)}`);
+			}
+		},
+	});
+
+	const dashboardTool = defineTool({
+		name: "dashboard",
+		label: "Dashboard",
+		description:
+			"Start, inspect or close the host dashboard; the agent itself is sandboxed and cannot bind the host port. " +
+			"Actions: open (url, mode, expiresAt, one-time ticket), status (running, port, mode, tunnel URL, expiry, external sessions), " +
+			"close (stop external access: tunnel + sessions + tickets; the local loopback dashboard keeps running). " +
+			"open is idempotent and defaults to mode='local' (loopback only, no link for remote chats). " +
+			"mode='tunnel' starts a temporary HTTPS quick tunnel and returns a single-use link (?t=…) that expires in minutes; " +
+			"the same link cannot be used twice, and it is a bearer credential for its TTL, so send it only to the thread that asked. " +
+			"Direct external logins still use the dashboard password. Available only in the owner's private chat or threads listed in " +
+			"dashboard.allowedThreads; a group link always requires an explicit mode='tunnel'.",
+		promptSnippet: "Open/status/close the host dashboard, with single-use tunnel links",
+		executionMode: "sequential",
+		parameters: Type.Object({
+			action: Type.Union([Type.Literal("open"), Type.Literal("status"), Type.Literal("close")]),
+			mode: Type.Optional(Type.Union([Type.Literal("local"), Type.Literal("tunnel")], {
+				description: "For open: local (default, loopback only) or tunnel (temporary HTTPS link for a remote chat).",
+			})),
+			thread: Type.Optional(Type.String({
+				description: "Only to disambiguate when this run carries several threads; must be one of them. Authorization always follows the requesting thread.",
+			})),
+		}),
+		execute: async (_toolCallId, params): Promise<ToolResult> => {
+			const dashboard = deps.dashboard;
+			if (!dashboard) throw new Error("the dashboard tool is not configured for this runtime");
+			const run = requireRun(deps, "dashboard");
+			const thread = resolveDashboardThread(run, params.thread);
+			switch (params.action) {
+				case "open": {
+					const result = await dashboard.open({ thread, mode: params.mode });
+					const lines = [
+						`Dashboard is running at ${result.localUrl} (loopback only, port ${result.port}).`,
+						result.reused
+							? "It was already running; no second process was started."
+							: "It was started in the background.",
+					];
+					if (result.mode === "tunnel" && result.ticket) {
+						lines.push(
+							`External link (single use, expires ${iso(result.expiresAt!)}):\n${result.url}`,
+							`Tunnel ends ${iso(result.tunnelExpiresAt!)}. Send the link only to ${thread}: it is a bearer credential for its TTL and stops working after one exchange.`,
+							`The dashboard password still works for direct external logins at ${result.tunnelUrl}.`,
+						);
+					} else if (result.tunnelUrl) {
+						lines.push(
+							`External access is active at ${result.tunnelUrl} (expires ${iso(result.tunnelExpiresAt ?? 0)}), but this link is loopback-only.`,
+							`Call dashboard({action:"open",mode:"tunnel"}) to get a link for a remote chat.`,
+						);
+					} else if (!result.privateThread) {
+						lines.push(
+							"This is the host's loopback URL and does not work from a remote chat.",
+							"External access must be requested explicitly: dashboard({action:\"open\",mode:\"tunnel\"}).",
+						);
+					}
+					return ok(maskSecrets(lines.join("\n\n"), deps.config.config.secrets), {
+						dashboard: {
+							action: "open",
+							thread,
+							url: result.url,
+							mode: result.mode,
+							expiresAt: result.expiresAt === null ? null : iso(result.expiresAt),
+							ticket: result.ticket,
+							ticketExpiresAt: result.ticketExpiresAt === undefined ? undefined : iso(result.ticketExpiresAt),
+							tunnelUrl: result.tunnelUrl,
+							tunnelExpiresAt: result.tunnelExpiresAt === undefined ? undefined : iso(result.tunnelExpiresAt),
+							localUrl: result.localUrl,
+							port: result.port,
+							reused: result.reused,
+						},
+					});
+				}
+				case "status": {
+					const result = await dashboard.status({ thread });
+					const lines = result.running
+						? [
+							`Dashboard is running on port ${result.port} at ${result.localUrl} (mode: ${result.mode}).`,
+							result.tunnelUrl
+								? `Tunnel: ${result.tunnelUrl}, expires ${iso(result.expiresAt ?? 0)}.`
+								: "No external access is attached.",
+							`Live external sessions: ${result.externalSessions}.`,
+						]
+						: [`No dashboard is answering on port ${result.port}.`];
+					return ok(maskSecrets(lines.join("\n"), deps.config.config.secrets), {
+						dashboard: {
+							action: "status",
+							thread,
+							running: result.running,
+							port: result.port,
+							mode: result.mode,
+							localUrl: result.localUrl,
+							tunnelUrl: result.tunnelUrl,
+							expiresAt: result.expiresAt === null ? null : iso(result.expiresAt),
+							startedAt: result.startedAt === null ? null : iso(result.startedAt),
+							externalSessions: result.externalSessions,
+						},
+					});
+				}
+				case "close": {
+					const result = await dashboard.close({ thread });
+					return ok(
+						maskSecrets(
+							[
+								result.stoppedTunnel ? "Stopped the tunnel." : "No tunnel was attached by this runtime.",
+								`Revoked ${result.revokedSessions} session(s) and ${result.revokedTickets} outstanding ticket(s).`,
+								result.running
+									? `The local dashboard keeps running at ${result.localUrl} (port ${result.port}).`
+									: "The local dashboard is not answering on its loopback port.",
+							].join("\n"),
+							deps.config.config.secrets,
+						),
+						{
+							dashboard: {
+								action: "close",
+								thread,
+								stoppedTunnel: result.stoppedTunnel,
+								revokedSessions: result.revokedSessions,
+								revokedTickets: result.revokedTickets,
+								running: result.running,
+								localUrl: result.localUrl,
+								port: result.port,
+							},
+						},
+					);
+				}
+				default:
+					throw new Error(`unsupported dashboard action ${String(params.action)}`);
 			}
 		},
 	});
@@ -1077,6 +1211,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		manageAgents,
 		messageAgent,
 		...(deps.workers ? [workerTool] : []),
+		...(deps.dashboard ? [dashboardTool] : []),
 		note,
 		retain,
 		memory,
@@ -1126,6 +1261,30 @@ function defaultThread(run: RunHandle): string | undefined {
 		if (thread) return thread;
 	}
 	return undefined;
+}
+
+/**
+ * The thread a dashboard call is attributed to.
+ *
+ * Authorization always follows the run's own threads: a model-supplied
+ * `thread` can only pick one of them, never an arbitrary allowlisted id. When
+ * several threads are present, the newest event wins (it is the request the
+ * agent is answering); without events the local console is assumed.
+ */
+function resolveDashboardThread(run: RunHandle, requested?: string): string {
+	const eventThreads = run.events.flatMap((event) => (event.thread ? [event.thread] : []));
+	const candidates = run.currentThreads?.length ? run.currentThreads : [...new Set(eventThreads)];
+	const value = requested?.trim();
+	if (value) {
+		if (candidates.length > 0 && !candidates.includes(value)) {
+			throw new Error(
+				`dashboard thread ${value} is not one of this run's threads (${candidates.join(", ")}); ` +
+				"authorization follows the thread that made the request",
+			);
+		}
+		return value;
+	}
+	return candidates[candidates.length - 1] ?? defaultThread(run) ?? "console";
 }
 
 function renderHistory(records: HistoryRecord[], thread?: string): string {

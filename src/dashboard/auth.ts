@@ -415,6 +415,16 @@ export class DashboardAuthStore {
 		}
 		return remaining;
 	}
+
+	/**
+	 * Count live sessions without rewriting the file. Used by the runtime
+	 * `dashboard` tool's status action ("external sessions").
+	 */
+	activeSessionCount(): number {
+		const now = this.now();
+		const state = readState(this.stateDir, now);
+		return Object.values(state.sessions).filter((record) => record.expiresAt > now).length;
+	}
 }
 
 export function revokeAllDashboardSessions(stateDir: string, now = Date.now()): number {

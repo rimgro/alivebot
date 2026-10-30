@@ -55,10 +55,19 @@ import {
 	readAgentSummary,
 	type DashboardProfile,
 } from "./state.js";
+import { DashboardTicketStore, type DashboardTicketOptions } from "./tickets.js";
+import { readDashboardRuntime } from "./state-file.js";
 
 export const DEFAULT_DASHBOARD_HOST = "127.0.0.1";
 export const DEFAULT_DASHBOARD_PORT = 7777;
 export const DEFAULT_DASHBOARD_SESSION_TTL_HOURS = 12;
+/**
+ * Header put on every dashboard response. The runtime `dashboard` tool probes
+ * the configured loopback port with it to tell "a dashboard is already running"
+ * apart from "some unrelated service owns the port".
+ */
+export const DASHBOARD_MARKER_HEADER = "x-alive-dashboard";
+export const DASHBOARD_MARKER_VALUE = "alive";
 /** Small body cap for login/logout forms. */
 export const DASHBOARD_AUTH_MAX_BODY_BYTES = 16 * 1024;
 /** One text for every bad credential; never say whether the password was close. */
@@ -130,6 +139,14 @@ export interface DashboardAuthOptions {
 	loginWindowMs?: number;
 }
 
+/** One-time external-access tickets; only meaningful together with `auth`. */
+export interface DashboardTicketServerOptions extends DashboardTicketOptions {
+	/** The root profile state directory; tickets and runtime state live in `<stateDir>/dashboard/`. */
+	stateDir: string;
+	/** Injectable clock, defaults to the server clock. */
+	now?: () => number;
+}
+
 export interface DashboardServerOptions {
 	rootDir: string;
 	configPath?: string;
@@ -143,6 +160,13 @@ export interface DashboardServerOptions {
 	auth?: DashboardAuthOptions;
 	/** Set when the loopback server is behind the temporary HTTPS tunnel. */
 	publicOrigin?: string;
+	/**
+	 * Enable `GET /t?t=…` one-time ticket exchange. The tunnel origin is then
+	 * also read from the shared dashboard state, so a tunnel started by the
+	 * runtime `dashboard` tool (not by this process) still enables Origin/Host
+	 * checks for non-GET requests.
+	 */
+	tickets?: DashboardTicketServerOptions;
 }
 
 export interface DashboardServer {
@@ -296,6 +320,7 @@ function send(
 		// No scripts, no forms, no frames: the page cannot become an action surface.
 		"content-security-policy":
 			"default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+		[DASHBOARD_MARKER_HEADER]: DASHBOARD_MARKER_VALUE,
 		...extraHeaders,
 	});
 	if (headOnly) {
@@ -359,6 +384,7 @@ function redirect(res: http.ServerResponse, location: string, setCookie?: string
 		"cache-control": "no-store",
 		"x-content-type-options": "nosniff",
 		"referrer-policy": "no-referrer",
+		[DASHBOARD_MARKER_HEADER]: DASHBOARD_MARKER_VALUE,
 	};
 	if (setCookie) headers["set-cookie"] = setCookie;
 	res.writeHead(303, headers);
@@ -474,7 +500,26 @@ export function createDashboardServer(options: DashboardServerOptions): Dashboar
 		: undefined;
 	const loginDelayMs = authOptions?.loginDelayMs ?? DASHBOARD_LOGIN_DELAY_MS;
 	const sessionTtlMs = authOptions?.ttlMs ?? DASHBOARD_SESSION_TTL_MS;
+	const ticketOptions = options.tickets;
+	const ticketStore = authOptions && ticketOptions?.stateDir
+		? new DashboardTicketStore(ticketOptions.stateDir, ticketOptions.now ?? now, ticketOptions)
+		: undefined;
 	let publicOrigin = options.publicOrigin ? validateDashboardPublicUrl(options.publicOrigin) : undefined;
+	/**
+	 * The tunnel may be started by the runtime `dashboard` tool, not by this
+	 * process. In that case its origin is in the shared dashboard state; read it
+	 * per request so Origin/Host checks apply as soon as the tunnel is up.
+	 */
+	const currentPublicOrigin = (): string | undefined => {
+		if (publicOrigin) return publicOrigin;
+		if (!ticketOptions?.stateDir) return undefined;
+		try {
+			const tunnelUrl = readDashboardRuntime(ticketOptions.stateDir, now())?.tunnelUrl;
+			return tunnelUrl === undefined ? undefined : validateDashboardPublicUrl(tunnelUrl);
+		} catch {
+			return undefined;
+		}
+	};
 
 	const safeLog = (line: string): void => {
 		options.log?.(maskSecrets(line, DEFAULT_SECRETS_CONFIG, env, createMaskContext()));
@@ -675,7 +720,46 @@ export function createDashboardServer(options: DashboardServerOptions): Dashboar
 				send(res, 400, renderErrorPage(400, "invalid URL", fallbackContext()), false);
 				return;
 			}
-			const exposed = publicOrigin !== undefined;
+			const publicBase = currentPublicOrigin();
+			const exposed = publicBase !== undefined;
+
+			// One-time external-access ticket: exchange for a short session cookie.
+			// Deliberately before the session gate — the ticket *is* the credential.
+			if (pathname === "/t") {
+				if (!ticketStore || !authStore) {
+					send(res, 404, renderErrorPage(404, "ticket access is not enabled on this dashboard", fallbackContext()), headOnly);
+					return;
+				}
+				if (method !== "GET" && !headOnly) {
+					send(res, 405, renderErrorPage(405, "only GET and HEAD are allowed on this route", fallbackContext()), false, {
+						allow: "GET, HEAD",
+					});
+					return;
+				}
+				const ticketValue = new URL(req.url ?? "/", "http://127.0.0.1").searchParams.get("t") ?? "";
+				const consumed = ticketStore.consume(ticketValue);
+				if (consumed.kind !== "ok") {
+					const status = consumed.kind === "expired" ? 403 : 401;
+					const message = consumed.kind === "expired"
+						? "this dashboard link has expired; ask the agent for a new one"
+						: "this dashboard link is invalid or was already used";
+					// The ticket value is never logged, only the outcome and (for an
+					// expired ticket) the thread it was issued to.
+					safeLog(
+						`dashboard ticket: ${new Date(now()).toISOString()} thread=${consumed.kind === "expired" ? consumed.thread : "unknown"} ${consumed.kind}`,
+					);
+					send(res, status, renderErrorPage(status, message, fallbackContext()), headOnly);
+					return;
+				}
+				const session = authStore.createSession({
+					ttlMs: ticketStore.sessionTtlMs,
+					ip: clientIp(req, exposed),
+					userAgent: userAgent(req),
+				});
+				safeLog(`dashboard ticket: ${new Date(now()).toISOString()} thread=${consumed.thread} exchanged`);
+				redirect(res, "/", sessionCookie(session.token, Math.ceil(ticketStore.sessionTtlMs / 1000)));
+				return;
+			}
 
 			if (authStore && (pathname === "/login" || pathname === "/logout")) {
 				if (pathname === "/login") {
@@ -690,7 +774,7 @@ export function createDashboardServer(options: DashboardServerOptions): Dashboar
 						return;
 					}
 					if (method === "POST") {
-						if (exposed && !originAndHostAllowed(req, publicOrigin!)) {
+						if (exposed && !originAndHostAllowed(req, publicBase!)) {
 							send(res, 403, renderErrorPage(403, "request origin or host is not allowed", fallbackContext()), false);
 							return;
 						}
@@ -708,7 +792,7 @@ export function createDashboardServer(options: DashboardServerOptions): Dashboar
 					});
 					return;
 				}
-				if (exposed && !originAndHostAllowed(req, publicOrigin!)) {
+				if (exposed && !originAndHostAllowed(req, publicBase!)) {
 					send(res, 403, renderErrorPage(403, "request origin or host is not allowed", fallbackContext()), false);
 					return;
 				}
@@ -721,7 +805,7 @@ export function createDashboardServer(options: DashboardServerOptions): Dashboar
 
 			// Origin/Host agreement is checked before session or CSRF for every
 			// non-GET request while the tunnel is attached.
-			if (exposed && method !== "GET" && !headOnly && !originAndHostAllowed(req, publicOrigin!)) {
+			if (exposed && method !== "GET" && !headOnly && !originAndHostAllowed(req, publicBase!)) {
 				send(res, 403, renderErrorPage(403, "request origin or host is not allowed", fallbackContext()), false);
 				return;
 			}

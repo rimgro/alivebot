@@ -1547,7 +1547,12 @@ async function dashboardCommand(cwd: string, flags: Record<string, string | bool
 		host: bind.host,
 		port: bind.port,
 		...(passwordProtected
-			? { auth: { stateDir: config.paths.stateDir, ...(ttlMs === undefined ? {} : { ttlMs }) } }
+			? {
+				auth: { stateDir: config.paths.stateDir, ...(ttlMs === undefined ? {} : { ttlMs }) },
+				// One-time ticket links issued by the runtime `dashboard` tool. The
+				// server only consumes them; issuance happens in the runtime process.
+				tickets: { stateDir: config.paths.stateDir },
+			}
 			: {}),
 		...(tunnelRequested
 			? { tunnel: { enabled: true, ...(flagString(flags, "cloudflared") ? { cloudflared: flagString(flags, "cloudflared") } : {}) } }
