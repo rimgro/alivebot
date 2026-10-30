@@ -36,6 +36,12 @@ export interface RenderContext {
 	secrets: SecretsConfig;
 	env: NodeJS.ProcessEnv;
 	now: number;
+	/**
+	 * Present on an authenticated render. The token is a per-render,
+	 * single-use CSRF token for the header logout form; the session token
+	 * itself never reaches a page.
+	 */
+	auth?: { logoutCsrfToken?: string };
 }
 
 class Masker {
@@ -219,10 +225,26 @@ button:hover { color: #f2ead6; border-color: var(--link); }
 button:disabled { color: var(--muted); border-color: var(--line); cursor: not-allowed; }
 .saved { border: 1px solid #3d5340; color: #a9cfa9; padding: 8px 12px; margin: 0 0 16px; }
 .disabled { border: 1px solid #5a3f3f; color: var(--error); padding: 8px 12px; margin: 0 0 16px; }
+header form.logout { margin: 0; }
+header form.logout button { padding: 2px 10px; font-size: 12px; }
+.login { max-width: 420px; margin: 8vh auto 0; }
+.login form { border: 1px solid var(--line); background: var(--panel); padding: 18px; }
+.login label { display: block; margin: 0 0 14px; }
+.login .label { display: block; color: var(--muted); font-size: 12px; margin-bottom: 5px; }
+.login input[type=password] { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line); font: inherit; padding: 8px 10px; }
+.login .error { border: 1px solid #5a3f3f; color: var(--error); padding: 8px 12px; margin: 0 0 14px; }
 `;
 
-function layout(masker: Masker, title: string, body: string, nav: string[] = []): string {
+interface LayoutOptions {
+	/** When set, the header carries a POST /logout form with this CSRF token. */
+	logoutCsrfToken?: string;
+}
+
+function layout(masker: Masker, title: string, body: string, nav: string[] = [], options: LayoutOptions = {}): string {
 	const navHtml = nav.length > 0 ? `<nav>${nav.join(" / ")}</nav>` : "";
+	const logout = options.logoutCsrfToken
+		? `<form class="logout" method="post" action="/logout"><input type="hidden" name="csrf" value="${masker.text(options.logoutCsrfToken)}"><button type="submit">log out</button></form>`
+		: "";
 	return masker.finish(`<!doctype html>
 <html lang="en">
 <head>
@@ -236,6 +258,7 @@ function layout(masker: Masker, title: string, body: string, nav: string[] = [])
 <header>
 <span class="brand">alive</span>
 ${navHtml}
+${logout}
 <span class="tag">127.0.0.1 · read-only unless settings</span>
 </header>
 <main>
@@ -244,6 +267,10 @@ ${body}
 <footer>read-only snapshot of on-disk agent state — the only write route is /agent/[id]/settings (loopback, CSRF-protected, backups kept).</footer>
 </body>
 </html>`);
+}
+
+function logoutOptions(context: RenderContext): LayoutOptions {
+	return { logoutCsrfToken: context.auth?.logoutCsrfToken };
 }
 
 function statusLabel(status: AgentStatus): string {
@@ -310,7 +337,7 @@ export function renderIndexPage(agents: AgentSummary[], context: RenderContext):
 ${rows.join("\n")}
 </tbody>
 </table>`;
-	return layout(masker, "agents", body);
+	return layout(masker, "agents", body, [], logoutOptions(context));
 }
 
 export function renderAgentPage(detail: AgentDetail, context: RenderContext): string {
@@ -348,7 +375,7 @@ ${reminderRows}
 	return layout(masker, summary.name, body, [
 		`<a href="/">agents</a>`,
 		`<span class="mono">${masker.text(summary.id)}</span>`,
-	]);
+	], logoutOptions(context));
 }
 
 function renderToolCalls(calls: ToolCallView[], masker: Masker): string {
@@ -456,7 +483,7 @@ ${transcript}`;
 		`<a href="/">agents</a>`,
 		`<a href="${agentHref(detail.agent.id, masker)}">${masker.text(detail.agent.name)}</a>`,
 		`<span class="mono">run #${masker.num(run.index)}</span>`,
-	]);
+	], logoutOptions(context));
 }
 
 // ---------------------------------------------------------------------------
@@ -573,7 +600,7 @@ ${renderTextSection(view.journal, "journal entry", "journal entries", view.query
 		`<a href="/">agents</a>`,
 		`<a href="${agentHref(view.agent.id, masker)}">${masker.text(view.agent.name)}</a>`,
 		`<span class="mono">memory</span>`,
-	]);
+	], logoutOptions(context));
 }
 
 export interface SettingsRenderOptions {
@@ -691,7 +718,7 @@ ${renderBackupList(view, masker)}`;
 		`<a href="/">agents</a>`,
 		`<a href="${agentHref(view.agent.id, masker)}">${masker.text(view.agent.name)}</a>`,
 		`<span class="mono">settings</span>`,
-	]);
+	], logoutOptions(context));
 }
 
 /** A rejected edit: what went wrong, and that nothing was written. */
@@ -710,7 +737,7 @@ export function renderSettingsErrorPage(
 		`<a href="/">agents</a>`,
 		`<a href="${agentHref(agent.id, masker)}">${masker.text(agent.name)}</a>`,
 		`<span class="mono">settings</span>`,
-	]);
+	], logoutOptions(context));
 }
 
 /** Local, masked basename: the renderer must not import `node:path` just for this. */
@@ -724,5 +751,27 @@ export function renderErrorPage(status: number, message: string, context: Render
 	const body = `<h1>${masker.num(status)}</h1>
 <p>${masker.text(message)}</p>
 <p><a href="/">back to agents</a></p>`;
-	return layout(masker, `error ${status}`, body);
+	return layout(masker, `error ${status}`, body, [], logoutOptions(context));
+}
+
+/**
+ * The password page. There is intentionally one error string for every bad
+ * credential, and the password input is never repopulated.
+ */
+export function renderLoginPage(context: RenderContext, error?: string): string {
+	const masker = new Masker(context.secrets, context.env);
+	const errorHtml = error ? `<p class="error">${masker.text(error)}</p>` : "";
+	const body = `<div class="login">
+<h1>sign in</h1>
+<p class="sub">This dashboard is exposed through a temporary HTTPS tunnel. Enter the dashboard password set with <span class="mono">alive dashboard --set-password</span>.</p>
+${errorHtml}
+<form method="post" action="/login">
+<label>
+<span class="label">password</span>
+<input type="password" name="password" autocomplete="current-password" autofocus required>
+</label>
+<button type="submit">sign in</button>
+</form>
+</div>`;
+	return layout(masker, "sign in", body);
 }
