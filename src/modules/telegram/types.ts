@@ -17,6 +17,19 @@ export interface TelegramUser {
 	can_manage_bots?: boolean;
 }
 
+export interface TelegramWebhookInfo {
+	/** Empty string when no webhook is set. */
+	url: string;
+	has_custom_certificate: boolean;
+	pending_update_count: number;
+	ip_address?: string;
+	last_error_date?: number;
+	last_error_message?: string;
+	last_synchronization_error_date?: number;
+	max_connections?: number;
+	allowed_updates?: string[];
+}
+
 export type TelegramChatType = "private" | "group" | "supergroup" | "channel";
 
 export interface TelegramChat {

@@ -48,6 +48,7 @@ import {
 	resolveOutgoingAttachment,
 } from "../runtime/attachments.js";
 import type { TelegramUpdate } from "../modules/telegram/types.js";
+import { readJsonl } from "../util.js";
 
 let failures = 0;
 
@@ -66,6 +67,41 @@ function section(name: string): void {
 
 function jsonResponse(value: unknown, status = 200): Response {
 	return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
+}
+
+/** Long-poll stand-in: stay pending until the module aborts the request. */
+function pendingResponse(init?: RequestInit): Promise<Response> {
+	return new Promise<Response>((_resolve, reject) => {
+		const signal = init?.signal;
+		if (!signal) return reject(new Error("getUpdates: missing abort signal"));
+		const fail = () => reject(signal.reason instanceof Error ? signal.reason : new Error("getUpdates aborted"));
+		if (signal.aborted) return fail();
+		signal.addEventListener("abort", fail, { once: true });
+	});
+}
+
+function telegramTestConfig(root: string, token = "test-token") {
+	return loadConfig({
+		cwd: root,
+		overrides: {
+			chat: { console: false, http: { enabled: false, host: "127.0.0.1", port: 0, token: "" } },
+			modules: {
+				telegram: {
+					...DEFAULT_CONFIG.modules.telegram,
+					enabled: true,
+					token,
+					tokenEnv: "ALIVE_TEST_TELEGRAM_TOKEN_UNSET",
+					apiBase: "https://api.telegram.org",
+					allowedChatIds: [],
+					allowedUserIds: [],
+					pollTimeoutSec: 0,
+					historyLimitPerThread: 0,
+				},
+				grafana: { ...DEFAULT_CONFIG.modules.grafana, enabled: false, host: "127.0.0.1", port: 0, token: "" },
+				external: [],
+			},
+		},
+	});
 }
 
 /** Minimal valid PDF with one Helvetica text line per array entry. */
@@ -1712,7 +1748,8 @@ section("telegram client: network failures keep the cause");
 section("telegram module: outage is reported once, not spammed");
 {
 	const outageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-outage-"));
-	const log = new Logger({ console: false, level: "error", scope: "outage-test" });
+	const outageLog = path.join(outageRoot, "outage.jsonl");
+	const log = new Logger({ console: false, level: "error", file: outageLog, scope: "outage-test" });
 	const store = EventStore.open(outageRoot);
 	const history = HistoryStore.open(outageRoot);
 	let pollAttempts = 0;
@@ -1780,14 +1817,400 @@ section("telegram module: outage is reported once, not spammed");
 			consecutiveFailures?: number;
 			lastError?: string;
 			lastErrorAt?: number;
+			networkProblem?: boolean;
 		};
 		check("an outage eventually marks the module unreachable", status.reachable === false, status);
 		check("consecutive failures are counted", (status.consecutiveFailures ?? 0) >= 1, status);
 		check("the outage reason names the errno", status.lastError?.includes("ECONNRESET") === true, status.lastError);
 		check("the outage is timestamped", typeof status.lastErrorAt === "number");
+		check("a network failure is classified as a network problem", status.networkProblem === true, status);
+		const outageLogs = readJsonl<{ level: string; msg: string; data?: { hint?: string } }>(outageLog);
+		const networkWarning = outageLogs.find((record) => record.level === "warn" && record.msg === "telegram getUpdates failed");
+		check(
+			"a genuine network failure keeps the VPN/proxy hint",
+			networkWarning?.data?.hint?.includes("VPN/proxy") === true,
+			networkWarning,
+		);
 		check("polling keeps retrying", pollAttempts >= 2, pollAttempts);
 		await host.stop();
 	} finally {
+		globalThis.fetch = realFetch;
+	}
+}
+
+// ---------------------------------------------------------------------------
+section("telegram 409: probe a webhook once, never delete blindly, report a duplicate poller");
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-409-"));
+	const logFile = path.join(root, "telegram.jsonl");
+	const log = new Logger({ console: false, level: "debug", file: logFile, scope: "telegram-409-test" });
+	const store = EventStore.open(root);
+	const history = HistoryStore.open(root);
+	const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+	let polls = 0;
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const method = String(input).slice(String(input).lastIndexOf("/") + 1);
+		const params = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+		calls.push({ method, params });
+		if (method === "getMe") return jsonResponse({ ok: true, result: { id: 999, is_bot: true, first_name: "Alive", username: "alive_bot" } });
+		if (method === "getWebhookInfo") {
+			return jsonResponse({ ok: true, result: { url: "", has_custom_certificate: false, pending_update_count: 0 } });
+		}
+		if (method === "deleteWebhook") return jsonResponse({ ok: true, result: true });
+		if (method === "getUpdates") {
+			polls += 1;
+			if (polls === 1) {
+				return jsonResponse(
+					{
+						ok: false,
+						error_code: 409,
+						description: "Conflict: terminated by other getUpdates request",
+						parameters: { retry_after: 1 },
+					},
+					409,
+				);
+			}
+			if (polls === 2) return jsonResponse({ ok: true, result: [] });
+			return pendingResponse(init);
+		}
+		return jsonResponse({ ok: true, result: true });
+	}) as unknown as typeof fetch;
+
+	const config = telegramTestConfig(root);
+	const telegram = new TelegramModule(config.config.modules.telegram);
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = fetchImpl;
+	let host: ModuleHost | undefined;
+	try {
+		host = new ModuleHost({
+			config,
+			log,
+			transports: [],
+			modules: [telegram],
+			ingest: (event) => store.append(event),
+			outbox: () => [],
+			history,
+			runtimeStatus: () => ({}),
+		});
+		await host.init();
+		await waitFor(() => polls >= 1, 4000);
+		await waitFor(
+			() => readJsonl<{ level?: string; msg?: string }>(logFile).some((record) => record.level === "warn"),
+			4000,
+		);
+		const status = telegram.status() as {
+			state?: string;
+			duplicatePoller?: boolean;
+			networkProblem?: boolean;
+			connected?: boolean;
+			lastError?: string;
+		};
+		const logs = readJsonl<{ level?: string; msg?: string; data?: { hint?: string } }>(logFile);
+		const conflictWarnings = logs.filter(
+			(record) => record.level === "warn" && (record.msg ?? "").includes("another poller is using this bot token"),
+		);
+		check(
+			"no deleteWebhook when getWebhookInfo reports no webhook",
+			calls.filter((call) => call.method === "deleteWebhook").length === 0,
+			calls.map((call) => call.method),
+		);
+		check(
+			"getWebhookInfo is checked exactly once",
+			calls.filter((call) => call.method === "getWebhookInfo").length === 1,
+			calls.filter((call) => call.method === "getWebhookInfo").length,
+		);
+		check(
+			"status reports a duplicate poller, not a network problem",
+			status.state === "duplicate-poller" && status.duplicatePoller === true && status.networkProblem === false,
+			status,
+		);
+		check("the duplicate poller clears connected", status.connected === false, status);
+		check(
+			"the error names the duplicate poller actionably",
+			status.lastError?.includes("another poller is using this bot token (duplicate agent/process or a shared token)") === true,
+			status.lastError,
+		);
+		check("the warning is emitted exactly once", conflictWarnings.length === 1, conflictWarnings);
+		check(
+			"a 409 warning carries no VPN/proxy hint",
+			conflictWarnings.every((record) => record.data?.hint?.includes("VPN/proxy") !== true),
+			conflictWarnings,
+		);
+		check(
+			"no false 'resuming polling' line is logged",
+			logs.every((record) => !String(record.msg ?? "").toLowerCase().includes("resuming")),
+			logs.map((record) => record.msg),
+		);
+		const continued = await waitFor(() => polls >= 3, 4000);
+		check("polling continues after the conflict", continued, { polls });
+	} finally {
+		if (host) await host.stop().catch(() => undefined);
+		globalThis.fetch = realFetch;
+	}
+}
+
+// ---------------------------------------------------------------------------
+section("telegram 409: a configured webhook is deleted once, then polling retries");
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-409-webhook-"));
+	const log = new Logger({ console: false, level: "error", scope: "telegram-409-webhook-test" });
+	const store = EventStore.open(root);
+	const history = HistoryStore.open(root);
+	const calls: string[] = [];
+	let polls = 0;
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const method = String(input).slice(String(input).lastIndexOf("/") + 1);
+		calls.push(method);
+		if (method === "getMe") return jsonResponse({ ok: true, result: { id: 999, is_bot: true, first_name: "Alive", username: "alive_bot" } });
+		if (method === "getWebhookInfo") {
+			return jsonResponse({ ok: true, result: { url: "https://example.test/telegram", has_custom_certificate: false, pending_update_count: 0 } });
+		}
+		if (method === "deleteWebhook") return jsonResponse({ ok: true, result: true });
+		if (method === "getUpdates") {
+			polls += 1;
+			if (polls === 1) {
+				return jsonResponse(
+					{
+						ok: false,
+						error_code: 409,
+						description: "Conflict: terminated by other getUpdates request",
+						parameters: { retry_after: 0 },
+					},
+					409,
+				);
+			}
+			if (polls === 2) return jsonResponse({ ok: true, result: [] });
+			return pendingResponse(init);
+		}
+		return jsonResponse({ ok: true, result: true });
+	}) as unknown as typeof fetch;
+
+	const config = telegramTestConfig(root);
+	const telegram = new TelegramModule(config.config.modules.telegram);
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = fetchImpl;
+	let host: ModuleHost | undefined;
+	try {
+		host = new ModuleHost({
+			config,
+			log,
+			transports: [],
+			modules: [telegram],
+			ingest: (event) => store.append(event),
+			outbox: () => [],
+			history,
+			runtimeStatus: () => ({}),
+		});
+		await host.init();
+		const retried = await waitFor(() => polls >= 2, 4000);
+		const status = telegram.status() as { state?: string; duplicatePoller?: boolean };
+		check("the poll retries after the webhook is removed", retried, { polls });
+		check(
+			"deleteWebhook is called exactly once",
+			calls.filter((method) => method === "deleteWebhook").length === 1,
+			calls,
+		);
+		check(
+			"the webhook is inspected before deleting it",
+			calls.filter((method) => method === "getWebhookInfo").length === 1,
+			calls,
+		);
+		check("a cleared webhook does not leave a duplicate-poller state", status.duplicatePoller !== true && status.state !== "duplicate-poller", status);
+	} finally {
+		if (host) await host.stop().catch(() => undefined);
+		globalThis.fetch = realFetch;
+	}
+}
+
+// ---------------------------------------------------------------------------
+section("telegram 409: repeated conflicts do not spam the log");
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-409-spam-"));
+	const logFile = path.join(root, "telegram.jsonl");
+	const log = new Logger({ console: false, level: "debug", file: logFile, scope: "telegram-409-spam-test" });
+	const store = EventStore.open(root);
+	const history = HistoryStore.open(root);
+	const counts = { polls: 0, webhookInfo: 0, deleteWebhook: 0 };
+	const fetchImpl = (async (input: string | URL | Request) => {
+		const method = String(input).slice(String(input).lastIndexOf("/") + 1);
+		if (method === "getMe") return jsonResponse({ ok: true, result: { id: 999, is_bot: true, first_name: "Alive", username: "alive_bot" } });
+		if (method === "getWebhookInfo") {
+			counts.webhookInfo += 1;
+			return jsonResponse({ ok: true, result: { url: "", has_custom_certificate: false, pending_update_count: 0 } });
+		}
+		if (method === "deleteWebhook") {
+			counts.deleteWebhook += 1;
+			return jsonResponse({ ok: true, result: true });
+		}
+		if (method === "getUpdates") {
+			counts.polls += 1;
+			return jsonResponse(
+				{
+					ok: false,
+					error_code: 409,
+					description: "Conflict: terminated by other getUpdates request",
+					parameters: { retry_after: 1 },
+				},
+				409,
+			);
+		}
+		return jsonResponse({ ok: true, result: true });
+	}) as unknown as typeof fetch;
+
+	const config = telegramTestConfig(root);
+	const telegram = new TelegramModule(config.config.modules.telegram);
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = fetchImpl;
+	let host: ModuleHost | undefined;
+	try {
+		host = new ModuleHost({
+			config,
+			log,
+			transports: [],
+			modules: [telegram],
+			ingest: (event) => store.append(event),
+			outbox: () => [],
+			history,
+			runtimeStatus: () => ({}),
+		});
+		await host.init();
+		const repeated = await waitFor(() => counts.polls >= 3, 6000);
+		const logs = readJsonl<{ level?: string; msg?: string }>(logFile);
+		const conflictWarnings = logs.filter(
+			(record) => record.level === "warn" && (record.msg ?? "").includes("another poller is using this bot token"),
+		);
+		check("the conflict keeps retrying", repeated, counts);
+		check("the warning is emitted at most once per window", conflictWarnings.length === 1, conflictWarnings);
+		check("the webhook is probed at most once per window", counts.webhookInfo === 1, counts);
+		check("no webhook is deleted when none is set", counts.deleteWebhook === 0, counts);
+		const status = telegram.status() as { state?: string; consecutiveFailures?: number };
+		check(
+			"status keeps reporting the duplicate-poller state",
+			status.state === "duplicate-poller" && (status.consecutiveFailures ?? 0) >= 3,
+			status,
+		);
+	} finally {
+		if (host) await host.stop().catch(() => undefined);
+		globalThis.fetch = realFetch;
+	}
+}
+
+// ---------------------------------------------------------------------------
+section("telegram identity: a managed bot id mismatch fails startup loudly");
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-identity-mismatch-"));
+	fs.writeFileSync(path.join(root, "telegram-managed-bot.json"), `${JSON.stringify({ id: 111, username: "stored_agent_bot" })}\n`);
+	const log = new Logger({ console: false, level: "error", scope: "telegram-identity-test" });
+	const store = EventStore.open(root);
+	const history = HistoryStore.open(root);
+	const calls: string[] = [];
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const method = String(input).slice(String(input).lastIndexOf("/") + 1);
+		calls.push(method);
+		if (method === "getMe") return jsonResponse({ ok: true, result: { id: 999, is_bot: true, first_name: "Alive", username: "alive_bot" } });
+		if (method === "getUpdates") return pendingResponse(init);
+		return jsonResponse({ ok: true, result: true });
+	}) as unknown as typeof fetch;
+
+	const config = telegramTestConfig(root);
+	const telegram = new TelegramModule(config.config.modules.telegram);
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = fetchImpl;
+	let host: ModuleHost | undefined;
+	try {
+		host = new ModuleHost({
+			config,
+			log,
+			transports: [],
+			modules: [telegram],
+			ingest: (event) => store.append(event),
+			outbox: () => [],
+			history,
+			runtimeStatus: () => ({}),
+		});
+		await host.init();
+		const moduleStatus = (host.status() as { modules: Record<string, { error?: string }> }).modules.telegram;
+		const failure = moduleStatus?.error ?? (telegram.status() as { lastError?: string }).lastError ?? "";
+		check("startup fails when the token belongs to another bot", moduleStatus?.error !== undefined, moduleStatus);
+		check("the failure names the actual bot id", failure.includes("999"), failure);
+		check("the failure names the managed bot id", failure.includes("111"), failure);
+		check(
+			"the failure says the token does not belong to this agent",
+			failure.includes("the config token does not belong to this agent"),
+			failure,
+		);
+		check("a fatal identity mismatch does not delete a webhook", !calls.includes("deleteWebhook"), calls);
+		const status = telegram.status() as { connected?: boolean; state?: string };
+		check("a failed startup is not reported as connected", status.connected === false, status);
+	} finally {
+		if (host) await host.stop().catch(() => undefined);
+		globalThis.fetch = realFetch;
+	}
+}
+
+// ---------------------------------------------------------------------------
+section("telegram identity: a failed getMe marks the stored bot stale");
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-identity-stale-"));
+	const config = telegramTestConfig(root);
+	const stateFile = path.join(config.paths.modulesDir, "telegram", "state.json");
+	fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+	fs.writeFileSync(
+		stateFile,
+		`${JSON.stringify({
+			offset: 0,
+			polls: 0,
+			updates: 0,
+			inbound: 0,
+			outbound: 0,
+			errors: 0,
+			me: { id: 777, username: "old_bot", firstName: "Old Bot", verifiedAt: 1_700_000_000_000 },
+		})}\n`,
+	);
+	const log = new Logger({ console: false, level: "error", scope: "telegram-identity-stale-test" });
+	const store = EventStore.open(root);
+	const history = HistoryStore.open(root);
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const method = String(input).slice(String(input).lastIndexOf("/") + 1);
+		if (method === "getMe") {
+			const cause = Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+			const err = new Error("fetch failed");
+			(err as { cause?: unknown }).cause = cause;
+			throw err;
+		}
+		if (method === "getUpdates") return pendingResponse(init);
+		return jsonResponse({ ok: true, result: true });
+	}) as unknown as typeof fetch;
+
+	const telegram = new TelegramModule(config.config.modules.telegram);
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = fetchImpl;
+	let host: ModuleHost | undefined;
+	try {
+		host = new ModuleHost({
+			config,
+			log,
+			transports: [],
+			modules: [telegram],
+			ingest: (event) => store.append(event),
+			outbox: () => [],
+			history,
+			runtimeStatus: () => ({}),
+		});
+		await host.init();
+		const status = telegram.status() as {
+			state?: string;
+			connected?: boolean;
+			bot?: { id?: number; stale?: boolean; staleAt?: number };
+			identity?: { status?: string; text?: string };
+		};
+		check("the stored bot is marked stale", status.bot?.id === 777 && status.bot.stale === true, status.bot);
+		check("the stale mark is timestamped", typeof status.bot?.staleAt === "number", status.bot);
+		check("status reports the identity as stale, not connected", status.identity?.status === "stale" && status.connected === false, status);
+		check("status says identity unknown with the last verification", status.identity?.text?.includes("identity unknown (last verified") === true, status.identity);
+		check("the module state is not a network-only label", status.state === "identity-stale", status);
+	} finally {
+		if (host) await host.stop().catch(() => undefined);
 		globalThis.fetch = realFetch;
 	}
 }

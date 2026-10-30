@@ -8,6 +8,7 @@ import type {
 	TelegramSentMessage,
 	TelegramUpdate,
 	TelegramUser,
+	TelegramWebhookInfo,
 } from "./types.js";
 import { TELEGRAM_MAX_CHARS, splitMessage } from "./text.js";
 
@@ -178,6 +179,10 @@ export class TelegramApi {
 
 	replaceManagedBotToken(userId: number): Promise<string> {
 		return this.call<string>("replaceManagedBotToken", { user_id: userId });
+	}
+
+	getWebhookInfo(): Promise<TelegramWebhookInfo> {
+		return this.call<TelegramWebhookInfo>("getWebhookInfo");
 	}
 
 	deleteWebhook(params: { drop_pending_updates?: boolean } = {}): Promise<boolean> {
