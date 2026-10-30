@@ -18,12 +18,36 @@ export interface TelegramPollerConflict {
 	message: string;
 }
 
+/**
+ * A provider quota stop for voice transcription.
+ *
+ * The provider answered with a daily-quota error once, so every further voice
+ * note that day is ingested without a transcript instead of hammering the API
+ * (and burning whatever quota is left) — incident #117.
+ */
+export interface TelegramTranscriptionQuota {
+	/** UTC day (YYYY-MM-DD) the marker belongs to; a new day clears it implicitly. */
+	day: string;
+	/** When the quota error was seen. */
+	at: number;
+	/**
+	 * Signature of the transcription configuration that produced this stop.
+	 * Changing the key/model/limits makes the marker stale, so transcription is
+	 * attempted again with the new settings.
+	 */
+	signature: string;
+	/** Classified reason (never the key or a provider body). */
+	reason: string;
+}
+
 export interface TelegramState {
 	/** Next getUpdates offset: last processed update_id + 1. */
 	offset: number;
 	me?: TelegramBotIdentity;
 	/** Last known duplicate-poller conflict. Cleared by the next successful poll. */
 	pollerConflict?: TelegramPollerConflict;
+	/** Set while voice transcription is skipped after a provider daily-quota error. */
+	transcriptionQuota?: TelegramTranscriptionQuota;
 	lastPollAt?: number;
 	lastUpdateAt?: number;
 	lastError?: string;

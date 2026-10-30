@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TelegramConfig, TelegramTranscriptionConfig } from "../../config.js";
+import { MAX_TRANSCRIPTION_RETRIES } from "../../config.js";
 import { findManagedBotRequest, managedBotRequestStatus, validateAgentId, type ManagedAgent } from "../../agents.js";
 import {
 	cancelAgentTelegram,
@@ -36,6 +37,7 @@ import {
 	telegramIdentityView,
 	type TelegramPollerConflict,
 	type TelegramState,
+	type TelegramTranscriptionQuota,
 } from "./state.js";
 import { chatLabel, isParseModeError, splitMessage } from "./text.js";
 import {
@@ -59,8 +61,10 @@ import type { TelegramCallbackQuery, TelegramChat, TelegramSentMessage, Telegram
 import { normalizeUpdate, type NormalizedInbound } from "./update.js";
 import { acceptBrowserPairing } from "../browser/operator.js";
 import {
-	GroqTranscriptionError,
+	GROQ_TRANSCRIPTION_MAX_RETRY_AFTER_MS,
+	classifyTranscriptionFailure,
 	transcribeWithGroq,
+	type TranscriptionFailure,
 } from "./voice-transcription.js";
 
 const DEFAULT_ALLOWED_UPDATES = ["message", "edited_message", "channel_post", "edited_channel_post", "callback_query"];
@@ -113,7 +117,23 @@ type VoiceTranscriptionResult =
 	| { status: "disabled" }
 	| { status: "not_configured" }
 	| { status: "too_large" }
+	/** The provider reported exhausted daily quota: no attempt was made (or it stopped here). */
+	| { status: "quota_exhausted" }
 	| { status: "failed"; reason: string };
+
+/** Upper bound for one backoff wait between transcription attempts. */
+const TRANSCRIPTION_BACKOFF_MAX_MS = 30_000;
+
+/**
+ * The Bot API could not hand us a usable file for this voice note. Not a
+ * provider failure: never retried, reported through the normal failure path.
+ */
+class VoiceAttachmentError extends Error {
+	constructor(reason: string) {
+		super(reason);
+		this.name = "VoiceAttachmentError";
+	}
+}
 
 /**
  * Full Telegram Bot API integration.
@@ -209,6 +229,7 @@ export class TelegramModule implements AliveModule {
 		this.state = new TelegramStateStore(moduleDir);
 		this.deliveryLedger = new TelegramDeliveryLedger(moduleDir);
 		this.allowlist = new TelegramAllowlistStore(moduleDir);
+		this.resetStaleTranscriptionQuota(ctx);
 		this.api = new TelegramApi({ token, apiBase: this.config.apiBase });
 		this.managedSweep = setInterval(() => void this.sweepManagedRequests(), 15_000);
 		this.managedSweep.unref?.();
@@ -334,6 +355,10 @@ export class TelegramModule implements AliveModule {
 					Boolean(process.env[this.config.transcription.apiKeyEnv]?.trim()),
 				provider: "groq",
 				model: this.config.transcription.model,
+				retries: this.config.transcriptionRetries,
+				retryDelayMs: this.config.transcriptionRetryDelayMs,
+				// True while a daily-quota marker pauses transcription until the day changes.
+				quotaExhausted: this.transcriptionQuotaBlock(this.config.transcription) !== undefined,
 			},
 			chats,
 			historyMessages: messages,
@@ -1006,6 +1031,19 @@ export class TelegramModule implements AliveModule {
 		}
 	}
 
+	/**
+	 * Download one voice note and transcribe it, with a bounded retry policy.
+	 *
+	 * Only transient failures are retried (`transcriptionRetries`, default 2 →
+	 * at most three attempts) with exponential backoff and jitter. Auth errors,
+	 * exhausted quota, unsupported audio and size problems fail on the first
+	 * attempt. A provider daily-quota error also persists a marker so the rest of
+	 * the day's voice notes are delivered without a transcript (#117).
+	 *
+	 * Logging contract: per-attempt detail is `debug` only; one message produces
+	 * exactly one `warn` summary line (or one quota-pause line), and model, key
+	 * or audio never appear in it.
+	 */
 	private async transcribeVoice(
 		voice: HistoryAttachment,
 		api: TelegramApi,
@@ -1021,28 +1059,182 @@ export class TelegramModule implements AliveModule {
 		if (!voice.fileId) return { status: "failed", reason: "Telegram voice attachment has no file id" };
 		if (voice.size !== undefined && voice.size > config.maxBytes) return { status: "too_large" };
 
-		const signal = AbortSignal.any([this.abort.signal, AbortSignal.timeout(config.timeoutMs)]);
-		try {
-			const file = await api.getFile({ file_id: voice.fileId }, { timeoutMs: config.timeoutMs, signal });
-			if (file.file_size !== undefined && file.file_size > config.maxBytes) return { status: "too_large" };
-			if (!file.file_path) return { status: "failed", reason: "Telegram did not provide a file path" };
-			const audio = await api.downloadFile(file.file_path, { maxBytes: config.maxBytes, signal });
-			const text = await transcribeWithGroq({
-				apiKey,
-				audio,
-				mimeType: voice.mime,
-				model: config.model,
-				maxBytes: config.maxBytes,
-				signal,
-				timeoutMs: config.timeoutMs,
+		// The provider already said "daily quota is gone" today: every further
+		// request would burn attempts and degrade the API for everyone.
+		if (this.transcriptionQuotaBlock(config)) {
+			ctx.log.debug("telegram voice transcription skipped: provider daily quota is exhausted", {
+				day: this.transcriptionQuotaDay(),
 			});
-			return { status: "transcribed", text };
+			return { status: "quota_exhausted" };
+		}
+
+		const maxAttempts = 1 + Math.max(0, Math.min(this.config.transcriptionRetries, MAX_TRANSCRIPTION_RETRIES));
+		const baseDelayMs = this.config.transcriptionRetryDelayMs;
+		let attempt = 0;
+		let audio: Uint8Array | undefined;
+		let failure: TranscriptionFailure = { class: "unknown", reason: "request failed", retryable: false, dailyQuota: false };
+
+		while (attempt < maxAttempts) {
+			attempt += 1;
+			// One timeout budget per attempt: retries must not be squeezed into the
+			// budget of the first request.
+			const signal = AbortSignal.any([this.abort.signal, AbortSignal.timeout(config.timeoutMs)]);
+			try {
+				if (!audio) {
+					const file = await api.getFile({ file_id: voice.fileId }, { timeoutMs: config.timeoutMs, signal });
+					if (file.file_size !== undefined && file.file_size > config.maxBytes) return { status: "too_large" };
+					if (!file.file_path) throw new VoiceAttachmentError("Telegram did not provide a file path");
+					audio = await api.downloadFile(file.file_path, { maxBytes: config.maxBytes, signal });
+				}
+				const text = await transcribeWithGroq({
+					apiKey,
+					audio,
+					mimeType: voice.mime,
+					model: config.model,
+					maxBytes: config.maxBytes,
+					signal,
+					timeoutMs: config.timeoutMs,
+				});
+				return { status: "transcribed", text };
+			} catch (err) {
+				// The byte cap also fires while streaming, after the update's own size check.
+				if (err instanceof TelegramFileTooLargeError) return { status: "too_large" };
+				if (err instanceof VoiceAttachmentError) {
+					failure = { class: "unsupported", reason: err.message, retryable: false, dailyQuota: false };
+					break;
+				}
+				failure = this.classifyVoiceFailure(err);
+				if (failure.dailyQuota) {
+					// Record the stop before returning: later messages skip the provider.
+					this.markTranscriptionQuota(config, ctx, failure);
+					return { status: "quota_exhausted" };
+				}
+				const retryAfterMs = failure.retryAfterMs;
+				const retrying =
+					failure.retryable &&
+					attempt < maxAttempts &&
+					!this.abort.signal.aborted &&
+					(retryAfterMs === undefined || retryAfterMs <= GROQ_TRANSCRIPTION_MAX_RETRY_AFTER_MS);
+				if (!retrying) break;
+				const waitMs =
+					retryAfterMs !== undefined
+						? Math.max(retryAfterMs, 0)
+						: jitter(Math.min(baseDelayMs * 2 ** (attempt - 1), TRANSCRIPTION_BACKOFF_MAX_MS));
+				// Per-attempt detail is debug-only: the incident was 7959 identical
+				// warning lines for one recording.
+				ctx.log.debug("telegram voice transcription attempt failed", {
+					attempt,
+					attempts: maxAttempts,
+					class: failure.class,
+					reason: failure.reason,
+					retryInMs: waitMs,
+				});
+				await sleep(waitMs, this.abort.signal);
+				// A shutdown during the backoff must not start one more request.
+				if (this.abort.signal.aborted) break;
+			}
+		}
+
+		ctx.log.warn("telegram voice transcription failed", {
+			attempts: attempt,
+			class: failure.class,
+			reason: failure.reason,
+		});
+		return { status: "failed", reason: failure.reason };
+	}
+
+	/** Classify one failed attempt: provider errors carry their own classification. */
+	private classifyVoiceFailure(err: unknown): TranscriptionFailure {
+		if (err instanceof TelegramApiError) {
+			const reason = err.errorCode !== undefined ? `Telegram returned HTTP/API ${err.errorCode}` : "Telegram file download failed";
+			// A request that never reached Telegram (reset, DNS, timeout) is transient.
+			if (err.network) return { class: "network", reason, retryable: true, dailyQuota: false };
+			if (err.errorCode === 429 || (err.errorCode !== undefined && err.errorCode >= 500)) {
+				return {
+					class: err.errorCode === 429 ? "rate_limit" : "provider_unavailable",
+					reason,
+					retryable: true,
+					dailyQuota: false,
+					retryAfterMs: err.retryAfterSec !== undefined ? err.retryAfterSec * 1000 : undefined,
+				};
+			}
+			return { class: "unsupported", reason, retryable: false, dailyQuota: false };
+		}
+		return classifyTranscriptionFailure(err, { aborted: this.abort.signal.aborted });
+	}
+
+	/** UTC day key: provider daily quotas reset on the UTC day, not the local one. */
+	private transcriptionQuotaDay(now = Date.now()): string {
+		return new Date(now).toISOString().slice(0, 10);
+	}
+
+	/** Fingerprint of the transcription settings a quota stop was recorded with. */
+	private transcriptionQuotaSignature(config: TelegramTranscriptionConfig): string {
+		return [
+			this.config.transcriptionRetries,
+			this.config.transcriptionRetryDelayMs,
+			config.apiKeyEnv,
+			config.model,
+			config.maxBytes,
+			config.timeoutMs,
+		].join("|");
+	}
+
+	/**
+	 * The active quota marker, if any. A marker from an earlier day or from a
+	 * different transcription configuration is stale: it is dropped so the next
+	 * voice note is attempted again (reset on day change / config change).
+	 */
+	private transcriptionQuotaBlock(config: TelegramTranscriptionConfig): TelegramTranscriptionQuota | undefined {
+		const state = this.state;
+		if (!state) return undefined;
+		let marker: TelegramTranscriptionQuota | undefined;
+		try {
+			marker = state.load().transcriptionQuota;
+		} catch {
+			return undefined;
+		}
+		if (!marker || typeof marker.day !== "string" || typeof marker.signature !== "string") return undefined;
+		if (marker.day === this.transcriptionQuotaDay() && marker.signature === this.transcriptionQuotaSignature(config)) return marker;
+		try {
+			state.patch({ transcriptionQuota: undefined });
+		} catch {
+			// Best effort: an unreadable state file must not block transcription.
+		}
+		return undefined;
+	}
+
+	/** Persist the day-long stop and say so exactly once. */
+	private markTranscriptionQuota(config: TelegramTranscriptionConfig, ctx: ModuleContext, failure: TranscriptionFailure): void {
+		const marker: TelegramTranscriptionQuota = {
+			day: this.transcriptionQuotaDay(),
+			at: Date.now(),
+			signature: this.transcriptionQuotaSignature(config),
+			reason: failure.reason,
+		};
+		// The one loud line for this event: the earlier attempts were debug-only.
+		ctx.log.warn("telegram voice transcription paused until the provider quota resets", {
+			day: marker.day,
+			class: failure.class,
+			reason: failure.reason,
+		});
+		try {
+			this.state?.patch({ transcriptionQuota: marker });
 		} catch (err) {
-			// The byte cap also fires while streaming, after the update's own size check.
-			if (err instanceof TelegramFileTooLargeError) return { status: "too_large" };
-			const reason = transcriptionFailureReason(err);
-			ctx.log.warn("telegram voice transcription failed", { reason });
-			return { status: "failed", reason };
+			ctx.log.warn("telegram voice transcription quota marker could not be persisted", { error: message(err) });
+		}
+	}
+
+	/** Drop a quota marker left by an earlier day or by older transcription settings. */
+	private resetStaleTranscriptionQuota(ctx: ModuleContext): void {
+		const marker = this.state?.load().transcriptionQuota;
+		if (!marker) return;
+		if (marker.day === this.transcriptionQuotaDay() && marker.signature === this.transcriptionQuotaSignature(this.config.transcription)) return;
+		try {
+			this.state?.patch({ transcriptionQuota: undefined });
+			ctx.log.debug("telegram voice transcription quota marker reset", { day: marker.day });
+		} catch {
+			// Best effort: the marker is re-read on the next voice note anyway.
 		}
 	}
 
@@ -1578,6 +1770,8 @@ function voiceAnnotation(result: VoiceTranscriptionResult, config: TelegramTrans
 			return `voice transcription unavailable: set ${config.apiKeyEnv} in the host environment`;
 		case "too_large":
 			return `voice transcription skipped: file exceeds the ${mibLabel(config.maxBytes)} limit`;
+		case "quota_exhausted":
+			return "voice transcription unavailable: provider daily quota exhausted (skipped until the quota resets)";
 		case "failed":
 			return `voice transcription unavailable: ${result.reason}`;
 	}
@@ -1585,21 +1779,6 @@ function voiceAnnotation(result: VoiceTranscriptionResult, config: TelegramTrans
 
 function mibLabel(bytes: number): string {
 	return bytes > 0 && bytes % (1024 * 1024) === 0 ? `${bytes / (1024 * 1024)} MiB` : `${bytes} bytes`;
-}
-
-/** Map a failure to a short reason that never carries the key, the URL, or a provider body. */
-function transcriptionFailureReason(err: unknown): string {
-	if (err instanceof GroqTranscriptionError) {
-		if (err.status !== undefined) return `Groq returned HTTP ${err.status}`;
-		if (err.code === "timeout") return "Groq request timed out";
-		if (err.code === "invalid_response") return "Groq returned an unreadable response";
-		return "Groq request failed";
-	}
-	if (err instanceof TelegramApiError) {
-		return err.errorCode !== undefined ? `Telegram returned HTTP/API ${err.errorCode}` : "Telegram file download failed";
-	}
-	if (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError")) return "request timed out";
-	return "request failed";
 }
 
 export type { TelegramState };

@@ -27,13 +27,14 @@ import { ModuleHost } from "../events/host.js";
 import { describeModules, loadModules } from "../events/loader.js";
 import type { AliveModule, ModuleContext } from "../events/api.js";
 import { Logger } from "../log.js";
-import { EventStore } from "../store/events.js";
+import { EventStore, type AliveEvent } from "../store/events.js";
 import { HistoryStore } from "../store/history.js";
 import { Outbox, type OutgoingMessage } from "../store/outbox.js";
 import type { ChatTransport } from "../transports/types.js";
 import { GrafanaModule } from "../modules/grafana/module.js";
 import { TelegramApi, TelegramApiError, TelegramFileTooLargeError } from "../modules/telegram/client.js";
 import { resolveToken, TelegramModule } from "../modules/telegram/module.js";
+import { TelegramStateStore } from "../modules/telegram/state.js";
 import { escapeHtml, isParseModeError, splitMessage } from "../modules/telegram/text.js";
 import { formatThread, isTelegramTarget, parseThread, resolveChatTarget, resolveThreadRef } from "../modules/telegram/threads.js";
 import { normalizeUpdate } from "../modules/telegram/update.js";
@@ -43,7 +44,9 @@ import {
 	GROQ_TRANSCRIPTION_MODEL,
 	GroqTranscriptionError,
 	TELEGRAM_VOICE_MAX_BYTES,
+	classifyTranscriptionFailure,
 	transcribeWithGroq,
+	type TranscriptionFailure,
 } from "../modules/telegram/voice-transcription.js";
 import {
 	extractPdfText,
@@ -712,6 +715,67 @@ section("Groq Whisper transcription client");
 		configuredLimitError = caught;
 	}
 	check("the byte ceiling is configurable", configuredLimitError instanceof GroqTranscriptionError && configuredLimitError.code === "too_large");
+
+	// Failure classification decides the retry policy: only transient errors may be retried.
+	const failureFor = async (fetchImpl: typeof fetch): Promise<TranscriptionFailure | undefined> => {
+		try {
+			await transcribeWithGroq({ apiKey: "test-groq-key", audio: Uint8Array.from([1]), fetchImpl });
+			return undefined;
+		} catch (caught) {
+			return classifyTranscriptionFailure(caught);
+		}
+	};
+	const failingFetch = (response: () => Response) => (async () => response()) as unknown as typeof fetch;
+
+	const dailyQuotaFailure = await failureFor(
+		failingFetch(() =>
+			jsonResponse(
+				{
+					error: {
+						message: "Rate limit reached for whisper-large-v3-turbo on requests per day (RPD): Limit 2000, Used 2000, Requested 1.",
+						type: "requests",
+						code: "rate_limit_exceeded",
+					},
+				},
+				429,
+			),
+		),
+	);
+	check(
+		"a daily-quota 429 is classified as exhausted quota and never retried",
+		dailyQuotaFailure?.class === "daily_quota" && dailyQuotaFailure.dailyQuota === true && dailyQuotaFailure.retryable === false,
+		dailyQuotaFailure,
+	);
+	check("the classified reason never repeats the provider body", JSON.stringify(dailyQuotaFailure).includes("Rate limit reached") === false, dailyQuotaFailure);
+
+	const insufficientQuotaFailure = await failureFor(
+		failingFetch(() => jsonResponse({ error: { code: "insufficient_quota", message: "You exceeded your current quota" } }, 429)),
+	);
+	check("insufficient_quota is a quota stop, not a transient limit", insufficientQuotaFailure?.dailyQuota === true && insufficientQuotaFailure.retryable === false, insufficientQuotaFailure);
+
+	const shortRateLimit = await failureFor(failingFetch(() => new Response("slow down", { status: 429, headers: { "retry-after": "2" } })));
+	check(
+		"a 429 with a short retry-after is transient and carries the wait",
+		shortRateLimit?.class === "rate_limit" && shortRateLimit.retryable === true && shortRateLimit.retryAfterMs === 2000,
+		shortRateLimit,
+	);
+	const longRateLimit = await failureFor(failingFetch(() => new Response("slow down", { status: 429, headers: { "retry-after": "3600" } })));
+	check("a 429 with a long retry-after is not worth another attempt", longRateLimit?.retryable === false, longRateLimit);
+
+	const serverFailure = await failureFor(failingFetch(() => new Response("boom", { status: 503 })));
+	check("a 5xx is transient", serverFailure?.class === "provider_unavailable" && serverFailure.retryable === true, serverFailure);
+	const authFailure = await failureFor(failingFetch(() => new Response("nope", { status: 403 })));
+	check("a 403 is permanent", authFailure?.class === "auth" && authFailure.retryable === false, authFailure);
+	const formatFailure = await failureFor(failingFetch(() => new Response("bad audio", { status: 415 })));
+	check("an unsupported format is permanent", formatFailure?.class === "unsupported" && formatFailure.retryable === false, formatFailure);
+	const resetFailure = await failureFor((async () => {
+		throw new TypeError("fetch failed");
+	}) as unknown as typeof fetch);
+	check("a connection failure is transient", resetFailure?.class === "network" && resetFailure.retryable === true, resetFailure);
+	const timeoutFailureClass = classifyTranscriptionFailure(Object.assign(new Error("aborted"), { name: "TimeoutError" }));
+	check("a timed-out request is transient", timeoutFailureClass.class === "timeout" && timeoutFailureClass.retryable === true, timeoutFailureClass);
+	const abortedFailure = classifyTranscriptionFailure(Object.assign(new Error("aborted"), { name: "AbortError" }), { aborted: true });
+	check("a shutdown abort is never retried or reported as a provider fault", abortedFailure.class === "aborted" && abortedFailure.retryable === false, abortedFailure);
 }
 
 // ---------------------------------------------------------------------------
@@ -981,6 +1045,8 @@ section("telegram module end-to-end against a fake Bot API");
 					historyLimitPerThread: 0,
 					maxMessageChars: 4096,
 					transcription: { ...DEFAULT_CONFIG.modules.telegram.transcription },
+					transcriptionRetries: 0,
+					transcriptionRetryDelayMs: DEFAULT_CONFIG.modules.telegram.transcriptionRetryDelayMs,
 				},
 				grafana: { enabled: false, host: "127.0.0.1", port: 0, path: "/grafana", token: "", firingPriority: "high", resolvedPriority: "low" },
 				external: [],
@@ -1212,6 +1278,384 @@ section("telegram module end-to-end against a fake Bot API");
 	await api.sendLongMessage({ chat_id: 42, text: `${"x".repeat(2500)}\n\n${"y".repeat(2500)}` });
 	const callsAfter = calls.filter((call) => call.method === "sendMessage").length;
 	check("sendLongMessage splits and sends every part", callsAfter - callsBefore === 2, callsAfter - callsBefore);
+}
+
+// ---------------------------------------------------------------------------
+section("telegram voice transcription: bounded retries, one line, quota stop (#117)");
+{
+	interface VoiceSpec {
+		fileId: string;
+		/** First byte of the downloaded audio: the fake provider switches on it. */
+		marker: number;
+		size?: number;
+	}
+	/** One fake Groq answer: `attempt` is per-marker, so a scenario can fail once and then succeed. */
+	type ProviderReply = (marker: number, attempt: number) => Response | Promise<Response>;
+	interface VoiceHarness {
+		config: ReturnType<typeof loadConfig>;
+		store: EventStore;
+		telegram: TelegramModule;
+		state: TelegramStateStore;
+		queue(updates: TelegramUpdate[]): void;
+		waitForEvent(messageId: string, timeoutMs?: number): Promise<AliveEvent | undefined>;
+		logs(): Array<{ level: string; msg: string; data?: Record<string, unknown> }>;
+		groqAttempts(marker: number): number;
+		providerCalls(): number;
+		getFileCalls(): number;
+		settle(ms?: number): Promise<void>;
+		close(): Promise<void>;
+	}
+
+	const GROQ_KEY = "test-groq-key";
+	let harness: VoiceHarness | undefined;
+	const previousGroqKey = process.env.GROQ_API_KEY;
+	process.env.GROQ_API_KEY = GROQ_KEY;
+
+	const voicePath = (spec: VoiceSpec) => `voice-${spec.fileId}.oga`;
+	const voiceUpdate = (updateId: number, messageId: number, fileId: string, size = 3): TelegramUpdate => ({
+		update_id: updateId,
+		message: {
+			message_id: messageId,
+			date: 1_700_000_000 + updateId,
+			chat: { id: 42, type: "private", first_name: "Alice", username: "alice" },
+			from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
+			voice: { file_id: fileId, file_unique_id: `${fileId}-unique`, file_size: size, duration: 2, mime_type: "audio/ogg" },
+		},
+	});
+
+	const createHarness = async (
+		label: string,
+		options: { voices: VoiceSpec[]; provider: ProviderReply; retries: number; retryDelayMs?: number },
+	): Promise<VoiceHarness> => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), `alive-voice-${label}-`));
+		const logFile = path.join(root, "voice.jsonl");
+		const log = new Logger({ console: false, level: "debug", file: logFile, scope: `voice-${label}` });
+		const store = EventStore.open(root);
+		const history = HistoryStore.open(root);
+		const outbox = new Outbox(root);
+		const batches: TelegramUpdate[][] = [];
+		const attempts = new Map<number, number>();
+		const files = new Map(options.voices.map((spec) => [spec.fileId, spec]));
+		let getFileCalls = 0;
+		let providerCalls = 0;
+
+		const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+			const url = String(input);
+			if (url === GROQ_TRANSCRIPTION_ENDPOINT) {
+				const file = init?.body instanceof FormData ? init.body.get("file") : undefined;
+				const bytes = file instanceof Blob ? new Uint8Array(await file.arrayBuffer()) : new Uint8Array();
+				const marker = bytes[0] ?? 0;
+				const attempt = attempts.get(marker) ?? 0;
+				attempts.set(marker, attempt + 1);
+				providerCalls += 1;
+				return options.provider(marker, attempt);
+			}
+			if (url.includes("/file/bot")) {
+				const name = url.slice(url.lastIndexOf("/") + 1);
+				const spec = [...files.values()].find((candidate) => voicePath(candidate) === name);
+				return new Response(Uint8Array.from([spec?.marker ?? 0, 1, 2]), { status: 200, headers: { "content-type": "audio/ogg" } });
+			}
+			const method = url.slice(url.lastIndexOf("/") + 1);
+			if (method === "getMe") return jsonResponse({ ok: true, result: { id: 999, is_bot: true, first_name: "Alive", username: "alive_bot" } });
+			if (method === "deleteWebhook") return jsonResponse({ ok: true, result: true });
+			if (method === "getFile") {
+				getFileCalls += 1;
+				const fileId = String((JSON.parse(String(init?.body ?? "{}")) as { file_id?: string }).file_id ?? "");
+				const spec = files.get(fileId);
+				if (!spec) return jsonResponse({ ok: false, error_code: 400, description: "Bad Request: invalid file_id" }, 400);
+				return jsonResponse({
+					ok: true,
+					result: { file_id: spec.fileId, file_unique_id: `${spec.fileId}-unique`, file_path: voicePath(spec), file_size: spec.size ?? 3 },
+				});
+			}
+			if (method === "getUpdates") {
+				const batch = batches.shift();
+				// Avoid a hot poll loop in the fake API; the real one long-polls.
+				await new Promise((resolve) => setTimeout(resolve, batch ? 0 : 20));
+				return jsonResponse({ ok: true, result: batch ?? [] });
+			}
+			if (method === "sendMessage" || method === "sendChatAction") return jsonResponse({ ok: true, result: true });
+			return jsonResponse({ ok: true, result: true });
+		}) as unknown as typeof fetch;
+
+		const config = loadConfig({
+			cwd: root,
+			overrides: {
+				chat: { console: false, http: { enabled: false, host: "127.0.0.1", port: 0, token: "" } },
+				modules: {
+					telegram: {
+						enabled: true,
+						token: "test-token",
+						tokenEnv: "ALIVE_TEST_TELEGRAM_TOKEN_UNSET",
+						managedBotTtlMs: DEFAULT_CONFIG.modules.telegram.managedBotTtlMs,
+						apiBase: "https://api.telegram.org",
+						allowedChatIds: [],
+						allowedUserIds: ["7"],
+						allowedBotIds: [],
+						requireMentionInGroups: false,
+						pollTimeoutSec: 0,
+						allowedUpdates: ["message"],
+						parseMode: "",
+						linkPreview: true,
+						allowUrlButtonsInGroups: false,
+						typingIndicator: false,
+						ackReaction: "",
+						ingestEdits: true,
+						editDebounceMs: 3000,
+						editExpectsReply: false,
+						historyLimitPerThread: 0,
+						maxMessageChars: 4096,
+						transcription: { ...DEFAULT_CONFIG.modules.telegram.transcription },
+						transcriptionRetries: options.retries,
+						transcriptionRetryDelayMs: options.retryDelayMs ?? 10,
+					},
+					grafana: { enabled: false, host: "127.0.0.1", port: 0, path: "/grafana", token: "", firingPriority: "high", resolvedPriority: "low" },
+					external: [],
+				},
+			},
+		});
+
+		const telegram = new TelegramModule(config.config.modules.telegram);
+		const state = new TelegramStateStore(path.join(config.paths.modulesDir, "telegram"));
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchImpl;
+		const host = new ModuleHost({
+			config,
+			log,
+			transports: [],
+			modules: [telegram],
+			ingest: (event) => store.append(event),
+			outbox: (limit) => outbox.list(limit),
+			history,
+			runtimeStatus: () => ({}),
+		});
+		await host.init();
+		await new Promise((resolve) => setTimeout(resolve, 40));
+
+		return {
+			config,
+			store,
+			telegram,
+			state,
+			queue: (updates) => {
+				batches.push(updates);
+			},
+			waitForEvent: async (messageId, timeoutMs = 5_000) => {
+				const deadline = Date.now() + timeoutMs;
+				while (Date.now() < deadline) {
+					const event = store.peekPending(50).find((candidate) => (candidate.payload as { messageId?: string })?.messageId === messageId);
+					if (event) return event;
+					await new Promise((resolve) => setTimeout(resolve, 10));
+				}
+				return undefined;
+			},
+			logs: () => readJsonl<{ level: string; msg: string; data?: Record<string, unknown> }>(logFile),
+			groqAttempts: (marker) => attempts.get(marker) ?? 0,
+			providerCalls: () => providerCalls,
+			getFileCalls: () => getFileCalls,
+			settle: (ms = 120) => new Promise((resolve) => setTimeout(resolve, ms)),
+			close: async () => {
+				await host.stop();
+				globalThis.fetch = realFetch;
+			},
+		};
+	};
+
+	const always = (reply: () => Response): ProviderReply => () => reply();
+	const voiceEvents = (current: VoiceHarness) =>
+		current.store.peekPending(50).filter((event) => (event.payload as { transcription?: unknown })?.transcription !== undefined);
+	const transcriptionLogs = (current: VoiceHarness) => current.logs().filter((record) => record.msg.startsWith("telegram voice transcription"));
+
+	try {
+		// 1. Transient provider error then success: retried once, silent except debug.
+		harness = await createHarness("flaky", {
+			voices: [{ fileId: "voice-flaky", marker: 2 }],
+			retries: 2,
+			retryDelayMs: 10,
+			provider: (marker, attempt) => {
+				if (marker === 2 && attempt === 0) return new Response("upstream exploded", { status: 503 });
+				return jsonResponse({ text: "recovered transcript" });
+			},
+		});
+		harness.queue([voiceUpdate(300, 301, "voice-flaky")]);
+		const flakyEvent = await harness.waitForEvent("301");
+		check("a transient provider error is retried and the voice is transcribed", flakyEvent?.text.includes("recovered transcript") === true, flakyEvent?.text);
+		check(
+			"the recovered message records a transcribed payload",
+			(flakyEvent?.payload as { transcription?: { status?: string } })?.transcription?.status === "transcribed",
+			flakyEvent?.payload,
+		);
+		check("exactly two provider attempts were made", harness.groqAttempts(2) === 2, harness.groqAttempts(2));
+		await harness.settle();
+		const flakyLogs = transcriptionLogs(harness);
+		check(
+			"the failed attempt is logged once at debug level",
+			flakyLogs.filter((record) => record.level === "debug" && record.msg === "telegram voice transcription attempt failed").length === 1,
+			flakyLogs,
+		);
+		check("a recovered transcription has no failure summary", flakyLogs.filter((record) => record.level === "warn").length === 0, flakyLogs);
+		check("the log never carries the provider key", harness.logs().every((record) => !JSON.stringify(record).includes(GROQ_KEY)));
+		check(
+			"module status exposes the retry policy",
+			(harness.telegram.status().transcription as { retries?: number })?.retries === 2,
+			harness.telegram.status().transcription,
+		);
+		await harness.close();
+		harness = undefined;
+
+		// 2. Always-failing transient: bounded attempts, one summary line, message delivered.
+		harness = await createHarness("down", {
+			voices: [{ fileId: "voice-down", marker: 3 }],
+			retries: 1,
+			retryDelayMs: 10,
+			provider: always(() => new Response("provider is on fire", { status: 503 })),
+		});
+		harness.queue([voiceUpdate(310, 311, "voice-down")]);
+		const downEvent = await harness.waitForEvent("311");
+		await harness.settle();
+		const downOfficialAttempts = harness.groqAttempts(3);
+		await harness.settle(150);
+		check("a permanently failing transcription stops after the configured attempts", downOfficialAttempts === 2, downOfficialAttempts);
+		check("no retry happens after the event was delivered", harness.groqAttempts(3) === 2, harness.groqAttempts(3));
+		check("the message is still delivered with an unavailable note", downEvent !== undefined && downEvent.text.includes("voice transcription unavailable: Groq returned HTTP 503"), downEvent?.text);
+		check(
+			"the failed payload records the failure status",
+			(downEvent?.payload as { transcription?: { status?: string } })?.transcription?.status === "failed",
+			downEvent?.payload,
+		);
+		const downAttachments = (downEvent?.payload as { attachments?: Array<{ kind?: string; fileId?: string }> })?.attachments;
+		check("the voice attachment stays intact on the event", downAttachments?.[0]?.kind === "voice" && downAttachments?.[0]?.fileId === "voice-down", downAttachments);
+		const downSummary = transcriptionLogs(harness).filter((record) => record.level === "warn");
+		check("a failed transcription produces exactly one summary line", downSummary.length === 1, downSummary);
+		check("the summary names the attempts and the final failure class", downSummary[0]?.data?.attempts === 2 && downSummary[0]?.data?.class === "provider_unavailable", downSummary[0]);
+		check("no provider body reaches the log", harness.logs().every((record) => !JSON.stringify(record).includes("provider is on fire")));
+		await harness.close();
+		harness = undefined;
+
+		// 3. Auth and unsupported errors: one attempt, no retry, one line each.
+		harness = await createHarness("permanent", {
+			voices: [
+				{ fileId: "voice-401", marker: 4 },
+				{ fileId: "voice-403", marker: 5 },
+				{ fileId: "voice-format", marker: 7 },
+			],
+			retries: 2,
+			retryDelayMs: 10,
+			provider: (marker) => {
+				if (marker === 4) return new Response("invalid key", { status: 401 });
+				if (marker === 5) return new Response("forbidden", { status: 403 });
+				return jsonResponse({ error: { message: "Invalid file format", type: "invalid_request_error" } }, 400);
+			},
+		});
+		harness.queue([voiceUpdate(320, 321, "voice-401"), voiceUpdate(321, 322, "voice-403"), voiceUpdate(322, 323, "voice-format")]);
+		const unauthorized = await harness.waitForEvent("321");
+		const forbidden = await harness.waitForEvent("322");
+		const unsupported = await harness.waitForEvent("323");
+		await harness.settle(150);
+		check("a 401 is not retried", harness.groqAttempts(4) === 1, harness.groqAttempts(4));
+		check("a 403 is not retried", harness.groqAttempts(5) === 1, harness.groqAttempts(5));
+		check("an unsupported format is not retried", harness.groqAttempts(7) === 1, harness.groqAttempts(7));
+		check("the 401 event is delivered with the unavailable note", unauthorized?.text.includes("voice transcription unavailable: Groq returned HTTP 401") === true, unauthorized?.text);
+		check("the 403 event is delivered with the unavailable note", forbidden?.text.includes("voice transcription unavailable: Groq returned HTTP 403") === true, forbidden?.text);
+		check("the unsupported-format event keeps the message", unsupported?.text.includes("voice transcription unavailable: Groq returned HTTP 400") === true, unsupported?.text);
+		const permanentWarnings = transcriptionLogs(harness).filter((record) => record.level === "warn");
+		check("each permanent failure produces exactly one summary line", permanentWarnings.length === 3, permanentWarnings);
+		check(
+			"permanent failures are summarised with their reason class",
+			permanentWarnings.every((record) => record.data?.attempts === 1),
+			permanentWarnings,
+		);
+		await harness.close();
+		harness = undefined;
+
+		// 4. Daily quota: one attempt, a persisted marker, later messages skip the API until the day changes.
+		harness = await createHarness("quota", {
+			voices: [
+				{ fileId: "voice-quota", marker: 6 },
+				{ fileId: "voice-ok", marker: 1 },
+			],
+			retries: 2,
+			retryDelayMs: 10,
+			provider: (marker) => {
+				if (marker === 6) {
+					return jsonResponse(
+						{
+							error: {
+								message:
+									"Rate limit reached for whisper-large-v3-turbo on requests per day (RPD): Limit 2000, Used 2000, Requested 1. Please try again in 2h0m.",
+								type: "requests",
+								code: "rate_limit_exceeded",
+							},
+						},
+						429,
+					);
+				}
+				return jsonResponse({ text: "quota is back" });
+			},
+		});
+		harness.queue([voiceUpdate(330, 331, "voice-quota"), voiceUpdate(331, 332, "voice-ok")]);
+		const quotaEvent = await harness.waitForEvent("331");
+		const skippedEvent = await harness.waitForEvent("332");
+		await harness.settle(150);
+		check("a daily-quota error is not retried", harness.groqAttempts(6) === 1, harness.groqAttempts(6));
+		check("the quota-affected message is still delivered", quotaEvent !== undefined && quotaEvent.text.includes("provider daily quota exhausted") === true, quotaEvent?.text);
+		check(
+			"the quota-affected payload records the quota stop",
+			(quotaEvent?.payload as { transcription?: { status?: string } })?.transcription?.status === "quota_exhausted",
+			quotaEvent?.payload,
+		);
+		check("later voice notes skip the provider entirely", harness.providerCalls() === 1, harness.providerCalls());
+		check("the skipped message is still delivered with a note", skippedEvent?.text.includes("provider daily quota exhausted") === true, skippedEvent?.text);
+		const skippedAttachments = (skippedEvent?.payload as { attachments?: Array<{ kind?: string; fileId?: string }> })?.attachments;
+		check("the skipped message keeps its voice attachment", skippedAttachments?.[0]?.kind === "voice" && skippedAttachments?.[0]?.fileId === "voice-ok", skippedAttachments);
+		const quotaWarnings = transcriptionLogs(harness).filter((record) => record.level === "warn");
+		check("the quota stop is logged loudly exactly once", quotaWarnings.filter((record) => record.msg.includes("daily") || String(record.data?.class) === "daily_quota").length === 1, quotaWarnings);
+		const quotaMarker = harness.state.load().transcriptionQuota;
+		check(
+			"the quota marker is persisted in the module state",
+			typeof quotaMarker?.day === "string" && quotaMarker.day === new Date().toISOString().slice(0, 10) && typeof quotaMarker.signature === "string",
+			quotaMarker,
+		);
+		check("module status reports the quota stop", (harness.telegram.status().transcription as { quotaExhausted?: boolean })?.quotaExhausted === true);
+
+		// A new day resets the marker: the next voice note is transcribed again.
+		harness.state.patch({ transcriptionQuota: { ...quotaMarker!, day: "2000-01-01" } });
+		harness.queue([voiceUpdate(332, 333, "voice-ok")]);
+		const resetEvent = await harness.waitForEvent("333");
+		check("a stale quota marker no longer blocks transcription", resetEvent?.text.includes("quota is back") === true, resetEvent?.text);
+		check("the provider is called again after the marker resets", harness.providerCalls() === 2, harness.providerCalls());
+		check("the stale marker is cleared from the module state", harness.state.load().transcriptionQuota === undefined, harness.state.load().transcriptionQuota);
+		check("no extra warning is logged for the reset", transcriptionLogs(harness).filter((record) => record.level === "warn").length === 1);
+		await harness.close();
+		harness = undefined;
+
+		// 5. Oversize is unchanged: no download, no provider call, the usual note.
+		harness = await createHarness("oversize", {
+			voices: [{ fileId: "voice-huge", marker: 1, size: TELEGRAM_VOICE_MAX_BYTES + 1 }],
+			retries: 2,
+			retryDelayMs: 10,
+			provider: always(() => jsonResponse({ text: "must not be called" })),
+		});
+		harness.queue([voiceUpdate(340, 341, "voice-huge", TELEGRAM_VOICE_MAX_BYTES + 1)]);
+		const hugeEvent = await harness.waitForEvent("341");
+		await harness.settle();
+		check(
+			"oversized voice notes are skipped without a provider call",
+			(hugeEvent?.payload as { transcription?: { status?: string } })?.transcription?.status === "too_large" &&
+				hugeEvent?.text.includes("MiB") === true &&
+				harness.providerCalls() === 0 &&
+				harness.getFileCalls() === 0,
+			{ text: hugeEvent?.text, providerCalls: harness.providerCalls(), getFileCalls: harness.getFileCalls() },
+		);
+		check("a size skip is not reported as a transcription failure", transcriptionLogs(harness).length === 0, transcriptionLogs(harness));
+		check("voice events are still the only ones with transcription payloads", voiceEvents(harness).length === 1, voiceEvents(harness).map((event) => event.id));
+		await harness.close();
+		harness = undefined;
+	} finally {
+		if (harness) await harness.close().catch(() => undefined);
+		if (previousGroqKey === undefined) delete process.env.GROQ_API_KEY;
+		else process.env.GROQ_API_KEY = previousGroqKey;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1658,6 +2102,8 @@ section("telegram outbound attachments: send_message delivers a workspace file")
 					historyLimitPerThread: 0,
 					maxMessageChars: 4096,
 					transcription: { ...DEFAULT_CONFIG.modules.telegram.transcription },
+					transcriptionRetries: 0,
+					transcriptionRetryDelayMs: DEFAULT_CONFIG.modules.telegram.transcriptionRetryDelayMs,
 				},
 				grafana: { enabled: false, host: "127.0.0.1", port: 0, path: "/grafana", token: "", firingPriority: "high", resolvedPriority: "low" },
 				external: [],
@@ -2565,6 +3011,8 @@ section("telegram module: outage is reported once, not spammed");
 					historyLimitPerThread: 0,
 					maxMessageChars: 4096,
 					transcription: { ...DEFAULT_CONFIG.modules.telegram.transcription },
+					transcriptionRetries: 0,
+					transcriptionRetryDelayMs: DEFAULT_CONFIG.modules.telegram.transcriptionRetryDelayMs,
 				},
 				grafana: { enabled: false, host: "127.0.0.1", port: 0, path: "/grafana", token: "", firingPriority: "high", resolvedPriority: "low" },
 			external: [],
@@ -3030,6 +3478,67 @@ section("modules config and loader");
 			transcriptionOverride.config.modules.telegram.transcription.model === GROQ_TRANSCRIPTION_MODEL,
 		transcriptionOverride.config.modules.telegram.transcription,
 	);
+	check(
+		"transcription retries default to two extra attempts and a 1.5 s base delay",
+		config.config.modules.telegram.transcriptionRetries === 2 &&
+			config.config.modules.telegram.transcriptionRetryDelayMs === 1500 &&
+			DEFAULT_CONFIG.modules.telegram.transcriptionRetries === 2 &&
+			DEFAULT_CONFIG.modules.telegram.transcriptionRetryDelayMs === 1500,
+		{
+			retries: config.config.modules.telegram.transcriptionRetries,
+			delayMs: config.config.modules.telegram.transcriptionRetryDelayMs,
+		},
+	);
+	const retryOverride = loadConfig({
+		cwd: configRoot,
+		overrides: { modules: { telegram: { transcriptionRetries: 1, transcriptionRetryDelayMs: 250 } } } as never,
+	});
+	check(
+		"transcription retry settings merge field by field",
+		retryOverride.config.modules.telegram.transcriptionRetries === 1 &&
+			retryOverride.config.modules.telegram.transcriptionRetryDelayMs === 250 &&
+			retryOverride.config.modules.telegram.transcription.model === GROQ_TRANSCRIPTION_MODEL,
+		retryOverride.config.modules.telegram,
+	);
+	/** Load a throwaway config with a `modules.telegram` patch; returns the validation error or "". */
+	const telegramError = (patch: Record<string, unknown>): string => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-config-"));
+		try {
+			fs.writeFileSync(path.join(dir, "alive.config.json"), JSON.stringify({ modules: { telegram: patch } }), "utf8");
+			loadConfig({ cwd: dir });
+			return "";
+		} catch (error) {
+			return error instanceof Error ? error.message : String(error);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	};
+	for (const valid of [0, 1, 2]) {
+		check(`transcriptionRetries ${valid} is accepted`, telegramError({ transcriptionRetries: valid }) === "", telegramError({ transcriptionRetries: valid }));
+	}
+	for (const invalid of [-1, 3, 1.5, "2"]) {
+		check(
+			`transcriptionRetries ${JSON.stringify(invalid)} is rejected`,
+			telegramError({ transcriptionRetries: invalid }) ===
+				`modules.telegram.transcriptionRetries must be an integer between 0 and 2, got "${String(invalid)}"`,
+			telegramError({ transcriptionRetries: invalid }),
+		);
+	}
+	for (const valid of [10, 1500, 60_000]) {
+		check(
+			`transcriptionRetryDelayMs ${valid} is accepted`,
+			telegramError({ transcriptionRetryDelayMs: valid }) === "",
+			telegramError({ transcriptionRetryDelayMs: valid }),
+		);
+	}
+	for (const invalid of [9, 60_001, 1.5, "1500"]) {
+		check(
+			`transcriptionRetryDelayMs ${JSON.stringify(invalid)} is rejected`,
+			telegramError({ transcriptionRetryDelayMs: invalid }) ===
+				`modules.telegram.transcriptionRetryDelayMs must be an integer between 10 and 60000 ms, got "${String(invalid)}"`,
+			telegramError({ transcriptionRetryDelayMs: invalid }),
+		);
+	}
 	check("grafana config merges with defaults", config.config.modules.grafana.host === "127.0.0.1" && config.config.modules.grafana.port === 5999, config.config.modules.grafana);
 	check("env token wins", resolveToken(config.config.modules.telegram, { MY_TG_TOKEN: "from-env" } as NodeJS.ProcessEnv) === "from-env");
 	check("config token is the fallback", resolveToken({ ...config.config.modules.telegram, token: "from-config" }, {} as NodeJS.ProcessEnv) === "from-config");

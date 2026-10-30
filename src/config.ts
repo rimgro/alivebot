@@ -297,7 +297,27 @@ export interface TelegramConfig {
 	maxMessageChars: number;
 	/** Voice-note transcription settings. */
 	transcription: TelegramTranscriptionConfig;
+	/**
+	 * Extra transcription attempts after a transient provider failure (timeout,
+	 * reset connection, 5xx, short 429). 0–2; the default 2 means at most three
+	 * attempts per voice note. Auth, quota, format and size errors are never retried.
+	 */
+	transcriptionRetries: number;
+	/** Base delay for the exponential backoff between transcription attempts, in milliseconds. */
+	transcriptionRetryDelayMs: number;
 }
+
+/**
+ * Retry policy for inbound voice transcription (#117).
+ *
+ * At most three attempts per voice note: the incident was an endless retry loop
+ * that burned an organisation's whole daily Groq quota on one recording.
+ */
+export const DEFAULT_TRANSCRIPTION_RETRIES = 2;
+export const MAX_TRANSCRIPTION_RETRIES = 2;
+export const DEFAULT_TRANSCRIPTION_RETRY_DELAY_MS = 1_500;
+export const MIN_TRANSCRIPTION_RETRY_DELAY_MS = 10;
+export const MAX_TRANSCRIPTION_RETRY_DELAY_MS = 60_000;
 
 /** Managed bots need the operator to confirm inside the Telegram client. */
 export const MANAGED_BOT_TTL_MIN_MS = 10 * 60_000;
@@ -321,6 +341,20 @@ export function validateTelegramConfig(value: TelegramConfig): TelegramConfig {
 	}
 	if (typeof value.allowUrlButtonsInGroups !== "boolean") {
 		throw new Error(`modules.telegram.allowUrlButtonsInGroups must be true or false, got "${String(value.allowUrlButtonsInGroups)}"`);
+	}
+	if (!Number.isSafeInteger(value.transcriptionRetries) || value.transcriptionRetries < 0 || value.transcriptionRetries > MAX_TRANSCRIPTION_RETRIES) {
+		throw new Error(
+			`modules.telegram.transcriptionRetries must be an integer between 0 and ${MAX_TRANSCRIPTION_RETRIES}, got "${String(value.transcriptionRetries)}"`,
+		);
+	}
+	if (
+		!Number.isSafeInteger(value.transcriptionRetryDelayMs) ||
+		value.transcriptionRetryDelayMs < MIN_TRANSCRIPTION_RETRY_DELAY_MS ||
+		value.transcriptionRetryDelayMs > MAX_TRANSCRIPTION_RETRY_DELAY_MS
+	) {
+		throw new Error(
+			`modules.telegram.transcriptionRetryDelayMs must be an integer between ${MIN_TRANSCRIPTION_RETRY_DELAY_MS} and ${MAX_TRANSCRIPTION_RETRY_DELAY_MS} ms, got "${String(value.transcriptionRetryDelayMs)}"`,
+		);
 	}
 	return value;
 }
@@ -621,6 +655,8 @@ export const DEFAULT_CONFIG: AliveConfig = {
 				maxBytes: TELEGRAM_VOICE_MAX_BYTES,
 				timeoutMs: GROQ_TRANSCRIPTION_TIMEOUT_MS,
 			},
+			transcriptionRetries: DEFAULT_TRANSCRIPTION_RETRIES,
+			transcriptionRetryDelayMs: DEFAULT_TRANSCRIPTION_RETRY_DELAY_MS,
 		},
 		grafana: {
 			enabled: false,
