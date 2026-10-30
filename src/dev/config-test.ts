@@ -135,7 +135,7 @@ section("existing identical env var: no duplicate line");
 }
 
 // ---------------------------------------------------------------------------
-section("existing different env var: keep it, warn, remove the config field");
+section("existing different env var: keep the config value, warn, touch nothing");
 {
 	const root = tempRoot("different");
 	const envName = "ALIVE_CONFIG_TEST_DIFFERENT_TOKEN";
@@ -152,8 +152,8 @@ section("existing different env var: keep it, warn, remove the config field");
 	check("one warning and no success line", lines.log.length === 0 && lines.warn.length === 1, lines);
 	check("warning names the variable", lines.warn[0]?.includes(envName) === true, lines.warn);
 	check("warning never prints either value", !lines.warn.join("\n").includes(existing) && !lines.warn.join("\n").includes(TELEGRAM_VALUE), lines.warn);
-	check("config token removed", !("token" in ((readConfig(root).modules as any).telegram as object)));
-	check("effective token is the existing env value", loaded.config.modules.telegram.token === existing);
+	check("config token is kept (never dropped because env differs)", ((readConfig(root).modules as any).telegram as { token?: string }).token === TELEGRAM_VALUE);
+	check("effective token is the config value", loaded.config.modules.telegram.token === TELEGRAM_VALUE);
 	fs.rmSync(root, { recursive: true, force: true });
 	cleanupEnv(envName);
 }
@@ -249,7 +249,7 @@ section("other module and integration secret fields follow the same path");
 }
 
 // ---------------------------------------------------------------------------
-section("process environment wins over the config value");
+section("process environment with a different value never overwrites the config secret");
 {
 	const root = tempRoot("envwins");
 	const envName = "ALIVE_CONFIG_TEST_ENV_WINS_TOKEN";
@@ -260,8 +260,8 @@ section("process environment wins over the config value");
 	});
 	const lines = capture();
 	const loaded = loadConfig({ cwd: root, secretLog: lines.logFn, secretWarn: lines.warnFn });
-	check("process env value wins", loaded.config.modules.telegram.token === existing);
-	check("config plaintext is still removed", !("token" in ((readConfig(root).modules as any).telegram as object)));
+	check("config value wins over a conflicting process env value", loaded.config.modules.telegram.token === TELEGRAM_VALUE);
+	check("config plaintext is kept on disk", ((readConfig(root).modules as any).telegram as { token?: string }).token === TELEGRAM_VALUE);
 	check("warning notes the different existing value", lines.warn.length === 1 && lines.warn[0]?.includes(envName) === true, lines);
 	check("no .env entry was needed", !fs.existsSync(path.join(root, ".env")) || envLineCount(path.join(root, ".env"), envName) === 0);
 	fs.rmSync(root, { recursive: true, force: true });

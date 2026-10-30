@@ -5,7 +5,10 @@ import { readJson } from "./util.js";
 import {
 	applySecretEnv,
 	collectSecretEnv,
+	defaultTelegramTokenEnv,
+	MASTER_TELEGRAM_TOKEN_ENV,
 	migrateConfigSecrets,
+	readEnvFileValues,
 } from "./config-secrets.js";
 import { DEFAULT_BROWSER_CONFIG, type BrowserConfig } from "./modules/browser/config.js";
 import {
@@ -21,11 +24,14 @@ export { DEFAULT_SECRETS_CONFIG, validateSecretsConfig, type SecretsConfig } fro
 export {
 	applySecretEnv,
 	collectSecretEnv,
+	defaultTelegramTokenEnv,
 	findSecretFields,
 	formatFieldPath,
 	formatSecretMigrationLine,
 	isSecretKey,
+	MASTER_TELEGRAM_TOKEN_ENV,
 	migrateConfigSecrets,
+	profileEnvSegment,
 	readEnvFileValues,
 	redactSecretFields,
 	stripSecretField,
@@ -33,6 +39,7 @@ export {
 	type SecretMigrationAction,
 	type SecretMigrationEntry,
 	type SecretMigrationReport,
+	type SecretNamingOptions,
 } from "./config-secrets.js";
 
 export interface LoopConfig {
@@ -438,7 +445,10 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		telegram: {
 			enabled: false,
 			token: "",
-			tokenEnv: "ALIVE_TELEGRAM_TOKEN",
+			// Root profile default. Managed profiles get their own variable derived from
+			// the agent id (`DEVELOPER_TELEGRAM_TOKEN`) so they can never read the
+			// master bot's token by accident (#108); see profileSecretDefaults().
+			tokenEnv: MASTER_TELEGRAM_TOKEN_ENV,
 			managedBotTtlMs: DEFAULT_MANAGED_BOT_TTL_MS,
 			apiBase: "https://api.telegram.org",
 			allowedChatIds: [],
@@ -548,19 +558,74 @@ export interface LoadConfigOptions {
 	secretWarn?: (line: string) => void;
 }
 
+export interface ProfileSecretDefaults {
+	/** Defaults to merge under a profile's config file. */
+	defaults: AliveConfig;
+	/** Managed profile id (agent id / config directory); undefined for the root profile. */
+	profile?: string;
+}
+
+/**
+ * Secret-variable defaults for one config file.
+ *
+ * A managed profile (its config declares `rootConfigPath`) gets its own bot token
+ * variable derived from the agent id / config directory, e.g. agent `developer`
+ * reads `DEVELOPER_TELEGRAM_TOKEN`. Only the root profile keeps the shared
+ * `ALIVE_TELEGRAM_TOKEN`, so exporting the master token can never move an agent
+ * onto the master bot (#108).
+ *
+ * An explicit `modules.telegram.tokenEnv` in the file always wins over this
+ * default. A variable that already exists in the profile's own `.env` is also
+ * kept: renaming it would break an already-applied per-agent workaround.
+ */
+export function profileSecretDefaults(configPath: string): ProfileSecretDefaults {
+	const resolved = path.resolve(configPath);
+	const directory = path.dirname(resolved);
+	const fileConfig = readJson<Partial<AliveConfig>>(resolved, {});
+	const localConfig = readJson<Partial<AliveConfig>>(path.join(directory, "alive.config.local.json"), {});
+	const mergedRaw = deepMerge(fileConfig as Record<string, unknown>, localConfig as Record<string, unknown>);
+	const rootConfigPath = typeof mergedRaw.rootConfigPath === "string" ? mergedRaw.rootConfigPath.trim() : "";
+	if (!rootConfigPath) return { defaults: DEFAULT_CONFIG };
+	const profile = path.basename(directory);
+	if (!profile) return { defaults: DEFAULT_CONFIG };
+	const envValues = readEnvFileValues(path.join(directory, ".env"));
+	const tokenEnv = envValues[MASTER_TELEGRAM_TOKEN_ENV] ? MASTER_TELEGRAM_TOKEN_ENV : defaultTelegramTokenEnv(profile);
+	return { defaults: defaultsWithTelegramTokenEnv(tokenEnv), profile };
+}
+
+function defaultsWithTelegramTokenEnv(tokenEnv: string): AliveConfig {
+	return {
+		...DEFAULT_CONFIG,
+		modules: {
+			...DEFAULT_CONFIG.modules,
+			telegram: { ...DEFAULT_CONFIG.modules.telegram, tokenEnv },
+		},
+	};
+}
+
 export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	const rootDir = path.resolve(options.cwd);
 	const configPath = options.configPath ? path.resolve(options.configPath) : path.join(rootDir, "alive.config.json");
+	const configDir = path.dirname(configPath);
 	// Machine-local, gitignored overrides (ports, non-secret settings).
-	const localConfigPath = path.join(path.dirname(configPath), "alive.config.local.json");
-	const envPath = path.join(path.dirname(configPath), ".env");
+	const localConfigPath = path.join(configDir, "alive.config.local.json");
+	// Lookup order for secrets, most specific first:
+	//   1. this config's own `.env` (next to alive.config.json)
+	//   2. the process environment (which index.ts fills from the root `.env`
+	//      after this file's `.env`)
+	//   3. the plaintext value still in the config file
+	const envPath = path.join(configDir, ".env");
+	// Defaults decide the secret variable names, so they are computed per profile
+	// before migration and used as the base of the merge below.
+	const { defaults, profile } = profileSecretDefaults(configPath);
 	if (options.migrateSecrets !== false) {
 		try {
 			migrateConfigSecrets({
 				configPaths: [configPath, localConfigPath],
 				envPath,
 				env: process.env,
-				defaults: DEFAULT_CONFIG,
+				defaults,
+				profile,
 				log: options.secretLog,
 				warn: options.secretWarn,
 			});
@@ -571,8 +636,10 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	}
 	const fileConfig = fs.existsSync(configPath) ? readJson<Partial<AliveConfig>>(configPath, {}) : {};
 	const localConfig = fs.existsSync(localConfigPath) ? readJson<Partial<AliveConfig>>(localConfigPath, {}) : {};
-	const merged = deepMerge(deepMerge(deepMerge(DEFAULT_CONFIG, fileConfig), localConfig), options.overrides);
-	// Env wins over the config value, and lets the file stop carrying it entirely.
+	const merged = deepMerge(deepMerge(deepMerge(defaults, fileConfig), localConfig), options.overrides);
+	// Env fills fields the file no longer carries; an explicit plaintext value the
+	// migration refused to move keeps winning, so a conflicting shared variable
+	// cannot capture the profile's token.
 	applySecretEnv(merged, collectSecretEnv(envPath, process.env));
 	migrateLoopConfig(merged.loop as unknown as Record<string, unknown>);
 	merged.sandbox = validateSandboxConfig(merged.sandbox);
