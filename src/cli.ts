@@ -4,6 +4,7 @@ import { configureAgentTelegram, createAgent, disableManagedAgent, enableManaged
 import type { AliveConfig, LoadedConfig } from "./config.js";
 import { DEFAULT_CONFIG, loadConfig, redactSecretFields, writeDefaultConfig, migrateConfigSecrets } from "./config.js";
 import { Logger } from "./log.js";
+import { createMaskContext, maskSecrets } from "./secrets.js";
 import { EventStore, type EventPriority } from "./store/events.js";
 import { ReminderStore } from "./store/reminders.js";
 import { PolicyStore, type NotifyMode } from "./store/policy.js";
@@ -1371,31 +1372,76 @@ function runningHint(config: LoadedConfig): string {
 }
 
 const DASHBOARD_USAGE =
-	"usage: alive dashboard [--port 7777] [--host 127.0.0.1] [--config CONFIG]\n" +
+	"usage: alive dashboard [--serve] [--tunnel] [--port 7777] [--host 127.0.0.1] [--config CONFIG]\n" +
+	"                       [--ttl-hours 12] [--set-password [PASSWORD]] [--revoke-sessions]\n" +
 	"\n" +
-	"  --port PORT     TCP port (default 7777)\n" +
-	"  --host HOST     127.0.0.1 or localhost; any other host is refused\n" +
-	"  --config FILE   profile config (default ./alive.config.json)\n" +
+	"  --serve             serve the dashboard (also the default with no action flag)\n" +
+	"  --tunnel            serve and expose the loopback dashboard through a temporary\n" +
+	"                      HTTPS quick tunnel (implies --serve; requires a password)\n" +
+	"  --port PORT         TCP port (default 7777)\n" +
+	"  --host HOST         127.0.0.1 or localhost; any other host is refused\n" +
+	"  --config FILE       profile config (default ./alive.config.json)\n" +
+	"  --ttl-hours HOURS   dashboard session lifetime (default 12)\n" +
+	"  --set-password [P]  set the dashboard password; without P a strong one is\n" +
+	"                      generated and printed exactly once\n" +
+	"  --revoke-sessions   invalidate every dashboard session\n" +
 	"\n" +
 	"Serves an HTML view of the agents' on-disk state: agents list, timeline,\n" +
 	"run details, prompts and memory. /agent/<id>/settings is the single write\n" +
 	"path (CSRF-protected form for config and prompt files, with backups).\n" +
-	"It binds to loopback only and never runs commands. Stop with Ctrl+C.\n";
+	"It binds to loopback only and never runs commands. Stop with Ctrl+C.\n" +
+	"The password verifier and hashed sessions live in <stateDir>/dashboard/auth.json.\n";
 
 async function dashboardCommand(cwd: string, flags: Record<string, string | boolean>): Promise<number> {
 	if (flagBool(flags, "help") || flagBool(flags, "h")) {
 		process.stdout.write(DASHBOARD_USAGE);
 		return 0;
 	}
-	const known = new Set(["port", "host", "config", "help", "h"]);
+	const known = new Set([
+		"port",
+		"host",
+		"config",
+		"serve",
+		"tunnel",
+		"ttl-hours",
+		"set-password",
+		"revoke-sessions",
+		"cloudflared",
+		"help",
+		"h",
+	]);
 	const unknown = Object.keys(flags).filter((key) => !known.has(key));
 	if (unknown.length > 0) {
 		throw new Error(`unknown flag${unknown.length === 1 ? "" : "s"}: --${unknown.join(", --")} (${DASHBOARD_USAGE.split("\n")[0]})`);
 	}
 	if (flags.port === true) throw new Error("--port requires a value (e.g. --port 7777)");
 	if (flags.host === true) throw new Error("--host requires a value (127.0.0.1 or localhost)");
+	if (flags["ttl-hours"] === true) throw new Error("--ttl-hours requires a value (e.g. --ttl-hours 12)");
+	if (flags.cloudflared === true) throw new Error("--cloudflared requires a path to the cloudflared executable");
+	const ttlHoursText = flagString(flags, "ttl-hours");
+	let ttlMs: number | undefined;
+	if (ttlHoursText !== undefined) {
+		const hours = Number(ttlHoursText);
+		if (!Number.isFinite(hours) || hours <= 0 || hours > 24 * 365) {
+			throw new Error(`--ttl-hours must be a positive number of hours (got "${ttlHoursText}")`);
+		}
+		ttlMs = Math.round(hours * 60 * 60 * 1000);
+	}
+
+	const setPasswordFlag = flags["set-password"];
+	const revokeSessions = flagBool(flags, "revoke-sessions");
+	const tunnelRequested = flagBool(flags, "tunnel");
+	const explicitServe = flagBool(flags, "serve") || tunnelRequested;
+	const actionOnly = setPasswordFlag !== undefined || revokeSessions;
+	const serveRequested = explicitServe || !actionOnly;
+	if (ttlMs !== undefined && !serveRequested) {
+		throw new Error("--ttl-hours only applies while serving (--serve or --tunnel)");
+	}
+
 	const { DEFAULT_DASHBOARD_HOST, DEFAULT_DASHBOARD_PORT, runDashboard, validateDashboardBind } =
 		await import("./dashboard/server.js");
+	const { hasDashboardPassword, revokeAllDashboardSessions, setDashboardPassword } =
+		await import("./dashboard/auth.js");
 	const host = flagString(flags, "host") ?? DEFAULT_DASHBOARD_HOST;
 	const portText = flagString(flags, "port");
 	const port = portText === undefined ? DEFAULT_DASHBOARD_PORT : Number(portText);
@@ -1403,11 +1449,44 @@ async function dashboardCommand(cwd: string, flags: Record<string, string | bool
 	// Never migrate config secrets here, that path writes .env: the dashboard's
 	// only write path is the explicit settings form.
 	const config = loadForCli(flags, { migrateSecrets: false });
+
+	const maskedWrite = (line: string): void => {
+		process.stdout.write(`${maskSecrets(line, config.config.secrets, process.env, createMaskContext())}\n`);
+	};
+
+	if (setPasswordFlag !== undefined) {
+		const supplied = typeof setPasswordFlag === "string" ? setPasswordFlag : undefined;
+		const result = await setDashboardPassword(config.paths.stateDir, supplied);
+		if (result.generated) {
+			// The one and only time the plaintext password is printed. It is not
+			// written to auth.json, the config, an HTML page or a log line.
+			process.stdout.write(`dashboard password (shown once): ${result.password}\n`);
+		} else {
+			maskedWrite("dashboard password updated");
+		}
+	}
+	if (revokeSessions) {
+		const removed = revokeAllDashboardSessions(config.paths.stateDir);
+		maskedWrite(`dashboard sessions revoked: ${removed}`);
+	}
+	if (!serveRequested) return 0;
+
+	const passwordProtected = tunnelRequested || hasDashboardPassword(config.paths.stateDir);
+	if (tunnelRequested && !hasDashboardPassword(config.paths.stateDir)) {
+		throw new Error("dashboard tunnel refused: no dashboard password is set; run `alive dashboard --set-password` first");
+	}
+
 	await runDashboard({
 		rootDir: config.paths.rootDir,
 		configPath: config.paths.configPath,
 		host: bind.host,
 		port: bind.port,
+		...(passwordProtected
+			? { auth: { stateDir: config.paths.stateDir, ...(ttlMs === undefined ? {} : { ttlMs }) } }
+			: {}),
+		...(tunnelRequested
+			? { tunnel: { enabled: true, ...(flagString(flags, "cloudflared") ? { cloudflared: flagString(flags, "cloudflared") } : {}) } }
+			: {}),
 	});
 	return 0;
 }
@@ -1481,8 +1560,10 @@ usage:
   alive browser host-status | host-stop | migrate-shared
                                               one private browser host for isolated agent connections
   alive thoughts [-n 20]                      the agent's private monologue
-  alive dashboard [--port 7777] [--host 127.0.0.1] [--config CONFIG]
-                                              read-only local dashboard: agents, timeline,
-                                              run details and prompts (loopback only)
+  alive dashboard [--serve] [--tunnel] [--port 7777] [--host 127.0.0.1]
+                  [--ttl-hours 12] [--set-password] [--revoke-sessions]
+                                              local dashboard: agents, timeline, run details,
+                                              prompts; --tunnel exposes it over temporary
+                                              password-protected HTTPS (--tunnel implies serve)
 `);
 }
