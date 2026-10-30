@@ -191,6 +191,7 @@ alive telegram whitelist remove 123456789
 | `alive status [--json]` | состояние рантайма, инбокса, политики, бюджета |
 | `alive heartbeat [--status] [--json]` | живость процесса: pid, `startedAt`, версия, возраст heartbeat; код 0 — свежий, 1 — нет/устарел |
 | `alive runs [-n 10]` | история run'ов (алиас: `wakes`) |
+| `alive usage [--days 14] [--agent <id>] [--json]` | куда ушли токены и деньги: итоги по дням, chat vs workers, топ-10 run'ов, расход провалов; только метаданные, без текста промптов и сообщений |
 | `alive policy [list\|add\|remove\|default\|reset]` | показать/править политику уведомлений |
 | `alive modules [--json]` | какие event-модули загружены и включены |
 | `alive history [--thread t] [--search s] [--all] [-n 30] [--json]` | история диалогов всех модулей |
@@ -202,6 +203,60 @@ alive telegram whitelist remove 123456789
 `say`/`emit`/`remind` пишут прямо в файлы состояния, поэтому работают и когда рантайм
 не запущен: события дождутся следующего старта. Если рантайм запущен — он подхватит их
 в течение ~`pollIntervalMs`; если агент в этот момент в `idle`, он проснётся сразу.
+
+### Расход: `alive usage`
+
+`alive usage [--days 14] [--agent <id>] [--json]` показывает, куда ушли токены и деньги,
+по уже записанной истории. По умолчанию — текущий профиль; `--agent main` или id
+managed-агента выбирает профиль (как в дашборде). `--days` считает сегодняшний день
+включительно.
+
+Что внутри:
+
+- **итоги по дням** (локальные дни по `finishedAt`): `cost`, input/output/cacheRead/cacheWrite,
+  `turns`, `runs`. Источник — `runs/runs.jsonl`; `usage.json` (счётчик рантайма) показывается
+  как источник и не перезаписывает записи run'ов;
+- **chat vs workers**: worker'ы пишут свой `workers/usage.jsonl` (`ts/cost/input/output`,
+  без turns и cache-токенов — отчёт так и пишет);
+- **разбивка по model/provider** — только если запись run'а реально несёт `model`/`provider`.
+  Сегодня `runs.jsonl` их не хранит (в `usage` только токены и стоимость), поэтому отчёт
+  честно пишет «not recorded» и показывает `models.current` — текущую модель из конфига и
+  `runtime.json` как настройку, а не исторический факт;
+- **топ-10 run'ов по стоимости**: индекс, день, cost, turns, длительность, outcome,
+  заголовок триггерного события и **имена** инструментов (из pi-сессий; аргументы и
+  результаты отбрасываются), либо явное «no session transcript»;
+- **cache hit share**: `cacheRead / (input + cacheRead)`, помечен как approximate —
+  провайдеры по-разному считают input и cache read;
+- **failed/aborted runs**: error/timeout/budget/abort со своим расходом, чтобы «сожжённые
+  токены без результата» были видны;
+- **partial**: если нет `usage.json`, запись run'а старого формата (без `usage`, cache-полей
+  или `durationMs`) или файл повреждён — отчёт всё равно печатает то, что есть, и
+  перечисляет пробелы в `partialReasons`.
+
+`--json` — стабильная машиночитаемая форма (`report: "alive-usage"`, `version: 1`):
+
+| поле | что означает |
+|---|---|
+| `window` | `{days, from, to, fromTs, toTs}` — окно включительно с сегодняшним днём |
+| `agent` | id/имя профиля, текущая модель, пути профиля |
+| `partial`, `partialReasons` | данные неполные и почему |
+| `totals` | суммы run'ов агента: `runs`, `turns`, `cost`, `durationMs`, `activeMs`, `idleMs`, `tokens.{input,output,cacheRead,cacheWrite,total}` |
+| `daily[]` | те же поля по локальным дням + `day`, `cacheHitShare` |
+| `split.chat` / `split.workers` | расход агента и worker'ов; `combinedCost` и доли |
+| `split.workers.tokens` | input/output/total; `cacheRead`/`cacheWrite`/`turns` = `null` |
+| `models.available`, `models.items[]` | разбивка по model/provider, только если запись её несёт; `coveredRuns`/`unattributedRuns` |
+| `models.current` | текущая модель из конфига и `runtime.json` (не история) |
+| `cache` | `hitShare`, `numerator`, `denominator`, `approximate: true` |
+| `topRuns[]` | до 10 самых дорогих: `id`, `index`, `day`, `finishedAt`, `stopReason`, `outcome`, `cost`, `turns`, `durationMs`, `activeMs`, `tokens`, `triggers[]` (kind/thread/title), `tools[]` (только имена), `toolsAvailable` |
+| `failures` | сумма и `items[]` провалившихся run'ов + `omitted` |
+| `sources` | какие файлы прочитаны, сколько записей и что в них отсутствует |
+| `notes` | оговорки: approximate cache, отсутствие модели, недоступные транскрипты |
+
+**Только метаданные.** В отчёте нет текста промптов, текста сообщений, аргументов и
+результатов инструментов, текста ошибок. Есть только числа, таймстемпы, сохранённые
+заголовки событий (метаданные, не тело сообщения) и имена инструментов. `src/dev/usage-test.ts`
+кладёт заметную строку в промпт, outbound-сообщение, аргументы и результат инструмента и
+текст ошибки и проверяет, что она не появляется ни в JSON, ни в таблице.
 
 ### Локальный дашборд и временный внешний доступ
 
@@ -747,6 +802,7 @@ history/threads.json    каталог тредов (заголовки, уча�
 modules/<name>/         приватное durable-состояние модуля (offset Telegram и т.п.)
 outbox/messages.jsonl   всё, что агент реально отправил, + результат доставки
 runs/runs.jsonl         запись каждого run: события, idle-время, токены, стоимость
+usage.json              дневной счётчик расхода рантайма (cost/runs/turns/input/output, ~30 дней)
 heartbeat.json          признак жизни процесса: pid, startedAt, version, tag/ref
                         (его читает `alive heartbeat` и внешний watchdog)
 logs/alive.jsonl        структурный лог рантайма

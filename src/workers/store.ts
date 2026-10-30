@@ -71,6 +71,19 @@ export function workersStateRoot(paths: Paths): string {
 	return path.join(paths.stateDir, "workers");
 }
 
+/** The append-only worker cost store. */
+export function workerUsagePath(stateDir: string): string {
+	return path.join(stateDir, "workers", "usage.jsonl");
+}
+
+/**
+ * Worker-run spend since `since`. Read-only and usable without a `Paths` object
+ * (the usage report only has a state directory).
+ */
+export function readWorkerUsage(stateDir: string, since = 0): WorkerUsageEntry[] {
+	return readJsonl<WorkerUsageEntry>(workerUsagePath(stateDir)).filter((entry) => entry.ts >= since);
+}
+
 export function worktreesRoot(paths: Paths, configured: string): string {
 	return path.resolve(paths.rootDir, configured || path.join(workersStateRoot(paths), "worktrees"));
 }
