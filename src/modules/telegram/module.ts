@@ -73,6 +73,32 @@ interface PreparedUpload {
 	path: string;
 }
 
+/**
+ * A burst of edits of the same Telegram message waiting for the debounce window
+ * to go quiet. Only the latest version is delivered; `edits` counts the whole
+ * burst so the event can say how many corrections it replaced.
+ */
+interface PendingEditBatch {
+	/** `${chatId}:${messageId}` — one batch per message, independent of topic. */
+	key: string;
+	thread: string;
+	latest: NormalizedInbound;
+	edits: number;
+	/** Timestamp (ms) of the first edit in the burst. */
+	firstEditAt: number;
+	timer?: NodeJS.Timeout;
+}
+
+/** Extra facts attached to a debounced edit event (absent for new messages). */
+interface EditBatchMeta {
+	edits: number;
+	firstEditAt: number;
+	editedAfterReply: boolean;
+}
+
+/** How often a debounced edit retries while a run is actively working on its thread. */
+const TELEGRAM_EDIT_RUN_RETRY_MS = 250;
+
 type VoiceTranscriptionResult =
 	| { status: "transcribed"; text: string }
 	| { status: "disabled" }
@@ -122,6 +148,8 @@ export class TelegramModule implements AliveModule {
 	private managedSweep?: NodeJS.Timeout;
 	private typingMaxMsValue = 5 * 60_000;
 	private readonly counters = { updates: 0, inbound: 0, outbound: 0, errors: 0 };
+	/** Debounced edit bursts, keyed by `${chatId}:${messageId}`. */
+	private readonly pendingEdits = new Map<string, PendingEditBatch>();
 	private consecutiveFailures = 0;
 	private outageStartedAt?: number;
 	private lastErrorAt?: number;
@@ -226,6 +254,10 @@ export class TelegramModule implements AliveModule {
 		if (this.managedSweep) clearInterval(this.managedSweep);
 		this.managedSweep = undefined;
 		for (const thread of [...this.typing.keys()]) this.stopTyping(thread);
+		// Deliver edits that were still inside their debounce window instead of
+		// silently dropping them: the event and history writes are synchronous.
+		for (const batch of [...this.pendingEdits.values()]) this.flushEditBatch(batch.key, true);
+		this.pendingEdits.clear();
 		await this.pollPromise?.catch(() => undefined);
 		this.pollPromise = undefined;
 	}
@@ -545,6 +577,7 @@ export class TelegramModule implements AliveModule {
 			allowedBotIds: this.config.allowedBotIds,
 			requireMentionInGroups: this.config.requireMentionInGroups,
 			ingestEdits: this.config.ingestEdits,
+			editExpectsReply: this.config.editExpectsReply,
 		});
 		if (!inbound) return;
 		if (update.callback_query) {
@@ -564,6 +597,28 @@ export class TelegramModule implements AliveModule {
 			}
 			return;
 		}
+
+		// Edits are corrections, not new questions (#113): debounce them per message
+		// and deliver one merged event for the whole burst instead of one run per
+		// keystroke. `processInbound` receives the burst metadata for `meta.edits`.
+		if (inbound.isEdit) {
+			this.queueEdit(inbound);
+			return;
+		}
+		await this.processInbound(inbound);
+	}
+
+	/**
+	 * Persist one normalized inbound update as history + a durable event.
+	 *
+	 * Edits arrive here only through the debounce batch below, so `edit` is set
+	 * when several corrections of one message collapsed into this event.
+	 */
+	private async processInbound(inbound: NormalizedInbound, edit?: EditBatchMeta): Promise<void> {
+		const ctx = this.ctx;
+		const api = this.api;
+		const state = this.state;
+		if (!ctx || !api || !state) return;
 
 		try {
 			let eventText = inbound.promptText;
@@ -611,6 +666,10 @@ export class TelegramModule implements AliveModule {
 				author: inbound.author?.name,
 				authorId: inbound.author?.id,
 				expectsReply: inbound.expectsReply,
+				// The store supports priorities and the prompt shows them. Edits are
+				// deliberately low: a correction should join the pending batch rather
+				// than compete with fresh human requests.
+				priority: inbound.isEdit ? "low" : "normal",
 				dedupeKey: inbound.dedupeKey,
 				ts: inbound.ts,
 				payload,
@@ -624,6 +683,9 @@ export class TelegramModule implements AliveModule {
 					updateType: inbound.updateType,
 					edited: inbound.isEdit,
 					replyTo: inbound.replyToMessageId,
+					...(edit
+						? { edits: edit.edits, firstEditAt: edit.firstEditAt, editedAfterReply: edit.editedAfterReply }
+						: {}),
 				},
 			});
 			ctx.history.append({
@@ -648,6 +710,7 @@ export class TelegramModule implements AliveModule {
 					updateId: inbound.updateId,
 					updateType: inbound.updateType,
 					edited: inbound.isEdit,
+					...(edit ? { edits: edit.edits, firstEditAt: edit.firstEditAt, editedAfterReply: edit.editedAfterReply } : {}),
 				},
 			});
 			this.maybePrune(inbound.thread);
@@ -683,8 +746,138 @@ export class TelegramModule implements AliveModule {
 			state.patch({ inbound: current.inbound + 1, lastUpdateAt: Date.now() });
 		} catch (err) {
 			this.counters.errors += 1;
-			ctx.log.error("telegram update handling failed", { updateId: update.update_id, error: message(err) });
+			ctx.log.error("telegram update handling failed", { updateId: inbound.updateId, error: message(err) });
 		}
+	}
+
+	// ------------------------------------------------------------------
+	// edit debouncing (#113)
+	// ------------------------------------------------------------------
+
+	/**
+	 * Add one edit to its message's batch and (re)start the quiet window.
+	 *
+	 * Debounce is trailing-edge: every correction restarts the timer, so a burst
+	 * of edits separated by less than `editDebounceMs` becomes one event that
+	 * carries the final text. `editDebounceMs: 0` flushes after each edit while
+	 * still tagging the event as an edit.
+	 */
+	private queueEdit(inbound: NormalizedInbound): void {
+		const key = `${inbound.chatId}:${inbound.messageId}`;
+		const existing = this.pendingEdits.get(key);
+		if (existing) {
+			existing.latest = inbound;
+			existing.edits += 1;
+			this.scheduleEditFlush(existing);
+			return;
+		}
+		const batch: PendingEditBatch = {
+			key,
+			thread: inbound.thread,
+			latest: inbound,
+			edits: 1,
+			firstEditAt: inbound.ts,
+		};
+		this.pendingEdits.set(key, batch);
+		this.scheduleEditFlush(batch);
+	}
+
+	private scheduleEditFlush(batch: PendingEditBatch): void {
+		if (batch.timer) clearTimeout(batch.timer);
+		const delay = this.config.editDebounceMs;
+		if (delay <= 0) {
+			batch.timer = undefined;
+			void this.flushEditBatch(batch.key);
+			return;
+		}
+		batch.timer = setTimeout(() => {
+			batch.timer = undefined;
+			void this.flushEditBatch(batch.key);
+		}, delay);
+		batch.timer.unref?.();
+	}
+
+	/**
+	 * Emit the merged batch once the quiet window elapsed.
+	 *
+	 * While a run is actively working on this thread the batch is not emitted
+	 * yet: it keeps merging and retries in a moment. Once the run goes idle the
+	 * event lands in the same durable pending batch and is claimed by that run's
+	 * `idle`, so a second parallel run never starts (the runtime is single-run by
+	 * construction). Edits are also emitted as `priority: "low"` — the store
+	 * records the field and the prompt shows it, while the pending queue itself
+	 * is still strict FIFO. `force` is used from `stop()` to flush instead of
+	 * losing the last window.
+	 */
+	private async flushEditBatch(key: string, force = false): Promise<void> {
+		const batch = this.pendingEdits.get(key);
+		if (!batch) return;
+		if (batch.timer) clearTimeout(batch.timer);
+		batch.timer = undefined;
+		if (this.stopped && !force) {
+			this.pendingEdits.delete(key);
+			return;
+		}
+		if (!force && this.threadHasWorkingRun(batch.thread)) {
+			this.retryEditFlush(batch);
+			return;
+		}
+		this.pendingEdits.delete(key);
+		const { inbound, edit } = this.mergeEditBatch(batch);
+		await this.processInbound(inbound, edit);
+	}
+
+	private retryEditFlush(batch: PendingEditBatch): void {
+		batch.timer = setTimeout(() => {
+			batch.timer = undefined;
+			void this.flushEditBatch(batch.key);
+		}, TELEGRAM_EDIT_RUN_RETRY_MS);
+		batch.timer.unref?.();
+	}
+
+	/** Is the runtime currently running the model for this thread (not idling)? */
+	private threadHasWorkingRun(thread: string): boolean {
+		const ctx = this.ctx;
+		if (!ctx) return false;
+		const status = ctx.runtimeStatus();
+		if (status.status !== "working") return false;
+		return (ctx.currentThreads?.() ?? []).includes(thread);
+	}
+
+	/** Latest text of the batch plus the counters and the after-answer marker. */
+	private mergeEditBatch(batch: PendingEditBatch): { inbound: NormalizedInbound; edit: EditBatchMeta } {
+		const inbound: NormalizedInbound = { ...batch.latest, payload: { ...batch.latest.payload } };
+		const editedAfterReply = this.hasRepliedTo(batch.thread, inbound.messageId);
+		if (editedAfterReply) {
+			inbound.promptText += "\n(правка после ответа: это сообщение изменено после того, как агент уже ответил; отвечай только если новая версия явно адресована боту)";
+			// An edit after the answer is a correction, never a renewed obligation.
+			// Only an explicit mention / reply-to-bot keeps `expectsReply` true.
+			if (!inbound.addressedToBot) inbound.expectsReply = false;
+		}
+		const edit: EditBatchMeta = { edits: batch.edits, firstEditAt: batch.firstEditAt, editedAfterReply };
+		inbound.payload = {
+			...inbound.payload,
+			edits: edit.edits,
+			firstEditAt: edit.firstEditAt,
+			editedAfterReply: edit.editedAfterReply,
+		};
+		return { inbound, edit };
+	}
+
+	/**
+	 * Did the agent already send a message that is a Telegram reply to this one?
+	 *
+	 * The outbound history record keeps `replyTo` as the Telegram message id when
+	 * `send_message` used `reply_to` (a raw id or an event id resolved through
+	 * history), which is the only durable evidence that the answer belongs to
+	 * this exact message.
+	 */
+	private hasRepliedTo(thread: string, messageId: string): boolean {
+		const history = this.ctx?.history;
+		if (!history) return false;
+		return history
+			.query({ thread, direction: "outbound", limit: 200, order: "desc" })
+			.some((record) => record.replyTo === messageId);
 	}
 
 	/**
