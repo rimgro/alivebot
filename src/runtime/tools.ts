@@ -23,7 +23,7 @@ import type { Journal } from "../store/journal.js";
 import type { HistoryQuery, HistoryRecord, HistoryStore } from "../store/history.js";
 import type { NoteStore } from "../store/notes.js";
 import type { MemoryService } from "../store/memory.js";
-import type { Outbox, OutgoingMessage } from "../store/outbox.js";
+import type { Outbox, OutgoingButtonRows, OutgoingMessage } from "../store/outbox.js";
 import type { NotifyMode, PolicyStore } from "../store/policy.js";
 import type { ReminderStore } from "../store/reminders.js";
 import type { ThreadStore } from "../store/threads.js";
@@ -33,6 +33,7 @@ import { managedAgentId, recordOperatorAgentReply, sendLocalAgentMessage } from 
 import { resolveOutgoingAttachment, toOutgoingAttachment } from "./attachments.js";
 import { snapshotRuntime } from "./daemon.js";
 import { requestAgentTelegram } from "../modules/telegram/managed-request.js";
+import { buttonHistorySummary, validateOutgoingButtons } from "../modules/telegram/buttons.js";
 import { renderWorkerList, renderWorkerRecord, type WorkerManager } from "../workers/manager.js";
 import type { DashboardTool } from "../dashboard/tool.js";
 import { formatDuration, iso, parseTimeSpec, parseTimestamp, sleep, truncate } from "../util.js";
@@ -629,7 +630,9 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		description:
 			"Send a message to a human. This is the ONLY way your words reach anyone: your plain assistant text is private thought. " +
 			"Use the thread id from the incoming event. Returns a message id when delivered. " +
-			"Set attachment to a workspace-relative file to deliver it with the text (Telegram sends images as photos, other files as documents).",
+			"Set attachment to a workspace-relative file to deliver it with the text (Telegram sends images as photos, other files as documents). " +
+			"Set buttons to rows of 1–3 inline quick-reply buttons: {text,data} sends a callback action and {text,url} opens a link. " +
+			"callback data is limited to 64 UTF-8 bytes; url buttons are refused in groups unless explicitly allowed.",
 		parameters: Type.Object({
 			text: Type.String({ description: "Message body. Write like a person: short, concrete, no process narration." }),
 			thread: Type.Optional(
@@ -650,13 +653,36 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 					description: "Force the delivery kind. Defaults to the mime type: images are photos, other files are documents.",
 				}),
 			),
+			buttons: Type.Optional(
+				Type.Array(
+					Type.Array(
+						Type.Object({
+							text: Type.String({ description: "Button label." }),
+							data: Type.Optional(
+								Type.String({ description: "Callback payload (UTF-8, at most 64 bytes). Use either data or url." }),
+							),
+							url: Type.Optional(Type.String({ description: "Absolute http(s) link to open. Use either data or url." })),
+						}),
+						{ minItems: 1, maxItems: 3 },
+					),
+					{ description: "Rows of 1–3 inline buttons (max one level of nesting)." },
+				),
+			),
 		}),
 		execute: async (_toolCallId, params): Promise<ToolResult> => {
 			const run = requireRun(deps, "send_message");
 			if (!params.text.trim()) throw new Error("send_message requires non-empty text");
 			const thread = params.thread ?? defaultThread(run) ?? "console";
 			// Validate before the outbox record and before any delivery attempt: an
-			// escaping or oversize file must fail as a tool error, not a half-sent message.
+			// escaping or oversize file, or an invalid/oversized button, must fail as a
+			// tool error, not a half-sent message.
+			const buttons = params.buttons as OutgoingButtonRows | undefined;
+			validateOutgoingButtons(buttons, {
+				thread,
+				chatType: deps.history.thread(thread)?.meta?.chatType as string | undefined,
+				allowUrlButtonsInGroups: deps.config.config.modules.telegram.allowUrlButtonsInGroups,
+			});
+			const buttonSummary = buttonHistorySummary(buttons);
 			const attachment =
 				params.attachment?.trim()
 					? toOutgoingAttachment(
@@ -666,7 +692,14 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 						)
 					: undefined;
 			const message = await deps.outbox.send(
-				{ runId: run.id, thread, text: params.text, replyTo: params.reply_to, attachments: attachment ? [attachment] : undefined },
+				{
+					runId: run.id,
+					thread,
+					text: params.text,
+					replyTo: params.reply_to,
+					attachments: attachment ? [attachment] : undefined,
+					buttons,
+				},
 				deps.deliver,
 			);
 			recordOperatorAgentReply(deps.history, deps.config, thread, {
@@ -677,13 +710,22 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 			});
 			run.outbound.push({ thread, text: params.text, delivered: message.delivered ?? false });
 			deps.threads.recordOutbound(thread, message.ts);
-			log.info("outbound message", { thread, chars: params.text.length, messageId: message.id, attachment: attachment?.path });
+			// Log only the button shape, never callback data values.
+			log.info("outbound message", {
+				thread,
+				chars: params.text.length,
+				messageId: message.id,
+				attachment: attachment?.path,
+				buttons: buttonSummary?.buttons.length ?? 0,
+			});
 			const attached = attachment ? ` with ${attachment.kind ?? "file"} ${attachment.name ?? attachment.path}` : "";
-			return ok(`Delivered to ${thread}${attached} (message ${message.id}).`, {
+			const withButtons = buttonSummary ? ` and ${buttonSummary.buttons.length} inline button(s)` : "";
+			return ok(`Delivered to ${thread}${attached}${withButtons} (message ${message.id}).`, {
 				messageId: message.id,
 				thread,
 				delivered: message.delivered ?? false,
 				...(attachment ? { attachment: { path: attachment.path, kind: attachment.kind } } : {}),
+				...(buttonSummary ? { buttons: buttonSummary } : {}),
 			});
 		},
 	});

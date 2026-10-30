@@ -1034,9 +1034,11 @@ alive agents restart researcher
 ```
 
 **Managed Bots (Bot API 9.6):** master-бот может запросить у пользователя создание
-саб-бота через `KeyboardButtonRequestManagedBot`. Пользователь подтверждает создание
-в Telegram; master-бот получает `managed_bot_created` и извлекает токен методом
-`getManagedBotToken`. Для этого управление ботами должно быть включено для master-бота
+саб-бота. Запрос приходит с inline-кнопкой (она не залипает над полем ввода);
+нажатие открывает одну нативную кнопку `KeyboardButtonRequestManagedBot`, потому
+что Bot API пока поддерживает managed bots только на reply-клавиатуре. Пользователь
+подтверждает создание в Telegram; master-бот получает `managed_bot_created` и
+извлекает токен методом `getManagedBotToken`. Для этого управление ботами должно быть включено для master-бота
 через Mini App @BotFather. Настроить создание и привязку к агенту:
 
 ```bash
