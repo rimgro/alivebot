@@ -112,8 +112,10 @@ type VoiceTranscriptionResult =
  * Inbound: long polling (`getUpdates`) with a persisted offset, so restarts
  * resume instead of replaying. Every accepted update becomes a durable
  * `user_message` event (deduped by message id) and a record in the shared
- * conversation history. User allowlists and non-allowlisted or unaddressed bot messages are filtered out
- * before anything reaches the agent.
+ * conversation history. User allowlists and non-allowlisted or unaddressed bot
+ * messages are filtered out before anything reaches the agent. Group messages
+ * that are not addressed to the bot are kept (event + history) but marked
+ * `wake: false`, so they never start a run by themselves (#116).
  *
  * Outbound: `send_message` to a `telegram:<chatId>[/<topicId>]` thread is split
  * across Telegram's 4096-character limit, replied to the message the agent chose
@@ -609,6 +611,24 @@ export class TelegramModule implements AliveModule {
 	}
 
 	/**
+	 * Is the agent actually being spoken to? (#116)
+	 *
+	 * Private chats and channels always are. In a group or supergroup only an
+	 * explicit mention, a reply to one of the bot's messages, a command or an
+	 * allowlisted peer-bot message counts; that is exactly what
+	 * `expectsReply`/`addressedToBot` already encode in `normalizeUpdate`.
+	 *
+	 * `requireMentionInGroups: true` stays the stricter option: such messages are
+	 * dropped before this point (no event *and* no history record). With the
+	 * default `false` they are kept, but they never start a run.
+	 */
+	private addressedToAgent(inbound: NormalizedInbound): boolean {
+		const group = inbound.chat.type === "group" || inbound.chat.type === "supergroup";
+		if (!group) return true;
+		return inbound.expectsReply || inbound.addressedToBot;
+	}
+
+	/**
 	 * Persist one normalized inbound update as history + a durable event.
 	 *
 	 * Edits arrive here only through the debounce batch below, so `edit` is set
@@ -659,6 +679,16 @@ export class TelegramModule implements AliveModule {
 				};
 			}
 
+			const wake = this.addressedToAgent(inbound);
+			if (!wake) {
+				// #116: unaddressed group traffic stays durable (history + inbox) so the
+				// agent can read the conversation later, but it must not spend a
+				// full-context run on it. The runtime never wakes for `wake: false`.
+				ctx.log.debug("unaddressed group message stored without waking the agent", {
+					thread: inbound.thread,
+					messageId: inbound.messageId,
+				});
+			}
 			const event = ctx.userMessage({
 				text: eventText,
 				thread: inbound.thread,
@@ -666,6 +696,9 @@ export class TelegramModule implements AliveModule {
 				author: inbound.author?.name,
 				authorId: inbound.author?.id,
 				expectsReply: inbound.expectsReply,
+				// Only an unaddressed group message opts out of starting a run; every
+				// other event keeps the default (wake-worthy).
+				...(wake ? {} : { wake: false }),
 				// The store supports priorities and the prompt shows them. Edits are
 				// deliberately low: a correction should join the pending batch rather
 				// than compete with fresh human requests.

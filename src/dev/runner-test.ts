@@ -5,6 +5,12 @@
  * stopping is nudged and stalled out, and that policy-approved notifications are
  * steered into a working run.
  *
+ * The last sections cover the empty-wake gate (#116): with an empty inbox the
+ * runtime starts no run and prompts no model, consecutive empty wakes stretch the
+ * idle interval up to the configured cap, an arriving event starts a run
+ * immediately and resets the streak, and an event that is not addressed to the
+ * agent (`wake: false`) never starts a run on its own.
+ *
  *   npm run test:runner
  */
 import * as fs from "node:fs";
@@ -24,6 +30,7 @@ import { RunLog } from "../store/runs.js";
 import { ThreadStore } from "../store/threads.js";
 import { HistoryStore } from "../store/history.js";
 import { AgentRunner } from "../runtime/agent.js";
+import { hasWakeWorthyPending, WakeScheduler, wakeIntervalMs } from "../runtime/wake.js";
 import { createAliveTools, type RunHandle, type ToolDeps } from "../runtime/tools.js";
 
 let failures = 0;
@@ -51,6 +58,7 @@ const config = loadConfig({
 			maxNudges: 3,
 			maxNudgesPerRun: 2,
 			interrupt: true,
+			emptyWakeBackoff: { enabled: true, afterWakes: 2, maxIntervalMs: 60 * 60_000 },
 		},
 	},
 });
@@ -239,6 +247,165 @@ section("policy-approved notifications are steered into a working run");
 	check("alice's event was steered in", steered.includes("urgent from alice"), steered);
 	check("bob's event was not steered in", !steered.includes("quiet from bob"), steered);
 	check("run counted the interrupt", (record?.interruptDeliveries ?? 0) === 1, record?.interruptDeliveries);
+}
+
+
+// ---------------------------------------------------------------------------
+// empty wakes (#116)
+// ---------------------------------------------------------------------------
+
+section("empty wakes: two quiet hours cost nothing, events wake and reset the backoff");
+{
+	// A separate fixture world: the shared store above has history of its own.
+	const wakeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-wake-test-"));
+	const wakeStore = EventStore.open(wakeRoot);
+	const wakeRuns = new RunLog(wakeRoot);
+	const wakeThreads = new ThreadStore(wakeRoot);
+	const wakePolicy = new PolicyStore(wakeRoot);
+	const wakeHistory = HistoryStore.open(wakeRoot);
+	const wakeNotes = new NoteStore(wakeRoot);
+	const wakeReminders = new ReminderStore(wakeRoot);
+	const wakeJournal = new Journal(wakeRoot);
+	const wakeOutbox = new Outbox(wakeRoot);
+	let wakeRun: RunHandle | undefined;
+	const wakeDeps: ToolDeps = {
+		config,
+		store: wakeStore,
+		reminders: wakeReminders,
+		notes: wakeNotes,
+		memory: new FakeMemoryStore(),
+		journal: wakeJournal,
+		threads: wakeThreads,
+		outbox: wakeOutbox,
+		policy: wakePolicy,
+		history: wakeHistory,
+		moduleTools: [],
+		deliver: async () => undefined,
+		getRun: () => wakeRun,
+		runtimeStatus: () => ({}),
+		isStopping: () => false,
+		log,
+	};
+	const wakeTools = createAliveTools(wakeDeps);
+	const wakeRetain = wakeTools.find((t) => t.name === "retain")!;
+	const wakeSleep = wakeTools.find((t) => t.name === "sleep")!;
+
+	const wakeSessions: FakeSession[] = [];
+	let wakeHandler: Handler = async () => undefined;
+	const wakeRunner = new AgentRunner({
+		config,
+		createSession: async () => {
+			const session = new FakeSession(`w${wakeSessions.length + 1}`, (s, p) => wakeHandler(s, p));
+			wakeSessions.push(session);
+			return session as unknown as AgentSession;
+		},
+		store: wakeStore,
+		runs: wakeRuns,
+		threads: wakeThreads,
+		policy: wakePolicy,
+		toolDeps: wakeDeps,
+		log,
+		thoughtsFile: path.join(wakeRoot, "thoughts.jsonl"),
+		getRun: () => wakeRun,
+		setRun: (next) => {
+			wakeRun = next;
+		},
+		runtimeStatus: () => ({}),
+		isStopping: () => false,
+		isBudgetExhausted: () => false,
+	});
+	await wakeRunner.init();
+
+	// Virtual clock: two hours pass in milliseconds. The intervals are the
+	// documented defaults (base 15 min, cap 60 min), so 15/30/60 is exactly what
+	// the production config does.
+	const BASE = 15 * 60_000;
+	const CAP = 60 * 60_000;
+	const clock = { now: Date.UTC(2026, 0, 1, 0, 0, 0) };
+	// One extra second so the 15+15+30+60 minute wait that ends at 2:00:00 is
+	// counted as the fourth empty wake instead of racing the stop check.
+	const phase = { endsAt: clock.now + 2 * 60 * 60_000 + 1_000 };
+	const emptyWakes: Array<{ emptyWakes: number; intervalMs: number }> = [];
+	const wake = new WakeScheduler({
+		baseIntervalMs: BASE,
+		pollIntervalMs: 750,
+		backoff: { enabled: true, afterWakes: 2, maxIntervalMs: CAP },
+		log,
+		hasWork: () => hasWakeWorthyPending(wakeStore),
+		isStopped: () => clock.now >= phase.endsAt,
+		now: () => clock.now,
+		sleep: async (ms) => {
+			clock.now += ms;
+		},
+		onEmptyWake: (info) => emptyWakes.push(info),
+	});
+
+	// Mirrors AliveRuntime.loop(): the gate decides, the runner executes, nothing else runs.
+	let startedRuns = 0;
+	const pump = async (): Promise<"event" | "stopped"> => {
+		const trigger = await wake.nextRun();
+		if (trigger === "event") startedRuns += 1;
+		return trigger;
+	};
+
+	const quiet = await pump();
+	check("two hours with an empty inbox start no run", quiet === "stopped" && startedRuns === 0, { quiet, startedRuns });
+	check("no run record and no spend was created", wakeRuns.list().length === 0 && wakeSessions.every((session) => session.prompts.length === 0), wakeRuns.list().length);
+	check("the inbox stayed empty", wakeStore.pendingCount() === 0, wakeStore.status());
+	check(
+		"empty wakes stretch the interval 15 → 30 → 60 and then hold at the cap",
+		emptyWakes.map((wake) => wake.intervalMs).join(",") === [BASE, 2 * BASE, 4 * BASE, CAP].join(","),
+		emptyWakes.map((wake) => wake.intervalMs),
+	);
+	check("two hours produce exactly four empty wakes (15+15+30+60 min)", emptyWakes.length === 4, emptyWakes.map((wake) => wake.emptyWakes));
+	check(
+		"the interval is the base until afterWakes, then doubles to the cap",
+		wakeIntervalMs({ baseIntervalMs: 900_000, emptyWakes: 0, backoff: { enabled: true, afterWakes: 2, maxIntervalMs: 3_600_000 } }) === 900_000 &&
+			wakeIntervalMs({ baseIntervalMs: 900_000, emptyWakes: 2, backoff: { enabled: true, afterWakes: 2, maxIntervalMs: 3_600_000 } }) === 1_800_000 &&
+			wakeIntervalMs({ baseIntervalMs: 900_000, emptyWakes: 3, backoff: { enabled: true, afterWakes: 2, maxIntervalMs: 3_600_000 } }) === 3_600_000 &&
+			wakeIntervalMs({ baseIntervalMs: 900_000, emptyWakes: 9, backoff: { enabled: true, afterWakes: 2, maxIntervalMs: 3_600_000 } }) === 3_600_000 &&
+			wakeIntervalMs({ baseIntervalMs: 900_000, emptyWakes: 9, backoff: { enabled: false, afterWakes: 2, maxIntervalMs: 3_600_000 } }) === 900_000,
+	);
+
+	// The fake model does the minimum: one turn, then retain + sleep.
+	wakeHandler = async (session) => {
+		session.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "on it" }], stopReason: "endTurn" } });
+		await session.turn();
+		await call(wakeRetain, { facts: [], scopes: [] });
+		await call(wakeSleep, { summary: "empty-wake test", summary_md: "# empty-wake test\n" });
+		session.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "sleeping" }], stopReason: "endTurn" } });
+	};
+
+	// The next wait would run into the (already expired) phase end; extend it and
+	// drop an event in. The gate must return before any more virtual time passes.
+	phase.endsAt = clock.now + 60 * 60_000;
+	const arrivingAt = clock.now;
+	wakeStore.append({ kind: "user_message", source: "test", priority: "normal", title: "hi", text: "real question", thread: "alice", expectsReply: true });
+	const woken = await pump();
+	check("an arriving event wakes the runtime immediately", woken === "event" && clock.now === arrivingAt, { woken, elapsed: clock.now - arrivingAt });
+	check("the wait polled often enough to see the event at once", wake.consecutiveEmptyWakes === 0, wake.consecutiveEmptyWakes);
+	const eventRun = await wakeRunner.execute({ requireEvents: true });
+	check("the event started a real run and reached the model", (eventRun?.events.length ?? 0) === 1 && wakeSessions.some((session) => session.prompts.length > 0), eventRun?.events);
+	check("the run was prompted once, for the event it was woken for", (eventRun?.stopReason === "slept") && (eventRun?.promptChars ?? 0) > 0 && wakeRuns.list().length === 1, { stopReason: eventRun?.stopReason, promptChars: eventRun?.promptChars, runs: wakeRuns.list().length });
+	check("a run with events resets the empty-wake streak", wake.consecutiveEmptyWakes === 0, wake.consecutiveEmptyWakes);
+	check("the interval is back at the base after the event", wake.intervalMs === BASE, { intervalMs: wake.intervalMs, base: BASE });
+
+	// Unaddressed chatter: stored, delivered later, never a reason to wake up.
+	phase.endsAt = clock.now + 30 * 60_000;
+	wakeStore.append({ kind: "user_message", source: "test", priority: "low", title: "group chatter", text: "just chatting", thread: "group", expectsReply: false, wake: false });
+	const chatterWake = await pump();
+	check("an unaddressed event does not start a run", chatterWake === "stopped" && startedRuns === 1, { chatterWake, startedRuns });
+	check("unaddressed chatter stays in the inbox", wakeStore.pendingCount() === 1, wakeStore.status());
+	check("the empty-wake streak keeps growing while only chatter arrives", wake.consecutiveEmptyWakes > 0, wake.consecutiveEmptyWakes);
+
+	phase.endsAt = clock.now + 60 * 60_000;
+	wakeStore.append({ kind: "user_message", source: "test", priority: "normal", title: "@alive status?", text: "@alive status?", thread: "group", expectsReply: true });
+	const addressedWake = await pump();
+	check("an addressed group message does wake the runtime", addressedWake === "event", addressedWake);
+	const addressedRun = await wakeRunner.execute({ requireEvents: true });
+	const addressedTitles = (addressedRun?.events ?? []).map((event) => event.title).join(",");
+	check("the addressed run delivers the chatter too, nothing is dropped", addressedTitles === "group chatter,@alive status?", addressedTitles);
+	check("the run counted only the event it was woken for as new work", addressedRun?.stopReason === "slept", addressedRun?.stopReason);
 }
 
 process.stdout.write(

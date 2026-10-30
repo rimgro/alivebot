@@ -21,6 +21,7 @@ import {
 } from "../store/runs.js";
 import { ThreadStore } from "../store/threads.js";
 import { buildAgent, readSoul } from "./session.js";
+import { hasWakeWorthyPending, WakeScheduler } from "./wake.js";
 import { SandboxManager } from "../sandbox/manager.js";
 import { WorkerManager } from "../workers/manager.js";
 import { DashboardTool } from "../dashboard/tool.js";
@@ -86,6 +87,7 @@ export class AliveRuntime {
 	private sleepCount = 0;
 	private abortController = new AbortController();
 	private loopPromise: Promise<void> | undefined;
+	private wake!: WakeScheduler;
 	private schedulerTimer: NodeJS.Timeout | undefined;
 	private stopping = false;
 	private initialized = false;
@@ -130,6 +132,16 @@ export class AliveRuntime {
 		this.policy = new PolicyStore(paths.stateDir);
 		this.history = HistoryStore.open(paths.stateDir);
 		this.runs = new RunLog(paths.stateDir);
+		// The idle-wake gate (#116): a run starts only when there is something to
+		// do, so an empty idle interval costs an inbox check, not a model call.
+		this.wake = new WakeScheduler({
+			baseIntervalMs: this.config.config.loop.sleepAfterMs,
+			pollIntervalMs: this.config.config.loop.pollIntervalMs,
+			backoff: this.config.config.loop.emptyWakeBackoff,
+			log: this.log.child("wake"),
+			hasWork: () => this.redeliveryRange !== undefined || hasWakeWorthyPending(this.store),
+			isStopped: () => this.stopping || this.abortController.signal.aborted,
+		});
 
 		this.workers = this.config.config.workers.enabled
 			? new WorkerManager({
@@ -394,6 +406,12 @@ export class AliveRuntime {
 					await this.waitForBudget();
 					continue;
 				}
+				// Block until something actually needs the agent. `nextRun` never
+				// calls the model: an idle interval that ends with an empty inbox is
+				// an empty wake (debug log only, interval stretched by the backoff)
+				// and the agent simply stays asleep. No run record and no spend.
+				const trigger = await this.wake.nextRun();
+				if (trigger === "stopped") break;
 				const range = this.redeliveryRange;
 				this.redeliveryRange = undefined;
 				const record = await this.runner.execute({ redeliveryRange: range });
@@ -530,6 +548,7 @@ export class AliveRuntime {
 			idling: run?.idling,
 			idleSince: run?.idleStartedAt,
 			sleeps: this.sleepCount,
+			emptyWakes: this.wake?.consecutiveEmptyWakes ?? 0,
 			mode: process.env.ALIVE_DAEMON === "1" ? "background" : "foreground",
 		};
 		writeRuntimeState(this.config.paths.stateDir, state);
@@ -585,6 +604,8 @@ export class AliveRuntime {
 			idleSince: run?.idleStartedAt,
 			sleeps: this.sleepCount,
 			pendingEvents: this.store.pendingCount(),
+			consecutiveEmptyWakes: this.wake?.consecutiveEmptyWakes ?? 0,
+			nextWakeIntervalMs: this.wake?.intervalMs,
 			openThreads: this.threads.unsettled(this.config.config.loop.maxNudges).map((t) => t.thread),
 			pendingReminders: this.reminders.list().length,
 			notificationPolicy: this.policy.load(),

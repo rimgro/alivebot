@@ -35,6 +35,7 @@ const config = loadConfig({
 			maxNudges: 3,
 			maxNudgesPerRun: 5,
 			interrupt: true,
+			emptyWakeBackoff: { enabled: true, afterWakes: 2, maxIntervalMs: 60 * 60_000 },
 		},
 	},
 });

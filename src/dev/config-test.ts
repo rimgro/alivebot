@@ -8,7 +8,16 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { loadConfig, redactSecretFields } from "../config.js";
+import {
+	DEFAULT_CONFIG,
+	DEFAULT_EMPTY_WAKE_BACKOFF,
+	EMPTY_WAKE_MAX_INTERVAL_MAX_MS,
+	EMPTY_WAKE_MAX_INTERVAL_MIN_MS,
+	loadConfig,
+	redactSecretFields,
+	validateLoopConfig,
+	type LoopConfig,
+} from "../config.js";
 import { findSecretFields, migrateConfigSecrets } from "../config-secrets.js";
 import { resolveToken } from "../modules/telegram/module.js";
 
@@ -267,6 +276,79 @@ section("process environment with a different value never overwrites the config 
 	fs.rmSync(root, { recursive: true, force: true });
 	cleanupEnv(envName);
 	fs.rmSync(configPath, { force: true });
+}
+
+
+// ---------------------------------------------------------------------------
+section("loop.emptyWakeBackoff: defaults, validation and safe fallbacks (#116)");
+{
+	const base = DEFAULT_CONFIG.loop;
+	check(
+		"the default block is enabled, doubles after 2 empty wakes and caps at 60 min",
+		DEFAULT_EMPTY_WAKE_BACKOFF.enabled === true &&
+			DEFAULT_EMPTY_WAKE_BACKOFF.afterWakes === 2 &&
+			DEFAULT_EMPTY_WAKE_BACKOFF.maxIntervalMs === 60 * 60_000,
+		DEFAULT_EMPTY_WAKE_BACKOFF,
+	);
+	const root = tempRoot("loop");
+	const loaded = loadConfig({ cwd: root, secretLog: () => undefined, secretWarn: () => undefined });
+	check(
+		"a config file without the block gets the defaults",
+		loaded.config.loop.emptyWakeBackoff.enabled === true &&
+			loaded.config.loop.emptyWakeBackoff.afterWakes === 2 &&
+			loaded.config.loop.emptyWakeBackoff.maxIntervalMs === 3_600_000,
+		loaded.config.loop.emptyWakeBackoff,
+	);
+	const overridden = loadConfig({
+		cwd: root,
+		secretLog: () => undefined,
+		secretWarn: () => undefined,
+		overrides: { loop: { ...base, emptyWakeBackoff: { enabled: false, afterWakes: 5, maxIntervalMs: 120_000 } } },
+	});
+	check(
+		"an explicit block wins over the defaults",
+		overridden.config.loop.emptyWakeBackoff.enabled === false &&
+			overridden.config.loop.emptyWakeBackoff.afterWakes === 5 &&
+			overridden.config.loop.emptyWakeBackoff.maxIntervalMs === 120_000,
+		overridden.config.loop.emptyWakeBackoff,
+	);
+	const rejects: Array<[string, unknown]> = [
+		["not an object", "nope"],
+		["enabled that is not a boolean", { enabled: "yes", afterWakes: 2, maxIntervalMs: 60_000 }],
+		["afterWakes 0", { enabled: true, afterWakes: 0, maxIntervalMs: 60_000 }],
+		["a negative afterWakes", { enabled: true, afterWakes: -1, maxIntervalMs: 60_000 }],
+		["a fractional afterWakes", { enabled: true, afterWakes: 1.5, maxIntervalMs: 60_000 }],
+		["an afterWakes above 100", { enabled: true, afterWakes: 101, maxIntervalMs: 60_000 }],
+		["a missing maxIntervalMs", { enabled: true, afterWakes: 2 }],
+		["a sub-minute maxIntervalMs", { enabled: true, afterWakes: 2, maxIntervalMs: 60 }],
+		["a maxIntervalMs beyond 24h", { enabled: true, afterWakes: 2, maxIntervalMs: EMPTY_WAKE_MAX_INTERVAL_MAX_MS + 1 }],
+		["a fractional maxIntervalMs", { enabled: true, afterWakes: 2, maxIntervalMs: 60_000.5 }],
+	];
+	for (const [label, block] of rejects) {
+		let message = "";
+		try {
+			validateLoopConfig({ ...base, emptyWakeBackoff: block as never });
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		check(`${label} is rejected`, message.startsWith("loop.emptyWakeBackoff"), message || "accepted");
+	}
+	const filled = validateLoopConfig({ ...base, emptyWakeBackoff: undefined as unknown as LoopConfig["emptyWakeBackoff"] });
+	const nulled = validateLoopConfig({ ...base, emptyWakeBackoff: null as unknown as LoopConfig["emptyWakeBackoff"] });
+	check(
+		"a missing or null block is filled with the defaults, not left undefined",
+		filled.emptyWakeBackoff.enabled === DEFAULT_EMPTY_WAKE_BACKOFF.enabled &&
+			filled.emptyWakeBackoff.afterWakes === DEFAULT_EMPTY_WAKE_BACKOFF.afterWakes &&
+			filled.emptyWakeBackoff.maxIntervalMs === DEFAULT_EMPTY_WAKE_BACKOFF.maxIntervalMs &&
+			nulled.emptyWakeBackoff.afterWakes === DEFAULT_EMPTY_WAKE_BACKOFF.afterWakes,
+		{ filled: filled.emptyWakeBackoff, nulled: nulled.emptyWakeBackoff },
+	);
+	check(
+		"the minimum and maximum caps are a minute and a day",
+		EMPTY_WAKE_MAX_INTERVAL_MIN_MS === 60_000 && EMPTY_WAKE_MAX_INTERVAL_MAX_MS === 86_400_000,
+		{ min: EMPTY_WAKE_MAX_INTERVAL_MIN_MS, max: EMPTY_WAKE_MAX_INTERVAL_MAX_MS },
+	);
+	fs.rmSync(root, { recursive: true, force: true });
 }
 
 process.stdout.write(`\n${failures === 0 ? "all config tests passed" : `${failures} config test(s) failed`}\n`);
