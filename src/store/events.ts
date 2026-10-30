@@ -24,6 +24,17 @@ export interface AliveEvent {
 	payload?: unknown;
 	thread?: string;
 	expectsReply?: boolean;
+	/**
+	 * May this event start a run on its own (#116)? Default true.
+	 *
+	 * Modules set it to `false` for traffic that is not addressed to the agent —
+	 * today that is unaddressed group chatter (`requireMentionInGroups: false`
+	 * keeps it, but it is not a request). Such an event is still stored and still
+	 * returned by `idle` while the agent is awake, so it reaches the context with
+	 * the next real wake; it just never wakes an idle runtime and never starts a
+	 * full-context run by itself.
+	 */
+	wake?: boolean;
 	dedupeKey?: string;
 	meta?: Record<string, unknown>;
 }
@@ -142,6 +153,7 @@ export class EventStore {
 			payload: input.payload,
 			thread: input.thread,
 			expectsReply: input.expectsReply,
+			wake: input.wake,
 			dedupeKey: input.dedupeKey,
 			meta: input.meta,
 		};
@@ -161,6 +173,21 @@ export class EventStore {
 		this.refresh();
 		const from = this.cursorSeq();
 		return this.events.filter((e) => e.seq > from).slice(0, max);
+	}
+
+	/**
+	 * First *pending* event matching `predicate`, or undefined. Stops at the first
+	 * match, so a question like "is anything worth waking for?" does not copy or
+	 * scan the whole inbox when an answer is near the front.
+	 */
+	findPending(predicate: (event: AliveEvent) => boolean): AliveEvent | undefined {
+		this.refresh();
+		const from = this.cursorSeq();
+		for (let index = from; index < this.events.length; index += 1) {
+			const event = this.events[index]!;
+			if (predicate(event)) return event;
+		}
+		return undefined;
 	}
 
 	pendingCount(): number {

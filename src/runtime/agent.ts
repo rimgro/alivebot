@@ -10,6 +10,7 @@ import type { PolicyStore } from "../store/policy.js";
 import type { RunLog, RunRecord, RunStopReason } from "../store/runs.js";
 import type { ThreadStore } from "../store/threads.js";
 import { renderAwakePrompt, renderInterruptPrompt, renderNudgePrompt } from "./prompt.js";
+import { hasWakeWorthyPending } from "./wake.js";
 import { maskSecrets } from "../secrets.js";
 import { privateMemoryScope } from "./memory-access.js";
 import type { RunHandle, ToolDeps } from "./tools.js";
@@ -122,7 +123,9 @@ export class AgentRunner {
 		const { config, store, runs, log } = this.deps;
 		if (this.deps.getRun()) throw new Error("a run is already active");
 
-		if (options.requireEvents && store.peekPending(1).length === 0) return null;
+		// An empty inbox is not a wake: no run, no model call, no spend (#116).
+		// `wake: false` events (unaddressed group chatter) count as no work here too.
+		if (options.requireEvents && !hasWakeWorthyPending(store)) return null;
 
 		const statsBefore = this.session.getSessionStats();
 		const startedAt = Date.now();

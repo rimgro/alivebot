@@ -40,6 +40,13 @@ export interface UserMessageInput {
 	priority?: EventPriority;
 	/** Defaults to true: an inbound human message is normally waiting for an answer. */
 	expectsReply?: boolean;
+	/**
+	 * May this event start a run on its own? Defaults to true.
+	 * Set `false` for messages that are not addressed to the agent (for example
+	 * group chatter that only names nobody): they are still stored and still shown
+	 * to an awake agent, but they never wake an idle runtime (#116).
+	 */
+	wake?: boolean;
 	payload?: unknown;
 	meta?: Record<string, unknown>;
 	/** Stable key so a redelivered provider update cannot double-spawn an event. */
@@ -57,6 +64,8 @@ export interface ModuleEventInput {
 	thread?: string;
 	/** Defaults to false: machine events do not oblige the agent to answer. */
 	expectsReply?: boolean;
+	/** May this event start a run on its own? Defaults to true (see `UserMessageInput.wake`). */
+	wake?: boolean;
 	payload?: unknown;
 	meta?: Record<string, unknown>;
 	dedupeKey?: string;

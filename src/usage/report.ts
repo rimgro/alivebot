@@ -131,6 +131,24 @@ export interface UsageFailureTotals extends UsageTotals {
 	note: string;
 }
 
+/**
+ * Runs that were prompted with an empty inbox (#116).
+ *
+ * Before the empty-wake fix the runtime started a run whenever its idle interval
+ * expired, even with nothing pending: the model loaded the full system prompt
+ * (~7k tokens), saw "no events" and went back to `idle`. These runs are the ones
+ * whose stored `events` array is empty; they cost money and produced nothing.
+ * Since the fix an idle runtime waits for an event instead, so the count should
+ * fall to zero (a forced `alive run --once` still records one).
+ */
+export interface UsageEmptyWakes extends UsageTotals {
+	/** Share of the window's agent spend (`cost / totals.cost`); null when nothing was spent. */
+	costShare: number | null;
+	/** Share of the window's agent tokens (`tokens.total / totals.tokens.total`). */
+	tokenShare: number | null;
+	note: string;
+}
+
 export interface UsageReportSources {
 	runs: {
 		path: string;
@@ -188,6 +206,7 @@ export interface UsageReport {
 	};
 	topRuns: UsageTopRun[];
 	failures: UsageFailureTotals;
+	emptyWakes: UsageEmptyWakes;
 }
 
 export interface BuildUsageReportOptions {
@@ -541,6 +560,20 @@ export function buildUsageReport(profile: DashboardProfile, options: BuildUsageR
 				: "no failed or aborted runs in the window",
 	};
 
+	// Empty wakes (#116): runs whose recorded trigger list is empty. Historical data:
+	// these are the runs that woke the model with nothing to do.
+	const emptyWakeViews = views.filter((view) => view.triggers.length === 0);
+	const emptyWakeTotals = toUsageTotals(emptyWakeViews);
+	const emptyWakes: UsageEmptyWakes = {
+		...emptyWakeTotals,
+		costShare: totals.cost > 0 ? emptyWakeTotals.cost / totals.cost : null,
+		tokenShare: totals.tokens.total > 0 ? emptyWakeTotals.tokens.total / totals.tokens.total : null,
+		note:
+			emptyWakeViews.length > 0
+				? `${emptyWakeViews.length} run(s) were prompted with no events at all (empty trigger list); since #116 an idle runtime waits for an event instead of starting a run, so this should trend to zero`
+				: "no run in the window was prompted with an empty inbox",
+	};
+
 	// Partial data: every gap gets a reason; the report still prints what exists.
 	const partialReasons: string[] = [];
 	if (!counterPresent) {
@@ -579,6 +612,7 @@ export function buildUsageReport(profile: DashboardProfile, options: BuildUsageR
 		);
 	}
 	if (!workerPresent) notes.push(workers.note);
+	if (emptyWakeViews.length > 0) notes.push(emptyWakes.note);
 
 	const tokens = totals.tokens;
 	const cacheDenominator = tokens.input + tokens.cacheRead;
@@ -647,6 +681,7 @@ export function buildUsageReport(profile: DashboardProfile, options: BuildUsageR
 		cache,
 		topRuns,
 		failures,
+		emptyWakes,
 	};
 }
 
@@ -688,6 +723,9 @@ export function renderUsageReport(report: UsageReport): string {
 	);
 	lines.push(
 		`  cache hit share ${formatShare(cache.hitShare)} (cacheRead ${cache.numerator} / (input + cacheRead) ${cache.denominator}) — approximate`,
+	);
+	lines.push(
+		`  empty wakes ${report.emptyWakes.runs} run(s) · ${report.emptyWakes.turns} turns · ${formatUsd(report.emptyWakes.cost)} · ${formatShare(report.emptyWakes.costShare)} of spend · tokens ${report.emptyWakes.tokens.total} (${formatShare(report.emptyWakes.tokenShare)})`,
 	);
 
 	lines.push("");

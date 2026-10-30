@@ -143,6 +143,8 @@ export interface RuntimeStateFile {
 	idleSince?: number;
 	/** How many full context resets (sleeps) this process has performed. */
 	sleeps: number;
+	/** Consecutive idle intervals that ended with an empty inbox (#116). */
+	emptyWakes?: number;
 	/** `background` for a detached CLI instance, `foreground` for an attached one. */
 	mode?: "background" | "foreground";
 	error?: string;

@@ -575,11 +575,62 @@ check(
 	topReport.notes,
 );
 
+section("empty wakes (#116)");
+const emptyWakeFixture = makeProfile("empty-wakes");
+writeJsonl(path.join(emptyWakeFixture.stateDir, "runs", "runs.jsonl"), [
+	// Two runs that were prompted with nothing: the old wake-on-timer behaviour.
+	runRecord({ index: 1, finishedAt: dayAt(0, 9), input: 1000, output: 100, cacheRead: 0, cacheWrite: 0, cost: 0.2, events: [] }),
+	runRecord({ index: 2, finishedAt: dayAt(0, 10), input: 100, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0.05, events: [] }),
+	// One run with a real trigger: it must not be counted as an empty wake.
+	runRecord({ index: 3, finishedAt: dayAt(0, 11), input: 100, output: 10, cacheRead: 50, cacheWrite: 5, cost: 0.05 }),
+]);
+const emptyWakeReport = buildUsageReport(emptyWakeFixture.profile, { days: 7, now: NOW });
+const emptyWakeTable = renderUsageReport(emptyWakeReport);
+check("empty-wake report counts runs with no events", emptyWakeReport.totals.runs === 3 && emptyWakeReport.emptyWakes.runs === 2, emptyWakeReport.emptyWakes);
+check(
+	"empty-wake tokens and cost are the empty runs' own",
+	emptyWakeReport.emptyWakes.tokens.input === 1100 &&
+		emptyWakeReport.emptyWakes.tokens.output === 110 &&
+		emptyWakeReport.emptyWakes.tokens.total === 1210 &&
+		Math.abs(emptyWakeReport.emptyWakes.cost - 0.25) < 1e-9 &&
+		emptyWakeReport.emptyWakes.turns === 4,
+	emptyWakeReport.emptyWakes,
+);
+check(
+	"empty wakes report their share of spend and tokens",
+	emptyWakeReport.emptyWakes.costShare !== null &&
+		Math.abs(emptyWakeReport.emptyWakes.costShare - 0.25 / 0.3) < 1e-9 &&
+		emptyWakeReport.emptyWakes.tokenShare !== null &&
+		Math.abs(emptyWakeReport.emptyWakes.tokenShare - 1210 / 1375) < 1e-9,
+	{ costShare: emptyWakeReport.emptyWakes.costShare, tokenShare: emptyWakeReport.emptyWakes.tokenShare },
+);
+check(
+	"the report explains what an empty wake is",
+	emptyWakeReport.emptyWakes.note.includes("empty trigger list") && emptyWakeReport.emptyWakes.note.includes("#116"),
+	emptyWakeReport.emptyWakes.note,
+);
+check("the table has an empty-wakes line", emptyWakeTable.includes("empty wakes 2 run(s)"), emptyWakeTable.split("\n").find((line) => line.includes("empty wakes")));
+check("the table shows the empty-wake share", emptyWakeTable.includes("83.3% of spend"), emptyWakeTable.split("\n").find((line) => line.includes("empty wakes")));
+check("a window with no empty wakes reports zero", report.emptyWakes.runs === 0 && report.emptyWakes.cost === 0, report.emptyWakes);
+check("the main fixture table still prints the line", tableText.includes("empty wakes 0 run(s)"), tableText.split("\n").find((line) => line.includes("empty wakes")));
+check(
+	"old records without an events array count as empty wakes",
+	partial.emptyWakes.runs === 1 && partial.emptyWakes.cost === 0,
+	partial.emptyWakes,
+);
+check(
+	"empty-wake keys are stable",
+	JSON.stringify(Object.keys(report.emptyWakes).sort()) ===
+		JSON.stringify(["activeMs", "cost", "costShare", "durationMs", "idleMs", "note", "runs", "tokenShare", "tokens", "turns"]),
+	Object.keys(report.emptyWakes).sort(),
+);
+
 section("stable --json shape");
 const TOP_LEVEL_KEYS = [
 	"agent",
 	"cache",
 	"daily",
+	"emptyWakes",
 	"failures",
 	"generatedAt",
 	"metadataOnly",
@@ -708,6 +759,7 @@ try {
 		tableRun.stdout.includes("per day") &&
 			tableRun.stdout.includes("top 10 runs by cost") &&
 			tableRun.stdout.includes("failed / aborted runs") &&
+			tableRun.stdout.includes("empty wakes") &&
 			tableRun.stdout.includes("cache hit share"),
 	);
 	check("the table never contains prompt or outbound text", !tableRun.stdout.includes(SECRET_PROMPT) && !tableRun.stdout.includes(SECRET_OUTBOUND));

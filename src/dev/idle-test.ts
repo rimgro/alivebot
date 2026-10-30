@@ -22,6 +22,7 @@ import { ReminderStore } from "../store/reminders.js";
 import { ThreadStore } from "../store/threads.js";
 import { HistoryStore } from "../store/history.js";
 import { createAliveTools, type RunHandle, type ToolDeps } from "../runtime/tools.js";
+import { hasWakeWorthyPending } from "../runtime/wake.js";
 
 let failures = 0;
 function check(name: string, condition: boolean, detail?: unknown): void {
@@ -48,6 +49,7 @@ const config = loadConfig({
 			maxNudges: 3,
 			maxNudgesPerRun: 5,
 			interrupt: true,
+			emptyWakeBackoff: { enabled: true, afterWakes: 2, maxIntervalMs: 60 * 60_000 },
 		},
 	},
 });
@@ -122,8 +124,17 @@ function makeRun(index: number): RunHandle {
 		retainedThisRun: false,
 	};
 }
-const event = (text: string, thread = "console") =>
-	store.append({ kind: "user_message", source: "test", priority: "normal", title: text, text, thread, expectsReply: true });
+const event = (text: string, thread = "console", options: { expectsReply?: boolean; wake?: boolean } = {}) =>
+	store.append({
+		kind: "user_message",
+		source: "test",
+		priority: "normal",
+		title: text,
+		text,
+		thread,
+		expectsReply: options.expectsReply ?? true,
+		wake: options.wake,
+	});
 
 section("idle returns pending events as tool output");
 {
@@ -237,6 +248,30 @@ section("notification policy steers and silences");
 	check("muted thread is muted", policy.shouldMute(event("x", "noise")));
 	const listed = await call(notifications, { action: "list" });
 	check("notifications list renders the policy", listed.content[0].text.includes(aliceRule.id), listed.content[0].text);
+}
+
+section("an unaddressed event never wakes the runtime but is still delivered (#116)");
+{
+	// Fresh inbox: wake-worthiness is decided from pending events alone.
+	const wakeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-idle-wake-test-"));
+	const wakeStore = EventStore.open(wakeRoot);
+	wakeStore.append({ kind: "user_message", source: "telegram", priority: "low", title: "group chatter", text: "just chatting", thread: "telegram:-1001", expectsReply: false, wake: false });
+	check("unaddressed chatter is pending", wakeStore.pendingCount() === 1, wakeStore.status());
+	check("unaddressed chatter does not count as a reason to wake", !hasWakeWorthyPending(wakeStore));
+	wakeStore.append({ kind: "user_message", source: "telegram", priority: "normal", title: "@alive status?", text: "@alive status?", thread: "telegram:-1001", expectsReply: true });
+	check("an addressed message behind it still counts", hasWakeWorthyPending(wakeStore));
+
+	// Nothing is dropped: the next time the agent is awake for another reason,
+	// `idle` hands it the chatter like any other event.
+	policy.reset();
+	run = makeRun(8);
+	store.beginRun(run.id);
+	event("group chatter", "group", { expectsReply: false, wake: false });
+	const delivered = await call(idle, { reason: "waiting" });
+	check("idle still returns an unaddressed event", delivered.content[0].text.includes("group chatter"), delivered.content[0].text);
+	check("idle counts the unaddressed event as delivered work", run.idleReturns === 1, run.idleReturns);
+	store.endRun();
+	fs.rmSync(wakeRoot, { recursive: true, force: true });
 }
 
 process.stdout.write(

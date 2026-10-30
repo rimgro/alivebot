@@ -52,6 +52,9 @@ export interface LoopConfig {
 	/**
 	 * How long a single `idle` may last before the agent is offered a sleep
 	 * (context reset). The agent may refuse with `idle({ important: true })`.
+	 *
+	 * It is also the base idle-wake interval: after a sleep the runtime waits this
+	 * long before it counts a wake-up with no events as an empty wake (#116).
 	 */
 	sleepAfterMs: number;
 	/**
@@ -68,6 +71,80 @@ export interface LoopConfig {
 	maxNudgesPerRun: number;
 	/** Allow interrupt-notification events to be steered into a running agent. */
 	interrupt: boolean;
+	/** Stretch the idle-wake interval while nothing happens (see `EmptyWakeBackoffConfig`). */
+	emptyWakeBackoff: EmptyWakeBackoffConfig;
+}
+
+/**
+ * Backoff for consecutive empty wake-ups (#116).
+ *
+ * An *empty wake* is one full idle interval that elapsed without a wake-worthy
+ * event: the runtime stays asleep, creates no run and never calls the model. Its
+ * only cost is the inbox check, and that check slows down while nothing happens.
+ *
+ * The base interval is `loop.sleepAfterMs` (default 15 min). After
+ * `afterWakes` consecutive empty wakes the interval doubles for every further
+ * one (15 → 30 → 60 min with the defaults), capped by `maxIntervalMs`. Any
+ * wake-worthy event resets the streak, so the next idle wait starts at the base
+ * interval again.
+ */
+export interface EmptyWakeBackoffConfig {
+	/** False = always wait the base interval; the streak is still counted. */
+	enabled: boolean;
+	/** Consecutive empty wakes before the interval starts doubling. */
+	afterWakes: number;
+	/** Hard cap for the stretched interval (milliseconds). */
+	maxIntervalMs: number;
+}
+
+export const DEFAULT_EMPTY_WAKE_BACKOFF: EmptyWakeBackoffConfig = {
+	enabled: true,
+	afterWakes: 2,
+	maxIntervalMs: 60 * 60_000,
+};
+
+/** A stretched wake interval below one minute is a typo, not a setting. */
+export const EMPTY_WAKE_MAX_INTERVAL_MIN_MS = 60_000;
+export const EMPTY_WAKE_MAX_INTERVAL_MAX_MS = 24 * 60 * 60_000;
+
+/**
+ * Validate the loop block's structured settings and fill safe defaults.
+ *
+ * Only `emptyWakeBackoff` is validated here: it is the one part of the loop with
+ * a shape that can be wrong in a way the runtime cannot recover from (a zero
+ * interval would spin, a missing cap would stretch to hours). Scalars such as
+ * `pollIntervalMs` keep their historical permissive behaviour.
+ */
+export function validateLoopConfig(value: LoopConfig): LoopConfig {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("loop must be an object");
+	const raw = (value as LoopConfig & { emptyWakeBackoff?: unknown }).emptyWakeBackoff;
+	const backoff = (raw ?? DEFAULT_EMPTY_WAKE_BACKOFF) as EmptyWakeBackoffConfig;
+	if (!backoff || typeof backoff !== "object" || Array.isArray(backoff)) {
+		throw new Error("loop.emptyWakeBackoff must be an object");
+	}
+	if (typeof backoff.enabled !== "boolean") throw new Error("loop.emptyWakeBackoff.enabled must be boolean");
+	if (!Number.isSafeInteger(backoff.afterWakes) || backoff.afterWakes < 1 || backoff.afterWakes > 100) {
+		throw new Error(
+			`loop.emptyWakeBackoff.afterWakes must be a whole number between 1 and 100, got "${String(backoff.afterWakes)}"`,
+		);
+	}
+	if (
+		!Number.isSafeInteger(backoff.maxIntervalMs) ||
+		backoff.maxIntervalMs < EMPTY_WAKE_MAX_INTERVAL_MIN_MS ||
+		backoff.maxIntervalMs > EMPTY_WAKE_MAX_INTERVAL_MAX_MS
+	) {
+		throw new Error(
+			`loop.emptyWakeBackoff.maxIntervalMs must be a whole number between ${EMPTY_WAKE_MAX_INTERVAL_MIN_MS} and ${EMPTY_WAKE_MAX_INTERVAL_MAX_MS} ms (1 minute to 24 hours), got "${String(backoff.maxIntervalMs)}"`,
+		);
+	}
+	return {
+		...value,
+		emptyWakeBackoff: {
+			enabled: backoff.enabled,
+			afterWakes: backoff.afterWakes,
+			maxIntervalMs: backoff.maxIntervalMs,
+		},
+	};
 }
 
 export interface BudgetConfig {
@@ -179,7 +256,12 @@ export interface TelegramConfig {
 	allowedUserIds: string[];
 	/** Explicit peer-bot allowlist; bot messages are accepted only when directly addressed to this bot. */
 	allowedBotIds: string[];
-	/** In group chats, only ingest messages that explicitly mention/reply to this bot. */
+	/**
+	 * In group chats, only ingest messages that explicitly mention/reply to this bot.
+	 * The stricter option: such messages are dropped entirely (no event, no history
+	 * record). With the default `false` they are stored and marked `wake: false`,
+	 * so they are readable later but never start a run by themselves (#116).
+	 */
 	requireMentionInGroups: boolean;
 	/** Long-poll timeout for getUpdates, in seconds. */
 	pollTimeoutSec: number;
@@ -476,6 +558,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		maxNudges: 3,
 		maxNudgesPerRun: 5,
 		interrupt: true,
+		emptyWakeBackoff: DEFAULT_EMPTY_WAKE_BACKOFF,
 	},
 	budget: {
 		maxDailyCostUsd: 0,
@@ -703,6 +786,7 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	// cannot capture the profile's token.
 	applySecretEnv(merged, collectSecretEnv(envPath, process.env));
 	migrateLoopConfig(merged.loop as unknown as Record<string, unknown>);
+	merged.loop = validateLoopConfig(merged.loop);
 	merged.sandbox = validateSandboxConfig(merged.sandbox);
 	merged.workers = validateWorkersConfig(merged.workers);
 	merged.updates = validateUpdatesConfig(merged.updates);
