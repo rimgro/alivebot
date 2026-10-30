@@ -195,6 +195,18 @@ export interface TelegramConfig {
 	ackReaction: string;
 	/** Treat edited messages / channel posts as events too. */
 	ingestEdits: boolean;
+	/**
+	 * Coalesce a burst of edits of the same message into one event. Each new
+	 * edit restarts the quiet window; the batch flushes after this many quiet
+	 * milliseconds. 0 turns debouncing off (every edit becomes its own event).
+	 */
+	editDebounceMs: number;
+	/**
+	 * Keep the pre-#113 rule for edits: an edited message expects a reply exactly
+	 * like a new one. Default false: an edit expects a reply only when it mentions
+	 * the bot or replies to one of its messages.
+	 */
+	editExpectsReply: boolean;
 	/** Keep at most N messages per chat locally. 0 = unlimited. */
 	historyLimitPerThread: number;
 	/** Split outgoing messages longer than this many characters. Telegram hard-limits 4096. */
@@ -219,6 +231,9 @@ export function validateTelegramConfig(value: TelegramConfig): TelegramConfig {
 		throw new Error(
 			`modules.telegram.managedBotTtlMs must be an integer between ${MANAGED_BOT_TTL_MIN_MS} and ${MANAGED_BOT_TTL_MAX_MS} ms`,
 		);
+	}
+	if (!Number.isSafeInteger(value.editDebounceMs) || value.editDebounceMs < 0) {
+		throw new Error(`modules.telegram.editDebounceMs must be a non-negative integer (milliseconds), got "${String(value.editDebounceMs)}"`);
 	}
 	return value;
 }
@@ -506,6 +521,8 @@ export const DEFAULT_CONFIG: AliveConfig = {
 			typingIndicator: true,
 			ackReaction: "",
 			ingestEdits: true,
+			editDebounceMs: 3000,
+			editExpectsReply: false,
 			historyLimitPerThread: 0,
 			maxMessageChars: 4000,
 			transcription: {

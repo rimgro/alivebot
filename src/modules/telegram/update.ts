@@ -26,6 +26,8 @@ export interface NormalizedInbound {
 	isEdit: boolean;
 	isChannel: boolean;
 	expectsReply: boolean;
+	/** The new text mentions the bot, text-mentions it, or replies to one of its messages. */
+	addressedToBot: boolean;
 	author?: TelegramAuthor;
 	/** What the human actually wrote (or a synthesized description of the media). */
 	text: string;
@@ -46,6 +48,12 @@ export interface NormalizeOptions {
 	allowedBotIds?: string[];
 	requireMentionInGroups?: boolean;
 	ingestEdits: boolean;
+	/**
+	 * Keep the pre-#113 rule for edits (they expect a reply like new messages).
+	 * Default false: an edit expects a reply only when explicitly addressed to
+	 * the bot (mention, text_mention or a reply to one of its messages).
+	 */
+	editExpectsReply?: boolean;
 }
 
 /**
@@ -88,7 +96,14 @@ export function normalizeUpdate(update: TelegramUpdate, options: NormalizeOption
 	const replyToMessageId = message.reply_to_message ? String(message.reply_to_message.message_id) : undefined;
 	const replyToPreview = message.reply_to_message ? previewOf(message.reply_to_message) : undefined;
 	const expectsReplyToMessage = expectsReply(message, isChannel, options);
+	// Group filtering keeps the "was this message addressed to us" rule even for
+	// edits: an edit is ingested only when the original update would have been.
 	if (options.requireMentionInGroups && (chat.type === "group" || chat.type === "supergroup") && !expectsReplyToMessage) return undefined;
+	const addressedToBot = isAddressedToBot(message, options);
+	// Edits are corrections, not new requests: by default they do not oblige the
+	// agent to answer unless the new version explicitly addresses the bot again.
+	// `editExpectsReply` restores the old "edits behave like new messages" rule.
+	const finalExpectsReply = isEdit && !options.editExpectsReply ? !isChannel && addressedToBot : expectsReplyToMessage;
 	const editSuffix = isEdit && message.edit_date ? `:edit:${message.edit_date}` : "";
 	const messageId = String(message.message_id);
 	const historyId = `telegram:${chatId}:${messageId}${editSuffix}`;
@@ -118,7 +133,8 @@ export function normalizeUpdate(update: TelegramUpdate, options: NormalizeOption
 		ts: (message.edit_date ?? message.date) * 1000,
 		isEdit,
 		isChannel,
-		expectsReply: expectsReplyToMessage,
+		expectsReply: finalExpectsReply,
+		addressedToBot,
 		author,
 		text,
 		promptText: promptLines.join("\n"),
@@ -172,6 +188,7 @@ function normalizeCallback(update: TelegramUpdate): NormalizedInbound | undefine
 		isEdit: false,
 		isChannel: chat.type === "channel",
 		expectsReply: true,
+		addressedToBot: true,
 		author: { id: String(query.from.id), name: displayName(query.from), username: query.from.username },
 		text,
 		promptText: `${text}\n(inline button on message ${messageId}; callback id ${query.id})`,

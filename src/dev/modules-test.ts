@@ -47,7 +47,7 @@ import {
 	assertAttachmentSize,
 	resolveOutgoingAttachment,
 } from "../runtime/attachments.js";
-import type { TelegramUpdate } from "../modules/telegram/types.js";
+import type { TelegramChat, TelegramMessageEntity, TelegramUpdate, TelegramUser } from "../modules/telegram/types.js";
 import { readJsonl } from "../util.js";
 
 let failures = 0;
@@ -512,6 +512,8 @@ const bot = { botId: 999, botUsername: "alive_bot", ingestEdits: true };
 	};
 	const edited = normalizeUpdate(edit, bot);
 	check("edits are marked", edited?.isEdit === true);
+	check("an unaddressed edit does not expect a reply", edited?.expectsReply === false && edited?.addressedToBot === false, edited?.expectsReply);
+	check("editExpectsReply restores the old expectation", normalizeUpdate(edit, { ...bot, editExpectsReply: true })?.expectsReply === true);
 	check("edits have their own history id", edited?.historyId === "telegram:42:10:edit:1700000100", edited?.historyId);
 	check("edits can be turned off", normalizeUpdate(edit, { ...bot, ingestEdits: false }) === undefined);
 
@@ -963,6 +965,8 @@ section("telegram module end-to-end against a fake Bot API");
 					typingIndicator: true,
 					ackReaction: "",
 					ingestEdits: true,
+					editDebounceMs: 3000,
+					editExpectsReply: false,
 					historyLimitPerThread: 0,
 					maxMessageChars: 4096,
 					transcription: { ...DEFAULT_CONFIG.modules.telegram.transcription },
@@ -1200,6 +1204,364 @@ section("telegram module end-to-end against a fake Bot API");
 }
 
 // ---------------------------------------------------------------------------
+section("telegram edits: debounce, reply rules, queueing and after-answer (#113)");
+{
+	const moduleRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-edit-test-"));
+	const log = new Logger({ console: false, level: "error", scope: "telegram-edit-test" });
+	const store = EventStore.open(moduleRoot);
+	const history = HistoryStore.open(moduleRoot);
+	const outbox = new Outbox(moduleRoot);
+	const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+	const updates: TelegramUpdate[] = [];
+	// The runtime is not part of this test: this closure stands in for its status.
+	const run = { active: false, threads: [] as string[] };
+
+	const privateChat: TelegramChat = { id: 42, type: "private", first_name: "Alice", username: "alice" };
+	const groupChat: TelegramChat = { id: -1001, type: "supergroup", title: "Team" };
+	const alice: TelegramUser = { id: 7, is_bot: false, first_name: "Alice", username: "alice" };
+	const botUser: TelegramUser = { id: 999, is_bot: true, first_name: "Alive", username: "alive_bot" };
+
+	const message = (updateId: number, messageId: number, chat: TelegramChat, text: string): TelegramUpdate => ({
+		update_id: updateId,
+		message: { message_id: messageId, date: 1_700_000_000, chat, from: alice, text },
+	});
+	const edit = (options: {
+		updateId: number;
+		messageId: number;
+		chat: TelegramChat;
+		text: string;
+		editDate: number;
+		from?: TelegramUser;
+		entities?: TelegramMessageEntity[];
+		replyToBot?: boolean;
+	}): TelegramUpdate => ({
+		update_id: options.updateId,
+		edited_message: {
+			message_id: options.messageId,
+			date: 1_700_000_000,
+			edit_date: options.editDate,
+			chat: options.chat,
+			from: options.from ?? alice,
+			text: options.text,
+			entities: options.entities,
+			reply_to_message: options.replyToBot
+				? { message_id: options.messageId - 1, date: 1_700_000_000, chat: options.chat, from: botUser, text: "earlier answer" }
+				: undefined,
+		},
+	});
+
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		const method = url.slice(url.lastIndexOf("/") + 1);
+		const params = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+		calls.push({ method, params });
+		if (method === "getMe") return jsonResponse({ ok: true, result: { ...botUser, id: botUser.id } });
+		if (method === "deleteWebhook") return jsonResponse({ ok: true, result: true });
+		if (method === "getUpdates") {
+			if (updates.length > 0) return jsonResponse({ ok: true, result: updates.splice(0) });
+			// Short-poll stand-in: answer with an empty batch so later pushes are seen.
+			return new Promise<Response>((resolve) => {
+				const done = () => {
+					clearTimeout(timer);
+					resolve(jsonResponse({ ok: true, result: [] }));
+				};
+				const timer = setTimeout(done, 10);
+				if (init?.signal?.aborted) return done();
+				init?.signal?.addEventListener("abort", done, { once: true });
+			});
+		}
+		if (method === "sendMessage") {
+			return jsonResponse({ ok: true, result: { message_id: 900 + calls.filter((call) => call.method === "sendMessage").length, date: 1, chat: { id: 42, type: "private" } } });
+		}
+		if (method === "sendChatAction" || method === "setMessageReaction") return jsonResponse({ ok: true, result: true });
+		return jsonResponse({ ok: true, result: true });
+	}) as unknown as typeof fetch;
+
+	const config = loadConfig({
+		cwd: moduleRoot,
+		overrides: {
+			chat: { console: false, http: { enabled: false, host: "127.0.0.1", port: 0, token: "" } },
+			modules: {
+				telegram: {
+					...DEFAULT_CONFIG.modules.telegram,
+					enabled: true,
+					token: "test-token",
+					tokenEnv: "ALIVE_TEST_TELEGRAM_TOKEN_UNSET",
+					allowedUserIds: ["7"],
+					pollTimeoutSec: 0,
+					historyLimitPerThread: 0,
+					// Real time in the test: a quiet window long enough to see the merge.
+					editDebounceMs: 80,
+				},
+				grafana: { ...DEFAULT_CONFIG.modules.grafana, enabled: false, host: "127.0.0.1", port: 0, token: "" },
+				external: [],
+			},
+		},
+	});
+
+	const telegram = new TelegramModule(config.config.modules.telegram);
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = fetchImpl;
+	try {
+		const host = new ModuleHost({
+			config,
+			log,
+			transports: [],
+			modules: [telegram],
+			ingest: (event) => store.append(event),
+			outbox: (limit) => outbox.list(limit),
+			history,
+			runtimeStatus: () => ({ status: run.active ? "working" : "idle", currentRunId: run.active ? "run_1" : undefined }),
+			currentThreads: () => run.threads,
+		});
+		await host.init();
+
+		const eventsFor = (messageId: string) =>
+			store.all().filter((event) => (event.meta as Record<string, unknown> | undefined)?.messageId === messageId);
+		const editEventsFor = (messageId: string) =>
+			eventsFor(messageId).filter((event) => (event.meta as Record<string, unknown> | undefined)?.edited === true);
+
+		// 1. Five quick corrections -> one event with the final text.
+		updates.push(message(1000, 30, privateChat, "first draft"));
+		check("the original message became an event", await waitFor(() => eventsFor("30").length === 1), eventsFor("30").map((event) => event.title));
+		for (let index = 1; index <= 5; index += 1) {
+			updates.push(edit({ updateId: 1000 + index, messageId: 30, chat: privateChat, text: `draft v${index}`, editDate: 1_700_000_100 + index }));
+		}
+		check("five quick edits collapse into one event", await waitFor(() => editEventsFor("30").length === 1), eventsFor("30").map((event) => event.meta));
+		// Outlive another debounce window to prove no trailing event appears.
+		await new Promise((resolve) => setTimeout(resolve, 160));
+		const debounced = editEventsFor("30");
+		check("only one edit event exists for the message", debounced.length === 1, debounced.map((event) => event.text));
+		check(
+			"the edit event carries the final text only",
+			debounced[0]?.text.includes("draft v5") === true && debounced[0]?.text.includes("draft v2") !== true,
+			debounced[0]?.text,
+		);
+		check("meta.edits counts the whole burst", (debounced[0]?.meta as { edits?: number } | undefined)?.edits === 5, debounced[0]?.meta);
+		check(
+			"meta.firstEditAt is the first edit of the burst",
+			(debounced[0]?.meta as { firstEditAt?: number } | undefined)?.firstEditAt === 1_700_000_101_000,
+			debounced[0]?.meta,
+		);
+		check(
+			"the existing edited note is kept",
+			debounced[0]?.text.includes("(this message was edited after it was first sent)") === true,
+			debounced[0]?.text,
+		);
+		check("edits are emitted as low priority", debounced[0]?.priority === "low", debounced[0]?.priority);
+		check("an unaddressed edit does not expect a reply", debounced[0]?.expectsReply === false, debounced[0]?.expectsReply);
+
+		// 2. Reply expectation rules for edits.
+		updates.push(message(1100, 31, groupChat, "group draft"));
+		check("the original group message became an event", await waitFor(() => eventsFor("31").length === 1));
+		updates.push(edit({ updateId: 1101, messageId: 31, chat: groupChat, text: "group draft fixed", editDate: 1_700_000_201 }));
+		check(
+			"a group edit without a mention does not expect a reply",
+			(await waitFor(() => editEventsFor("31").length === 1)) && editEventsFor("31")[0]?.expectsReply === false,
+			editEventsFor("31")[0]?.expectsReply,
+		);
+		updates.push(
+			edit({
+				updateId: 1102,
+				messageId: 31,
+				chat: groupChat,
+				text: "@alive_bot group draft fixed",
+				editDate: 1_700_000_301,
+				entities: [{ type: "mention", offset: 0, length: 10 }],
+			}),
+		);
+		check(
+			"an edit that mentions the bot expects a reply",
+			(await waitFor(() => editEventsFor("31").length === 2)) && editEventsFor("31")[1]?.expectsReply === true,
+			editEventsFor("31").map((event) => event.expectsReply),
+		);
+		updates.push(message(1110, 32, groupChat, "question"));
+		await waitFor(() => eventsFor("32").length === 1);
+		updates.push(edit({ updateId: 1111, messageId: 32, chat: groupChat, text: "question, edited", editDate: 1_700_000_401, replyToBot: true }));
+		check(
+			"an edit that replies to the bot expects a reply",
+			(await waitFor(() => editEventsFor("32").length === 1)) && editEventsFor("32")[0]?.expectsReply === true,
+			editEventsFor("32")[0]?.expectsReply,
+		);
+
+		// 3. An edit during a run working on this thread waits, then merges once.
+		updates.push(message(1200, 33, privateChat, "about to be edited"));
+		await waitFor(() => eventsFor("33").length === 1);
+		run.active = true;
+		run.threads = ["telegram:42"];
+		updates.push(edit({ updateId: 1201, messageId: 33, chat: privateChat, text: "working edit 1", editDate: 1_700_000_501 }));
+		updates.push(edit({ updateId: 1202, messageId: 33, chat: privateChat, text: "working edit 2", editDate: 1_700_000_502 }));
+		await new Promise((resolve) => setTimeout(resolve, 450));
+		check("an edit waits while a run is working on its thread", editEventsFor("33").length === 0, editEventsFor("33").map((event) => event.text));
+		check("the waiting edit did not start a run", store.status().openRunId === null, store.status());
+		run.active = false;
+		run.threads = [];
+		check("the queued edit is delivered after the run goes idle", await waitFor(() => editEventsFor("33").length === 1), eventsFor("33").map((event) => event.text));
+		const queued = editEventsFor("33");
+		check(
+			"queued edits merged into one low-priority event",
+			queued[0]?.text.includes("working edit 2") === true &&
+				queued[0]?.text.includes("working edit 1") !== true &&
+				(queued[0]?.meta as { edits?: number } | undefined)?.edits === 2 &&
+				queued[0]?.priority === "low",
+			{ text: queued[0]?.text, meta: queued[0]?.meta, priority: queued[0]?.priority },
+		);
+
+		// 4. An edit after the agent answered carries the note and no obligation.
+		updates.push(message(1300, 34, privateChat, "please answer"));
+		await waitFor(() => eventsFor("34").length === 1);
+		await host.deliver({ id: "edit_reply_34", runId: "run_1", thread: "telegram:42", text: "here is the answer", replyTo: "34", ts: Date.now() });
+		check(
+			"the outbound answer is linked to the original message",
+			history.query({ thread: "telegram:42", direction: "outbound" }).some((record) => record.replyTo === "34"),
+			history.query({ thread: "telegram:42", direction: "outbound" }).map((record) => record.replyTo),
+		);
+		updates.push(edit({ updateId: 1301, messageId: 34, chat: privateChat, text: "please answer (typo fixed)", editDate: 1_700_000_601 }));
+		check("an edit after the answer is delivered", await waitFor(() => editEventsFor("34").length === 1), eventsFor("34").map((event) => event.text));
+		const afterAnswer = editEventsFor("34")[0];
+		check("the after-answer note is in the event text", afterAnswer?.text.includes("правка после ответа") === true, afterAnswer?.text);
+		check("the after-answer edit does not expect a reply", afterAnswer?.expectsReply === false, afterAnswer?.expectsReply);
+		check(
+			"the payload records the after-answer flag",
+			(afterAnswer?.payload as { editedAfterReply?: boolean } | undefined)?.editedAfterReply === true,
+			afterAnswer?.payload,
+		);
+		updates.push(
+			edit({
+				updateId: 1302,
+				messageId: 34,
+				chat: privateChat,
+				text: "@alive_bot please answer again",
+				editDate: 1_700_000_701,
+				entities: [{ type: "mention", offset: 0, length: 10 }],
+			}),
+		);
+		check(
+			"an after-answer edit that addresses the bot expects a reply",
+			(await waitFor(() => editEventsFor("34").length === 2)) && editEventsFor("34")[1]?.expectsReply === true,
+			editEventsFor("34").map((event) => event.expectsReply),
+		);
+
+		// 5. An edit of the bot's own message is filtered by botId.
+		const eventsBeforeOwnEdit = store.all().length;
+		updates.push(edit({ updateId: 1400, messageId: 35, chat: privateChat, text: "bot edit", editDate: 1_700_000_801, from: botUser }));
+		await new Promise((resolve) => setTimeout(resolve, 250));
+		check("an edit of the bot's own message is ignored", store.all().length === eventsBeforeOwnEdit, store.all().map((event) => event.title));
+
+		await host.stop();
+	} finally {
+		globalThis.fetch = realFetch;
+	}
+}
+
+// ---------------------------------------------------------------------------
+section("telegram edits: editExpectsReply restores the old behaviour");
+{
+	const moduleRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-edit-config-test-"));
+	const log = new Logger({ console: false, level: "error", scope: "telegram-edit-config-test" });
+	const store = EventStore.open(moduleRoot);
+	const history = HistoryStore.open(moduleRoot);
+	const outbox = new Outbox(moduleRoot);
+	const sent: TelegramUpdate[] = [
+		{
+			update_id: 2000,
+			edited_message: {
+				message_id: 40,
+				date: 1_700_000_000,
+				edit_date: 1_700_000_100,
+				chat: { id: 42, type: "private", first_name: "Alice", username: "alice" },
+				from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
+				text: "quietly edited",
+			},
+		},
+	];
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		const method = url.slice(url.lastIndexOf("/") + 1);
+		if (method === "getMe") return jsonResponse({ ok: true, result: { id: 999, is_bot: true, first_name: "Alive", username: "alive_bot" } });
+		if (method === "deleteWebhook") return jsonResponse({ ok: true, result: true });
+		if (method === "getUpdates") {
+			if (sent.length > 0) return jsonResponse({ ok: true, result: sent.splice(0) });
+			return new Promise<Response>((resolve) => {
+				const done = () => {
+					clearTimeout(timer);
+					resolve(jsonResponse({ ok: true, result: [] }));
+				};
+				const timer = setTimeout(done, 10);
+				if (init?.signal?.aborted) return done();
+				init?.signal?.addEventListener("abort", done, { once: true });
+			});
+		}
+		return jsonResponse({ ok: true, result: true });
+	}) as unknown as typeof fetch;
+
+	const config = loadConfig({
+		cwd: moduleRoot,
+		overrides: {
+			chat: { console: false, http: { enabled: false, host: "127.0.0.1", port: 0, token: "" } },
+			modules: {
+				telegram: {
+					...DEFAULT_CONFIG.modules.telegram,
+					enabled: true,
+					token: "test-token",
+					tokenEnv: "ALIVE_TEST_TELEGRAM_TOKEN_UNSET",
+					allowedUserIds: ["7"],
+					pollTimeoutSec: 0,
+					editDebounceMs: 30,
+					editExpectsReply: true,
+				},
+				grafana: { ...DEFAULT_CONFIG.modules.grafana, enabled: false, host: "127.0.0.1", port: 0, token: "" },
+				external: [],
+			},
+		},
+	});
+	const telegram = new TelegramModule(config.config.modules.telegram);
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = fetchImpl;
+	try {
+		const host = new ModuleHost({
+			config,
+			log,
+			transports: [],
+			modules: [telegram],
+			ingest: (event) => store.append(event),
+			outbox: (limit) => outbox.list(limit),
+			history,
+			runtimeStatus: () => ({}),
+		});
+		await host.init();
+		check(
+			"editExpectsReply: true keeps the pre-#113 rule for a private edit",
+			await waitFor(() => store.all().some((event) => (event.meta as Record<string, unknown> | undefined)?.messageId === "40")),
+			store.all().map((event) => event.title),
+		);
+		const editEvent = store.all().find((event) => (event.meta as Record<string, unknown> | undefined)?.messageId === "40");
+		check("the config flag restores expectsReply", editEvent?.expectsReply === true, editEvent?.expectsReply);
+		check("the config flag keeps the debounce metadata", (editEvent?.meta as { edits?: number } | undefined)?.edits === 1, editEvent?.meta);
+		await host.stop();
+	} finally {
+		globalThis.fetch = realFetch;
+	}
+
+	let invalidDebounce = false;
+	try {
+		loadConfig({
+			cwd: moduleRoot,
+			overrides: {
+				modules: {
+					telegram: { ...DEFAULT_CONFIG.modules.telegram, editDebounceMs: -1 },
+					grafana: { ...DEFAULT_CONFIG.modules.grafana },
+					external: [],
+				},
+			},
+		});
+	} catch (err) {
+		invalidDebounce = err instanceof Error && err.message.includes("editDebounceMs");
+	}
+	check("a negative editDebounceMs is rejected by config validation", invalidDebounce);
+}
+
+// ---------------------------------------------------------------------------
 section("telegram outbound attachments: send_message delivers a workspace file");
 {
 	const moduleRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-attachment-test-"));
@@ -1279,6 +1641,8 @@ section("telegram outbound attachments: send_message delivers a workspace file")
 					typingIndicator: true,
 					ackReaction: "",
 					ingestEdits: true,
+					editDebounceMs: 3000,
+					editExpectsReply: false,
 					historyLimitPerThread: 0,
 					maxMessageChars: 4096,
 					transcription: { ...DEFAULT_CONFIG.modules.telegram.transcription },
@@ -1786,6 +2150,8 @@ section("telegram module: outage is reported once, not spammed");
 					typingIndicator: false,
 					ackReaction: "",
 					ingestEdits: true,
+					editDebounceMs: 3000,
+					editExpectsReply: false,
 					historyLimitPerThread: 0,
 					maxMessageChars: 4096,
 					transcription: { ...DEFAULT_CONFIG.modules.telegram.transcription },
