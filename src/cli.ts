@@ -36,6 +36,8 @@ import {
 	restartRefusalText,
 } from "./runtime/harness-guard.js";
 import { LOG_SOURCES, followFile, readLogTail, renderLogLine, resolveLogSource } from "./logs.js";
+import { findProfile, loadDashboard, loadRootConfig } from "./dashboard/state.js";
+import { DEFAULT_USAGE_DAYS, buildUsageReport, renderUsageReport } from "./usage/report.js";
 import { WorkerStore, validateWorkerId, workerLabel } from "./workers/store.js";
 import { gitDiff, gitState, isGitRepository } from "./workers/worktree.js";
 import { createHostWorkerEnvironment } from "./workers/environment.js";
@@ -320,6 +322,9 @@ export async function main(argv: string[], options: CliOptions = {}): Promise<nu
 			}
 			case "runs": {
 				return runsCommand(cwd, flags);
+			}
+			case "usage": {
+				return usageCommand(cwd, flags);
 			}
 			case "wakes": {
 				return runsCommand(cwd, flags);
@@ -1093,6 +1098,37 @@ function runsCommand(_cwd: string, flags: Record<string, string | boolean>): num
 	return 0;
 }
 
+/**
+ * `alive usage`: where tokens and money went, metadata only.
+ *
+ * Prints a plain table by default; `--json` prints the stable machine-readable
+ * report (`src/usage/report.ts`, shape documented in the README).
+ */
+function usageCommand(cwd: string, flags: Record<string, string | boolean>): number {
+	const rawDays = flags["days"];
+	if (rawDays === true) throw new Error("--days requires a number (e.g. --days 14)");
+	const days = rawDays === undefined ? DEFAULT_USAGE_DAYS : Number(rawDays);
+	if (!Number.isSafeInteger(days) || days < 1 || days > 3650) {
+		throw new Error("--days must be a whole number between 1 and 3650");
+	}
+	const profiles = loadDashboard(loadRootConfig({ rootDir: cwd, configPath: flagString(flags, "config") }));
+	const agentId = flagString(flags, "agent");
+	const profile = agentId === undefined ? profiles[0] : findProfile(profiles, agentId);
+	if (!profile) {
+		const known = profiles.map((entry) => entry.id).join(", ") || "(none)";
+		throw new Error(
+			agentId === undefined ? "no agent profile found here" : `unknown agent "${agentId}"; known agent ids: ${known}`,
+		);
+	}
+	const report = buildUsageReport(profile, { days });
+	if (flagBool(flags, "json")) {
+		process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+		return 0;
+	}
+	process.stdout.write(renderUsageReport(report));
+	return 0;
+}
+
 function policyCommand(_cwd: string, positionals: string[]): number {
 	const config = loadForCli({});
 	const policy = new PolicyStore(config.paths.stateDir);
@@ -1540,6 +1576,10 @@ usage:
   alive status [--json]                       show runtime + inbox state
   alive heartbeat [--status] [--json]         process heartbeat: exit 0 fresh, 1 missing/stale
   alive runs [-n 10]                          run history (alias: wakes)
+  alive usage [--days 14] [--agent <id>] [--json]
+                                              where tokens and money went: daily totals,
+                                              chat vs workers, top runs, failed-run spend
+                                              (metadata only, no prompt or message text)
   alive policy [list]                         show the notification policy
   alive policy add <interrupt|queue|mute> [thread]
   alive policy default <interrupt|queue|mute> set the fallback mode
