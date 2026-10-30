@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { DEFAULT_CONFIG, DEFAULT_CONTRACT, loadConfig, resolveMemoryDatabasePath, type AgentManagementPermissions, type LoadedConfig } from "./config.js";
-import { migrateConfigSecrets, readEnvFileValues } from "./config-secrets.js";
+import { defaultTelegramTokenEnv, MASTER_TELEGRAM_TOKEN_ENV, migrateConfigSecrets, profileEnvSegment, readEnvFileValues } from "./config-secrets.js";
 import { snapshotRuntime, spawnBackground, stopRuntime, waitForRuntime } from "./runtime/daemon.js";
 import { sleep } from "./util.js";
 import { mergeSandboxConfig, type SandboxConfig } from "./sandbox/config.js";
@@ -92,9 +92,12 @@ export function createAgent(base: LoadedConfig, idInput: string, name?: string, 
 	config.memory.databasePath = resolveMemoryDatabasePath(base);
 	config.memory.sharedScopes = [];
 	config.tools.allowlist = allowedTools;
-	// Every agent needs its own bot identity. Keep Telegram off until explicitly configured.
+	// Every agent needs its own bot identity. Keep Telegram off until explicitly
+	// configured, and point it at a variable scoped to this agent
+	// (`DEVELOPER_TELEGRAM_TOKEN`) so it can never read the master bot's token (#108).
 	config.modules.telegram.enabled = false;
 	config.modules.telegram.token = "";
+	config.modules.telegram.tokenEnv = defaultTelegramTokenEnv(id);
 	config.modules.grafana.token = "";
 	fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
 	fs.writeFileSync(soulPath, fs.readFileSync(base.paths.soulPath, "utf8"), { mode: 0o600 });
@@ -464,6 +467,40 @@ export function cancelManagedBotRequests(root: string, agentId: string): Managed
 	return removed;
 }
 
+/**
+ * Default bot-token variable for a managed profile: agent `developer` reads
+ * `DEVELOPER_TELEGRAM_TOKEN`. Exported so the CLI can name it in errors.
+ */
+export function defaultAgentTelegramTokenEnv(agentId: string): string {
+	return defaultTelegramTokenEnv(validateAgentId(agentId));
+}
+
+/**
+ * Refuse a token variable that is shared with (or owned by) another profile.
+ *
+ * The master's `ALIVE_TELEGRAM_TOKEN` is the one that caused the incident: three
+ * agents long-polled the master bot because they inherited that variable, and
+ * Telegram answered 409 for hours. A managed agent must read its own variable.
+ */
+function assertAgentScopedTokenEnv(agent: ManagedAgent, envName: string): string {
+	const fallback = defaultTelegramTokenEnv(agent.id);
+	if (envName === fallback) return envName;
+	if (envName === MASTER_TELEGRAM_TOKEN_ENV) {
+		throw new Error(
+			`refusing --token-env ${envName}: it is the master bot's token variable, so agent ${agent.id} would answer the master's bot. ` +
+				`Use the per-agent default ${fallback} instead (put ${fallback}=<token> in ${path.join(agent.directory, ".env")}).`,
+		);
+	}
+	const SCOPE_SUFFIX = "_TELEGRAM_TOKEN";
+	if (envName.endsWith(SCOPE_SUFFIX) && envName.slice(0, -SCOPE_SUFFIX.length) !== profileEnvSegment(agent.id)) {
+		throw new Error(
+			`refusing --token-env ${envName}: it looks like the token variable of another profile. ` +
+				`Use the per-agent default ${fallback} instead.`,
+		);
+	}
+	return envName;
+}
+
 function removePlaintextManagedToken(agent: ManagedAgent, envName: string): void {
 	try {
 		const current = readAgentConfig(agent);
@@ -480,7 +517,9 @@ function removePlaintextManagedToken(agent: ManagedAgent, envName: string): void
 /** Keep the bot token in `.env` (0600) and only its variable name in the config. */
 export function attachManagedBotToken(agent: ManagedAgent, token: string, bot: { id: number; username?: string }): void {
 	if (!token.trim()) throw new Error("Telegram returned an empty managed-bot token");
-	const envName = `ALIVE_TELEGRAM_${agent.id.replace(/[^A-Za-z0-9]+/g, "_").replace(/^_+|_+$/g, "").toUpperCase()}_${bot.id}_TOKEN`;
+	// Scoped to this agent (and the bot) so provisioning twice cannot collide and
+	// the token can never live under the master's variable (#108).
+	const envName = assertAgentScopedTokenEnv(agent, `${profileEnvSegment(agent.id)}_TELEGRAM_${bot.id}_TOKEN`);
 	const raw = readAgentConfig(agent);
 	raw.modules ??= {};
 	raw.modules.telegram ??= {};
@@ -520,11 +559,23 @@ export function attachManagedBotToken(agent: ManagedAgent, token: string, bot: {
 	writeTextPrivate(path.join(agent.directory, "telegram-managed-bot.json"), `${JSON.stringify(bot, null, 2)}\n`);
 }
 
-export function configureAgentTelegram(agent: ManagedAgent, tokenEnv: string): void {
-	if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(tokenEnv)) throw new Error("token environment variable name is invalid");
+/**
+ * Point a managed agent at the environment variable holding its own bot token.
+ *
+ * `tokenEnv` is optional: the per-agent default (`DEVELOPER_TELEGRAM_TOKEN` for
+ * agent `developer`) is derived automatically. An explicit value is accepted only
+ * when it is scoped to this agent: a managed agent must never read the master's
+ * `ALIVE_TELEGRAM_TOKEN`, or it answers the master bot and Telegram returns 409
+ * for everyone polling it (#108). Returns the variable name that was written.
+ */
+export function configureAgentTelegram(agent: ManagedAgent, tokenEnv?: string): string {
+	const requested = tokenEnv?.trim() ?? "";
+	if (requested && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(requested)) throw new Error("token environment variable name is invalid");
+	const envName = requested ? assertAgentScopedTokenEnv(agent, requested) : defaultTelegramTokenEnv(agent.id);
 	const raw = JSON.parse(fs.readFileSync(agent.configPath, "utf8"));
 	raw.modules.telegram.enabled = true;
 	raw.modules.telegram.token = "";
-	raw.modules.telegram.tokenEnv = tokenEnv;
+	raw.modules.telegram.tokenEnv = envName;
 	fs.writeFileSync(agent.configPath, `${JSON.stringify(raw, null, 2)}\n`, { mode: 0o600 });
+	return envName;
 }

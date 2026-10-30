@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { configureAgentTelegram, createAgent, disableManagedAgent, enableManagedAgent, ensureAdminAgent, getAgentEnabled, listAgents, restartManagedAgent, startManagedAgent, stopManagedAgent, updateManagedAgentProfile, validateAgentId } from "./agents.js";
 import type { AliveConfig, LoadedConfig } from "./config.js";
-import { DEFAULT_CONFIG, loadConfig, redactSecretFields, writeDefaultConfig, migrateConfigSecrets } from "./config.js";
+import { loadConfig, profileSecretDefaults, redactSecretFields, writeDefaultConfig, migrateConfigSecrets } from "./config.js";
 import { Logger } from "./log.js";
 import { createMaskContext, maskSecrets } from "./secrets.js";
 import { EventStore, type EventPriority } from "./store/events.js";
@@ -389,9 +389,12 @@ function configCommand(cwd: string, flags: Record<string, string | boolean>, pos
 		const localConfigPath = path.join(path.dirname(configPath), "alive.config.local.json");
 		const json = flagBool(flags, "json");
 		const dryRun = flagBool(flags, "dry-run");
+		const profile = profileSecretDefaults(configPath);
 		const report = migrateConfigSecrets({
 			configPaths: [configPath, localConfigPath],
-			defaults: DEFAULT_CONFIG,
+			envPath: path.join(path.dirname(configPath), ".env"),
+			defaults: profile.defaults,
+			profile: profile.profile,
 			dryRun,
 			log: json ? () => undefined : (line) => process.stdout.write(`${line}\n`),
 			warn: json ? () => undefined : (line) => process.stderr.write(`${line}\n`),
@@ -747,9 +750,7 @@ async function agentsCommand(cwd: string, flags: Record<string, string | boolean
 	}
 	if (action === "telegram") {
 		const agent = findManagedAgent(base, positionals[1]);
-		const tokenEnv = flagString(flags, "token-env");
-		if (!tokenEnv) throw new Error("usage: alive agents telegram <id> --token-env <ENV_NAME> (create the bot with @BotFather first)");
-		configureAgentTelegram(agent, tokenEnv);
+		const tokenEnv = configureAgentTelegram(agent, flagString(flags, "token-env"));
 		process.stdout.write(`Telegram enabled for ${agent.id} using $${tokenEnv}; restart the agent to apply.\n`);
 		return 0;
 	}
@@ -1546,7 +1547,7 @@ usage:
   alive agents permissions <id> --permissions-file JSON
   alive agents send <id> <message>          send a durable local message to an agent
   alive agents inbox <id> [--thread ID]     list/read local messages for an agent
-  alive agents telegram <id> --token-env ENV
+  alive agents telegram <id> [--token-env ENV]   (default: <AGENT>_TELEGRAM_TOKEN)
   alive agents request-telegram <id> --chat ID
                                               request a Managed Bot for an agent via Telegram 9.6
                                               (--foreground: stay attached, --once: one run)
