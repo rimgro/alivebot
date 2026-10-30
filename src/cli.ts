@@ -15,7 +15,7 @@ import { Outbox } from "./store/outbox.js";
 import { listLocalMessages, operatorAgentThread, sendLocalAgentMessage } from "./runtime/agent-messaging.js";
 import { runAgentConsole } from "./tui/agent-console.js";
 import { describeModules } from "./events/loader.js";
-import { TelegramApi } from "./modules/telegram/client.js";
+import { TelegramApi, TelegramApiError } from "./modules/telegram/client.js";
 import {
 	cancelAgentTelegram,
 	formatManagedBotStatus,
@@ -25,7 +25,7 @@ import {
 } from "./modules/telegram/managed-request.js";
 import { resolveToken } from "./modules/telegram/module.js";
 import { browserCommand } from "./modules/browser/cli.js";
-import { TelegramAllowlistStore } from "./modules/telegram/state.js";
+import { TelegramAllowlistStore, TelegramStateStore, telegramIdentityView } from "./modules/telegram/state.js";
 import { AliveRuntime } from "./runtime/loop.js";
 import { readHeartbeatStatus } from "./heartbeat.js";
 import { snapshotRuntime, spawnBackground, stdoutLogPath, stopRuntime, waitForRuntime, type StopResult } from "./runtime/daemon.js";
@@ -874,6 +874,20 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 	const usage = runs.usageToday();
 	const storeStatus = store.status();
 	const running = runtime ? isProcessAlive(runtime.pid) : false;
+	// Telegram keeps its identity/conflict state on disk so `alive status` can
+	// report a stale bot or a duplicate poller even while the runtime is busy.
+	const telegramState = config.config.modules.telegram.enabled
+		? new TelegramStateStore(path.join(config.paths.modulesDir, "telegram")).load()
+		: undefined;
+	const telegramIdentity = telegramState ? telegramIdentityView(telegramState.me) : undefined;
+	const telegramConflict = telegramState?.pollerConflict;
+	const telegramReport =
+		telegramIdentity && (telegramConflict || telegramState?.me)
+			? {
+					identity: telegramIdentity,
+					...(telegramConflict ? { pollerConflict: { ...telegramConflict, state: "duplicate-poller" } } : {}),
+				}
+			: undefined;
 
 	if (flagBool(flags, "json")) {
 		process.stdout.write(
@@ -888,6 +902,7 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 					threads: threads.all(),
 					policy: policy.load(),
 					modules: describeModules(config.config),
+					...(telegramReport ? { telegram: telegramReport } : {}),
 					workers: config.config.workers.enabled ? new WorkerStore(config.paths).list() : undefined,
 					usageToday: usage,
 					lastRun: runs.last(),
@@ -928,6 +943,14 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 	const modules = describeModules(config.config);
 	const enabledModules = modules.filter((m) => m.enabled);
 	line("modules", enabledModules.length > 0 ? enabledModules.map((m) => m.name).join(", ") : `none (${modules.length} available)`);
+	if (telegramReport) {
+		line(
+			"telegram",
+			telegramConflict
+				? `duplicate poller: ${telegramConflict.message} (since ${iso(telegramConflict.since)})`
+				: telegramIdentity!.text,
+		);
+	}
 	line("budget", `$${usage.cost.toFixed(4)} today, ${usage.runs} runs, ${usage.turns} turns`);
 	const last = runs.last();
 	line("last run", last ? `#${last.index} ${formatDuration(last.durationMs)} ${last.stopReason}` : "never");
@@ -1340,11 +1363,16 @@ async function telegramCommand(
 			process.stdout.write(`ok: @${me.username ?? "?"} (id ${me.id})\n`);
 			return 0;
 		} catch (err) {
-			process.stderr.write(`${term.red("telegram unreachable:")} ${err instanceof Error ? err.message : String(err)}\n`);
+			const network = err instanceof TelegramApiError && err.network;
 			process.stderr.write(
-				"hint: запрос не дошёл до Telegram (ECONNRESET/ETIMEDOUT — обычно VPN/прокси-маршрут). " +
-					"Проверь сеть или задай modules.telegram.apiBase на локальный прокси.\n",
+				`${term.red(network ? "telegram unreachable:" : "telegram request failed:")} ${err instanceof Error ? err.message : String(err)}\n`,
 			);
+			if (network) {
+				process.stderr.write(
+					"hint: запрос не дошёл до Telegram (ECONNRESET/ETIMEDOUT — обычно VPN/прокси-маршрут). " +
+						"Проверь сеть или задай modules.telegram.apiBase на локальный прокси.\n",
+				);
+			}
 			return 2;
 		}
 	}

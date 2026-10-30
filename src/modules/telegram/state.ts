@@ -1,10 +1,29 @@
 import * as path from "node:path";
-import { readJson, writeJsonAtomic } from "../../util.js";
+import { iso, readJson, writeJsonAtomic } from "../../util.js";
+
+export interface TelegramBotIdentity {
+	id: number;
+	username?: string;
+	firstName: string;
+	/** Last successful getMe. Older state files may not have it. */
+	verifiedAt?: number;
+	/** Set when a later getMe failed: the stored identity is no longer trustworthy. */
+	stale?: boolean;
+	staleAt?: number;
+}
+
+/** A 409 that was not (or not only) caused by a webhook. */
+export interface TelegramPollerConflict {
+	since: number;
+	message: string;
+}
 
 export interface TelegramState {
 	/** Next getUpdates offset: last processed update_id + 1. */
 	offset: number;
-	me?: { id: number; username?: string; firstName: string };
+	me?: TelegramBotIdentity;
+	/** Last known duplicate-poller conflict. Cleared by the next successful poll. */
+	pollerConflict?: TelegramPollerConflict;
 	lastPollAt?: number;
 	lastUpdateAt?: number;
 	lastError?: string;
@@ -13,6 +32,44 @@ export interface TelegramState {
 	inbound: number;
 	outbound: number;
 	errors: number;
+}
+
+/** Status wording shared by `alive status`, `GET /status` and the status tool. */
+export interface TelegramIdentityView {
+	status: "verified" | "stale" | "unknown";
+	id?: number;
+	username?: string;
+	name?: string;
+	verifiedAt?: number;
+	staleAt?: number;
+	text: string;
+}
+
+export function telegramIdentityView(me: TelegramBotIdentity | undefined): TelegramIdentityView {
+	if (!me) {
+		return { status: "unknown", text: "identity unknown (not verified yet)" };
+	}
+	const bot = `bot id ${me.id}${me.username ? `, @${me.username}` : ""}`;
+	if (me.stale) {
+		const verified = me.verifiedAt === undefined ? "unknown" : iso(me.verifiedAt);
+		return {
+			status: "stale",
+			id: me.id,
+			username: me.username,
+			name: me.firstName,
+			verifiedAt: me.verifiedAt,
+			staleAt: me.staleAt,
+			text: `identity unknown (last verified ${verified}); last known ${bot}`,
+		};
+	}
+	return {
+		status: "verified",
+		id: me.id,
+		username: me.username,
+		name: me.firstName,
+		verifiedAt: me.verifiedAt,
+		text: `${bot} (verified${me.verifiedAt === undefined ? "" : ` ${iso(me.verifiedAt)}`})`,
+	};
 }
 
 const EMPTY: TelegramState = { offset: 0, polls: 0, updates: 0, inbound: 0, outbound: 0, errors: 0 };

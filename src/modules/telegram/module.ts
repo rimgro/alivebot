@@ -26,7 +26,14 @@ import {
 	imageRelativePath,
 	type InboundImageResult,
 } from "./images.js";
-import { TelegramAllowlistStore, TelegramDeliveryLedger, TelegramStateStore, type TelegramState } from "./state.js";
+import {
+	TelegramAllowlistStore,
+	TelegramDeliveryLedger,
+	TelegramStateStore,
+	telegramIdentityView,
+	type TelegramPollerConflict,
+	type TelegramState,
+} from "./state.js";
 import { chatLabel, isParseModeError, splitMessage } from "./text.js";
 import {
 	TELEGRAM_CAPTION_MAX_CHARS,
@@ -48,6 +55,13 @@ import {
 } from "./voice-transcription.js";
 
 const DEFAULT_ALLOWED_UPDATES = ["message", "edited_message", "channel_post", "edited_channel_post", "callback_query"];
+
+/** Telegram's 409 description omits the cause; this is the actionable version. */
+export const TELEGRAM_DUPLICATE_POLLER_MESSAGE =
+	"another poller is using this bot token (duplicate agent/process or a shared token)";
+
+/** Probe/delete and report a 409 at most once per five minutes for this token. */
+const TELEGRAM_CONFLICT_WINDOW_MS = 5 * 60_000;
 
 /** A validated attachment, loaded and ready for one Bot API upload. */
 interface PreparedUpload {
@@ -112,6 +126,11 @@ export class TelegramModule implements AliveModule {
 	private outageStartedAt?: number;
 	private lastErrorAt?: number;
 	private lastSuccessAt?: number;
+	private lastErrorKind?: "network" | "api" | "duplicate-poller";
+	private lastFailureNetwork = false;
+	private pollerConflict?: TelegramPollerConflict;
+	private lastConflictProbeAt = 0;
+	private lastConflictNoticeAt = 0;
 
 	constructor(config: TelegramConfig) {
 		this.config = config;
@@ -157,29 +176,47 @@ export class TelegramModule implements AliveModule {
 		void this.sweepManagedRequests();
 
 		// Polling must never depend on the identity handshake: a single network blip
-		// during getMe/deleteWebhook used to leave the bot silently deaf until a
-		// restart. Start the long-poll loop first, then treat identity as best-effort.
+		// during getMe used to leave the bot silently deaf until a restart. Start the
+		// long-poll loop first, then treat identity as best-effort. A webhook is no
+		// longer deleted unconditionally here: the 409 handler checks first.
 		this.pollPromise = this.poll();
 
+		let me: Awaited<ReturnType<TelegramApi["getMe"]>> | undefined;
 		try {
-			await this.api.deleteWebhook({ drop_pending_updates: false });
+			me = await this.api.getMe();
 		} catch (err) {
+			const now = Date.now();
 			this.lastError = message(err);
-			this.lastErrorAt = Date.now();
-			ctx.log.warn("telegram deleteWebhook failed; polling anyway", { error: this.lastError });
+			this.lastErrorAt = now;
+			this.lastErrorKind = isNetworkError(err) ? "network" : "api";
+			this.lastFailureNetwork = isNetworkError(err);
+			// A failed getMe invalidates whatever bot was recorded by an earlier run:
+			// status must not keep presenting that identity as connected.
+			const current = this.state.load();
+			if (current.me) this.state.patch({ me: { ...current.me, stale: true, staleAt: now } });
+			ctx.log.warn("telegram getMe failed; polling anyway", { error: this.lastError });
 		}
 
-		try {
-			const me = await this.api.getMe();
+		if (me) {
+			const mismatch = this.managedBotIdentityMismatch(ctx, me.id);
+			if (mismatch) {
+				const error = new Error(mismatch);
+				this.lastError = mismatch;
+				this.lastErrorAt = Date.now();
+				this.lastErrorKind = "api";
+				ctx.log.error("telegram bot identity mismatch; refusing to poll", { error: mismatch, botId: me.id });
+				// The poll loop already started; a fatal identity mismatch must not leave
+				// a second poller behind.
+				await this.stop();
+				throw error;
+			}
 			this.botId = me.id;
 			this.botUsername = me.username;
 			this.botName = [me.first_name, me.last_name].filter(Boolean).join(" ") || me.username || "bot";
-			this.state.patch({ me: { id: me.id, username: me.username, firstName: me.first_name } });
+			this.state.patch({
+				me: { id: me.id, username: me.username, firstName: me.first_name, verifiedAt: Date.now() },
+			});
 			ctx.log.info("telegram connected", { bot: this.botName, username: this.botUsername, id: this.botId });
-		} catch (err) {
-			this.lastError = message(err);
-			this.lastErrorAt = Date.now();
-			ctx.log.warn("telegram getMe failed; polling anyway", { error: this.lastError });
 		}
 	}
 
@@ -202,17 +239,46 @@ export class TelegramModule implements AliveModule {
 		const state = this.state?.load();
 		const chats = this.ctx ? this.ctx.history.threads({ module: "telegram" }).length : 0;
 		const messages = this.ctx ? this.ctx.history.stats().messages : 0;
+		const identity = telegramIdentityView(state?.me);
+		const conflict = this.pollerConflict ?? state?.pollerConflict;
+		const networkProblem = Boolean(this.api) && this.consecutiveFailures > 0 && this.lastFailureNetwork;
+		const connected =
+			Boolean(this.api) &&
+			!this.stopped &&
+			identity.status === "verified" &&
+			this.consecutiveFailures === 0 &&
+			conflict === undefined;
+		const moduleState = conflict
+			? "duplicate-poller"
+			: identity.status === "stale"
+				? "identity-stale"
+				: identity.status === "unknown" && this.api
+					? "identity-unknown"
+					: networkProblem
+						? "network-error"
+						: this.consecutiveFailures > 0
+							? "error"
+							: this.stopped
+								? "stopped"
+								: "connected";
 		return {
 			configured: Boolean(this.api),
 			polling: Boolean(this.pollPromise),
-			connected: Boolean(this.api) && this.consecutiveFailures === 0,
-			reachable: Boolean(this.api) && this.consecutiveFailures === 0,
+			pollingBlocked: conflict !== undefined,
+			state: moduleState,
+			connected,
+			reachable: Boolean(this.api) && !networkProblem,
+			networkProblem,
+			identity,
 			bot: state?.me,
+			duplicatePoller: conflict !== undefined,
+			pollerConflict: conflict ? { ...conflict, state: "duplicate-poller" } : undefined,
 			offset: state?.offset,
 			lastPollAt: state?.lastPollAt,
 			lastUpdateAt: state?.lastUpdateAt,
 			lastSuccessAt: this.lastSuccessAt,
-			lastError: this.lastError ?? state?.lastError,
+			lastError: this.lastError ?? conflict?.message ?? state?.lastError,
+			lastErrorKind: this.lastErrorKind ?? (conflict ? "duplicate-poller" : undefined),
 			lastErrorAt: this.lastErrorAt,
 			consecutiveFailures: this.consecutiveFailures,
 			outageMs: this.outageStartedAt ? Date.now() - this.outageStartedAt : 0,
@@ -263,8 +329,12 @@ export class TelegramModule implements AliveModule {
 					polls: current.polls + 1,
 					updates: current.updates + updates.length,
 					lastError: undefined,
+					pollerConflict: undefined,
 				});
 				this.lastError = undefined;
+				this.lastErrorKind = undefined;
+				this.lastFailureNetwork = false;
+				this.pollerConflict = undefined;
 				this.lastSuccessAt = Date.now();
 				backoff = 1000;
 				if (this.consecutiveFailures > 0) {
@@ -273,49 +343,131 @@ export class TelegramModule implements AliveModule {
 				}
 				this.consecutiveFailures = 0;
 				this.outageStartedAt = undefined;
+				// Probe again immediately if a conflict returns after this recovery.
+				this.lastConflictProbeAt = 0;
 			} catch (err) {
 				if (this.stopped || this.abort.signal.aborted) break;
 				this.counters.errors += 1;
 				this.consecutiveFailures += 1;
-				this.lastError = message(err);
 				this.lastErrorAt = Date.now();
 				this.outageStartedAt ??= this.lastErrorAt;
 				const current = state.load();
-				state.patch({ lastError: this.lastError, errors: current.errors + 1 });
-				if (err instanceof TelegramApiError && err.errorCode === 401) {
-					ctx.log.error("telegram rejected the bot token; polling stopped", { error: this.lastError });
-					break;
-				}
-				// A leftover webhook makes every getUpdates fail with 409. Startup could not
-				// clear it (offline), so retry here instead of staying deaf forever.
-				if (err instanceof TelegramApiError && err.errorCode === 409) {
-					try {
-						await api.deleteWebhook({ drop_pending_updates: false });
-						ctx.log.warn("telegram cleared a conflicting webhook; resuming polling", { error: this.lastError });
-					} catch {
-						// keep the normal backoff path below
+				const duplicatePoller = err instanceof TelegramApiError && err.errorCode === 409;
+
+				if (duplicatePoller) {
+					// 409 almost always means another process polls this token; deleting the
+					// webhook every cycle cannot fix that and can destroy a real webhook.
+					// Record the condition before the probe so status is never transiently
+					// misreported as a generic error while getWebhookInfo is in flight.
+					this.lastError = TELEGRAM_DUPLICATE_POLLER_MESSAGE;
+					this.lastErrorKind = "duplicate-poller";
+					this.lastFailureNetwork = false;
+					this.pollerConflict = {
+						since: current.pollerConflict?.since ?? this.pollerConflict?.since ?? this.lastErrorAt,
+						message: TELEGRAM_DUPLICATE_POLLER_MESSAGE,
+					};
+					state.patch({ lastError: this.lastError, errors: current.errors + 1, pollerConflict: this.pollerConflict });
+					// Probe once per window and delete only a webhook that is actually set.
+					const probe = await this.probeConflictingWebhook(api);
+					const detail = {
+						error: this.lastError,
+						state: "duplicate-poller",
+						failures: this.consecutiveFailures,
+						outageMs: Date.now() - (this.outageStartedAt ?? Date.now()),
+						webhookChecked: probe.checked,
+						webhookRemoved: probe.removed,
+						...(probe.error ? { webhookCheckError: probe.error } : {}),
+					};
+					if (probe.removed) {
+						ctx.log.info("telegram removed a webhook that was blocking polling", detail);
+					} else if (this.lastErrorAt - this.lastConflictNoticeAt >= TELEGRAM_CONFLICT_WINDOW_MS) {
+						this.lastConflictNoticeAt = this.lastErrorAt;
+						ctx.log.warn(`telegram 409: ${TELEGRAM_DUPLICATE_POLLER_MESSAGE}`, detail);
+					} else {
+						ctx.log.debug("telegram is still blocked by a duplicate poller", detail);
 					}
+				} else {
+					this.lastError = message(err);
+					this.lastFailureNetwork = isNetworkError(err);
+					this.lastErrorKind = this.lastFailureNetwork ? "network" : "api";
+					state.patch({ lastError: this.lastError, errors: current.errors + 1 });
+					if (err instanceof TelegramApiError && err.errorCode === 401) {
+						ctx.log.error("telegram rejected the bot token; polling stopped", { error: this.lastError });
+						break;
+					}
+					const retryAfter = err instanceof TelegramApiError ? err.retryAfterSec : undefined;
+					const waitMs = retryAfter !== undefined ? retryAfter * 1000 : jitter(backoff);
+					// One warning when the outage starts (and occasionally after), otherwise
+					// debug: a blocked route must not flood the console every second.
+					const loud = this.consecutiveFailures === 1 || this.consecutiveFailures % 30 === 0;
+					const detail = {
+						error: this.lastError,
+						networkCode: err instanceof TelegramApiError ? err.networkCode : undefined,
+						failures: this.consecutiveFailures,
+						outageMs: Date.now() - (this.outageStartedAt ?? Date.now()),
+						waitMs,
+						// The VPN/proxy hint is only for a request that never reached Telegram.
+						...(this.consecutiveFailures === 1 && this.lastFailureNetwork
+							? { hint: "telegram is unreachable from this host; check the VPN/proxy route or point modules.telegram.apiBase at a local proxy" }
+							: {}),
+					};
+					if (loud) ctx.log.warn("telegram getUpdates failed", detail);
+					else ctx.log.debug("telegram getUpdates still failing", detail);
 				}
+
 				const retryAfter = err instanceof TelegramApiError ? err.retryAfterSec : undefined;
 				const waitMs = retryAfter !== undefined ? retryAfter * 1000 : jitter(backoff);
-				// One warning when the outage starts (and occasionally after), otherwise
-				// debug: a blocked route must not flood the console every second.
-				const loud = this.consecutiveFailures === 1 || this.consecutiveFailures % 30 === 0;
-				const detail = {
-					error: this.lastError,
-					networkCode: err instanceof TelegramApiError ? err.networkCode : undefined,
-					failures: this.consecutiveFailures,
-					outageMs: Date.now() - (this.outageStartedAt ?? Date.now()),
-					waitMs,
-					...(this.consecutiveFailures === 1 && isNetworkError(err)
-						? { hint: "telegram is unreachable from this host; check the VPN/proxy route or point modules.telegram.apiBase at a local proxy" }
-						: {}),
-				};
-				if (loud) ctx.log.warn("telegram getUpdates failed", detail);
-				else ctx.log.debug("telegram getUpdates still failing", detail);
 				await sleep(waitMs, this.abort.signal);
 				backoff = Math.min(backoff * 2, 60_000);
 			}
+		}
+	}
+
+	/**
+	 * Guard against a managed agent accidentally reading somebody else's token:
+	 * `telegram-managed-bot.json` records the bot Telegram assigned to this agent.
+	 */
+	private managedBotIdentityMismatch(ctx: ModuleContext, actualId: number): string | undefined {
+		const file = path.join(ctx.paths.rootDir, "telegram-managed-bot.json");
+		if (!fs.existsSync(file)) return undefined;
+		try {
+			const raw = JSON.parse(fs.readFileSync(file, "utf8")) as { id?: unknown };
+			const recordedId = Number(raw.id);
+			if (!Number.isSafeInteger(recordedId) || recordedId <= 0) {
+				ctx.log.warn("telegram-managed-bot.json has no valid bot id; skipping the identity check", { file });
+				return undefined;
+			}
+			if (recordedId === actualId) return undefined;
+			return (
+				`telegram bot identity mismatch: getMe returned bot id ${actualId}, but telegram-managed-bot.json ` +
+				`records bot id ${recordedId}; the config token does not belong to this agent`
+			);
+		} catch (err) {
+			ctx.log.warn("telegram-managed-bot.json could not be read; skipping the identity check", { file, error: message(err) });
+			return undefined;
+		}
+	}
+
+	/**
+	 * A 409 means another poller holds this token, but Telegram also reports it
+	 * when a webhook is set. Check `getWebhookInfo` at most once per window and
+	 * delete a webhook only if one is really configured. Never delete blindly.
+	 */
+	private async probeConflictingWebhook(
+		api: TelegramApi,
+	): Promise<{ checked: boolean; removed: boolean; error?: string }> {
+		const now = Date.now();
+		if (now - this.lastConflictProbeAt < TELEGRAM_CONFLICT_WINDOW_MS) {
+			return { checked: false, removed: false };
+		}
+		this.lastConflictProbeAt = now;
+		try {
+			const info = await api.getWebhookInfo();
+			if (!info.url?.trim()) return { checked: true, removed: false };
+			await api.deleteWebhook({ drop_pending_updates: false });
+			return { checked: true, removed: true };
+		} catch (err) {
+			return { checked: true, removed: false, error: message(err) };
 		}
 	}
 
