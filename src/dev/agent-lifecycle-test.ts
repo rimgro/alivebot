@@ -131,7 +131,8 @@ try {
 		await requestBot("123");
 		assert.equal(sent.length, 1);
 		assert.equal(sent[0].chat_id, 123);
-		assert.ok(sent[0].reply_markup.keyboard[0][0].request_managed_bot);
+		assert.equal(sent[0].reply_markup.inline_keyboard[0][0].callback_data, "alive:mb:analyst");
+		assert.equal(sent[0].reply_markup.keyboard, undefined, "the initial request must not add a reply keyboard");
 		const firstRequest = findManagedBotRequest(requestRoot, 123);
 		assert.equal(firstRequest?.agentId, "analyst");
 		const repeat = await requestBot("123");

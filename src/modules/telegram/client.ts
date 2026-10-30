@@ -150,6 +150,7 @@ export class TelegramApi {
 		parse_mode?: string;
 		message_thread_id?: number;
 		reply_to_message_id?: number;
+		reply_markup?: unknown;
 	}): Promise<TelegramMessage> {
 		const form = new FormData();
 		form.append("chat_id", String(params.chat_id));
@@ -157,6 +158,7 @@ export class TelegramApi {
 		if (params.parse_mode) form.append("parse_mode", params.parse_mode);
 		if (params.message_thread_id !== undefined) form.append("message_thread_id", String(params.message_thread_id));
 		if (params.reply_to_message_id !== undefined) form.append("reply_to_message_id", String(params.reply_to_message_id));
+		if (params.reply_markup !== undefined) form.append("reply_markup", JSON.stringify(params.reply_markup));
 		const bytes = new Uint8Array(params.file.data);
 		const blob = new Blob([bytes], params.file.mime ? { type: params.file.mime } : undefined);
 		const field = params.field ?? "document";

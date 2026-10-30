@@ -79,11 +79,54 @@ export function formatManagedBotStatus(views: ManagedBotRequestView[]): string {
 function expiryText(request: ManagedBotRequest, ttlMs: number): string {
 	const minutes = Math.round(ttlMs / 60_000);
 	return (
-		`Заявка на создание бота для агента «${request.agentId}» истекла, начни заново. ` +
+		`Заявка на создание бота для агента «${request.agentId}» истекла, кнопка создания убрана, начни заново. ` +
 		`Telegram не прислал подтверждение за ${minutes} мин: возможно, твой клиент не поддерживает managed bots ` +
 		"(нужен актуальный Telegram). Запасной вариант — создать бота через @BotFather и выполнить " +
 		`alive agents telegram ${request.agentId} --token-env <ENV_NAME>.`
 	);
+}
+
+/**
+ * Internal callback code for the inline "Create bot" button.
+ *
+ * Kept short because Telegram limits `callback_data` to 64 bytes and an agent id
+ * can be 48 characters. The Bot API exposes `request_managed_bot` only on reply
+ * keyboards, so the inline button asks the module to send that one native
+ * button; pressing it starts Telegram's own managed-bot confirmation flow.
+ */
+export const MANAGED_BOT_CALLBACK_PREFIX = "alive:mb:";
+
+export function managedBotCallbackData(agentId: string): string {
+	return `${MANAGED_BOT_CALLBACK_PREFIX}${agentId}`;
+}
+
+export function parseManagedBotCallbackData(data: string | undefined): string | undefined {
+	if (!data?.startsWith(MANAGED_BOT_CALLBACK_PREFIX)) return undefined;
+	const agentId = data.slice(MANAGED_BOT_CALLBACK_PREFIX.length);
+	return agentId || undefined;
+}
+
+/** The sticky-free inline button shown by `requestAgentTelegram`. */
+export function managedBotInlineKeyboard(agentId: string) {
+	return {
+		reply_markup: {
+			inline_keyboard: [[{ text: `Create bot for ${agentId}`, callback_data: managedBotCallbackData(agentId) }]],
+		},
+	};
+}
+
+/**
+ * Native Telegram button, sent only after the operator taps the inline one.
+ * This is the only Bot API surface that can actually start managed-bot creation.
+ */
+export function managedBotNativeKeyboard(agentId: string) {
+	return {
+		reply_markup: {
+			keyboard: [[{ text: `Create bot for ${agentId}`, request_managed_bot: { request_id: Date.now() % 2_147_483_647, suggested_name: `${agentId} agent` } }]],
+			resize_keyboard: true,
+			one_time_keyboard: true,
+		},
+	};
 }
 
 export function managedBotKeyboardRemoval() {
@@ -125,12 +168,10 @@ export async function requestAgentTelegram(base: LoadedConfig, agent: ManagedAge
 	try {
 		await api.sendMessage({
 			chat_id: chatId,
-			text: `Create a Telegram bot profile for agent “${agent.id}” and share it with me. Telegram will ask you to confirm.`,
-			reply_markup: {
-				keyboard: [[{ text: `Create bot for ${agent.id}`, request_managed_bot: { request_id: Date.now() % 2_147_483_647, suggested_name: `${agent.id} agent` } }]],
-				resize_keyboard: true,
-				one_time_keyboard: true,
-			},
+			text:
+				`Create a Telegram bot profile for agent “${agent.id}” and share it with me. ` +
+				"Tap the inline button and confirm creation in Telegram. It never adds a keyboard above your message box.",
+			...managedBotInlineKeyboard(agent.id),
 		});
 	} catch {
 		clearManagedBotRequest(scope.root, pending);
@@ -229,7 +270,7 @@ export async function finalizeManagedBotRequest(options: {
 			chat_id: request.chatId,
 			text:
 				`Managed bot @${bot.username ?? bot.id} подключён к агенту «${request.agentId}». ` +
-				`Токен лежит в .env агента (0600). Запусти: alive agents start ${request.agentId}`,
+				`Кнопка создания убрана. Токен лежит в .env агента (0600). Запусти: alive agents start ${request.agentId}`,
 			...managedBotKeyboardRemoval(),
 		})
 		.catch(() => undefined);

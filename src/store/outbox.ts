@@ -19,6 +19,22 @@ export interface OutgoingAttachment {
 	size?: number;
 }
 
+/**
+ * One inline quick-reply button produced by the agent.
+ *
+ * Exactly one of `data` (a callback action) or `url` (a link) is used. The
+ * Telegram module validates the provider-specific limits; other sinks ignore
+ * buttons they cannot render.
+ */
+export interface OutgoingButton {
+	text: string;
+	data?: string;
+	url?: string;
+}
+
+/** Rows of inline buttons, 1–3 buttons per row. */
+export type OutgoingButtonRows = OutgoingButton[][];
+
 export interface OutgoingMessage {
 	id: string;
 	/**
@@ -35,6 +51,8 @@ export interface OutgoingMessage {
 	text: string;
 	/** Files delivered together with the text (`text` becomes the caption). */
 	attachments?: OutgoingAttachment[];
+	/** Inline quick-reply buttons attached to the message. */
+	buttons?: OutgoingButtonRows;
 	/** Explicit recipient for local managed-agent routing; thread remains a conversation id. */
 	recipientAgentId?: string;
 	senderId?: string;
@@ -128,6 +146,7 @@ export class Outbox {
 			senderId?: string;
 			senderName?: string;
 			attachments?: OutgoingAttachment[];
+			buttons?: OutgoingButtonRows;
 		},
 		deliver: (message: OutgoingMessage) => Promise<void>,
 	): Promise<OutgoingMessage> {
@@ -139,6 +158,7 @@ export class Outbox {
 			thread: input.thread,
 			text: input.text,
 			...(input.attachments && input.attachments.length > 0 ? { attachments: input.attachments } : {}),
+			...(input.buttons && input.buttons.length > 0 ? { buttons: input.buttons } : {}),
 			recipientAgentId: input.recipientAgentId,
 			senderId: input.senderId,
 			senderName: input.senderName,

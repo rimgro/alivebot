@@ -189,6 +189,8 @@ export interface TelegramConfig {
 	parseMode: string;
 	/** Show link previews on outgoing messages. */
 	linkPreview: boolean;
+	/** Allow agent-supplied `url` buttons in group/channel threads. Default false. */
+	allowUrlButtonsInGroups: boolean;
 	/** Send "typing…" while the agent is working on a reply. */
 	typingIndicator: boolean;
 	/** Emoji reaction added to inbound user messages as an acknowledgement. Empty = off. */
@@ -234,6 +236,9 @@ export function validateTelegramConfig(value: TelegramConfig): TelegramConfig {
 	}
 	if (!Number.isSafeInteger(value.editDebounceMs) || value.editDebounceMs < 0) {
 		throw new Error(`modules.telegram.editDebounceMs must be a non-negative integer (milliseconds), got "${String(value.editDebounceMs)}"`);
+	}
+	if (typeof value.allowUrlButtonsInGroups !== "boolean") {
+		throw new Error(`modules.telegram.allowUrlButtonsInGroups must be true or false, got "${String(value.allowUrlButtonsInGroups)}"`);
 	}
 	return value;
 }
@@ -518,6 +523,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 			],
 			parseMode: "",
 			linkPreview: true,
+			allowUrlButtonsInGroups: false,
 			typingIndicator: true,
 			ackReaction: "",
 			ingestEdits: true,

@@ -18,6 +18,7 @@ import {
 	expireManagedBotRequests,
 	finalizeManagedBotRequest,
 	formatManagedBotStatus,
+	managedBotCallbackData,
 	managedBotScope,
 	managedBotStatus,
 	requestAgentTelegram,
@@ -104,6 +105,13 @@ try {
 		const requested = await requestAgentTelegram(config, agent, "123456789");
 		check("a new request is pending", requested.status === "pending", requested);
 		check("the request carries the target agent and chat", requested.agentId === "analyst" && requested.chatId === 123456789, requested);
+		const requestMessage = calls.filter((call) => call.method === "sendMessage").at(-1)?.params;
+		check(
+			"the request uses an inline keyboard that cannot stick above the composer",
+			requestMessage?.reply_markup?.inline_keyboard?.[0]?.[0]?.callback_data === managedBotCallbackData("analyst") &&
+				requestMessage?.reply_markup?.keyboard === undefined,
+			requestMessage?.reply_markup,
+		);
 		check(
 			"expiry is the request time plus the TTL",
 			requested.expiresAt === requested.requestedAt + config.config.modules.telegram.managedBotTtlMs,
@@ -116,7 +124,7 @@ try {
 		const sendsBefore = calls.filter((call) => call.method === "sendMessage").length;
 		const repeated = await requestAgentTelegram(config, agent, "123456789");
 		check("a repeat request returns the same request", repeated.requestedAt === requested.requestedAt && repeated.expiresAt === requested.expiresAt, { requested, repeated });
-		check("a repeat request does not send another keyboard", calls.filter((call) => call.method === "sendMessage").length === sendsBefore);
+		check("a repeat request does not send another button message", calls.filter((call) => call.method === "sendMessage").length === sendsBefore);
 	}
 
 	section("cancel and retry");
@@ -181,6 +189,7 @@ try {
 			successMessage,
 		);
 		check("success removes the Telegram keyboard", successMessage?.reply_markup?.remove_keyboard === true, successMessage);
+		check("the success caption explains the button was removed", String(successMessage?.text).includes("Кнопка создания убрана"), successMessage);
 		check("status shows the created request", managedBotStatus(scope)[0]?.status === "created", managedBotStatus(scope));
 	}
 

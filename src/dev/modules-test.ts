@@ -13,6 +13,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG, DEFAULT_UPDATES_CONFIG, isValidUpdatesWindow, loadConfig } from "../config.js";
+import { createAgent } from "../agents.js";
+import { createAliveTools, type RunHandle, type ToolDeps } from "../runtime/tools.js";
+import {
+	cancelAgentTelegram,
+	expireManagedBotRequests,
+	managedBotCallbackData,
+	managedBotScope,
+	managedBotStatus,
+	requestAgentTelegram,
+} from "../modules/telegram/managed-request.js";
 import { ModuleHost } from "../events/host.js";
 import { describeModules, loadModules } from "../events/loader.js";
 import type { AliveModule, ModuleContext } from "../events/api.js";
@@ -962,6 +972,7 @@ section("telegram module end-to-end against a fake Bot API");
 					allowedUpdates: ["message"],
 					parseMode: "",
 					linkPreview: true,
+					allowUrlButtonsInGroups: false,
 					typingIndicator: true,
 					ackReaction: "",
 					ingestEdits: true,
@@ -1638,6 +1649,7 @@ section("telegram outbound attachments: send_message delivers a workspace file")
 					allowedUpdates: ["message"],
 					parseMode: "",
 					linkPreview: true,
+					allowUrlButtonsInGroups: false,
 					typingIndicator: true,
 					ackReaction: "",
 					ingestEdits: true,
@@ -1820,6 +1832,403 @@ section("telegram outbound attachments: send_message delivers a workspace file")
 		);
 		const textRecord = history.query({ thread: "telegram:42", direction: "outbound" }).find((record) => record.meta?.agentMessageId === "att_text");
 		check("a text-only message has no attachment record", textRecord !== undefined && textRecord.attachments === undefined, textRecord);
+	} finally {
+		await started?.stop();
+		globalThis.fetch = realFetch;
+	}
+}
+
+// ---------------------------------------------------------------------------
+section("telegram send_message buttons and managed-bot inline requests (#84, #85)");
+{
+	const moduleRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-buttons-test-"));
+	const log = new Logger({ console: false, level: "error", scope: "telegram-buttons-test" });
+	const store = EventStore.open(moduleRoot);
+	const history = HistoryStore.open(moduleRoot);
+	const outbox = new Outbox(moduleRoot);
+	const calls: Array<{ method: string; params: Record<string, unknown>; form?: Record<string, unknown> }> = [];
+	const updates: TelegramUpdate[] = [];
+	let sendSequence = 1000;
+
+	const privateChat: TelegramChat = { id: 42, type: "private", first_name: "Alice", username: "alice" };
+	const alice: TelegramUser = { id: 7, is_bot: false, first_name: "Alice", username: "alice" };
+	const botUser: TelegramUser = { id: 999, is_bot: true, first_name: "Alive", username: "alive_bot" };
+
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		const method = url.slice(url.lastIndexOf("/") + 1);
+		const isForm = init?.body instanceof FormData;
+		const form = isForm
+			? Object.fromEntries(
+					[...(init!.body as FormData).entries()].map(([key, value]) => [
+						key,
+						typeof value === "string" ? value : { name: value.name, type: value.type, size: value.size },
+					]),
+				)
+			: undefined;
+		const params = isForm
+			? { __multipart: [...(init!.body as FormData).keys()] }
+			: init?.body
+				? (JSON.parse(String(init.body)) as Record<string, unknown>)
+				: {};
+		calls.push({ method, params, form });
+		if (method === "getMe") return jsonResponse({ ok: true, result: { ...botUser, can_manage_bots: true } });
+		if (method === "deleteWebhook") return jsonResponse({ ok: true, result: true });
+		if (method === "getUpdates") {
+			if (updates.length > 0) return jsonResponse({ ok: true, result: updates.splice(0) });
+			return new Promise<Response>((resolve) => {
+				const timer = setTimeout(() => resolve(jsonResponse({ ok: true, result: [] })), 10);
+				init?.signal?.addEventListener(
+					"abort",
+					() => {
+						clearTimeout(timer);
+						resolve(jsonResponse({ ok: true, result: [] }));
+					},
+					{ once: true },
+				);
+			});
+		}
+		if (method === "sendMessage") {
+			const chatId = params.chat_id;
+			return jsonResponse({
+				ok: true,
+				result: {
+					message_id: sendSequence++,
+					date: 1,
+					chat: { id: Number(chatId), type: String(chatId).startsWith("-") ? "supergroup" : "private" },
+				},
+			});
+		}
+		if (method === "sendDocument" || method === "sendPhoto") {
+			return jsonResponse({ ok: true, result: { message_id: 1500, date: 1, chat: { id: 42, type: "private" } } });
+		}
+		if (method === "getManagedBotToken") return jsonResponse({ ok: true, result: "555:managed-bot-secret" });
+		if (method === "answerCallbackQuery" || method === "sendChatAction") return jsonResponse({ ok: true, result: true });
+		return jsonResponse({ ok: true, result: true });
+	}) as unknown as typeof fetch;
+
+	const config = loadConfig({
+		cwd: moduleRoot,
+		overrides: {
+			chat: { console: false, http: { enabled: false, host: "127.0.0.1", port: 0, token: "" } },
+			modules: {
+				telegram: {
+					...DEFAULT_CONFIG.modules.telegram,
+					enabled: true,
+					token: "test-token",
+					tokenEnv: "ALIVE_TEST_TELEGRAM_TOKEN_UNSET",
+					allowedUserIds: ["7"],
+					pollTimeoutSec: 0,
+					historyLimitPerThread: 0,
+					allowUrlButtonsInGroups: false,
+				},
+				grafana: { ...DEFAULT_CONFIG.modules.grafana, enabled: false },
+				external: [],
+			},
+		},
+	});
+	const workspace = config.paths.workspaceDir;
+	fs.mkdirSync(workspace, { recursive: true });
+	fs.writeFileSync(path.join(workspace, "note.txt"), "attachment");
+	fs.writeFileSync(path.join(moduleRoot, "SOUL.md"), "buttons test soul\n");
+	fs.writeFileSync(path.join(moduleRoot, "CONTRACT.md"), "buttons test contract\n");
+
+	const telegram = new TelegramModule(config.config.modules.telegram);
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = fetchImpl;
+	let started: ModuleHost | undefined;
+	try {
+		const host = new ModuleHost({
+			config,
+			log,
+			transports: [],
+			modules: [telegram],
+			ingest: (event) => store.append(event),
+			outbox: (limit) => outbox.list(limit),
+			history,
+			runtimeStatus: () => ({}),
+			workspaceFiles: {
+				rootDir: workspace,
+				readFile: async (file) => fs.readFileSync(file),
+				writeFile: async (file, data) => {
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, data);
+					return file;
+				},
+			},
+		});
+		started = host;
+		await host.init();
+		await new Promise((resolve) => setTimeout(resolve, 40));
+		calls.length = 0;
+
+		const run = { id: "run_buttons", outbound: [] as Array<{ thread: string; text: string; delivered: boolean }> } as unknown as RunHandle;
+		const deps = {
+			config,
+			history,
+			outbox,
+			threads: { recordOutbound: () => undefined },
+			moduleTools: [],
+			deliver: (message: OutgoingMessage) => host.deliver(message),
+			getRun: () => run,
+			runtimeStatus: () => ({}),
+			isStopping: () => false,
+			log: log.child("tools"),
+		} as unknown as ToolDeps;
+		const sendMessage = createAliveTools(deps).find((tool) => tool.name === "send_message")!;
+		const send = (params: Record<string, unknown>) =>
+			sendMessage.execute("call", params as never, undefined, undefined, {} as never) as Promise<{
+				content: Array<{ text: string }>;
+				details: Record<string, unknown>;
+			}>;
+		const lastSend = () => calls.filter((call) => call.method === "sendMessage").at(-1);
+
+		section("send_message callback buttons");
+		const withButtons = await send({
+			thread: "telegram:42",
+			text: "Pick one",
+			buttons: [
+				[
+					{ text: "Yes", data: "yes" },
+					{ text: "No", data: "no" },
+				],
+			],
+		});
+		const buttonCall = lastSend();
+		const markup = buttonCall?.params.reply_markup as { inline_keyboard?: Array<Array<{ text?: string; callback_data?: string; url?: string }>> } | undefined;
+		check(
+			"two callback buttons are sent as one inline row",
+			markup?.inline_keyboard?.length === 1 &&
+				markup.inline_keyboard[0]?.length === 2 &&
+				markup.inline_keyboard[0]?.[0]?.text === "Yes" &&
+				markup.inline_keyboard[0]?.[0]?.callback_data === "yes" &&
+				markup.inline_keyboard[0]?.[1]?.callback_data === "no",
+			markup,
+		);
+		check("callback buttons never add a sticky reply keyboard", (buttonCall?.params.reply_markup as { keyboard?: unknown })?.keyboard === undefined);
+		const buttonRecord = history
+			.query({ thread: "telegram:42", direction: "outbound" })
+			.find((record) => record.meta?.agentMessageId === withButtons.details.messageId);
+		const historyButtons = buttonRecord?.meta?.buttons as { rows?: number; buttons?: Array<{ text?: string; kind?: string; dataBytes?: number }> } | undefined;
+		check(
+			"history records button labels and kinds",
+			historyButtons?.rows === 1 &&
+				historyButtons.buttons?.length === 2 &&
+				historyButtons.buttons[0]?.kind === "callback" &&
+				historyButtons.buttons[0]?.dataBytes === 3,
+			historyButtons,
+		);
+		check("history does not duplicate callback payload values", !JSON.stringify(historyButtons ?? {}).includes("\"data\""));
+
+		const pressedMessageId = 2000;
+		updates.push({
+			update_id: 8001,
+			callback_query: {
+				id: "cb_yes",
+				from: alice,
+				chat_instance: "chat-instance",
+				data: "yes",
+				message: { message_id: pressedMessageId, date: 1, chat: privateChat, text: "Pick one" },
+			},
+		});
+		check(
+			"a button press becomes an event",
+			await waitFor(() => store.all().some((event) => (event.payload as { callbackQueryId?: string })?.callbackQueryId === "cb_yes")),
+			store.all().map((event) => event.payload),
+		);
+		const pressEvent = store.all().find((event) => (event.payload as { callbackQueryId?: string })?.callbackQueryId === "cb_yes");
+		check("the press keeps the same thread", pressEvent?.thread === "telegram:42", pressEvent?.thread);
+		check("the press event carries the callback data", (pressEvent?.payload as { data?: string })?.data === "yes", pressEvent?.payload);
+		check("the press keeps the author", (pressEvent?.payload as { author?: { id?: string } })?.author?.id === "7", pressEvent?.payload);
+		check(
+			"the client spinner is stopped with answerCallbackQuery",
+			calls.some((call) => call.method === "answerCallbackQuery" && call.params.callback_query_id === "cb_yes"),
+			calls.filter((call) => call.method === "answerCallbackQuery"),
+		);
+
+		section("send_message button validation");
+		const exactly64 = "z".repeat(64);
+		await send({ thread: "telegram:42", text: "Boundary", buttons: [[{ text: "Max", data: exactly64 }]] });
+		check(
+			"a callback_data of exactly 64 bytes is accepted",
+			(lastSend()?.params.reply_markup as { inline_keyboard?: Array<Array<{ callback_data?: string }>> } | undefined)?.inline_keyboard?.[0]?.[0]
+				?.callback_data === exactly64,
+			lastSend()?.params.reply_markup,
+		);
+		const beforeOversize = calls.length;
+		const outboxSize = outbox.list(100).length;
+		let oversizeError: Error | undefined;
+		try {
+			await send({
+				thread: "telegram:42",
+				text: "Too much data",
+				buttons: [[{ text: "Long", data: "x".repeat(65) }]],
+			});
+		} catch (error) {
+			oversizeError = error as Error;
+		}
+		check(
+			"callback_data over 64 bytes fails before any API call and names the button",
+			oversizeError !== undefined &&
+				/Long/.test(oversizeError.message) &&
+				/callback_data is 65 bytes/.test(oversizeError.message) &&
+				calls.length === beforeOversize &&
+				outbox.list(100).length === outboxSize,
+			{ error: oversizeError?.message, calls: calls.length - beforeOversize },
+		);
+
+		let bothError: Error | undefined;
+		try {
+			await send({ thread: "telegram:42", text: "Ambiguous", buttons: [[{ text: "Both", data: "a", url: "https://example.com" }]] });
+		} catch (error) {
+			bothError = error as Error;
+		}
+		check("a button cannot be both callback and link", bothError !== undefined && /exactly one of data/.test(bothError.message), bothError?.message);
+		let rowError: Error | undefined;
+		try {
+			await send({
+				thread: "telegram:42",
+				text: "Too many",
+				buttons: [[{ text: "1", data: "1" }, { text: "2", data: "2" }, { text: "3", data: "3" }, { text: "4", data: "4" }]],
+			});
+		} catch (error) {
+			rowError = error as Error;
+		}
+		check("a row with more than three buttons is refused", rowError !== undefined && /has 4 buttons/.test(rowError.message), rowError?.message);
+
+		section("send_message url buttons in groups");
+		const beforeGroup = calls.length;
+		let groupError: Error | undefined;
+		try {
+			await send({ thread: "telegram:-1001", text: "Docs", buttons: [[{ text: "Docs", url: "https://example.com/docs" }]] });
+		} catch (error) {
+			groupError = error as Error;
+		}
+		check(
+			"a url button in a group is refused without the config flag",
+			groupError !== undefined && /url button in a group thread/.test(groupError.message) && calls.length === beforeGroup,
+			{ error: groupError?.message, calls: calls.length - beforeGroup },
+		);
+		config.config.modules.telegram.allowUrlButtonsInGroups = true;
+		await send({ thread: "telegram:-1001", text: "Docs", buttons: [[{ text: "Docs", url: "https://example.com/docs" }]] });
+		const groupCall = lastSend();
+		const groupMarkup = groupCall?.params.reply_markup as { inline_keyboard?: Array<Array<{ url?: string }>> } | undefined;
+		check(
+			"the explicit flag allows a url button in a group",
+			String(groupCall?.params.chat_id) === "-1001" && groupMarkup?.inline_keyboard?.[0]?.[0]?.url === "https://example.com/docs",
+			groupCall?.params,
+		);
+
+		section("text-only and attachment regression");
+		const beforePlain = calls.length;
+		await send({ thread: "telegram:42", text: "plain text only" });
+		const plainCalls = calls.slice(beforePlain);
+		check(
+			"text-only send_message is still one sendMessage without reply_markup",
+			plainCalls.length === 1 && plainCalls[0]?.method === "sendMessage" && plainCalls[0]?.params.reply_markup === undefined,
+			plainCalls.map((call) => call.method),
+		);
+		const beforeAttachment = calls.length;
+		await send({ thread: "telegram:42", text: "file attached", attachment: "note.txt" });
+		const attachmentCalls = calls.slice(beforeAttachment);
+		check(
+			"an attachment still uses sendDocument and no reply_markup",
+			attachmentCalls.length === 1 &&
+				attachmentCalls[0]?.method === "sendDocument" &&
+				String(attachmentCalls[0]?.form?.reply_markup ?? "") === "",
+			attachmentCalls.map((call) => ({ method: call.method, form: call.form })),
+		);
+
+		section("managed-bot request is inline and removes any native keyboard");
+		const managedAgent = createAgent(config, "buttonhelper", "Button Helper");
+		const scope = managedBotScope(config);
+		const pending = await requestAgentTelegram(config, managedAgent, "42");
+		const requestMessage = lastSend();
+		const requestMarkup = requestMessage?.params.reply_markup as
+			| { inline_keyboard?: Array<Array<{ text?: string; callback_data?: string }>>; keyboard?: unknown }
+			| undefined;
+		check(
+			"the managed-bot request uses an inline keyboard",
+			pending.status === "pending" &&
+				requestMarkup?.inline_keyboard?.[0]?.[0]?.callback_data === managedBotCallbackData("buttonhelper") &&
+				requestMarkup?.keyboard === undefined,
+			requestMarkup,
+		);
+		const requestMessageId = 3000;
+		updates.push({
+			update_id: 8010,
+			callback_query: {
+				id: "cb_managed",
+				from: alice,
+				chat_instance: "chat-instance",
+				data: managedBotCallbackData("buttonhelper"),
+				message: { message_id: requestMessageId, date: 1, chat: privateChat, text: "Create a bot" },
+			},
+		});
+		check(
+			"the inline press opens the native managed-bot button",
+			await waitFor(() =>
+				calls.some(
+					(call) =>
+						call.method === "sendMessage" &&
+						((call.params.reply_markup as { keyboard?: Array<Array<{ request_managed_bot?: unknown }>> } | undefined)?.keyboard?.[0]?.[0]
+							?.request_managed_bot !== undefined),
+				),
+			),
+			calls.filter((call) => call.method === "sendMessage").map((call) => call.params.reply_markup),
+		);
+		check(
+			"the managed callback is answered",
+			calls.some((call) => call.method === "answerCallbackQuery" && call.params.callback_query_id === "cb_managed"),
+			calls.filter((call) => call.method === "answerCallbackQuery"),
+		);
+		updates.push({
+			update_id: 8011,
+			message: {
+				message_id: 3001,
+				date: 1,
+				chat: privateChat,
+				// A private chat id equals the operator's own user id.
+				from: { ...alice, id: 42 },
+				managed_bot_created: { bot: { id: 555, is_bot: true, first_name: "Button Helper", username: "buttonhelper_bot" } },
+			},
+		});
+		check(
+			"creation sends remove_keyboard with a caption",
+			await waitFor(() => {
+				const call = lastSend();
+				return (
+					(call?.params.reply_markup as { remove_keyboard?: boolean } | undefined)?.remove_keyboard === true &&
+					String(call?.params.text ?? "").includes("Кнопка создания убрана")
+				);
+			}),
+			lastSend()?.params,
+		);
+
+		const cancelPending = await requestAgentTelegram(config, managedAgent, "42");
+		check("a new managed request is pending before cancel", cancelPending.status === "pending", cancelPending);
+		const api = new TelegramApi({ token: "test-token", fetchImpl });
+		await cancelAgentTelegram(scope, api, "buttonhelper");
+		check(
+			"cancellation sends remove_keyboard",
+			(lastSend()?.params.reply_markup as { remove_keyboard?: boolean } | undefined)?.remove_keyboard === true,
+			lastSend()?.params,
+		);
+		const expiryPending = await requestAgentTelegram(config, managedAgent, "42");
+		check("a new managed request is pending before expiry", expiryPending.status === "pending", expiryPending);
+		await expireManagedBotRequests(scope, api, { now: Date.now() + scope.ttlMs + 1 });
+		check(
+			"expiry sends remove_keyboard",
+			(lastSend()?.params.reply_markup as { remove_keyboard?: boolean } | undefined)?.remove_keyboard === true,
+			lastSend()?.params,
+		);
+		check(
+			"the removed request is recorded as expired",
+			managedBotStatus(scope).some((view) => view.agentId === "buttonhelper" && view.status === "expired"),
+			managedBotStatus(scope),
+		);
+
+		await host.stop();
 	} finally {
 		await started?.stop();
 		globalThis.fetch = realFetch;
@@ -2147,6 +2556,7 @@ section("telegram module: outage is reported once, not spammed");
 					allowedUpdates: ["message"],
 					parseMode: "",
 					linkPreview: true,
+					allowUrlButtonsInGroups: false,
 					typingIndicator: false,
 					ackReaction: "",
 					ingestEdits: true,

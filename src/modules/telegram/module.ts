@@ -8,8 +8,11 @@ import {
 	expireManagedBotRequests,
 	finalizeManagedBotRequest,
 	formatManagedBotStatus,
+	managedBotKeyboardRemoval,
+	managedBotNativeKeyboard,
 	managedBotScope,
 	managedBotStatus,
+	parseManagedBotCallbackData,
 } from "./managed-request.js";
 import type { AliveModule, ModuleContext } from "../../events/api.js";
 import type { HistoryAttachment } from "../../store/history.js";
@@ -45,8 +48,14 @@ import {
 	mimeForFile,
 } from "../../runtime/attachments.js";
 import { createTelegramTools, type TelegramToolHost } from "./tools.js";
+import {
+	buttonHistorySummary,
+	buttonsToReplyMarkup,
+	validateOutgoingButtons,
+	type ButtonHistorySummary,
+} from "./buttons.js";
 import { formatThread, isTelegramTarget, parseThread, resolveThreadRef } from "./threads.js";
-import type { TelegramChat, TelegramSentMessage, TelegramUpdate } from "./types.js";
+import type { TelegramCallbackQuery, TelegramChat, TelegramSentMessage, TelegramUpdate } from "./types.js";
 import { normalizeUpdate, type NormalizedInbound } from "./update.js";
 import { acceptBrowserPairing } from "../browser/operator.js";
 import {
@@ -538,6 +547,47 @@ export class TelegramModule implements AliveModule {
 		}
 	}
 
+	/**
+	 * Inline "Create bot" press: send the one native reply-keyboard button that
+	 * can start Telegram's managed-bot confirmation, then let `finalize` remove it.
+	 * Returns false for ordinary agent buttons so they keep their existing path.
+	 */
+	private async handleManagedBotCallback(query: TelegramCallbackQuery): Promise<boolean> {
+		const agentId = parseManagedBotCallbackData(query.data);
+		if (!agentId) return false;
+		const ctx = this.ctx;
+		const api = this.api;
+		if (!ctx || !api) return true;
+		// Stop the client spinner for this internal button before doing any work.
+		void api.answerCallbackQuery({ callback_query_id: query.id }).catch(() => undefined);
+		const chatId = query.message?.chat.id;
+		if (chatId === undefined) return true;
+		const scope = managedBotScope({ paths: ctx.paths, config: { modules: { telegram: this.config } } });
+		const request = findManagedBotRequest(scope.root, chatId);
+		if (!request || request.agentId !== agentId || managedBotRequestStatus(request, scope.ttlMs) !== "pending") {
+			await api
+				.sendMessage({
+					chat_id: chatId,
+					text: `Заявка на создание бота для агента «${agentId}» уже неактуальна. Запроси её заново, кнопка убрана.`,
+					...managedBotKeyboardRemoval(),
+				})
+				.catch(() => undefined);
+			return true;
+		}
+		try {
+			await api.sendMessage({
+				chat_id: chatId,
+				text:
+					`Нажми «Create bot for ${agentId}» ниже и подтверди создание в Telegram. ` +
+					"Это нативная кнопка Managed Bot; после создания, отмены или истечения заявки она будет убрана.",
+				...managedBotNativeKeyboard(agentId),
+			});
+		} catch (err) {
+			ctx.log.warn("managed-bot native button failed", { agentId, error: message(err) });
+		}
+		return true;
+	}
+
 	/** Expire overdue managed-bot requests and remove their stale keyboards. */
 	private async sweepManagedRequests(): Promise<void> {
 		const ctx = this.ctx;
@@ -562,6 +612,7 @@ export class TelegramModule implements AliveModule {
 		const api = this.api;
 		const state = this.state;
 		if (!ctx || !api || !state) return;
+		if (update.callback_query && (await this.handleManagedBotCallback(update.callback_query))) return;
 		if (update.message?.text?.match(/^\/browser_pair(?:@[A-Za-z0-9_]+)?(?:\s|$)/)) {
 			const operator = acceptBrowserPairing(ctx.paths.modulesDir, update.message, this.config.allowedChatIds);
 			if (operator) this.allowlist?.add(operator.userId);
@@ -994,10 +1045,24 @@ export class TelegramModule implements AliveModule {
 		const topicId = ref.topicId !== undefined ? Number(ref.topicId) : undefined;
 		const threadId = Number.isFinite(topicId) ? topicId : undefined;
 		const replyTo = this.resolveReplyTo(message);
+		// Buttons are validated before the first API call too: an oversize callback
+		// payload or a disallowed group link must not leave half a message behind.
+		validateOutgoingButtons(message.buttons, {
+			thread: message.thread,
+			chatType: ctx.history.thread(message.thread)?.meta?.chatType as string | undefined,
+			allowUrlButtonsInGroups: this.config.allowUrlButtonsInGroups,
+		});
+		const replyMarkup = buttonsToReplyMarkup(message.buttons);
+		const buttonSummary = buttonHistorySummary(message.buttons);
 		// Attachments are read and limit-checked before the first API call: an
 		// unreadable or oversize file must not leave half a message in the chat.
 		const uploads = await this.prepareAttachments(ctx, message.attachments);
-		const sent: Array<{ result: TelegramSentMessage; text: string; attachment?: PreparedUpload }> = [];
+		const sent: Array<{
+			result: TelegramSentMessage;
+			text: string;
+			attachment?: PreparedUpload;
+			buttons?: ButtonHistorySummary;
+		}> = [];
 		let replyUsed = false;
 		const nextReplyTo = () => (replyUsed ? undefined : ((replyUsed = true), replyTo));
 		// One stable idempotency key per outbox message part. Recovery of a message
@@ -1010,8 +1075,10 @@ export class TelegramModule implements AliveModule {
 			// ordinary text messages so no part of the reply is lost. Only the first
 			// attachment carries the caption (one file per `send_message` today).
 			const captions = splitMessage(text, TELEGRAM_CAPTION_MAX_CHARS);
+			const followUps = captions.slice(1);
 			for (const [index, upload] of uploads.entries()) {
 				const caption = index === 0 ? captions[0] ?? "" : "";
+				const carriesButtons = index === uploads.length - 1 && followUps.length === 0 && replyMarkup !== undefined;
 				const params = {
 					chat_id: ref.chatId,
 					file: { data: upload.data, name: upload.name, mime: upload.mime },
@@ -1019,6 +1086,7 @@ export class TelegramModule implements AliveModule {
 					caption: caption || undefined,
 					message_thread_id: threadId,
 					reply_to_message_id: nextReplyTo(),
+					reply_markup: carriesButtons ? replyMarkup : undefined,
 				};
 				const result = await this.sendPart(partKey(index), ref.chatId, message.thread, async () => {
 					try {
@@ -1031,21 +1099,30 @@ export class TelegramModule implements AliveModule {
 						throw err;
 					}
 				});
-				if (result) sent.push({ result, text: caption || `[${upload.kind}: ${upload.name}]`, attachment: upload });
+				if (result) {
+					sent.push({
+						result,
+						text: caption || `[${upload.kind}: ${upload.name}]`,
+						attachment: upload,
+						...(carriesButtons && buttonSummary ? { buttons: buttonSummary } : {}),
+					});
+				}
 			}
-			for (const [index, text] of captions.slice(1).entries()) {
+			for (const [index, text] of followUps.entries()) {
+				const carriesButtons = index === followUps.length - 1 && replyMarkup !== undefined;
 				const result = await this.sendPart(partKey(uploads.length + index), ref.chatId, message.thread, () =>
-					this.sendTextChunk(ctx, api, ref.chatId, threadId, text, nextReplyTo()),
+					this.sendTextChunk(ctx, api, ref.chatId, threadId, text, nextReplyTo(), carriesButtons ? replyMarkup : undefined),
 				);
-				if (result) sent.push({ result, text });
+				if (result) sent.push({ result, text, ...(carriesButtons && buttonSummary ? { buttons: buttonSummary } : {}) });
 			}
 		} else {
 			const chunks = splitMessage(text, this.config.maxMessageChars);
 			for (const [index, text] of chunks.entries()) {
+				const carriesButtons = index === chunks.length - 1 && replyMarkup !== undefined;
 				const result = await this.sendPart(partKey(index), ref.chatId, message.thread, () =>
-					this.sendTextChunk(ctx, api, ref.chatId, threadId, text, nextReplyTo()),
+					this.sendTextChunk(ctx, api, ref.chatId, threadId, text, nextReplyTo(), carriesButtons ? replyMarkup : undefined),
 				);
-				if (result) sent.push({ result, text });
+				if (result) sent.push({ result, text, ...(carriesButtons && buttonSummary ? { buttons: buttonSummary } : {}) });
 			}
 		}
 
@@ -1070,6 +1147,7 @@ export class TelegramModule implements AliveModule {
 					parts: sent.length,
 					chatId: ref.chatId,
 					topicId: ref.topicId,
+					...(entry.buttons ? { buttons: entry.buttons } : {}),
 				},
 			});
 		}
@@ -1084,6 +1162,8 @@ export class TelegramModule implements AliveModule {
 			parts: sent.length,
 			chars: text.length,
 			attachments: uploads.map((upload) => `${upload.kind}:${upload.name}`),
+			// Button labels/kind are safe; callback payload values are never logged.
+			buttons: message.buttons?.reduce((total, row) => total + row.length, 0) ?? 0,
 		});
 		return sent.map((entry) => entry.result);
 	}
@@ -1136,6 +1216,7 @@ export class TelegramModule implements AliveModule {
 		threadId: number | undefined,
 		text: string,
 		replyTo: number | undefined,
+		replyMarkup?: unknown,
 	): Promise<TelegramSentMessage> {
 		const base: SendMessageParams = {
 			chat_id: chatId,
@@ -1144,6 +1225,7 @@ export class TelegramModule implements AliveModule {
 			disable_web_page_preview: !this.config.linkPreview,
 			reply_to_message_id: replyTo,
 			allow_sending_without_reply: true,
+			...(replyMarkup !== undefined ? { reply_markup: replyMarkup } : {}),
 		};
 		try {
 			return await api.sendMessage({ ...base, parse_mode: this.config.parseMode || undefined });
