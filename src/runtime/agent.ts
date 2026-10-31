@@ -10,6 +10,7 @@ import type { PolicyStore } from "../store/policy.js";
 import type { RunLog, RunRecord, RunStopReason } from "../store/runs.js";
 import type { ThreadStore } from "../store/threads.js";
 import { renderAwakePrompt, renderInterruptPrompt, renderNudgePrompt } from "./prompt.js";
+import { TurnTraceRecorder } from "./run-trace.js";
 import { hasWakeWorthyPending } from "./wake.js";
 import { maskSecrets } from "../secrets.js";
 import { privateMemoryScope } from "./memory-access.js";
@@ -54,6 +55,8 @@ export class AgentRunner {
 	private budgetRunId: string | null = null;
 	private aborting = false;
 	private interruptInFlight = false;
+	/** Per-turn usage of the current run, persisted on its record (#121). */
+	private readonly turnTrace = new TurnTraceRecorder();
 
 	constructor(deps: AgentRunnerDeps) {
 		this.deps = deps;
@@ -129,6 +132,7 @@ export class AgentRunner {
 
 		const statsBefore = this.session.getSessionStats();
 		const startedAt = Date.now();
+		this.turnTrace.reset();
 		const run: RunHandle = {
 			id: `run_${startedAt.toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
 			index: runs.nextIndex(),
@@ -269,7 +273,9 @@ export class AgentRunner {
 			idleReturns: run.idleReturns,
 			interruptDeliveries: run.interruptDeliveries,
 			nudges: run.nudges,
-			turns: run.turns,
+			turnCount: run.turns,
+			// Bounded per-turn trace: the page checks its sum against `usage`.
+			turns: this.turnTrace.snapshot(),
 			promptChars: run.promptChars,
 			usage,
 			sleep: run.sleepRequested ? { forced: run.sleepForced, summaryChars: run.sleepSummary?.length ?? 0 } : undefined,
@@ -448,7 +454,14 @@ export class AgentRunner {
 				}
 				break;
 			}
+			case "turn_start": {
+				if (run) this.turnTrace.startTurn();
+				break;
+			}
 			case "turn_end": {
+				// The assistant message carries the provider usage of this turn; the
+				// tool results name the tools it called.
+				if (run) this.turnTrace.endTurn({ message: event.message, toolResults: event.toolResults });
 				void this.deliverInterrupts();
 				break;
 			}

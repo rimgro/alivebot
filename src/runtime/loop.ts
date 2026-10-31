@@ -13,6 +13,7 @@ import { dispatchDueReminders, ReminderStore } from "../store/reminders.js";
 import { AgentRunner, describeRunRecord } from "./agent.js";
 import {
 	readRuntimeState,
+	runTurnCount,
 	RunLog,
 	writeRuntimeState,
 	type RunRecord,
@@ -470,7 +471,7 @@ export class AliveRuntime {
 						...new Set(record.outbound.map((m) => m.thread)),
 					].join(", ")}`
 				: "no outbound",
-			`${record.turns} turns`,
+			`${runTurnCount(record)} turns`,
 			record.usage.cost > 0 ? `$${record.usage.cost.toFixed(4)}` : undefined,
 			record.stopReason === "slept" ? "slept (context reset)" : record.stopReason,
 		].filter(Boolean);

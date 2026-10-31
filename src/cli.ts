@@ -9,7 +9,7 @@ import { EventStore, type EventPriority } from "./store/events.js";
 import { ReminderStore } from "./store/reminders.js";
 import { PolicyStore, type NotifyMode } from "./store/policy.js";
 import { ThreadStore } from "./store/threads.js";
-import { RunLog, readRuntimeState } from "./store/runs.js";
+import { RunLog, readRuntimeState, runTurnCount } from "./store/runs.js";
 import { HistoryStore, type HistoryDirection, type HistoryQuery } from "./store/history.js";
 import { Outbox } from "./store/outbox.js";
 import { listLocalMessages, operatorAgentThread, sendLocalAgentMessage } from "./runtime/agent-messaging.js";
@@ -1115,7 +1115,7 @@ function runsCommand(_cwd: string, flags: Record<string, string | boolean>): num
 		const out = record.outbound.length > 0 ? `→ ${record.outbound.map((m) => m.thread).join(",")}` : "—";
 		process.stdout.write(
 			`#${String(record.index).padStart(4)} ${iso(record.finishedAt)} ${formatDuration(record.durationMs).padStart(7)} ` +
-				`${record.stopReason.padEnd(10)} events=${record.events.length} idle=${record.idleReturns} turns=${record.turns} out=${out} $${record.usage.cost.toFixed(4)}\n`,
+				`${record.stopReason.padEnd(10)} events=${record.events.length} idle=${record.idleReturns} turns=${runTurnCount(record)} out=${out} $${record.usage.cost.toFixed(4)}\n`,
 		);
 		if (record.error) process.stdout.write(`      error: ${record.error}\n`);
 	}

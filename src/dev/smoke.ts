@@ -17,6 +17,7 @@ import { Logger } from "../log.js";
 import { AliveRuntime } from "../runtime/loop.js";
 import { EventStore } from "../store/events.js";
 import { Outbox } from "../store/outbox.js";
+import { runTurnCount } from "../store/runs.js";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-smoke-"));
 const config = loadConfig({
@@ -68,7 +69,7 @@ const thoughts = fs.existsSync(config.paths.thoughtsFile)
 
 log.info("smoke result", {
 	run: record ? `#${record.index} ${record.stopReason}` : "(no run)",
-	turns: record?.turns,
+	turns: record ? runTurnCount(record) : undefined,
 	idleReturns: record?.idleReturns,
 	outbound: messages.length,
 	thoughtRecords: thoughts,

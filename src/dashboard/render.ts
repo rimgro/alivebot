@@ -9,6 +9,7 @@
  * once more as a safety net, so a forgotten interpolation cannot leak a token.
  */
 import { createMaskContext, maskSecrets, type MaskContext, type SecretsConfig } from "../secrets.js";
+import { RUN_TURN_TRACE_LIMIT } from "../store/runs.js";
 import { formatDuration, oneLine } from "../util.js";
 import {
 	MEMORY_MAX_TEXT_CHARS,
@@ -21,13 +22,18 @@ import {
 import {
 	TIMELINE_KINDS,
 	formatCost,
+	formatRate,
 	formatTimestamp,
 	hasTimelineFilters,
 	timelineQueryString,
+	RUN_STEP_COST_EPSILON,
 	type AgentDetail,
 	type AgentStatus,
 	type AgentSummary,
 	type RunDetail,
+	type RunStepView,
+	type RunStepsView,
+	type RunUsageView,
 	type RunView,
 	type SessionTurn,
 	type TimelineItem,
@@ -232,6 +238,11 @@ code { font-family: var(--mono); font-size: 12px; }
 .scopes { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
 .scope { font-family: var(--mono); font-size: 11px; color: var(--link); border: 1px solid var(--line); padding: 1px 6px; }
 .revision { border-top: 1px solid var(--line); margin-top: 10px; padding-top: 10px; color: var(--muted); }
+table.steps tfoot th, table.steps tfoot td { border-top: 1px solid #33312b; border-bottom: none; font-size: 12px; }
+table.steps tfoot tr.check th { color: var(--muted); font-weight: 500; }
+.check.match { color: var(--sleep); }
+.check.partial { color: var(--waiting); }
+.check.mismatch { color: var(--error); font-weight: 600; }
 .revision .fact-text { color: var(--text); }
 .search { border: 1px solid var(--line); background: var(--panel); padding: 10px 14px; margin: 0 0 14px; }
 .search .term { font-family: var(--mono); color: var(--link); }
@@ -511,6 +522,136 @@ ${reminderRows}
 	], logoutOptions(context));
 }
 
+const STEP_DASH = "—";
+/** turn, time, input, output, cacheRead, cacheWrite, step cost, duration, tools. */
+const STEP_COLUMNS = 9;
+
+function dashCells(count: number): string {
+	return `<td class="num">${STEP_DASH}</td>`.repeat(count);
+}
+
+/** input, output, cacheRead, cacheWrite, cost (5 cells). */
+function stepUsageCells(usage: RunUsageView, masker: Masker): string {
+	return `<td class="num">${masker.num(usage.input)}</td>` +
+		`<td class="num">${masker.num(usage.output)}</td>` +
+		`<td class="num">${masker.num(usage.cacheRead)}</td>` +
+		`<td class="num">${masker.num(usage.cacheWrite)}</td>` +
+		`<td class="num">${masker.text(formatCost(usage.cost))}</td>`;
+}
+
+function stepToolLabel(tools: string[], masker: Masker): string {
+	return tools.length > 0 ? masker.text(tools.join(", ")) : STEP_DASH;
+}
+
+function stepRow(step: RunStepView, masker: Masker): string {
+	return `<tr>
+<td class="mono">${masker.num(step.index)}</td>
+<td class="mono">${masker.text(formatTimestamp(step.startedAt))}</td>
+${stepUsageCells(step.usage, masker)}
+<td class="num">${masker.text(formatDuration(step.durationMs))}</td>
+<td class="mono">${stepToolLabel(step.tools, masker)}</td>
+</tr>`;
+}
+
+/** One dash row per turn we know about, but never more than the trace bound. */
+function dashRow(index: number, masker: Masker): string {
+	return `<tr>
+<td class="mono">${masker.num(index)}</td>
+<td class="mono">${STEP_DASH}</td>
+${dashCells(5)}
+<td class="num">${STEP_DASH}</td>
+<td class="mono">${STEP_DASH}</td>
+</tr>`;
+}
+
+function stepDelta(steps: RunStepsView, masker: Masker): string {
+	const parts: string[] = [];
+	const tokens: Array<[string, number]> = [
+		["input", steps.aggregate.input - steps.sum.input],
+		["output", steps.aggregate.output - steps.sum.output],
+		["cacheRead", steps.aggregate.cacheRead - steps.sum.cacheRead],
+		["cacheWrite", steps.aggregate.cacheWrite - steps.sum.cacheWrite],
+		["total", steps.aggregate.total - steps.sum.total],
+	];
+	for (const [name, delta] of tokens) {
+		if (delta !== 0) parts.push(`${name} ${delta > 0 ? "+" : "−"}${Math.abs(delta).toLocaleString("en-US")}`);
+	}
+	const costDelta = steps.aggregate.cost - steps.sum.cost;
+	if (Math.abs(costDelta) > RUN_STEP_COST_EPSILON) {
+		parts.push(`cost ${costDelta > 0 ? "+" : "−"}${formatCost(Math.abs(costDelta))}`);
+	}
+	return masker.text(parts.join(" · "));
+}
+
+function renderStepTable(steps: RunStepsView, masker: Masker): string {
+	const notes = steps.notes.map((note) => `<p class="note">${masker.text(note)}</p>`).join("");
+	const rows: string[] = [];
+	if (steps.recorded) {
+		rows.push(...steps.steps.map((step) => stepRow(step, masker)));
+	} else {
+		const shown = Math.min(steps.turnCount, RUN_TURN_TRACE_LIMIT);
+		for (let index = 1; index <= shown; index += 1) rows.push(dashRow(index, masker));
+		if (steps.turnCount > shown) {
+			rows.push(`<tr><td colspan="${STEP_COLUMNS}" class="sub">… ${masker.num(steps.turnCount - shown)} more turn(s) not listed</td></tr>`);
+		}
+	}
+	if (rows.length === 0) {
+		rows.push(`<tr><td colspan="${STEP_COLUMNS}" class="empty">This run recorded no model turns.</td></tr>`);
+	}
+
+	const sumCells = steps.recorded ? stepUsageCells(steps.sum, masker) : dashCells(5);
+	const aggregateCells = stepUsageCells(steps.aggregate, masker);
+	const checkClass = steps.partial ? "partial" : !steps.recorded ? "" : steps.mismatch ? "mismatch" : "match";
+	const checkText = !steps.recorded
+		? "not comparable — per-turn usage was not recorded for this run"
+		: steps.partial
+			? `partial — the stored trace covers turns ${steps.firstIndex}–${steps.lastIndex}, so the step sum is not compared with the aggregate`
+			: steps.mismatch
+				? `MISMATCH — the sum of the stored steps differs from the run aggregate: ${stepDelta(steps, masker)}`
+				: "match — the sum of the stored steps equals the run aggregate";
+
+	const rate = steps.cacheHitRate;
+	const cacheText = rate === null
+		? `cache hit rate ${STEP_DASH} (the run recorded no input or cacheRead tokens)`
+		: `cache hit rate ${formatRate(rate)} = cacheRead ${steps.aggregate.cacheRead.toLocaleString("en-US")} / (input ${steps.aggregate.input.toLocaleString("en-US")} + cacheRead ${steps.aggregate.cacheRead.toLocaleString("en-US")}) · from the run aggregate`;
+
+	return `${notes}
+<table class="steps">
+<thead><tr><th>turn</th><th>time</th><th class="num">input</th><th class="num">output</th><th class="num">cacheRead</th><th class="num">cacheWrite</th><th class="num">step cost</th><th class="num">duration</th><th>tools</th></tr></thead>
+<tbody>
+${rows.join("\n")}
+</tbody>
+<tfoot>
+<tr><th colspan="2">sum of steps</th>${sumCells}<td class="num">${STEP_DASH}</td><td class="mono">${STEP_DASH}</td></tr>
+<tr><th colspan="2">run aggregate (runs.jsonl)</th>${aggregateCells}<td class="num">${STEP_DASH}</td><td class="mono">${STEP_DASH}</td></tr>
+<tr class="check"><th>check</th><td colspan="8" class="check ${checkClass}">${masker.text(checkText)}</td></tr>
+</tfoot>
+</table>
+<p class="sub mono">${masker.text(cacheText)}</p>`;
+}
+
+function renderTopSteps(steps: RunStepsView, masker: Masker): string {
+	if (!steps.recorded) {
+		return `<p class="empty">No per-step cost: per-turn usage was not recorded for this run.</p>`;
+	}
+	if (steps.top.length === 0) return `<p class="empty">No steps were recorded for this run.</p>`;
+	const rows = steps.top.map((step, rank) => `<tr>
+<td class="mono">${masker.num(rank + 1)}</td>
+<td class="mono">#${masker.num(step.index)}</td>
+<td class="num">${masker.text(formatCost(step.usage.cost))}</td>
+<td class="num">${masker.num(step.usage.input)}</td>
+<td class="num">${masker.num(step.usage.output)}</td>
+<td class="num">${masker.text(formatDuration(step.durationMs))}</td>
+<td class="mono">${stepToolLabel(step.tools, masker)}</td>
+</tr>`).join("\n");
+	return `<table>
+<thead><tr><th>#</th><th>turn</th><th class="num">step cost</th><th class="num">input</th><th class="num">output</th><th class="num">duration</th><th>tools</th></tr></thead>
+<tbody>
+${rows}
+</tbody>
+</table>`;
+}
+
 function renderToolCalls(calls: ToolCallView[], masker: Masker): string {
 	if (calls.length === 0) return `<p class="empty">No tool calls recorded in this run's session transcript.</p>`;
 	const rows = calls.map((call, index) => `<tr>
@@ -585,6 +726,12 @@ run ${masker.text(run.id)} · ${masker.text(formatTimestamp(run.startedAt))} →
 <tr><th>outbound</th><td class="mono">${masker.num(run.outboundCount)}</td><th>reminders created</th><td class="mono">${masker.num(run.remindersCreated.length)}</td><th>journal entries</th><td class="mono">${masker.num(run.journalEntries)}</td></tr>
 ${run.sleep ? `<tr><th>sleep</th><td class="mono" colspan="5">${masker.text(run.sleep.forced ? "forced by the runtime" : "requested by the agent")} · summary ${masker.num(run.sleep.summaryChars)} chars</td></tr>` : ""}
 </table>
+
+<h2>steps (per-turn usage)</h2>
+${renderStepTable(detail.steps, masker)}
+
+<h2>most expensive steps</h2>
+${renderTopSteps(detail.steps, masker)}
 
 <h2>trigger</h2>
 <table>

@@ -26,10 +26,11 @@ import { FakeMemoryStore } from "./fake-memory.js";
 import { Outbox } from "../store/outbox.js";
 import { PolicyStore } from "../store/policy.js";
 import { ReminderStore } from "../store/reminders.js";
-import { RunLog } from "../store/runs.js";
+import { RUN_TURN_TRACE_LIMIT, RunLog } from "../store/runs.js";
 import { ThreadStore } from "../store/threads.js";
 import { HistoryStore } from "../store/history.js";
 import { AgentRunner } from "../runtime/agent.js";
+import { TurnTraceRecorder } from "../runtime/run-trace.js";
 import { hasWakeWorthyPending, WakeScheduler, wakeIntervalMs } from "../runtime/wake.js";
 import { createAliveTools, type RunHandle, type ToolDeps } from "../runtime/tools.js";
 
@@ -247,6 +248,126 @@ section("policy-approved notifications are steered into a working run");
 	check("alice's event was steered in", steered.includes("urgent from alice"), steered);
 	check("bob's event was not steered in", !steered.includes("quiet from bob"), steered);
 	check("run counted the interrupt", (record?.interruptDeliveries ?? 0) === 1, record?.interruptDeliveries);
+}
+
+
+// ---------------------------------------------------------------------------
+// per-turn usage (#121)
+// ---------------------------------------------------------------------------
+
+section("per-turn usage is persisted on the run record (#121)");
+{
+	handler = async (session) => {
+		const turns = [
+			{ input: 100, output: 10, cacheRead: 50, cacheWrite: 5, cost: 0.001, tools: ["read"] },
+			{ input: 200, output: 20, cacheRead: 150, cacheWrite: 0, cost: 0.0025, tools: ["bash", "edit"] },
+		];
+		for (const [index, turn] of turns.entries()) {
+			session.emit({ type: "turn_start" });
+			session.emit({
+				type: "turn_end",
+				message: {
+					role: "assistant",
+					content: [
+						{ type: "text", text: `turn ${index + 1}` },
+						...turn.tools.map((name, callIndex) => ({
+							type: "toolCall",
+							id: `call_${index}_${callIndex}`,
+							name,
+							arguments: {},
+						})),
+					],
+					usage: {
+						input: turn.input,
+						output: turn.output,
+						cacheRead: turn.cacheRead,
+						cacheWrite: turn.cacheWrite,
+						totalTokens: turn.input + turn.output + turn.cacheRead + turn.cacheWrite,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: turn.cost },
+					},
+					stopReason: "toolUse",
+				},
+				toolResults: turn.tools.map((name, callIndex) => ({
+					role: "toolResult",
+					toolCallId: `call_${index}_${callIndex}`,
+					toolName: name,
+					content: [],
+				})),
+			});
+			await session.turn();
+		}
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "trace test", summary_md: "# trace test\n" });
+	};
+	const turnsBefore = runs.usageToday().turns;
+	const record = await runner.execute();
+	const trace = record?.turns ?? [];
+	check(
+		"the run record stores the per-turn trace and the turn count",
+		record?.turnCount === 2 && trace.length === 2,
+		{ turnCount: record?.turnCount, steps: trace.length },
+	);
+	check("turns are numbered from 1", trace.map((turn) => turn.index).join(",") === "1,2", trace.map((turn) => turn.index));
+	check(
+		"token usage and cost are copied per turn",
+		trace[0]?.usage.input === 100 &&
+			trace[0]?.usage.cacheRead === 50 &&
+			trace[1]?.usage.cacheRead === 150 &&
+			trace[1]?.usage.cost === 0.0025,
+		trace.map((turn) => turn.usage),
+	);
+	check(
+		"the tools called in each turn are recorded",
+		trace[0]?.tools.join(",") === "read" && trace[1]?.tools.join(",") === "bash,edit",
+		trace.map((turn) => turn.tools),
+	);
+	check(
+		"turn timing is measured from turn_start to turn_end",
+		trace.every((turn) => turn.startedAt > 0 && turn.durationMs >= 0),
+		trace.map((turn) => ({ startedAt: turn.startedAt, durationMs: turn.durationMs })),
+	);
+	const persisted = runs.list(1)[0];
+	check(
+		"the trace is persisted to runs.jsonl",
+		persisted?.turnCount === 2 && persisted.turns?.length === 2 && persisted.turns[1]?.usage.cacheRead === 150,
+		{ turnCount: persisted?.turnCount, steps: persisted?.turns?.length },
+	);
+	check("the daily counter counts the run's turns", runs.usageToday().turns === turnsBefore + 2, {
+		before: turnsBefore,
+		after: runs.usageToday().turns,
+	});
+}
+
+section("the turn recorder is bounded and tolerates malformed events (#121)");
+{
+	const clock = { now: 1_000 };
+	const recorder = new TurnTraceRecorder(() => clock.now);
+	check("a turn_end without an assistant message is ignored", recorder.endTurn({ message: undefined }) === undefined);
+	check("a non-assistant message is ignored", recorder.endTurn({ message: { role: "user", content: [] } }) === undefined);
+	check("a non-object message is ignored", recorder.endTurn({ message: "nope" }) === undefined);
+	check("a message without usage records zeros, not fabricated values", recorder.endTurn({ message: { role: "assistant" } })?.usage.input === 0);
+	recorder.reset();
+	for (let index = 0; index < RUN_TURN_TRACE_LIMIT + 5; index += 1) {
+		clock.now += 1_000;
+		recorder.startTurn();
+		clock.now += 500;
+		recorder.endTurn({
+			message: {
+				role: "assistant",
+				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { total: 0.0001 } },
+			},
+			at: clock.now,
+		});
+	}
+	const snapshot = recorder.snapshot();
+	check(`the trace is bounded to the last ${RUN_TURN_TRACE_LIMIT} turns`, snapshot.length === RUN_TURN_TRACE_LIMIT, snapshot.length);
+	check(
+		"indexes stay absolute after truncation",
+		snapshot[0]?.index === 6 && snapshot[snapshot.length - 1]?.index === RUN_TURN_TRACE_LIMIT + 5,
+		{ first: snapshot[0]?.index, last: snapshot[snapshot.length - 1]?.index },
+	);
+	check("each recorded turn keeps its own duration", snapshot[0]?.durationMs === 500, snapshot[0]?.durationMs);
+	check("snapshot() returns a copy", recorder.snapshot() !== snapshot && recorder.snapshot()[0] !== snapshot[0]);
 }
 
 

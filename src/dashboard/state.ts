@@ -16,7 +16,15 @@ import { DEFAULT_CONTRACT, loadConfig, type LoadedConfig } from "../config.js";
 import { buildSystemPrompt } from "../runtime/prompt.js";
 import type { AliveEvent } from "../store/events.js";
 import type { Reminder } from "../store/reminders.js";
-import type { RunRecord, RunStopReason, RuntimeStateFile, UsageBucket } from "../store/runs.js";
+import {
+	RUN_TURN_TRACE_LIMIT,
+	runTurnCount,
+	type RunRecord,
+	type RunStopReason,
+	type RunUsage,
+	type RuntimeStateFile,
+	type UsageBucket,
+} from "../store/runs.js";
 import { formatDuration, isProcessAlive, localDay, oneLine, readJson, readJsonl } from "../util.js";
 
 /** The root profile is always addressable as `main` (same id local agent messaging uses). */
@@ -154,13 +162,62 @@ export interface RunTrigger {
 	redelivered?: boolean;
 }
 
-export interface RunUsageView {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	total: number;
-	cost: number;
+export type RunUsageView = RunUsage;
+
+export interface RunStepView {
+	index: number;
+	startedAt: number;
+	durationMs: number;
+	usage: RunUsageView;
+	tools: string[];
+}
+
+function finiteNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function usageView(value: unknown): RunUsageView {
+	const fields = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+	return {
+		input: finiteNumber(fields.input) ?? 0,
+		output: finiteNumber(fields.output) ?? 0,
+		cacheRead: finiteNumber(fields.cacheRead) ?? 0,
+		cacheWrite: finiteNumber(fields.cacheWrite) ?? 0,
+		total: finiteNumber(fields.total) ?? 0,
+		cost: finiteNumber(fields.cost) ?? 0,
+	};
+}
+
+/**
+ * Sanitize the stored per-turn traces.
+ *
+ * Returns `undefined` when the record has no usable `turns` array (an old run,
+ * or a malformed field). Individual malformed entries are skipped instead of
+ * turning into zero-cost steps; the dashboard must show "not recorded" rather
+ * than invented numbers.
+ */
+export function toRunStepViews(value: unknown): RunStepView[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	const steps: RunStepView[] = [];
+	for (const entry of value) {
+		if (!entry || typeof entry !== "object") continue;
+		const record = entry as Record<string, unknown>;
+		// A step without a usage object has nothing to show; skipping it keeps
+		// the step table honest about what was recorded.
+		if (!record.usage || typeof record.usage !== "object") continue;
+		const index = finiteNumber(record.index);
+		steps.push({
+			index: index === undefined ? steps.length + 1 : Math.max(1, Math.trunc(index)),
+			startedAt: finiteNumber(record.startedAt) ?? 0,
+			durationMs: Math.max(0, finiteNumber(record.durationMs) ?? 0),
+			usage: usageView(record.usage),
+			tools: Array.isArray(record.tools)
+				? record.tools.filter((tool): tool is string => typeof tool === "string")
+				: [],
+		});
+	}
+	steps.sort((left, right) => left.index - right.index);
+	return steps;
 }
 
 export interface RunView {
@@ -175,6 +232,8 @@ export interface RunView {
 	outcome: RunOutcome;
 	error?: string;
 	turns: number;
+	/** Per-turn usage from the run record; `undefined` when it was not recorded. */
+	steps?: RunStepView[];
 	promptChars: number;
 	usage: RunUsageView;
 	nudges: number;
@@ -201,7 +260,8 @@ export function toRunView(record: RunRecord): RunView {
 		stopReason: record.stopReason,
 		outcome: runOutcome(record.stopReason),
 		error: record.error,
-		turns: record.turns,
+		turns: runTurnCount(record),
+		steps: toRunStepViews(record.turns),
 		promptChars: record.promptChars,
 		usage: {
 			input: usage.input ?? 0,
@@ -274,6 +334,159 @@ export function sumRuns(runs: RunView[]): RunTotals {
 }
 
 // ---------------------------------------------------------------------------
+// per-turn / per-step usage (#121)
+// ---------------------------------------------------------------------------
+
+/** Tolerance when comparing a step sum against the run aggregate (floating cents). */
+export const RUN_STEP_COST_EPSILON = 1e-6;
+
+export interface RunStepsView {
+	/** True when the run record carried a usable per-turn trace. */
+	recorded: boolean;
+	/** Recorded steps, oldest first. Empty when nothing was recorded. */
+	steps: RunStepView[];
+	/** Turn count stored on the record (known even for old runs). */
+	turnCount: number;
+	/** First/last absolute turn index in the stored trace (null when empty). */
+	firstIndex: number | null;
+	lastIndex: number | null;
+	/** True when only the last turns were kept, so the sum covers a window. */
+	truncated: boolean;
+	/** Sum of the recorded steps. All zeros when nothing was recorded. */
+	sum: RunUsageView;
+	/** The run's own aggregate usage from `runs.jsonl`. */
+	aggregate: RunUsageView;
+	/** True when the recorded sum does not match the aggregate. */
+	mismatch: boolean;
+	/** True when sums exist but only cover part of the run (bounded trace). */
+	partial: boolean;
+	/** `cacheRead / (input + cacheRead)` over the run aggregate, or null when there is no input. */
+	cacheHitRate: number | null;
+	/** Up to three recorded steps with the highest step cost. */
+	top: RunStepView[];
+	/** Honest notes shown above the table. */
+	notes: string[];
+}
+
+function emptyUsageView(): RunUsageView {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 };
+}
+
+function addUsage(target: RunUsageView, usage: RunUsageView): void {
+	target.input += usage.input;
+	target.output += usage.output;
+	target.cacheRead += usage.cacheRead;
+	target.cacheWrite += usage.cacheWrite;
+	target.total += usage.total;
+	target.cost += usage.cost;
+}
+
+/** `cacheRead / (input + cacheRead)`, the usual cache hit rate; null when there is no prompt tokens. */
+export function cacheHitRate(usage: RunUsageView): number | null {
+	const prompt = usage.input + usage.cacheRead;
+	if (prompt <= 0) return null;
+	return usage.cacheRead / prompt;
+}
+
+export function formatRate(rate: number | null): string {
+	if (rate === null || !Number.isFinite(rate)) return "—";
+	return `${(rate * 100).toFixed(1)}%`;
+}
+
+/**
+ * Build the per-step view for a run page.
+ *
+ * The sum check compares the recorded steps with the run's aggregate `usage`.
+ * A mismatch is surfaced (`mismatch: true`), never hidden or corrected. Old runs
+ * have no trace at all: `recorded` is false and the page shows `—` per step.
+ */
+export function buildRunSteps(
+	run: Pick<RunView, "turns" | "steps" | "usage">,
+): RunStepsView {
+	const aggregate: RunUsageView = { ...run.usage };
+	const notes: string[] = [];
+	const steps = run.steps;
+	const rate = cacheHitRate(aggregate);
+	if (!steps) {
+		notes.push(
+			"per-turn usage was not recorded for this run (records written before issue #121 store only the aggregate); " +
+				"the step rows show — and no numbers are reconstructed",
+		);
+		return {
+			recorded: false,
+			steps: [],
+			turnCount: run.turns,
+			firstIndex: null,
+			lastIndex: null,
+			truncated: false,
+			sum: emptyUsageView(),
+			aggregate,
+			mismatch: false,
+			partial: false,
+			cacheHitRate: rate,
+			top: [],
+			notes,
+		};
+	}
+
+	const sum = emptyUsageView();
+	for (const step of steps) addUsage(sum, step.usage);
+	const firstIndex = steps.length > 0 ? steps[0]!.index : null;
+	const lastIndex = steps.length > 0 ? steps[steps.length - 1]!.index : null;
+	const truncated = firstIndex !== null && firstIndex > 1;
+	const partial = truncated;
+	const mismatch = !truncated && (
+		sum.input !== aggregate.input ||
+		sum.output !== aggregate.output ||
+		sum.cacheRead !== aggregate.cacheRead ||
+		sum.cacheWrite !== aggregate.cacheWrite ||
+		sum.total !== aggregate.total ||
+		Math.abs(sum.cost - aggregate.cost) > RUN_STEP_COST_EPSILON
+	);
+
+	notes.push("per-turn usage was recorded by the runtime from the pi session's turn events (turn_start/turn_end)");
+	notes.push(
+		"the run aggregate also counts provider usage from compaction/branch summaries and tool executions, " +
+			"which belong to no turn; such a difference is shown below as a mismatch, never corrected",
+	);
+	if (truncated) {
+		notes.push(
+			`the trace is bounded to the last ${RUN_TURN_TRACE_LIMIT} turns: stored turns ${firstIndex}–${lastIndex}, ` +
+				"so the step sums cover only this window and cannot be compared with the run aggregate",
+		);
+	}
+	if (steps.length === 0 && run.turns > 0) {
+		notes.push(`the record lists ${run.turns} turn(s) but stored no usable per-turn usage`);
+	}
+	if (!truncated && steps.length > 0 && run.turns > 0 && steps.length !== run.turns) {
+		notes.push(`the record counts ${run.turns} turn(s) but the trace has ${steps.length} step(s)`);
+	}
+	if (mismatch) {
+		notes.push("the step sum does not match the run aggregate; both are shown below unchanged");
+	}
+
+	const top = [...steps]
+		.sort((left, right) => right.usage.cost - left.usage.cost || left.index - right.index)
+		.slice(0, 3);
+
+	return {
+		recorded: true,
+		steps,
+		turnCount: run.turns,
+		firstIndex,
+		lastIndex,
+		truncated,
+		sum,
+		aggregate,
+		mismatch,
+		partial,
+		cacheHitRate: rate,
+		top,
+		notes,
+	};
+}
+
+// ---------------------------------------------------------------------------
 // usage / runtime / reminders / events
 // ---------------------------------------------------------------------------
 
@@ -294,7 +507,7 @@ export function readUsageToday(stateDir: string, now = Date.now()): UsageBucket 
 		if (localDay(record.finishedAt) !== day) continue;
 		bucket.cost += record.usage?.cost ?? 0;
 		bucket.runs += 1;
-		bucket.turns += record.turns ?? 0;
+		bucket.turns += runTurnCount(record);
 		bucket.input += record.usage?.input ?? 0;
 		bucket.output += record.usage?.output ?? 0;
 	}
@@ -379,7 +592,7 @@ export interface AgentSummaryOptions extends DeriveStatusOptions {
 
 export function describeRun(record: RunRecord): string {
 	const outcome = runOutcome(record.stopReason);
-	return `#${record.index} ${formatDuration(record.durationMs)} · ${outcome.key} · ${record.turns} turns · ${record.events?.length ?? 0} events`;
+	return `#${record.index} ${formatDuration(record.durationMs)} · ${outcome.key} · ${runTurnCount(record)} turns · ${record.events?.length ?? 0} events`;
 }
 
 export function readAgentSummary(
@@ -1065,6 +1278,8 @@ function readTextFile(file: string): string {
 export interface RunDetail {
 	agent: { id: string; name: string; model: string };
 	run: RunView;
+	/** Per-turn cost breakdown and its sum check against the aggregate (#121). */
+	steps: RunStepsView;
 	toolCalls: ToolCallView[];
 	errors: string[];
 	systemPrompt: SystemPromptView;
@@ -1120,6 +1335,7 @@ export function loadRunDetail(
 			model: profile.config.config.model.trim() || "default",
 		},
 		run,
+		steps: buildRunSteps(run),
 		toolCalls: extractToolCalls(turns),
 		errors,
 		systemPrompt: reconstructSystemPrompt(profile),
