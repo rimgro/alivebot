@@ -36,8 +36,11 @@ import { MemoryStore } from "../store/memory.js";
 import type { RunRecord } from "../store/runs.js";
 import { formatDuration, localDay } from "../util.js";
 import {
+	buildCostTrend,
 	buildTimeline,
+	COST_TREND_DAYS,
 	deriveAgentStatus,
+	estimatePromptTokens,
 	filterTimeline,
 	findProfile,
 	hasTimelineFilters,
@@ -609,6 +612,171 @@ appendJsonl(path.join(tracedStateDir, "runs", "runs.jsonl"), [
 	runMixed,
 	runTruncated,
 ]);
+
+// ---------------------------------------------------------------------------
+// prompt-composition fixtures (#121, slice 3)
+// ---------------------------------------------------------------------------
+
+// A profile with a real session transcript whose awake prompt carries a
+// summary.md section and a memory-fact section. The exact block sizes below are
+// derived from these strings, so the test asserts measured values, not guesses.
+const promptRoot = path.join(root, "prompted");
+const promptStateDir = path.join(promptRoot, ".alive");
+writeJson(path.join(promptRoot, "alive.config.json"), {
+	name: "Prompted",
+	model: "anthropic/claude-test",
+	stateDir: ".alive",
+	workspace: ".alive/workspace",
+	sandbox: { enabled: false },
+});
+fs.writeFileSync(path.join(promptRoot, "SOUL.md"), "# Soul\n\nsoul body line.\n", "utf8");
+fs.writeFileSync(path.join(promptRoot, "CONTRACT.md"), "# Role: prompted\n\ncontract body line.\n", "utf8");
+fs.writeFileSync(path.join(promptRoot, "summary.md"), "# Summary\n\nsummary line one\nsummary line two\n", "utf8");
+
+const promptBase = base + 400_000;
+const summarySection = "summary line one\nsummary line two";
+const memorySection = "- (project:shared; since 2026-01-01) fact one\n- (agent:main; since 2026-01-02) fact two";
+const promptOneText =
+	`## AWAKE #1 — first prompt\n\n### Carried over\n\n` +
+	`Long-term memory (summary.md — primary, always loaded):\n${summarySection}\n\n` +
+	`Relevant fact memories (search the memory tool for more):\n${memorySection}\n\n` +
+	`### Budget\n\n- cost today: $0.0000`;
+const promptTwoText =
+	`## AWAKE #2 — second prompt\n\n### New events (1)\n\nnew event mentions ${OPENAI_KEY}\n\n### Carried over\n\n` +
+	`Long-term memory (summary.md — primary, always loaded):\n${summarySection}\n\n` +
+	`Relevant fact memories (search the memory tool for more):\n${memorySection}\n\n` +
+	`### Budget\n\n- cost today: $0.0100`;
+const promptAssistantText = "assistant reply body";
+const promptToolResultText = "tool output body";
+const promptToolArgs = JSON.stringify({ command: "ls" });
+
+const promptRun = {
+	id: "run_p1",
+	index: 1,
+	startedAt: promptBase,
+	finishedAt: promptBase + 20_000,
+	durationMs: 20_000,
+	activeMs: 20_000,
+	idleMs: 0,
+	stopReason: "slept" as const,
+	events: [
+		{ seq: 1, kind: "user_message", thread: "console", title: "compose me" },
+		{ seq: 2, kind: "user_message", thread: "console", title: "compose me too" },
+	],
+	outbound: [],
+	remindersCreated: [],
+	notesTouched: [],
+	journalEntries: 0,
+	idleReturns: 0,
+	interruptDeliveries: 0,
+	nudges: 0,
+	turnCount: 1,
+	turns: [
+		{ index: 1, startedAt: promptBase + 1_000, durationMs: 2_000, usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, total: 110, cost: 0.001 }, tools: ["bash"] },
+	],
+	// Exactly what the runtime counts: the text of every prompt it sent.
+	promptChars: promptOneText.length + promptTwoText.length,
+	usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, total: 110, cost: 0.001 },
+	sleep: { forced: false, summaryChars: summarySection.length },
+};
+appendJsonl(path.join(promptStateDir, "runs", "runs.jsonl"), [promptRun]);
+appendJsonl(path.join(promptStateDir, "sessions", "prompt-session.jsonl"), [
+	{ type: "session", version: 3, id: "prompt-session", timestamp: new Date(promptBase - 1_000).toISOString(), cwd: promptRoot },
+	{
+		type: "message",
+		timestamp: new Date(promptBase + 1_000).toISOString(),
+		message: { role: "user", content: promptOneText, timestamp: promptBase + 1_000 },
+	},
+	{
+		type: "message",
+		timestamp: new Date(promptBase + 3_000).toISOString(),
+		message: {
+			role: "assistant",
+			content: [
+				{ type: "text", text: promptAssistantText },
+				{ type: "toolCall", id: "prompt_call_1", name: "bash", arguments: { command: "ls" } },
+			],
+			timestamp: promptBase + 3_000,
+		},
+	},
+	{
+		type: "message",
+		timestamp: new Date(promptBase + 4_000).toISOString(),
+		message: {
+			role: "toolResult",
+			toolCallId: "prompt_call_1",
+			toolName: "bash",
+			content: [{ type: "text", text: promptToolResultText }],
+			timestamp: promptBase + 4_000,
+		},
+	},
+	{
+		type: "message",
+		timestamp: new Date(promptBase + 5_000).toISOString(),
+		message: { role: "user", content: promptTwoText, timestamp: promptBase + 5_000 },
+	},
+	{
+		type: "message",
+		timestamp: new Date(promptBase + 7_000).toISOString(),
+		message: { role: "assistant", content: [{ type: "text", text: "done" }], timestamp: promptBase + 7_000 },
+	},
+]);
+
+// A trend profile: some days come from usage.json, one only from runs.jsonl,
+// one has no runs at all, and one is outside the 14-day window.
+const trendRoot = path.join(root, "trend");
+const trendStateDir = path.join(trendRoot, ".alive");
+writeJson(path.join(trendRoot, "alive.config.json"), {
+	name: "Trend",
+	model: "anthropic/claude-test",
+	stateDir: ".alive",
+	workspace: ".alive/workspace",
+	sandbox: { enabled: false },
+});
+function trendDay(offset: number): number {
+	const date = new Date(now);
+	date.setDate(date.getDate() - offset);
+	date.setHours(12, 0, 0, 0);
+	return date.getTime();
+}
+function trendRun(id: string, index: number, finishedAt: number, cost: number): unknown {
+	return {
+		id,
+		index,
+		startedAt: finishedAt - 5_000,
+		finishedAt,
+		durationMs: 5_000,
+		activeMs: 5_000,
+		idleMs: 0,
+		stopReason: "stalled",
+		events: [],
+		outbound: [],
+		remindersCreated: [],
+		notesTouched: [],
+		journalEntries: 0,
+		idleReturns: 0,
+		interruptDeliveries: 0,
+		nudges: 0,
+		turns: 1,
+		promptChars: 10,
+		usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, total: 11, cost },
+	};
+}
+appendJsonl(path.join(trendStateDir, "runs", "runs.jsonl"), [
+	trendRun("trend_today_1", 1, trendDay(0), 0.1),
+	trendRun("trend_today_2", 2, trendDay(0), 0.1),
+	trendRun("trend_today_3", 3, trendDay(0), 0.1),
+	trendRun("trend_yesterday_1", 4, trendDay(1), 0.05),
+	trendRun("trend_yesterday_2", 5, trendDay(1), 0.05),
+	trendRun("trend_five_1", 6, trendDay(5), 0.07),
+	trendRun("trend_outside", 7, trendDay(20), 0.99),
+]);
+writeJson(path.join(trendStateDir, "usage.json"), {
+	days: {
+		[localDay(trendDay(0))]: { cost: 0.3, runs: 3, turns: 3, input: 300, output: 30 },
+		[localDay(trendDay(1))]: { cost: 0.1, runs: 2, turns: 2, input: 200, output: 20 },
+	},
+});
 
 const memoryDbPath = path.join(stateDir, "memory.sqlite");
 
@@ -1188,6 +1356,202 @@ async function main(): Promise<void> {
 		"the page explains that the sums cover only the stored window",
 		truncatedHtml.includes("partial — the stored trace covers turns 199–200") && !truncatedHtml.includes("MISMATCH"),
 		truncatedHtml.match(/partial[^<]*/)?.[0],
+	);
+
+	section("prompt composition (#121)");
+	const promptProfile = findProfile(loadDashboard(loadRootConfig({ rootDir: promptRoot })), "main")!;
+	const prompted = loadRunDetail(promptProfile, "run_p1")!;
+	const promptBlocks = Object.fromEntries(prompted.promptComposition.blocks.map((block) => [block.key, block]));
+	const promptSystemChars = prompted.systemPrompt.baseChars + prompted.systemPrompt.soulChars + prompted.systemPrompt.contractChars;
+	const expectedHistoryChars = promptOneText.length + promptAssistantText.length + promptToolArgs.length;
+	const expectedTotalChars = promptSystemChars + promptTwoText.length + expectedHistoryChars + promptToolResultText.length;
+	check(
+		"composition uses the last awake prompt in the window",
+		prompted.promptComposition.available &&
+			prompted.promptComposition.promptIndex === 2 &&
+			prompted.promptComposition.promptCount === 2,
+		prompted.promptComposition,
+	);
+	check(
+		"base, SOUL and contract sizes come from the reconstructed system prompt",
+		promptBlocks.base.chars === prompted.systemPrompt.baseChars &&
+			promptBlocks.soul.chars === prompted.systemPrompt.soulChars &&
+			promptBlocks.contract.chars === prompted.systemPrompt.contractChars &&
+			promptBlocks.base.chars + promptBlocks.soul.chars + promptBlocks.contract.chars === prompted.systemPrompt.text.length,
+		{ blocks: prompted.promptComposition.blocks, system: prompted.systemPrompt },
+	);
+	check(
+		"summary.md and memory facts are measured from the prompt text",
+		promptBlocks.summary.chars === summarySection.length &&
+			promptBlocks.memory.chars === memorySection.length &&
+			promptBlocks.summary.source === "measured" &&
+			promptBlocks.memory.source === "measured",
+		{ summary: promptBlocks.summary, memory: promptBlocks.memory },
+	);
+	check(
+		"session history and tool results are measured from the transcript",
+		promptBlocks.history.chars === expectedHistoryChars &&
+			promptBlocks.toolResults.chars === promptToolResultText.length,
+		{ history: promptBlocks.history, toolResults: promptBlocks.toolResults },
+	);
+	const expectedUnattributed = promptTwoText.length - summarySection.length - memorySection.length;
+	check(
+		"the rest of the prompt is reported as unattributed, not guessed",
+		promptBlocks.unattributed.chars === expectedUnattributed &&
+			expectedUnattributed > 0 &&
+			promptBlocks.unattributed.source === "unattributed",
+		{ unattributed: promptBlocks.unattributed, expectedUnattributed },
+	);
+	check(
+		"tool schemas are explicitly not recorded",
+		promptBlocks.toolSchemas.chars === null &&
+			promptBlocks.toolSchemas.tokens === null &&
+			promptBlocks.toolSchemas.share === null &&
+			promptBlocks.toolSchemas.source === "not-recorded",
+		promptBlocks.toolSchemas,
+	);
+	check(
+		"the reconstructed total is the sum of the measured/reconstructed blocks",
+		prompted.promptComposition.totalChars === expectedTotalChars &&
+			prompted.promptComposition.blocks.every((block) => block.chars === null || block.tokens === estimatePromptTokens(block.chars)),
+		{ total: prompted.promptComposition.totalChars, expectedTotalChars },
+	);
+	const measuredShares = prompted.promptComposition.blocks.filter((block) => block.share !== null);
+	check(
+		"shares are of the total and add up to 1",
+		Math.abs(measuredShares.reduce((sum, block) => sum + (block.share ?? 0), 0) - 1) < 1e-9,
+		measuredShares.map((block) => [block.key, block.share]),
+	);
+
+	section("prompt delta and cost pairing (#121)");
+	const promptDelta = prompted.promptComposition.delta;
+	const deltaRow = (key: string) => promptDelta.rows.find((row) => row.key === key);
+	check(
+		"first→last delta compares both transcript prompts",
+		promptDelta.available && promptDelta.promptCount === 2 && promptDelta.firstAt === promptBase + 1_000 && promptDelta.lastAt === promptBase + 5_000,
+		promptDelta,
+	);
+	check(
+		"history and tool results are what grew",
+		deltaRow("history")?.delta === expectedHistoryChars &&
+			deltaRow("toolResults")?.delta === promptToolResultText.length &&
+			(deltaRow("history")?.delta ?? 0) > 0 &&
+			(deltaRow("toolResults")?.delta ?? 0) > 0,
+		{ history: deltaRow("history"), toolResults: deltaRow("toolResults") },
+	);
+	check(
+		"unchanged blocks have a zero delta and tool schemas stay —",
+		deltaRow("summary")?.delta === 0 && deltaRow("memory")?.delta === 0 && deltaRow("toolSchemas")?.delta === null,
+		{ summary: deltaRow("summary"), memory: deltaRow("memory"), toolSchemas: deltaRow("toolSchemas") },
+	);
+	const promptPairs = prompted.promptCostPairs.pairs;
+	const stepPair = promptPairs.find((pair) => pair.turn === 1);
+	const promptOnlyPair = promptPairs.find((pair) => pair.turn === null);
+	check(
+		"a recorded step pairs with the prompt that preceded it",
+		promptPairs.length === 2 &&
+			stepPair?.promptChars === promptOneText.length &&
+			stepPair?.stepCost === 0.001,
+		promptPairs,
+	);
+	check(
+		"a prompt after the last step has no cost and renders —",
+		promptOnlyPair?.promptChars === promptTwoText.length && promptOnlyPair?.stepCost === null,
+		promptOnlyPair,
+	);
+	const promptedHtml = renderRunPage(prompted, renderContext);
+	check(
+		"the run page renders the composition, delta and prompt→cost sections",
+		promptedHtml.includes("prompt composition") &&
+			promptedHtml.includes("tokens (est.)") &&
+			promptedHtml.includes("first → last prompt delta") &&
+			promptedHtml.includes("prompt → step cost") &&
+			promptedHtml.includes("unattributed") &&
+			promptedHtml.includes("not recorded"),
+		promptedHtml.match(/prompt composition[^<]*/)?.[0],
+	);
+	check(
+		"the prompt→cost table shows both halves or —",
+		promptedHtml.includes(`<td class="num">${promptOneText.length}</td>`) &&
+			promptedHtml.includes("<td class=\"num\">—</td>"),
+		promptedHtml.match(/prompt → step cost[\s\S]{0,600}/)?.[0],
+	);
+	check(
+		"composition/first-last blocks stay masked",
+		!promptedHtml.includes(OPENAI_KEY) && /\[openai#\d+\]/.test(promptedHtml),
+		{ hasToken: promptedHtml.includes(OPENAI_KEY), masked: /\[openai#\d+\]/.test(promptedHtml) },
+	);
+	const noTranscriptComposition = loadRunDetail(tracedProfile, "run_t1")!.promptComposition;
+	check(
+		"without a transcript the delta is explicitly unavailable",
+		!noTranscriptComposition.available &&
+			!noTranscriptComposition.delta.available &&
+			noTranscriptComposition.delta.notes.some((note) => note.includes("no user-role prompt")),
+		noTranscriptComposition,
+	);
+	check(
+		"without a transcript the non-system blocks are —, not zero-filled",
+		noTranscriptComposition.blocks.filter((block) => block.key !== "base" && block.key !== "soul" && block.key !== "contract").every((block) => block.chars === null),
+		noTranscriptComposition.blocks,
+	);
+	const noTranscriptHtml = renderRunPage(loadRunDetail(tracedProfile, "run_t1")!, renderContext);
+	check(
+		"the page says the delta is unavailable instead of inventing one",
+		noTranscriptHtml.includes("first→last prompt delta not available.") &&
+			noTranscriptHtml.includes("prompt text is not available for this run"),
+		noTranscriptHtml.match(/first→last prompt delta[^<]*/)?.[0],
+	);
+
+	section("cost trend (#121)");
+	const trendProfile = findProfile(loadDashboard(loadRootConfig({ rootDir: trendRoot })), "main")!;
+	const trend = buildCostTrend(trendProfile, { now });
+	const trendRow = (offset: number) => trend.days.find((day) => day.day === localDay(trendDay(offset)));
+	check("the trend has exactly 14 local days, oldest first", trend.days.length === COST_TREND_DAYS && trend.days[13]?.day === localDay(now), trend.days.map((day) => day.day));
+	check(
+		"days covered by usage.json use its cost and run count",
+		trendRow(0)?.source === "usage.json" &&
+			trendRow(0)?.runs === 3 &&
+			Math.abs((trendRow(0)?.cost ?? 0) - 0.3) < 1e-9 &&
+			Math.abs((trendRow(1)?.avgCostPerRun ?? 0) - 0.05) < 1e-9,
+		{ today: trendRow(0), yesterday: trendRow(1) },
+	);
+	check(
+		"a day missing from usage.json is summed from runs.jsonl",
+		trendRow(5)?.source === "runs.jsonl" && trendRow(5)?.runs === 1 && Math.abs((trendRow(5)?.cost ?? 0) - 0.07) < 1e-9,
+		trendRow(5),
+	);
+	check(
+		"a day with no runs is a zero row with — average, not interpolated",
+		trendRow(2)?.runs === 0 && trendRow(2)?.cost === 0 && trendRow(2)?.avgCostPerRun === null && trendRow(2)?.source === "none",
+		trendRow(2),
+	);
+	check("day 20 is outside the 14-day window", trendRow(20) === undefined);
+	check(
+		"the trend totals only the visible days",
+		Math.abs(trend.totalCost - 0.47) < 1e-9 && trend.totalRuns === 6 && Math.abs((trend.avgCostPerRun ?? 0) - 0.47 / 6) < 1e-9 && Math.abs(trend.maxDayCost - 0.3) < 1e-9,
+		trend,
+	);
+	const writerTrend = buildCostTrend(writer, { now });
+	check(
+		"without usage.json the whole trend falls back to runs.jsonl",
+		writerTrend.days.every((day) => day.source !== "usage.json") &&
+			writerTrend.days[13]?.source === "runs.jsonl" &&
+			writerTrend.days[13]?.runs === 1 &&
+			Math.abs((writerTrend.days[13]?.cost ?? 0) - 0.005) < 1e-9,
+		writerTrend.days[13],
+	);
+	const trendHtml = renderAgentPage(loadAgentDetail(trendProfile, { now }), renderContext);
+	check(
+		"the agent page shows the 14-day trend above the timeline",
+		trendHtml.includes("cost / run trend (last 14 days)") &&
+			trendHtml.indexOf("cost / run trend") < trendHtml.indexOf("timeline (newest first)") &&
+			trendHtml.includes("bar-fill") &&
+			trendHtml.includes("avg / run"),
+	);
+	check(
+		"a no-run day is visible in the rendered trend",
+		trendHtml.includes(localDay(trendDay(2))) && trendHtml.includes("no runs"),
+		trendHtml.match(/no runs[^<]*/)?.[0],
 	);
 
 	section("memory page");

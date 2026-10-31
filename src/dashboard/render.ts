@@ -30,6 +30,11 @@ import {
 	type AgentDetail,
 	type AgentStatus,
 	type AgentSummary,
+	type CostTrendView,
+	type PromptBlockView,
+	type PromptCompositionView,
+	type PromptCostPairsView,
+	type PromptDeltaView,
 	type RunDetail,
 	type RunStepView,
 	type RunStepsView,
@@ -245,6 +250,12 @@ table.steps tfoot tr.check th { color: var(--muted); font-weight: 500; }
 .check.mismatch { color: var(--error); font-weight: 600; }
 .revision .fact-text { color: var(--text); }
 .search { border: 1px solid var(--line); background: var(--panel); padding: 10px 14px; margin: 0 0 14px; }
+.trend td.barcell { width: 38%; }
+.trend .bar-track { display: block; background: var(--panel); border: 1px solid var(--line); height: 8px; }
+.trend .bar-fill { display: block; height: 100%; background: #5a564c; }
+.trend tr.zero td { color: var(--muted); }
+.trend tfoot th, .trend tfoot td { border-top: 1px solid #33312b; border-bottom: none; font-size: 12px; }
+.prompt-block.source-not-recorded { color: var(--muted); }
 .search .term { font-family: var(--mono); color: var(--link); }
 form.settings { border: 1px solid var(--line); background: var(--panel); padding: 14px 16px; margin: 0 0 18px; }
 form.settings fieldset { border: none; margin: 0 0 18px; padding: 0; }
@@ -463,6 +474,147 @@ function renderTimeline(page: TimelinePage, agentId: string, masker: Masker): st
 	return `<ol class="feed">\n${rows.join("\n")}\n</ol>\n${more}`;
 }
 
+// ---------------------------------------------------------------------------
+// cost / run trend (#121)
+// ---------------------------------------------------------------------------
+
+/**
+ * A compact 14-day table with an inline bar. The bar is plain HTML/CSS: no
+ * chart library and no client JavaScript. Widths are relative to the most
+ * expensive day in the window; a zero day renders an empty bar and `—` average.
+ */
+function renderCostTrend(trend: CostTrendView, masker: Masker): string {
+	const notes = trend.notes.map((note) => `<p class="note">${masker.text(note)}</p>`).join("");
+	const rows = trend.days.map((day) => {
+		const width = trend.maxDayCost > 0 ? Math.round((day.cost / trend.maxDayCost) * 100) : 0;
+		const avg = day.avgCostPerRun === null ? STEP_DASH : formatCost(day.avgCostPerRun);
+		const source = day.source === "usage.json"
+			? "usage.json"
+			: day.source === "runs.jsonl"
+				? "runs.jsonl"
+				: "no runs";
+		return `<tr class="${day.runs === 0 ? "zero" : ""}">
+<td class="mono">${masker.text(day.day)}</td>
+<td class="num">${masker.num(day.runs)}</td>
+<td class="num">${masker.text(formatCost(day.cost))}</td>
+<td class="num">${masker.text(avg)}</td>
+<td class="barcell"><span class="bar-track"><span class="bar-fill" style="width:${masker.text(String(width))}%"></span></span></td>
+<td class="sub">${masker.text(source)}</td>
+</tr>`;
+	});
+	const avgTotal = trend.avgCostPerRun === null ? STEP_DASH : formatCost(trend.avgCostPerRun);
+	return `${notes}
+<table class="trend">
+<thead><tr><th>day</th><th class="num">runs</th><th class="num">cost</th><th class="num">avg / run</th><th>cost bar</th><th>source</th></tr></thead>
+<tbody>
+${rows.join("\n")}
+</tbody>
+<tfoot><tr><th colspan="4">last ${masker.num(trend.days.length)} days</th><th colspan="2" class="mono">${masker.text(formatCost(trend.totalCost))} · ${masker.num(trend.totalRuns)} runs · ${masker.text(avgTotal)} avg/run</th></tr></tfoot>
+</table>`;
+}
+
+// ---------------------------------------------------------------------------
+// prompt composition / delta / cost pairing (#121)
+// ---------------------------------------------------------------------------
+
+const PROMPT_SOURCE_LABELS: Record<PromptBlockView["source"], string> = {
+	reconstructed: "reconstructed",
+	measured: "measured",
+	unattributed: "unattributed",
+	"not-recorded": "not recorded",
+};
+
+function renderPromptPercent(share: number | null, masker: Masker): string {
+	if (share === null || !Number.isFinite(share)) return STEP_DASH;
+	return masker.text(`${(share * 100).toFixed(1)}%`);
+}
+
+function renderPromptComposition(composition: PromptCompositionView, masker: Masker): string {
+	const notes = composition.notes.map((note) => `<p class="note">${masker.text(note)}</p>`).join("");
+	const rows = composition.blocks.map((block) => {
+		const chars = block.chars === null ? STEP_DASH : masker.num(block.chars);
+		const tokens = block.tokens === null ? STEP_DASH : masker.num(block.tokens);
+		const note = block.note ? ` <span class="sub">${masker.text(block.note)}</span>` : "";
+		return `<tr class="prompt-block source-${block.source}">
+<td>${masker.text(block.label)}${note}</td>
+<td class="num">${chars}</td>
+<td class="num">${tokens}</td>
+<td class="num">${renderPromptPercent(block.share, masker)}</td>
+<td class="sub">${masker.text(PROMPT_SOURCE_LABELS[block.source])}</td>
+</tr>`;
+	});
+	const where = composition.promptIndex === null
+		? "the prompt text is not available for this run"
+		: `prompt ${masker.num(composition.promptIndex)} of ${masker.num(composition.promptCount)}, ${masker.text(formatTimestamp(composition.promptAt ?? 0))}`;
+	const total = composition.totalChars > 0
+		? `<p class="sub mono">accounted context: ${masker.num(composition.totalChars)} chars · ~${masker.num(composition.totalTokens)} tokens (estimate, chars / 4)</p>`
+		: "";
+	return `${notes}
+<p class="sub">${where}</p>
+<table class="prompt-composition">
+<thead><tr><th>block</th><th class="num">chars</th><th class="num">tokens (est.)</th><th class="num">share</th><th>source</th></tr></thead>
+<tbody>
+${rows.join("\n")}
+</tbody>
+</table>
+${total}`;
+}
+
+function renderPromptDelta(delta: PromptDeltaView, masker: Masker): string {
+	const notes = delta.notes.map((note) => `<p class="note">${masker.text(note)}</p>`).join("");
+	if (!delta.available) return `<p class="empty">first→last prompt delta not available.</p>${notes}`;
+	const rows = delta.rows.map((row) => {
+		const first = row.firstChars === null ? STEP_DASH : masker.num(row.firstChars);
+		const last = row.lastChars === null ? STEP_DASH : masker.num(row.lastChars);
+		const change = row.delta === null
+			? STEP_DASH
+			: row.delta === 0
+				? "0"
+				: `${row.delta > 0 ? "+" : "−"}${Math.abs(row.delta).toLocaleString("en-US")}`;
+		return `<tr>
+<td>${masker.text(row.label)}</td>
+<td class="num">${first}</td>
+<td class="num">${last}</td>
+<td class="num">${masker.text(change)}</td>
+</tr>`;
+	});
+	return `${notes}
+<table class="mini prompt-delta">
+<thead><tr><th>block</th><th class="num">first prompt</th><th class="num">last prompt</th><th class="num">delta (chars)</th></tr></thead>
+<tbody>
+${rows.join("\n")}
+</tbody>
+</table>`;
+}
+
+function renderPromptCostPairs(pairs: PromptCostPairsView, masker: Masker): string {
+	const notes = pairs.notes.map((note) => `<p class="note">${masker.text(note)}</p>`).join("");
+	if (pairs.pairs.length === 0) {
+		return `<p class="empty">No prompts or recorded steps to pair.</p>${notes}`;
+	}
+	const rows = pairs.pairs.map((pair) => {
+		const turn = pair.turn === null ? STEP_DASH : `#${pair.turn}`;
+		const prompt = pair.promptAt === null
+			? STEP_DASH
+			: `${masker.text(formatTimestamp(pair.promptAt))}`;
+		const chars = pair.promptChars === null ? STEP_DASH : masker.num(pair.promptChars);
+		const cost = pair.stepCost === null ? STEP_DASH : masker.text(formatCost(pair.stepCost));
+		return `<tr>
+<td class="mono">${turn}</td>
+<td class="mono">${prompt}</td>
+<td class="num">${chars}</td>
+<td class="num">${cost}</td>
+</tr>`;
+	});
+	return `${notes}
+<table class="mini prompt-cost">
+<thead><tr><th>turn</th><th>prompt</th><th class="num">prompt chars</th><th class="num">step cost</th></tr></thead>
+<tbody>
+${rows.join("\n")}
+</tbody>
+</table>`;
+}
+
 export function renderIndexPage(agents: AgentSummary[], context: RenderContext): string {
 	const masker = new Masker(context.secrets, context.env);
 	const rows = agents.map((agent) => `<tr>
@@ -503,6 +655,9 @@ export function renderAgentPage(detail: AgentDetail, context: RenderContext): st
 <tr><th>runs recorded</th><td class="mono">${masker.num(detail.totals.runs)}</td><th>lifetime cost</th><td class="mono">${masker.text(formatCost(detail.totals.cost))}</td></tr>
 <tr><th>pid</th><td class="mono">${summary.pid === undefined ? "—" : masker.num(summary.pid)}</td><th>config</th><td class="mono">${masker.text(summary.configPath)}</td></tr>
 </table>
+
+<h2>cost / run trend (last ${masker.num(detail.trend.days.length)} days)</h2>
+${renderCostTrend(detail.trend, masker)}
 
 <h2>timeline (newest first)</h2>
 <p class="note">key events are inbox events with high/interrupt priority, or runtime system/worker events; normal chat messages appear as run triggers. filters are plain GET parameters (kind, period, q, page), no JavaScript.</p>
@@ -732,6 +887,15 @@ ${renderStepTable(detail.steps, masker)}
 
 <h2>most expensive steps</h2>
 ${renderTopSteps(detail.steps, masker)}
+
+<h2>prompt composition</h2>
+${renderPromptComposition(detail.promptComposition, masker)}
+
+<h3>first → last prompt delta</h3>
+${renderPromptDelta(detail.promptComposition.delta, masker)}
+
+<h3>prompt → step cost</h3>
+${renderPromptCostPairs(detail.promptCostPairs, masker)}
 
 <h2>trigger</h2>
 <table>
