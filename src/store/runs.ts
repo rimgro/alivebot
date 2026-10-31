@@ -17,6 +17,33 @@ export type RunStopReason =
 	| "error"
 	| "aborted";
 
+export interface RunUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	total: number;
+	cost: number;
+}
+
+/**
+ * One model turn of a run, as reported by the pi session.
+ *
+ * `startedAt`/`durationMs` come from the `turn_start`/`turn_end` events, the
+ * token counts and cost from the assistant message's provider usage, and
+ * `tools` from the tool calls that turn made.
+ */
+export interface RunTurnTrace {
+	index: number;
+	startedAt: number;
+	durationMs: number;
+	usage: RunUsage;
+	tools: string[];
+}
+
+/** How many per-turn traces are kept on a run record (the oldest are dropped). */
+export const RUN_TURN_TRACE_LIMIT = 200;
+
 export interface RunRecord {
 	id: string;
 	index: number;
@@ -40,10 +67,33 @@ export interface RunRecord {
 	interruptDeliveries: number;
 	/** How many times we had to re-prompt after a stop without idle/sleep. */
 	nudges: number;
-	turns: number;
+	/** How many model turns the run completed. Older records stored this in the numeric `turns` field. */
+	turnCount: number;
 	promptChars: number;
-	usage: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number; cost: number };
+	usage: RunUsage;
+	/**
+	 * Per-turn usage captured while the run happened (bounded to the last
+	 * `RUN_TURN_TRACE_LIMIT` turns). Absent on records written before #121.
+	 */
+	turns?: RunTurnTrace[];
 	sleep?: { forced: boolean; summaryChars: number };
+}
+
+/**
+ * The number of model turns in a run record, for both shapes on disk.
+ *
+ * Records written before #121 store a numeric `turns`; new records store the
+ * count in `turnCount` and keep the per-turn trace in `turns`. Readers must use
+ * this helper instead of touching either field directly.
+ */
+export function runTurnCount(record: { turnCount?: unknown; turns?: unknown }): number {
+	if (typeof record.turnCount === "number" && Number.isFinite(record.turnCount)) {
+		return Math.max(0, Math.trunc(record.turnCount));
+	}
+	if (typeof record.turns === "number" && Number.isFinite(record.turns)) {
+		return Math.max(0, Math.trunc(record.turns));
+	}
+	return Array.isArray(record.turns) ? record.turns.length : 0;
 }
 
 export interface UsageBucket {
@@ -113,7 +163,7 @@ export class RunLog {
 		const bucket = usage.days[day] ?? { cost: 0, runs: 0, turns: 0, input: 0, output: 0 };
 		bucket.cost += record.usage.cost;
 		bucket.runs += 1;
-		bucket.turns += record.turns;
+		bucket.turns += runTurnCount(record);
 		bucket.input += record.usage.input;
 		bucket.output += record.usage.output;
 		usage.days[day] = bucket;

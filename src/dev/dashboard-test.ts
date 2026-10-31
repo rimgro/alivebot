@@ -33,6 +33,7 @@ import {
 } from "../dashboard/settings.js";
 import { DEFAULT_SECRETS_CONFIG, createMaskContext, maskSecrets } from "../secrets.js";
 import { MemoryStore } from "../store/memory.js";
+import type { RunRecord } from "../store/runs.js";
 import { formatDuration, localDay } from "../util.js";
 import {
 	buildTimeline,
@@ -427,6 +428,182 @@ writeJson(path.join(writerDir, "state", "runtime.json"), {
 	sleeps: 1,
 });
 
+// Per-turn step fixtures (#121), kept in their own profile so they do not
+// disturb the timeline/usage fixtures above.
+const tracedRoot = path.join(root, "traced");
+const tracedStateDir = path.join(tracedRoot, ".alive");
+writeJson(path.join(tracedRoot, "alive.config.json"), {
+	name: "Traced",
+	model: "anthropic/claude-test",
+	stateDir: ".alive",
+	workspace: ".alive/workspace",
+	sandbox: { enabled: false },
+});
+fs.writeFileSync(path.join(tracedRoot, "SOUL.md"), "# Who you are\n\nYou are the traced test agent.\n", "utf8");
+fs.writeFileSync(path.join(tracedRoot, "CONTRACT.md"), "# Role: tracer\n\nOnly trace things.\n", "utf8");
+
+const tracedBase = base + 300_000;
+/** New-shape record: per-turn traces whose sum equals the aggregate exactly. */
+const runTraced = {
+	id: "run_t1",
+	index: 1,
+	startedAt: tracedBase,
+	finishedAt: tracedBase + 15_000,
+	durationMs: 15_000,
+	activeMs: 14_000,
+	idleMs: 1_000,
+	stopReason: "slept" as const,
+	events: [{ seq: 1, kind: "user_message", thread: "console", title: "trace me" }],
+	outbound: [],
+	remindersCreated: [],
+	notesTouched: [],
+	journalEntries: 0,
+	idleReturns: 0,
+	interruptDeliveries: 0,
+	nudges: 0,
+	turnCount: 3,
+	turns: [
+		{ index: 1, startedAt: tracedBase + 1_000, durationMs: 4_000, usage: { input: 100, output: 10, cacheRead: 50, cacheWrite: 5, total: 165, cost: 0.001 }, tools: ["read"] },
+		{ index: 2, startedAt: tracedBase + 6_000, durationMs: 5_000, usage: { input: 200, output: 20, cacheRead: 150, cacheWrite: 0, total: 370, cost: 0.0025 }, tools: ["bash", "edit"] },
+		{ index: 3, startedAt: tracedBase + 12_000, durationMs: 3_000, usage: { input: 50, output: 5, cacheRead: 100, cacheWrite: 1, total: 156, cost: 0.0007 }, tools: [] },
+	],
+	promptChars: 100,
+	usage: { input: 350, output: 35, cacheRead: 300, cacheWrite: 6, total: 691, cost: 0.0042 },
+	sleep: { forced: false, summaryChars: 10 },
+};
+/** Deliberate mismatch: the stored step sum is smaller than the aggregate. */
+const runMismatch = {
+	id: "run_t2",
+	index: 2,
+	startedAt: tracedBase + 60_000,
+	finishedAt: tracedBase + 70_000,
+	durationMs: 10_000,
+	activeMs: 10_000,
+	idleMs: 0,
+	stopReason: "stalled" as const,
+	events: [],
+	outbound: [],
+	remindersCreated: [],
+	notesTouched: [],
+	journalEntries: 0,
+	idleReturns: 0,
+	interruptDeliveries: 0,
+	nudges: 1,
+	turnCount: 1,
+	turns: [
+		{ index: 1, startedAt: tracedBase + 61_000, durationMs: 2_000, usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, total: 11, cost: 0.001 }, tools: ["bash"] },
+	],
+	promptChars: 50,
+	usage: { input: 12, output: 1, cacheRead: 0, cacheWrite: 0, total: 13, cost: 0.0015 },
+};
+/** Old-shape record: numeric `turns`, no per-turn trace at all. */
+const runLegacy = {
+	id: "run_t3",
+	index: 3,
+	startedAt: tracedBase + 120_000,
+	finishedAt: tracedBase + 130_000,
+	durationMs: 10_000,
+	activeMs: 10_000,
+	idleMs: 0,
+	stopReason: "error" as const,
+	events: [],
+	outbound: [],
+	remindersCreated: [],
+	notesTouched: [],
+	journalEntries: 0,
+	idleReturns: 0,
+	interruptDeliveries: 0,
+	nudges: 0,
+	turns: 2,
+	promptChars: 20,
+	usage: { input: 40, output: 4, cacheRead: 20, cacheWrite: 2, total: 66, cost: 0.003 },
+};
+/** Malformed `turns`: not an array at all, must be ignored. */
+const runMalformed = {
+	id: "run_t4",
+	index: 4,
+	startedAt: tracedBase + 180_000,
+	finishedAt: tracedBase + 190_000,
+	durationMs: 10_000,
+	activeMs: 10_000,
+	idleMs: 0,
+	stopReason: "stalled" as const,
+	events: [],
+	outbound: [],
+	remindersCreated: [],
+	notesTouched: [],
+	journalEntries: 0,
+	idleReturns: 0,
+	interruptDeliveries: 0,
+	nudges: 0,
+	turnCount: 1,
+	turns: "not-an-array",
+	promptChars: 10,
+	usage: { input: 5, output: 1, cacheRead: 0, cacheWrite: 0, total: 6, cost: 0.0005 },
+};
+/** Malformed entries inside an otherwise valid array: garbage skipped, valid kept. */
+const runMixed = {
+	id: "run_t5",
+	index: 5,
+	startedAt: tracedBase + 240_000,
+	finishedAt: tracedBase + 250_000,
+	durationMs: 10_000,
+	activeMs: 10_000,
+	idleMs: 0,
+	stopReason: "stalled" as const,
+	events: [],
+	outbound: [],
+	remindersCreated: [],
+	notesTouched: [],
+	journalEntries: 0,
+	idleReturns: 0,
+	interruptDeliveries: 0,
+	nudges: 0,
+	turnCount: 1,
+	turns: [
+		{ index: 1, startedAt: tracedBase + 241_000, durationMs: 1_000, usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, total: 11, cost: 0.001 }, tools: ["read"] },
+		"garbage",
+		null,
+		{ index: 3 },
+	],
+	promptChars: 10,
+	usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 0, total: 11, cost: 0.001 },
+};
+/** A bounded trace: only the last turns were kept, so sums must not be compared. */
+const runTruncated = {
+	id: "run_t6",
+	index: 6,
+	startedAt: tracedBase + 300_000,
+	finishedAt: tracedBase + 320_000,
+	durationMs: 20_000,
+	activeMs: 20_000,
+	idleMs: 0,
+	stopReason: "slept" as const,
+	events: [],
+	outbound: [],
+	remindersCreated: [],
+	notesTouched: [],
+	journalEntries: 0,
+	idleReturns: 0,
+	interruptDeliveries: 0,
+	nudges: 0,
+	turnCount: 200,
+	turns: [
+		{ index: 199, startedAt: tracedBase + 310_000, durationMs: 1_000, usage: { input: 10, output: 1, cacheRead: 5, cacheWrite: 0, total: 16, cost: 0.0001 }, tools: ["read"] },
+		{ index: 200, startedAt: tracedBase + 312_000, durationMs: 1_000, usage: { input: 10, output: 1, cacheRead: 5, cacheWrite: 0, total: 16, cost: 0.0001 }, tools: ["read"] },
+	],
+	promptChars: 10,
+	usage: { input: 5_000, output: 500, cacheRead: 4_000, cacheWrite: 50, total: 9_550, cost: 0.05 },
+};
+appendJsonl(path.join(tracedStateDir, "runs", "runs.jsonl"), [
+	runTraced,
+	runMismatch,
+	runLegacy,
+	runMalformed,
+	runMixed,
+	runTruncated,
+]);
+
 const memoryDbPath = path.join(stateDir, "memory.sqlite");
 
 // Settings fixtures: a managed profile whose SOUL.md path is configured under
@@ -568,7 +745,12 @@ async function main(): Promise<void> {
 	check("run timeline item carries the trigger", runItems[0]!.title.startsWith("trigger: reminder"), runItems[0]);
 
 	section("run totals");
-	const allRuns: RunView[] = [toRunView(runA), toRunView(runB), toRunView(runC)];
+	// runA..runC are the legacy shape written by older runtimes (numeric `turns`).
+	const allRuns: RunView[] = [
+		toRunView(runA as unknown as RunRecord),
+		toRunView(runB as unknown as RunRecord),
+		toRunView(runC as unknown as RunRecord),
+	];
 	const totals = sumRuns(allRuns);
 	check("input tokens summed", totals.input === 60, totals.input);
 	check("output tokens summed", totals.output === 12, totals.output);
@@ -610,6 +792,154 @@ async function main(): Promise<void> {
 	check("run page masks the token in the reconstructed system prompt", !runHtml.includes(GITHUB_TOKEN), runHtml.includes(GITHUB_TOKEN));
 	check("masking keeps the prompt readable around the placeholder", runHtml.includes("AWAKE #3") && runHtml.includes("You are the root test agent."));
 	check("run page states when the exact system prompt is unavailable", runHtml.includes("not persisted") && runHtml.includes("reconstructed"));
+
+	section("per-turn steps (#121)");
+	const tracedProfile = findProfile(loadDashboard(loadRootConfig({ rootDir: tracedRoot })), "main")!;
+	const traced = loadRunDetail(tracedProfile, "run_t1")!;
+	check(
+		"per-turn traces are read from the run record",
+		traced.steps.recorded && traced.run.steps?.length === 3,
+		traced.run.steps,
+	);
+	check("the turn count still comes from the record", traced.run.turns === 3, traced.run.turns);
+	check("the step sum matches the aggregate", !traced.steps.mismatch && !traced.steps.partial, traced.steps);
+	check(
+		"sum of steps equals the stored usage",
+		traced.steps.sum.input === 350 &&
+			traced.steps.sum.output === 35 &&
+			traced.steps.sum.cacheRead === 300 &&
+			traced.steps.sum.cacheWrite === 6 &&
+			Math.abs(traced.steps.sum.cost - 0.0042) < 1e-9,
+		traced.steps.sum,
+	);
+	check(
+		"top-3 steps are ordered by step cost",
+		traced.steps.top.map((step) => step.index).join(",") === "2,1,3",
+		traced.steps.top.map((step) => step.index),
+	);
+	check(
+		"cache hit rate is cacheRead / (input + cacheRead)",
+		traced.steps.cacheHitRate !== null && Math.abs(traced.steps.cacheHitRate - 300 / 650) < 1e-9,
+		traced.steps.cacheHitRate,
+	);
+	const tracedHtml = renderRunPage(traced, renderContext);
+	check(
+		"the page renders a steps table with the right columns",
+		tracedHtml.includes("steps (per-turn usage)") &&
+			tracedHtml.includes("step cost") &&
+			tracedHtml.includes("cacheRead") &&
+			tracedHtml.includes("duration"),
+		tracedHtml.includes("steps (per-turn usage)"),
+	);
+	check(
+		"every step shows its tools",
+		tracedHtml.includes("bash, edit") && tracedHtml.includes(">read<") && tracedHtml.includes("most expensive steps"),
+		tracedHtml.includes("bash, edit"),
+	);
+	check(
+		"the footer shows the step sum, the aggregate and a match",
+		tracedHtml.includes("sum of steps") &&
+			tracedHtml.includes("run aggregate (runs.jsonl)") &&
+			tracedHtml.includes("match — the sum of the stored steps equals the run aggregate"),
+		tracedHtml.match(/check[^<]*/)?.[0],
+	);
+	check("the page shows the run cache hit rate", tracedHtml.includes("cache hit rate 46.2%"), tracedHtml.match(/cache hit rate[^<]*/)?.[0]);
+	const topSection = tracedHtml.split("most expensive steps")[1]?.split("<h2>trigger</h2>")[0] ?? "";
+	check(
+		"the top-3 table lists the priciest turns in order",
+		topSection.includes("#2") &&
+			topSection.indexOf("#2") < topSection.indexOf("#1") &&
+			topSection.indexOf("#1") < topSection.indexOf("#3"),
+		topSection.slice(0, 240),
+	);
+
+	const mismatched = loadRunDetail(tracedProfile, "run_t2")!;
+	check("a deliberate mismatch is flagged", mismatched.steps.mismatch && !mismatched.steps.partial, mismatched.steps);
+	const mismatchHtml = renderRunPage(mismatched, renderContext);
+	check(
+		"the page shows the mismatch instead of hiding it",
+		mismatchHtml.includes("MISMATCH") && mismatchHtml.includes("input +2") && mismatchHtml.includes("total +2"),
+		mismatchHtml.match(/MISMATCH[^<]*/)?.[0],
+	);
+
+	const legacy = loadRunDetail(tracedProfile, "run_t3")!;
+	check(
+		"old records have no per-turn trace but keep their turn count",
+		legacy.run.steps === undefined && !legacy.steps.recorded && legacy.run.turns === 2,
+		{ steps: legacy.run.steps, turns: legacy.run.turns },
+	);
+	check(
+		"old records still report the aggregate cache hit rate",
+		legacy.steps.cacheHitRate !== null && Math.abs(legacy.steps.cacheHitRate - 20 / 60) < 1e-9,
+		legacy.steps.cacheHitRate,
+	);
+	const legacyHtml = renderRunPage(legacy, renderContext);
+	check(
+		"old runs say per-turn usage was not recorded",
+		legacyHtml.includes("per-turn usage was not recorded") &&
+			legacyHtml.includes("not comparable — per-turn usage was not recorded"),
+		legacyHtml.match(/per-turn usage[^<]*/)?.[0],
+	);
+	check(
+		"old runs show one dash row per known turn",
+		(legacyHtml.match(/<td class="mono">[12]<\/td>\n<td class="mono">—<\/td>/g) ?? []).length === 2,
+		legacyHtml.match(/<td class="mono">[12]<\/td>/g),
+	);
+	check(
+		"old runs show — for the step sum instead of an invented 0",
+		legacyHtml.includes('<th colspan="2">sum of steps</th><td class="num">—</td>'),
+		legacyHtml.includes("sum of steps"),
+	);
+	const legacyTop = legacyHtml.split("most expensive steps")[1] ?? "";
+	check(
+		"old runs have no invented per-step costs",
+		legacy.steps.top.length === 0 &&
+			legacyTop.includes("No per-step cost: per-turn usage was not recorded for this run."),
+		legacyTop.slice(0, 120),
+	);
+
+	const malformed = loadRunDetail(tracedProfile, "run_t4")!;
+	check(
+		"a malformed turns field is ignored, not fatal",
+		malformed.run.steps === undefined && !malformed.steps.recorded && malformed.run.turns === 1,
+		{ steps: malformed.run.steps, turns: malformed.run.turns },
+	);
+	const malformedHtml = renderRunPage(malformed, renderContext);
+	check(
+		"a malformed turns field still renders a complete page",
+		malformedHtml.includes("steps (per-turn usage)") && malformedHtml.includes("per-turn usage was not recorded"),
+		malformedHtml.slice(0, 80),
+	);
+	const mixed = loadRunDetail(tracedProfile, "run_t5")!;
+	check(
+		"garbage entries inside turns are skipped",
+		mixed.run.steps?.length === 1 && mixed.run.steps[0]!.index === 1 && mixed.steps.recorded,
+		mixed.run.steps,
+	);
+	check("a run with only valid entries still matches its aggregate", !mixed.steps.mismatch, mixed.steps);
+	renderRunPage(mixed, renderContext);
+
+	const truncated = loadRunDetail(tracedProfile, "run_t6")!;
+	check(
+		"a bounded trace is detected from its absolute turn indexes",
+		truncated.steps.recorded &&
+			truncated.steps.truncated &&
+			truncated.steps.partial &&
+			truncated.steps.firstIndex === 199 &&
+			truncated.steps.lastIndex === 200,
+		{ first: truncated.steps.firstIndex, last: truncated.steps.lastIndex },
+	);
+	check(
+		"a bounded trace is not reported as a mismatch",
+		!truncated.steps.mismatch,
+		truncated.steps,
+	);
+	const truncatedHtml = renderRunPage(truncated, renderContext);
+	check(
+		"the page explains that the sums cover only the stored window",
+		truncatedHtml.includes("partial — the stored trace covers turns 199–200") && !truncatedHtml.includes("MISMATCH"),
+		truncatedHtml.match(/partial[^<]*/)?.[0],
+	);
 
 	section("memory page");
 	const memory = loadMemoryPage(main);

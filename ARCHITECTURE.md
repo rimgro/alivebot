@@ -344,10 +344,19 @@ worker'а и его pi-сессия лежат в `.alive/workers/<id>/`; при
 
 `id, index, startedAt, finishedAt, durationMs, activeMs, idleMs, stopReason, error,
 events[], outbound[], remindersCreated[], notesTouched[], journalEntries, idleReturns,
-interruptDeliveries, nudges, turns, promptChars, usage, sleep?`
+interruptDeliveries, nudges, turnCount, promptChars, usage, turns?[], sleep?`
 
 `stopReason`: `slept | stalled | timeout | budget | error | aborted`.
 Это одновременно аудит, телеметрия и «сонник» для секции `Recent runs` в промпте.
+
+`turns` — необязательный per-turn разрез стоимости, который пишется новыми
+записями (#121): `{ index, startedAt, durationMs, usage: { input, output,
+cacheRead, cacheWrite, total, cost }, tools[] }`. Массив ограничен последними
+200 ходами (индексы остаются абсолютными). В старых записях поля `turns` нет,
+а счётчик ходов лежит в числовом `turns`; читать его нужно через
+`runTurnCount()`, а не напрямую. run-страница дашборда показывает таблицу
+шагов, сумму шагов против агрегата `usage`, top-3 самых дорогих шагов и cache
+hit rate; для старых записей вместо чисел стоят `—`.
 
 ### `HistoryRecord` (`history/messages.jsonl`)
 

@@ -1,7 +1,7 @@
 import type { AliveEvent } from "../store/events.js";
 import type { NotifyPolicyFile } from "../store/policy.js";
 import type { Reminder } from "../store/reminders.js";
-import type { RunRecord } from "../store/runs.js";
+import { runTurnCount, type RunRecord } from "../store/runs.js";
 import type { ThreadState } from "../store/threads.js";
 import { formatDuration, iso, localTime, oneLine, truncate } from "../util.js";
 import { DEFAULT_CONTRACT } from "../config.js";
@@ -303,7 +303,7 @@ function carriedOver(input: AwakePromptInput, context: MaskContext): string[] {
 					.slice(-3)
 					.map((r) => {
 						const out = r.outbound.length > 0 ? `→ ${r.outbound.length} msg` : "no outbound";
-						return `- #${r.index} ${localTime(r.finishedAt)} ${formatDuration(r.durationMs)}: ${r.events.length} events, ${out}, ${r.turns} turns, ended: ${r.stopReason}`;
+						return `- #${r.index} ${localTime(r.finishedAt)} ${formatDuration(r.durationMs)}: ${r.events.length} events, ${out}, ${runTurnCount(r)} turns, ended: ${r.stopReason}`;
 					})
 					.join("\n"),
 		);

@@ -33,7 +33,7 @@ import {
 	type RunView,
 	type SessionTurn,
 } from "../dashboard/state.js";
-import type { RunRecord, RunStopReason } from "../store/runs.js";
+import { runTurnCount, type RunRecord, type RunStopReason } from "../store/runs.js";
 import { formatDuration, localDay, oneLine, readJson } from "../util.js";
 import { readWorkerUsage, workerUsagePath } from "../workers/store.js";
 
@@ -345,7 +345,8 @@ function scanRuns(stateDir: string, fromTs: number): RunScan {
 		const normalized: RunRecord = {
 			...record,
 			durationMs,
-			turns: numberOr(record.turns, 0),
+			// `turnCount` is the new field; older records keep the count in `turns`.
+			turnCount: runTurnCount(record),
 			events: Array.isArray(record.events) ? record.events : [],
 			outbound: Array.isArray(record.outbound) ? record.outbound : [],
 			usage: {
