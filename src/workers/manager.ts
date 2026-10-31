@@ -34,7 +34,8 @@ import {
 	repositoryHead,
 	runGit,
 } from "./worktree.js";
-import { isTransientProviderError, providerRetryDelayMs } from "./retry.js";
+import { MAX_PROVIDER_RETRY_DELAY_MS } from "./retry.js";
+import { classifyNetworkError, withRetries } from "../retry.js";
 import { createWorkerEnvironment, type WorkerEnvironment } from "./environment.js";
 import {
 	validateWorkerId,
@@ -71,8 +72,8 @@ interface WorkerHandle {
 	sessionError?: string;
 	/** Tool executions started during the current run. */
 	toolCalls: number;
-	/** Resolves an in-flight provider-retry backoff (stop, shutdown, run limits). */
-	wakeRetryDelay?: () => void;
+	/** Aborts an in-flight provider-retry backoff (stop, shutdown, run limits). */
+	retryAbort?: AbortController;
 	/** Timers bounding the current run; absent when no run is active. */
 	runTimers?: RunTimers;
 }
@@ -118,6 +119,22 @@ const MAX_PROMPT_CHARS = 100_000;
 const MAX_RESULT_CHARS = 20_000;
 const MAX_ERROR_CHARS = 4_000;
 const MAX_WAIT_MS = 10 * 60_000;
+
+/**
+ * A prompt that ended in a transient provider failure and may be repeated.
+ *
+ * It is thrown (not returned) so the generic retry helper can own the backoff,
+ * the retry log line and the abort handling; `execute` decodes the last outcome.
+ */
+class RetryableProviderFailure extends Error {
+	readonly outcome: { status: WorkerStatus; error?: string };
+
+	constructor(outcome: { status: WorkerStatus; error?: string }) {
+		super(outcome.error ?? "transient provider failure");
+		this.name = "RetryableProviderFailure";
+		this.outcome = outcome;
+	}
+}
 const EMPTY_RUN_ERROR = "worker produced no output: the model returned no text, no tool calls and no new tokens";
 
 export class WorkerManager {
@@ -145,6 +162,7 @@ export class WorkerManager {
 			agentDir: options.config.config.piAgentDir,
 			config: options.config,
 			sandbox: options.sandbox,
+			log: options.log,
 		});
 		this.budgetAllows = options.budgetAllows;
 	}
@@ -677,41 +695,58 @@ export class WorkerManager {
 		let status: WorkerStatus = "idle";
 		let error: string | undefined;
 		let attempt = 0;
+		const retryAbort = new AbortController();
+		handle.retryAbort = retryAbort;
 		try {
 			// One user-visible run may spend several prompts on transient provider
 			// failures. Every attempt is counted, but `runs` counts the run once.
 			// Defensive: a config object built without validation must not loop.
 			const retries = Number.isInteger(this.cfg.providerRetries) && this.cfg.providerRetries > 0 ? this.cfg.providerRetries : 0;
 			const maxAttempts = 1 + retries;
-			for (;;) {
-				attempt += 1;
-				record.attempts = attempt;
-				handle.sessionError = undefined;
-				const outcome = await this.attemptPrompt(handle, prompt, { tokensBefore, textBefore, previousAbortReason });
+			let outcome: { status: WorkerStatus; error?: string };
+			try {
+				outcome = await withRetries(
+					async (attemptNumber) => {
+						handle.sessionError = undefined;
+						const result = await this.attemptPrompt(handle, prompt, { tokensBefore, textBefore, previousAbortReason });
+						// `attemptPrompt` refuses the retry when a tool call or new tokens prove
+						// the provider already did (and billed) something: replaying that would
+						// duplicate work. Everything else returns its outcome unchanged.
+						if (result.retryable && attemptNumber < maxAttempts) throw new RetryableProviderFailure(result);
+						return result;
+					},
+					{
+						attempts: maxAttempts,
+						baseDelayMs: this.cfg.providerRetryDelayMs,
+						maxDelayMs: MAX_PROVIDER_RETRY_DELAY_MS,
+						label: `worker ${record.id} provider`,
+						log: this.log,
+						signal: retryAbort.signal,
+						shouldRetry: (caught) => caught instanceof RetryableProviderFailure,
+						onAttempt: ({ attempt: current }) => {
+							attempt = current;
+							record.attempts = current;
+							// A retry delay is still activity: do not let the inactivity timer
+							// mistake a scheduled backoff for a stuck provider.
+							this.touchRunActivity(handle);
+						},
+					},
+				);
 				status = outcome.status;
 				error = outcome.error;
-				if (!outcome.retryable || attempt >= maxAttempts) break;
-				// A retry delay is still activity: do not let the inactivity timer
-				// mistake a scheduled backoff for a stuck provider.
-				this.touchRunActivity(handle);
-				const delayMs = providerRetryDelayMs(this.cfg.providerRetryDelayMs, attempt);
-				this.log.warn("worker provider failure; retrying the prompt", {
-					id: record.id,
-					attempt,
-					maxAttempts,
-					delayMs,
-					error: oneLine(error ?? "", 200),
-				});
-				await this.waitRetryDelay(handle, delayMs);
-				// A stopped or shutting-down run never retries, and neither does one
-				// whose run limits fired while it was backing off.
-				if (this.closing || handle.abortReason) {
-					const aborted = this.abortOutcome(handle, previousAbortReason);
-					if (aborted) {
-						status = aborted.status;
-						error = aborted.error;
-					}
-					break;
+			} catch (caught) {
+				// An exhausted retry loop throws the last failure; a stop or a run limit
+				// aborts the backoff and takes precedence over the provider text.
+				const aborted = this.abortOutcome(handle, previousAbortReason);
+				if (aborted) {
+					status = aborted.status;
+					error = aborted.error;
+				} else if (caught instanceof RetryableProviderFailure) {
+					status = caught.outcome.status;
+					error = caught.outcome.error;
+				} else {
+					status = "failed";
+					error = errorDetail(caught);
 				}
 			}
 			// Only a genuine provider failure gets the retry summary; a run killed by
@@ -720,6 +755,7 @@ export class WorkerManager {
 				error = `${error ?? "worker run failed"} (gave up after ${attempt} attempts)`;
 			}
 		} finally {
+			handle.retryAbort = undefined;
 			this.clearRunTimers(handle);
 			try {
 				const stats = session.getSessionStats();
@@ -811,35 +847,24 @@ export class WorkerManager {
 				error = errorDetail(caught);
 			}
 		}
+		// The shared classifier delegates to the provider text rules in
+		// `src/workers/retry.ts`, so workers and every other call site agree on what
+		// "transient" means.
 		const retryable =
 			status === "failed" &&
 			this.abortOutcome(handle, previousAbortReason) === undefined &&
 			handle.toolCalls === 0 &&
 			this.tokenTotal(session) <= tokensBefore &&
-			isTransientProviderError(error);
+			classifyNetworkError(error).transient;
 		return { status, error, retryable };
 	}
 
-	/** Sleep between provider attempts; `stop`/`close` and the run limits resolve it early. */
-	private waitRetryDelay(handle: WorkerHandle, delayMs: number): Promise<void> {
-		if (!(delayMs > 0)) return Promise.resolve();
-		return new Promise<void>((resolve) => {
-			let settled = false;
-			let timer: NodeJS.Timeout | undefined;
-			const done = (): void => {
-				if (settled) return;
-				settled = true;
-				if (timer) clearTimeout(timer);
-				if (handle.wakeRetryDelay === done) handle.wakeRetryDelay = undefined;
-				resolve();
-			};
-			timer = setTimeout(done, delayMs);
-			handle.wakeRetryDelay = done;
-		});
-	}
-
+	/**
+	 * Interrupt an in-flight provider-retry backoff (stop, shutdown, run limits).
+	 * The retry helper treats the abort as final, so no further prompt is sent.
+	 */
 	private wakeRetryDelay(handle: WorkerHandle): void {
-		handle.wakeRetryDelay?.();
+		handle.retryAbort?.abort();
 	}
 
 	/**

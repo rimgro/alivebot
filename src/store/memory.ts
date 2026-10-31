@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { withRetries, type RetryLogger } from "../retry.js";
 
 export interface MemoryConfig {
 	enabled?: boolean;
@@ -12,6 +13,8 @@ export interface MemoryConfig {
 	embeddingModel: string;
 	embeddingDimensions: number;
 	revisionThreshold: number;
+	/** Optional retry log sink; the runtime passes its logger so attempts are visible. */
+	log?: RetryLogger;
 }
 
 export interface MemoryFact {
@@ -164,20 +167,43 @@ export class MemoryStore implements MemoryService {
 	private async embed(text: string): Promise<number[]> {
 		const base = this.config.embeddingBaseUrl.replace(/\/+$/, "");
 		const cloudflare = this.config.embeddingProvider === "cloudflare";
-		const response = await fetch(
-			cloudflare ? `${base}/${this.config.embeddingModel}` : `${base}/embeddings`,
+		// The request is idempotent (it only computes a vector), so a transient
+		// network failure, 429 or 5xx is worth another attempt. 4xx and quota
+		// failures are never retried by the shared classifier.
+		const response = await withRetries(
+			async () => {
+				const res = await fetch(
+					cloudflare ? `${base}/${this.config.embeddingModel}` : `${base}/embeddings`,
+					{
+						method: "POST",
+						headers: {
+							"content-type": "application/json",
+							...(this.config.embeddingApiKey ? { authorization: `Bearer ${this.config.embeddingApiKey}` } : {}),
+						},
+						body: JSON.stringify(cloudflare
+							? { text: [text] }
+							: { model: this.config.embeddingModel, input: text }),
+					},
+				);
+				if (!res.ok) {
+					const body = await res.text().catch(() => "");
+					const failure = new Error(`Embedding request failed (${res.status}): ${body.slice(0, 500)}`);
+					failure.name = "EmbeddingRequestError";
+					Object.assign(failure, { status: res.status });
+					const retryAfter = Number(res.headers.get("retry-after"));
+					if (Number.isFinite(retryAfter) && retryAfter >= 0) Object.assign(failure, { retryAfterSec: retryAfter });
+					throw failure;
+				}
+				return res;
+			},
 			{
-				method: "POST",
-				headers: {
-					"content-type": "application/json",
-					...(this.config.embeddingApiKey ? { authorization: `Bearer ${this.config.embeddingApiKey}` } : {}),
-				},
-				body: JSON.stringify(cloudflare
-					? { text: [text] }
-					: { model: this.config.embeddingModel, input: text }),
+				attempts: 3,
+				baseDelayMs: 250,
+				maxDelayMs: 4_000,
+				label: "memory embeddings",
+				log: this.config.log,
 			},
 		);
-		if (!response.ok) throw new Error(`Embedding request failed (${response.status}): ${(await response.text()).slice(0, 500)}`);
 		const payload = await response.json() as {
 			data?: Array<{ embedding?: number[] }>;
 			result?: { data?: number[][] };

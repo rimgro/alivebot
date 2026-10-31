@@ -14,6 +14,7 @@ import type { SandboxManager } from "../sandbox/manager.js";
 import { createSandboxTools } from "../sandbox/tools.js";
 import { ensureDir } from "../util.js";
 import type { WorkerIsolation } from "./store.js";
+import type { RetryLogger } from "../retry.js";
 
 /** Minimal surface WorkerManager needs. Tests can substitute a fake. */
 export interface WorkerSession {
@@ -93,6 +94,8 @@ export interface PiWorkerSessionFactoryOptions {
 	config: LoadedConfig;
 	/** Present for sandboxed profiles; workers then use the same VM as the agent. */
 	sandbox?: SandboxManager;
+	/** Retry log sink for network tools (GitHub reads). */
+	log?: RetryLogger;
 }
 
 /**
@@ -124,7 +127,7 @@ export function createPiWorkerSessionFactory(options: PiWorkerSessionFactoryOpti
 			retry: { enabled: true, maxRetries: 2 },
 		});
 		const sandboxTools = input.sandboxed
-			? createSandboxTools(options.sandbox!, options.config, { rootDir: input.workspacePath })
+			? createSandboxTools(options.sandbox!, options.config, { rootDir: input.workspacePath, log: options.log })
 				.filter((tool) => input.tools.includes(tool.name))
 			: [];
 		const resourceLoader = new DefaultResourceLoader({

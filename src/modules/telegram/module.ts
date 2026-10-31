@@ -60,6 +60,7 @@ import { formatThread, isTelegramTarget, parseThread, resolveThreadRef } from ".
 import type { TelegramCallbackQuery, TelegramChat, TelegramSentMessage, TelegramUpdate } from "./types.js";
 import { normalizeUpdate, type NormalizedInbound } from "./update.js";
 import { acceptBrowserPairing } from "../browser/operator.js";
+import { classifyNetworkError, withRetries } from "../../retry.js";
 import {
 	GROQ_TRANSCRIPTION_MAX_RETRY_AFTER_MS,
 	classifyTranscriptionFailure,
@@ -382,13 +383,27 @@ export class TelegramModule implements AliveModule {
 		while (!this.stopped && !this.abort.signal.aborted) {
 			try {
 				const current = state.load();
-				const updates = await api.getUpdates({
-					offset: current.offset > 0 ? current.offset : undefined,
-					limit: 100,
-					timeout: this.config.pollTimeoutSec,
-					allowed_updates: this.config.allowedUpdates.length > 0 ? this.config.allowedUpdates : DEFAULT_ALLOWED_UPDATES,
-					signal: this.abort.signal,
-				});
+				const updates = await withRetries(
+					() =>
+						api.getUpdates({
+							offset: current.offset > 0 ? current.offset : undefined,
+							limit: 100,
+							timeout: this.config.pollTimeoutSec,
+							allowed_updates: this.config.allowedUpdates.length > 0 ? this.config.allowedUpdates : DEFAULT_ALLOWED_UPDATES,
+							signal: this.abort.signal,
+						}),
+					{
+						attempts: 2,
+						baseDelayMs: 500,
+						maxDelayMs: 3_000,
+						label: "telegram getUpdates",
+						log: ctx.log,
+						signal: this.abort.signal,
+						// 409 is a duplicate-poller conflict, not a transient hiccup: leave it
+						// to the existing #108 handler below without an inner retry.
+						shouldRetry: (error) => !isPollerConflict(error) && classifyNetworkError(error).transient,
+					},
+				);
 				let highest = current.offset - 1;
 				for (const update of updates) {
 					await this.handleUpdate(update);
@@ -1011,11 +1026,17 @@ export class TelegramModule implements AliveModule {
 		const mime = imageMime(photo);
 		// One budget for the metadata call and the streamed download, aborted with the module.
 		const signal = AbortSignal.any([this.abort.signal, AbortSignal.timeout(TELEGRAM_IMAGE_TIMEOUT_MS)]);
+		const fileId = photo.fileId;
 		try {
-			const file = await api.getFile({ file_id: photo.fileId }, { timeoutMs: TELEGRAM_IMAGE_TIMEOUT_MS, signal });
+			const file = await this.retryRead("telegram getFile", signal, () =>
+				api.getFile({ file_id: fileId }, { timeoutMs: TELEGRAM_IMAGE_TIMEOUT_MS, signal }),
+			);
 			if (file.file_size !== undefined && file.file_size > TELEGRAM_IMAGE_MAX_BYTES) return { status: "too_large" };
-			if (!file.file_path) return { status: "failed", reason: "Telegram did not provide a file path" };
-			const data = await api.downloadFile(file.file_path, { maxBytes: TELEGRAM_IMAGE_MAX_BYTES, signal });
+			const filePath = file.file_path;
+			if (!filePath) return { status: "failed", reason: "Telegram did not provide a file path" };
+			const data = await this.retryRead("telegram downloadFile", signal, () =>
+				api.downloadFile(filePath, { maxBytes: TELEGRAM_IMAGE_MAX_BYTES, signal }),
+			);
 			const relativePath = imageRelativePath(messageId, photo.fileUniqueId, mime);
 			if (ctx.workspaceFiles) {
 				await ctx.workspaceFiles.writeFile(path.posix.join(ctx.workspaceFiles.rootDir, relativePath), data);
@@ -1084,10 +1105,16 @@ export class TelegramModule implements AliveModule {
 			const signal = AbortSignal.any([this.abort.signal, AbortSignal.timeout(config.timeoutMs)]);
 			try {
 				if (!audio) {
-					const file = await api.getFile({ file_id: voice.fileId }, { timeoutMs: config.timeoutMs, signal });
+					const fileId = voice.fileId;
+					const file = await this.retryRead("telegram getFile", signal, () =>
+						api.getFile({ file_id: fileId }, { timeoutMs: config.timeoutMs, signal }),
+					);
 					if (file.file_size !== undefined && file.file_size > config.maxBytes) return { status: "too_large" };
-					if (!file.file_path) throw new VoiceAttachmentError("Telegram did not provide a file path");
-					audio = await api.downloadFile(file.file_path, { maxBytes: config.maxBytes, signal });
+					const filePath = file.file_path;
+					if (!filePath) throw new VoiceAttachmentError("Telegram did not provide a file path");
+					audio = await this.retryRead("telegram downloadFile", signal, () =>
+						api.downloadFile(filePath, { maxBytes: config.maxBytes, signal }),
+					);
 				}
 				const text = await transcribeWithGroq({
 					apiKey,
@@ -1326,7 +1353,7 @@ export class TelegramModule implements AliveModule {
 						}
 						throw err;
 					}
-				});
+				}, "telegram sendFile");
 				if (result) {
 					sent.push({
 						result,
@@ -1340,6 +1367,7 @@ export class TelegramModule implements AliveModule {
 				const carriesButtons = index === followUps.length - 1 && replyMarkup !== undefined;
 				const result = await this.sendPart(partKey(uploads.length + index), ref.chatId, message.thread, () =>
 					this.sendTextChunk(ctx, api, ref.chatId, threadId, text, nextReplyTo(), carriesButtons ? replyMarkup : undefined),
+					"telegram sendMessage",
 				);
 				if (result) sent.push({ result, text, ...(carriesButtons && buttonSummary ? { buttons: buttonSummary } : {}) });
 			}
@@ -1349,6 +1377,7 @@ export class TelegramModule implements AliveModule {
 				const carriesButtons = index === chunks.length - 1 && replyMarkup !== undefined;
 				const result = await this.sendPart(partKey(index), ref.chatId, message.thread, () =>
 					this.sendTextChunk(ctx, api, ref.chatId, threadId, text, nextReplyTo(), carriesButtons ? replyMarkup : undefined),
+					"telegram sendMessage",
 				);
 				if (result) sent.push({ result, text, ...(carriesButtons && buttonSummary ? { buttons: buttonSummary } : {}) });
 			}
@@ -1409,6 +1438,7 @@ export class TelegramModule implements AliveModule {
 		chatId: string,
 		thread: string,
 		send: () => Promise<TelegramSentMessage>,
+		label = "telegram send",
 	): Promise<TelegramSentMessage | undefined> {
 		const ledger = this.deliveryLedger;
 		const prior = ledger?.shouldSkip(key);
@@ -1423,7 +1453,19 @@ export class TelegramModule implements AliveModule {
 		}
 		ledger?.markSending(key, chatId);
 		try {
-			const sent = await send();
+			// A send is retried only when Telegram certainly did not accept it
+			// (transport failure) or explicitly asked to slow down (429): repeating a
+			// 5xx after a possible write could post a duplicate. `retry_after` is
+			// honoured by the shared classifier.
+			const sent = await withRetries(send, {
+				attempts: 3,
+				baseDelayMs: 500,
+				maxDelayMs: 5_000,
+				label,
+				log: this.ctx?.log,
+				signal: this.abort.signal,
+				shouldRetry: shouldRetryTelegramSend,
+			});
 			ledger?.markSent(key, chatId, sent.message_id);
 			return sent;
 		} catch (err) {
@@ -1434,6 +1476,23 @@ export class TelegramModule implements AliveModule {
 			if (network || rejected) ledger?.markFailed(key, chatId, message(err));
 			throw err;
 		}
+	}
+
+	/**
+	 * Retry a read-only Bot API call (`getFile`, `downloadFile`).
+	 *
+	 * Reads have no side effects, so network hiccups, 429 and 5xx are repeatable.
+	 * Abort (module stop or the per-call timeout) is never retried.
+	 */
+	private retryRead<T>(label: string, signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+		return withRetries(operation, {
+			attempts: 2,
+			baseDelayMs: 500,
+			maxDelayMs: 2_000,
+			label,
+			log: this.ctx?.log,
+			signal,
+		});
 	}
 
 	/** One text chunk of an outbound message, with the plain-text fallback for broken markup. */
@@ -1563,15 +1622,27 @@ export class TelegramModule implements AliveModule {
 		const caption = input.caption === undefined
 			? undefined
 			: maskSecrets(input.caption, ctx.config.secrets, process.env, new MaskContext());
-		const sent = await api.sendFile({
-			chat_id: ref.chatId,
-			file: { data, name, mime: mimeForFile(name) },
-			field,
-			caption,
-			parse_mode: this.config.parseMode || undefined,
-			message_thread_id: ref.topicId !== undefined ? Number(ref.topicId) : undefined,
-			reply_to_message_id: replyTo,
-		});
+		const sent = await withRetries(
+			() =>
+				api.sendFile({
+					chat_id: ref.chatId,
+					file: { data, name, mime: mimeForFile(name) },
+					field,
+					caption,
+					parse_mode: this.config.parseMode || undefined,
+					message_thread_id: ref.topicId !== undefined ? Number(ref.topicId) : undefined,
+					reply_to_message_id: replyTo,
+				}),
+			{
+				attempts: 3,
+				baseDelayMs: 500,
+				maxDelayMs: 5_000,
+				label: "telegram sendFile",
+				log: ctx.log,
+				signal: this.abort.signal,
+				shouldRetry: shouldRetryTelegramSend,
+			},
+		);
 		this.stopTyping(input.thread);
 		ctx.history.append({
 			id: `telegram:${ref.chatId}:${sent.message_id}`,
@@ -1722,6 +1793,22 @@ function message(err: unknown): string {
 /** Transport-level failure (never reached Telegram): reset, timeout, DNS, TLS. */
 function isNetworkError(err: unknown): boolean {
 	return err instanceof TelegramApiError && err.network;
+}
+
+/** Telegram returns 409 when another poller or a leftover webhook owns the token. */
+function isPollerConflict(err: unknown): boolean {
+	return err instanceof TelegramApiError && err.errorCode === 409;
+}
+
+/**
+ * A Bot API write may be repeated only when it certainly did not take effect:
+ * a transport failure ("never reached Telegram") or an explicit 429. A 5xx is
+ * ambiguous (the message may have been accepted before the response was lost),
+ * so it is left `sending` by the delivery ledger and never re-sent here.
+ */
+function shouldRetryTelegramSend(err: unknown): boolean {
+	if (!(err instanceof TelegramApiError)) return false;
+	return err.network || err.errorCode === 429;
 }
 
 /** Spread retries so a fleet of bots does not reconnect in lockstep. */

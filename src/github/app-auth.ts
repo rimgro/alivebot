@@ -5,6 +5,7 @@ import { Type } from "typebox";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { LoadedConfig } from "../config.js";
 import type { SandboxManager } from "../sandbox/manager.js";
+import { withRetries, type RetryLogger } from "../retry.js";
 
 const APP_FOR_PROFILE: Record<string, string> = {
 	"slava-manager": "manager",
@@ -38,25 +39,34 @@ function createAppJwt(appId: number, privateKey: string): string {
 	return `${unsigned}.${signer.sign(privateKey, "base64url")}`;
 }
 
-async function githubJson<T>(url: string, token: string, method = "GET", body?: unknown, signal?: AbortSignal): Promise<T> {
-	const response = await fetch(url, {
-		method,
-		headers: {
-			accept: "application/vnd.github+json",
-			authorization: `Bearer ${token}`,
-			"user-agent": USER_AGENT,
-			"x-github-api-version": "2022-11-28",
-			...(body === undefined ? {} : { "content-type": "application/json" }),
-		},
-		...(body === undefined ? {} : { body: JSON.stringify(body) }),
-		signal,
-	});
-	const data = await response.json().catch(() => ({})) as { message?: unknown };
-	if (!response.ok) {
-		const message = typeof data.message === "string" ? data.message.slice(0, 300) : "unknown GitHub API error";
-		throw new Error(`GitHub API request failed (${response.status}): ${message}`);
-	}
-	return data as T;
+async function githubJson<T>(url: string, token: string, method = "GET", body?: unknown, signal?: AbortSignal, log?: RetryLogger): Promise<T> {
+	const request = async (): Promise<T> => {
+		const response = await fetch(url, {
+			method,
+			headers: {
+				accept: "application/vnd.github+json",
+				authorization: `Bearer ${token}`,
+				"user-agent": USER_AGENT,
+				"x-github-api-version": "2022-11-28",
+				...(body === undefined ? {} : { "content-type": "application/json" }),
+			},
+			...(body === undefined ? {} : { body: JSON.stringify(body) }),
+			signal,
+		});
+		const data = await response.json().catch(() => ({})) as { message?: unknown };
+		if (!response.ok) {
+			const message = typeof data.message === "string" ? data.message.slice(0, 300) : "unknown GitHub API error";
+			const error = new Error(`GitHub API request failed (${response.status}): ${message}`);
+			// Status lets the shared classifier retry 5xx/429 and stop on 401/403.
+			Object.assign(error, { status: response.status });
+			throw error;
+		}
+		return data as T;
+	};
+	// Only reads are retried: a repeated POST/PATCH could duplicate a created
+	// issue, comment or token. The token mint itself is not idempotent by contract.
+	if (method !== "GET") return request();
+	return withRetries(request, { attempts: 3, baseDelayMs: 500, maxDelayMs: 5_000, label: "github app", log, signal });
 }
 
 function readApp(stateDir: string, appProfile: string): { directory: string; metadata: AppMetadata; privateKey: string } {
@@ -80,12 +90,12 @@ function readApp(stateDir: string, appProfile: string): { directory: string; met
 	return { directory, metadata, privateKey: fs.readFileSync(keyPath, "utf8") };
 }
 
-async function mintRepositoryToken(metadata: AppMetadata, privateKey: string, signal?: AbortSignal): Promise<{ token: string; expiresAt: string }> {
+async function mintRepositoryToken(metadata: AppMetadata, privateKey: string, signal?: AbortSignal, log?: RetryLogger): Promise<{ token: string; expiresAt: string }> {
 	const jwt = createAppJwt(metadata.app_id, privateKey);
-	const app = await githubJson<{ id: number; slug: string }>(`${API}/app`, jwt, "GET", undefined, signal);
+	const app = await githubJson<{ id: number; slug: string }>(`${API}/app`, jwt, "GET", undefined, signal, log);
 	if (app.id !== metadata.app_id || app.slug !== metadata.slug) throw new Error("GitHub App identity changed; refusing token mint");
 	const installation = await githubJson<{ id: number; repository_selection: string; account?: { login?: string }; permissions?: Record<string, string> }>(
-		`${API}/app/installations/${metadata.installation_id}`, jwt, "GET", undefined, signal,
+		`${API}/app/installations/${metadata.installation_id}`, jwt, "GET", undefined, signal, log,
 	);
 	if (installation.id !== metadata.installation_id || installation.repository_selection !== "selected"
 		|| installation.account?.login?.toLowerCase() !== "rimgro") {
@@ -95,11 +105,11 @@ async function mintRepositoryToken(metadata: AppMetadata, privateKey: string, si
 		if (installation.permissions?.[permission] !== level) throw new Error(`GitHub App permission changed: ${permission}`);
 	}
 	const created = await githubJson<{ token: string; expires_at: string }>(
-		`${API}/app/installations/${metadata.installation_id}/access_tokens`, jwt, "POST", { repository_names: ["alivebot"] }, signal,
+		`${API}/app/installations/${metadata.installation_id}/access_tokens`, jwt, "POST", { repository_names: ["alivebot"] }, signal, log,
 	);
 	if (typeof created.token !== "string" || typeof created.expires_at !== "string") throw new Error("GitHub did not return a valid installation token");
 	const visible = await githubJson<{ repositories?: Array<{ full_name?: string }> }>(
-		`${API}/installation/repositories`, created.token, "GET", undefined, signal,
+		`${API}/installation/repositories`, created.token, "GET", undefined, signal, log,
 	);
 	const names = (visible.repositories ?? []).map((repo) => repo.full_name?.toLowerCase());
 	if (names.length !== 1 || names[0] !== REPOSITORY) throw new Error("Installation token is not restricted to rimgro/alivebot");
@@ -113,13 +123,13 @@ export function appProfileFor(loaded: LoadedConfig): string | undefined {
 	return profile ? APP_FOR_PROFILE[profile] : undefined;
 }
 
-export async function getScopedInstallationToken(loaded: LoadedConfig, signal?: AbortSignal): Promise<{ token: string; expiresAt: string; metadata: AppMetadata }> {
+export async function getScopedInstallationToken(loaded: LoadedConfig, signal?: AbortSignal, log?: RetryLogger): Promise<{ token: string; expiresAt: string; metadata: AppMetadata }> {
 	const profile = appProfileFor(loaded);
 	if (!profile) throw new Error("This Alive profile has no GitHub App configured");
 	const { metadata, privateKey } = readApp(loaded.paths.stateDir, profile);
 	const cached = tokenCache.get(profile);
 	if (cached && Date.parse(cached.expiresAt) > Date.now() + 120_000) return cached;
-	const minted = await mintRepositoryToken(metadata, privateKey, signal);
+	const minted = await mintRepositoryToken(metadata, privateKey, signal, log);
 	const result = { ...minted, metadata };
 	tokenCache.set(profile, result);
 	return result;
@@ -130,7 +140,7 @@ function shellQuote(value: string): string {
 }
 
 /** Add a narrow token-refresh tool only to the three profiles with dedicated GitHub Apps. */
-export function createGitHubAuthTool(manager: SandboxManager, loaded: LoadedConfig): ToolDefinition | undefined {
+export function createGitHubAuthTool(manager: SandboxManager, loaded: LoadedConfig, log?: RetryLogger): ToolDefinition | undefined {
 	if (!appProfileFor(loaded)) return undefined;
 
 	return {
@@ -142,7 +152,7 @@ export function createGitHubAuthTool(manager: SandboxManager, loaded: LoadedConf
 		async execute(_toolCallId, _params, signal) {
 			return manager.exclusive(async () => {
 				signal?.throwIfAborted();
-				const { metadata, token, expiresAt } = await getScopedInstallationToken(loaded, signal);
+				const { metadata, token, expiresAt } = await getScopedInstallationToken(loaded, signal, log);
 				const credentialPath = path.posix.join(manager.workspaceDir, ".github-credentials-alive");
 				const credential = `https://x-access-token:${token}@github.com/rimgro/alivebot.git\n`;
 				const files = await manager.files();
