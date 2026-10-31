@@ -1364,6 +1364,7 @@ export function reconstructSystemPrompt(profile: DashboardProfile): SystemPrompt
 		workspace: paths.workspaceDir,
 		stateDir: paths.stateDir,
 		runTimeoutMs: cfg.loop.runTimeoutMs,
+		runWarnMs: cfg.loop.runWarnMs,
 		sleepAfterMs: cfg.loop.sleepAfterMs,
 		workers: cfg.workers.enabled
 			? {

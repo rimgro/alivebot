@@ -29,7 +29,8 @@ import { ReminderStore } from "../store/reminders.js";
 import { RUN_TURN_TRACE_LIMIT, RunLog } from "../store/runs.js";
 import { ThreadStore } from "../store/threads.js";
 import { HistoryStore } from "../store/history.js";
-import { AgentRunner } from "../runtime/agent.js";
+import { RunEventLog } from "../store/run-events.js";
+import { AgentRunner, runActiveMs } from "../runtime/agent.js";
 import { TurnTraceRecorder } from "../runtime/run-trace.js";
 import { hasWakeWorthyPending, WakeScheduler, wakeIntervalMs } from "../runtime/wake.js";
 import { createAliveTools, type RunHandle, type ToolDeps } from "../runtime/tools.js";
@@ -55,6 +56,9 @@ const config = loadConfig({
 			pollIntervalMs: 10,
 			sleepAfterMs: 60_000,
 			runTimeoutMs: 60_000,
+			runWarnMs: 10 * 60_000,
+			runNoOutboundTurns: 60,
+			runVeryLongMs: 3 * 60 * 60_000,
 			maxEventsPerIdle: 8,
 			maxNudges: 3,
 			maxNudgesPerRun: 2,
@@ -75,6 +79,7 @@ const outbox = new Outbox(config.paths.stateDir);
 const policy = new PolicyStore(config.paths.stateDir);
 const history = HistoryStore.open(config.paths.stateDir);
 const runs = new RunLog(config.paths.stateDir);
+const runEvents = new RunEventLog(config.paths.stateDir);
 
 let currentRun: RunHandle | undefined;
 const deps: ToolDeps = {
@@ -182,6 +187,7 @@ const runner = new AgentRunner({
 	toolDeps: deps,
 	log,
 	thoughtsFile: config.paths.thoughtsFile,
+	runEvents,
 	getRun: () => currentRun,
 	setRun: (run) => {
 		currentRun = run;
@@ -250,6 +256,211 @@ section("policy-approved notifications are steered into a working run");
 	check("run counted the interrupt", (record?.interruptDeliveries ?? 0) === 1, record?.interruptDeliveries);
 }
 
+
+// ---------------------------------------------------------------------------
+// run health: soft warning + anomaly events instead of a wall-clock kill (#127)
+// ---------------------------------------------------------------------------
+
+/** Anomaly events recorded for one run (read back from the JSONL sink). */
+const anomaliesFor = (runId: string) => runEvents.list(5_000).filter((event) => event.runId === runId);
+const anomaliesOf = (runId: string, type: string) => anomaliesFor(runId).filter((event) => event.type === type);
+
+function setRunHealth(patch: {
+	runTimeoutMs?: number;
+	runWarnMs?: number;
+	runNoOutboundTurns?: number;
+	runVeryLongMs?: number;
+}): void {
+	Object.assign(config.config.loop, patch);
+}
+function resetRunHealth(): void {
+	setRunHealth({
+		runTimeoutMs: 0,
+		runWarnMs: 10 * 60_000,
+		runNoOutboundTurns: 60,
+		runVeryLongMs: 3 * 60 * 60_000,
+	});
+}
+
+section("a 20-minute active run is warned, never killed, with runTimeoutMs = 0 (#127)");
+{
+	policy.reset();
+	resetRunHealth();
+	const WARN = "работаешь долго — закругляйся или объясни, зачем столько";
+	handler = async (session) => {
+		const run = currentRun!;
+		runner.checkRunGuards(run.startedAt + 9 * 60_000);
+		check(
+			"nothing is warned or recorded before the window",
+			session.steered.length === 0 && anomaliesOf(run.id, "run_long").length === 0,
+			{ steered: session.steered.length, events: anomaliesOf(run.id, "run_long").length },
+		);
+		runner.checkRunGuards(run.startedAt + 10 * 60_000 + 1_000);
+		check(
+			"the built-in long-run warning is steered once",
+			session.steered.length === 1 && session.steered[0]?.includes(WARN),
+			session.steered,
+		);
+		const fired = anomaliesOf(run.id, "run_long");
+		check(
+			"run_long carries the run id, agent and counters",
+			fired.length === 1 &&
+				fired[0]?.runId === run.id &&
+				fired[0]?.runIndex === run.index &&
+				fired[0]?.agent === config.config.name &&
+				fired[0]?.turns === run.turns &&
+				fired[0]?.outbound === 0 &&
+				fired[0]?.limitMs === 10 * 60_000 &&
+				(fired[0]?.activeMs ?? 0) >= 10 * 60_000,
+			fired[0],
+		);
+		check(
+			"run_long stores no prompt or message text",
+			fired.every((event) => !("text" in event) && !("prompt" in event) && !("message" in event)),
+			fired[0],
+		);
+		runner.checkRunGuards(run.startedAt + 13 * 60_000);
+		check(
+			"the warning is not repeated inside the same window",
+			session.steered.length === 1 && anomaliesOf(run.id, "run_long").length === 1,
+			{ steered: session.steered.length, events: anomaliesOf(run.id, "run_long").length },
+		);
+		runner.checkRunGuards(run.startedAt + 21 * 60_000);
+		check(
+			"crossing the next runWarnMs window warns once more",
+			session.steered.length === 2 && anomaliesOf(run.id, "run_long").length === 2,
+			{ steered: session.steered.length, events: anomaliesOf(run.id, "run_long").length },
+		);
+		check(
+			"20 minutes of active work did not abort the run",
+			session.aborted === false && currentRun?.id === run.id,
+			{ aborted: session.aborted },
+		);
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "long-run warning test", summary_md: "# long-run warning test\n" });
+	};
+	const record = await runner.execute();
+	check("the run ended by sleeping, not by a timeout", record?.stopReason === "slept", record?.stopReason);
+	check(
+		"both run_long events are persisted next to the run records",
+		anomaliesOf(record?.id ?? "", "run_long").length === 2,
+		anomaliesFor(record?.id ?? ""),
+	);
+}
+
+section("a positive runTimeoutMs still aborts the run (regression)");
+{
+	policy.reset();
+	setRunHealth({ runTimeoutMs: 60_000, runWarnMs: 0, runNoOutboundTurns: 0, runVeryLongMs: 0 });
+	handler = async (session) => {
+		const run = currentRun!;
+		runner.checkRunGuards(run.startedAt + 61_000);
+		check("the configured active-time limit still aborts the session", session.aborted === true);
+		check("the hard stop does not also steer a warning", session.steered.length === 0, session.steered);
+	};
+	const record = await runner.execute();
+	check("the run is recorded as a timeout", record?.stopReason === "timeout", record?.stopReason);
+	resetRunHealth();
+}
+
+section("run_no_outbound fires above the turn threshold, once");
+{
+	policy.reset();
+	setRunHealth({ runTimeoutMs: 0, runWarnMs: 0, runNoOutboundTurns: 60, runVeryLongMs: 0 });
+	handler = async (session) => {
+		const run = currentRun!;
+		run.turns = 60;
+		runner.checkRunGuards(Date.now());
+		check("exactly N turns is not an anomaly yet", anomaliesOf(run.id, "run_no_outbound").length === 0);
+		run.turns = 61;
+		runner.checkRunGuards(Date.now());
+		const fired = anomaliesOf(run.id, "run_no_outbound");
+		check("more than N turns with zero outbound fires run_no_outbound", fired.length === 1, fired);
+		check(
+			"run_no_outbound carries the counters",
+			fired[0]?.runId === run.id &&
+				fired[0]?.agent === config.config.name &&
+				fired[0]?.turns === 61 &&
+				fired[0]?.outbound === 0 &&
+				fired[0]?.limitTurns === 60,
+			fired[0],
+		);
+		run.turns = 90;
+		runner.checkRunGuards(Date.now());
+		check("it fires once per run, not on every scheduler tick", anomaliesOf(run.id, "run_no_outbound").length === 1);
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "no-outbound test", summary_md: "# no-outbound test\n" });
+	};
+	const record = await runner.execute();
+	check("the anomaly did not stop the run", record?.stopReason === "slept", record?.stopReason);
+}
+
+section("run_very_long fires at the active-time threshold, not before");
+{
+	policy.reset();
+	setRunHealth({ runTimeoutMs: 0, runWarnMs: 0, runNoOutboundTurns: 0, runVeryLongMs: 3 * 60 * 60_000 });
+	handler = async (session) => {
+		const run = currentRun!;
+		runner.checkRunGuards(run.startedAt + 3 * 60 * 60_000 - 1_000);
+		check("no run_very_long just before the threshold", anomaliesOf(run.id, "run_very_long").length === 0);
+		runner.checkRunGuards(run.startedAt + 3 * 60 * 60_000 + 1_000);
+		const fired = anomaliesOf(run.id, "run_very_long");
+		check(
+			"run_very_long fires past three hours of active work",
+			fired.length === 1 && fired[0]?.limitMs === 3 * 60 * 60_000 && (fired[0]?.activeMs ?? 0) >= 3 * 60 * 60_000,
+			fired,
+		);
+		runner.checkRunGuards(run.startedAt + 5 * 60 * 60_000);
+		check("run_very_long fires once per run", anomaliesOf(run.id, "run_very_long").length === 1);
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "very-long test", summary_md: "# very-long test\n" });
+	};
+	const record = await runner.execute();
+	check("the run kept going past the anomaly threshold", record?.stopReason === "slept", record?.stopReason);
+	const idleRun = { idling: true, activeMs: 5_000, activeSince: undefined, startedAt: 0 } as unknown as RunHandle;
+	check(
+		"hours inside idle are not counted as long active work",
+		runActiveMs(idleRun, 10 * 60 * 60_000) === 5_000,
+		runActiveMs(idleRun, 10 * 60 * 60_000),
+	);
+}
+
+section("run_repeat_tool fires on the third identical call in a row");
+{
+	policy.reset();
+	resetRunHealth();
+	handler = async (session) => {
+		const run = currentRun!;
+		const toolCall = (args: Record<string, unknown>) => session.emit({ type: "tool_execution_start", toolName: "bash", args });
+		// Same arguments, different key order: the fingerprint is canonical.
+		toolCall({ command: "ls -la", cwd: "/tmp" });
+		toolCall({ cwd: "/tmp", command: "ls -la" });
+		check("two identical calls are not an anomaly", anomaliesOf(run.id, "run_repeat_tool").length === 0);
+		toolCall({ command: "ls -la", cwd: "/tmp" });
+		const fired = anomaliesOf(run.id, "run_repeat_tool");
+		check(
+			"the third identical call in a row fires run_repeat_tool",
+			fired.length === 1 && fired[0]?.tool === "bash" && fired[0]?.repeats === 3 && fired[0]?.runId === run.id,
+			fired,
+		);
+		check(
+			"tool arguments are never recorded",
+			fired.every((event) => !JSON.stringify(event).includes("ls -la")),
+			fired[0],
+		);
+		toolCall({ command: "ls -la", cwd: "/tmp" });
+		check("it fires once per streak, not on every further repeat", anomaliesOf(run.id, "run_repeat_tool").length === 1);
+		toolCall({ command: "pwd", cwd: "/tmp" });
+		toolCall({ command: "ls -la", cwd: "/tmp" });
+		toolCall({ command: "ls -la", cwd: "/tmp" });
+		toolCall({ command: "ls -la", cwd: "/tmp" });
+		check("a new streak of three fires again", anomaliesOf(run.id, "run_repeat_tool").length === 2);
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "repeat-tool test", summary_md: "# repeat-tool test\n" });
+	};
+	const record = await runner.execute();
+	check("the anomaly did not stop the run", record?.stopReason === "slept", record?.stopReason);
+}
 
 // ---------------------------------------------------------------------------
 // per-turn usage (#121)

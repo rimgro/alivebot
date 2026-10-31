@@ -201,7 +201,10 @@ export class TelegramModule implements AliveModule {
 
 	async start(ctx: ModuleContext): Promise<void> {
 		this.ctx = ctx;
-		this.typingMaxMsValue = ctx.config.loop.runTimeoutMs + 60_000;
+		// Upper bound for the typing indicator: a crashed run must not leave the bot
+		// "typing" forever, but a live run is no longer cut at `runTimeoutMs` (#127),
+		// so follow the soft warning horizon as well.
+		this.typingMaxMsValue = Math.max(ctx.config.loop.runTimeoutMs, ctx.config.loop.runWarnMs) + 60_000;
 		ctx.signal.addEventListener(
 			"abort",
 			() => {

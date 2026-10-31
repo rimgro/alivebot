@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { LoadedConfig } from "../config.js";
@@ -9,8 +10,9 @@ import type { EventStore } from "../store/events.js";
 import type { PolicyStore } from "../store/policy.js";
 import type { RunLog, RunRecord, RunStopReason } from "../store/runs.js";
 import type { ThreadStore } from "../store/threads.js";
-import { renderAwakePrompt, renderInterruptPrompt, renderNudgePrompt } from "./prompt.js";
+import { renderAwakePrompt, renderInterruptPrompt, renderLongRunWarning, renderNudgePrompt } from "./prompt.js";
 import { TurnTraceRecorder } from "./run-trace.js";
+import type { RunAnomalyEvent, RunEventSink } from "../store/run-events.js";
 import { hasWakeWorthyPending } from "./wake.js";
 import { maskSecrets } from "../secrets.js";
 import { privateMemoryScope } from "./memory-access.js";
@@ -27,11 +29,47 @@ export interface AgentRunnerDeps {
 	toolDeps: ToolDeps;
 	log: Logger;
 	thoughtsFile: string;
+	/** Durable sink for `run_*` anomaly events (#127). Omit to log them only. */
+	runEvents?: RunEventSink;
 	getRun: () => RunHandle | undefined;
 	setRun: (run: RunHandle | undefined) => void;
 	runtimeStatus: () => Record<string, unknown>;
 	isStopping: () => boolean;
 	isBudgetExhausted: () => boolean;
+}
+
+/**
+ * Active milliseconds of a run, idle excluded.
+ *
+ * `idle` freezes the clock: it flushes the elapsed active stretch into
+ * `run.activeMs` and clears `activeSince`; the stretch that started after the
+ * last idle is added on top. A run that idles for hours therefore never looks
+ * "long" to any of the guards below.
+ */
+export function runActiveMs(run: RunHandle, now = Date.now()): number {
+	if (run.idling) return run.activeMs;
+	return run.activeMs + Math.max(0, now - (run.activeSince ?? run.startedAt));
+}
+
+/** How many identical tool calls in a row count as `run_repeat_tool`. */
+export const RUN_REPEAT_TOOL_THRESHOLD = 3;
+
+/**
+ * Per-run guard state. Nothing here knows about prompts or messages: it is
+ * counters and a tool-argument fingerprint only, so an anomaly event can never
+ * leak conversation content.
+ */
+interface RunWatch {
+	runId: string;
+	/** How many `runWarnMs` windows have already produced a warning. */
+	warningsSent: number;
+	noOutboundFlagged: boolean;
+	veryLongFlagged: boolean;
+	/** Stable fingerprint of the last tool call: name + canonical arguments. */
+	lastToolKey?: string;
+	/** Consecutive calls with the same tool and identical arguments. */
+	repeatCount: number;
+	repeatFlagged: boolean;
 }
 
 /**
@@ -57,6 +95,8 @@ export class AgentRunner {
 	private interruptInFlight = false;
 	/** Per-turn usage of the current run, persisted on its record (#121). */
 	private readonly turnTrace = new TurnTraceRecorder();
+	/** Soft run-health state for the current run (#127); reset by every `execute`. */
+	private watch: RunWatch | undefined;
 
 	constructor(deps: AgentRunnerDeps) {
 		this.deps = deps;
@@ -100,22 +140,133 @@ export class AgentRunner {
 	}
 
 	/**
-	 * Active-time watchdog. Idle time does not count, so an agent may wait for
-	 * hours, but it may not burn the model for longer than `runTimeoutMs` without
-	 * yielding. Called by the runtime scheduler.
+	 * Run health check, called by the runtime scheduler on every tick.
+	 *
+	 * Idle time never counts: the agent may wait for hours. While it is actively
+	 * working the runtime:
+	 *
+	 *   - aborts the run **only** if an operator configured a positive
+	 *     `runTimeoutMs` (the historical watchdog, off by default since #127);
+	 *   - steers one built-in "wrap up or explain" warning per `runWarnMs` window
+	 *     of active work and records a `run_long` event;
+	 *   - records `run_no_outbound` and `run_very_long` anomaly events once per run.
+	 *
+	 * Nothing here is a step limit. `now` is a clock seam for tests.
 	 */
-	checkActiveTimeout(): void {
+	checkRunGuards(now = Date.now()): void {
 		const run = this.deps.getRun();
 		if (!run || run.idling) return;
-		const since = run.activeSince ?? run.startedAt;
-		if (Date.now() - since < this.deps.config.config.loop.runTimeoutMs) return;
-		if (this.timedOutRunId === run.id) return;
-		this.timedOutRunId = run.id;
-		this.deps.log.warn(`run #${run.index} exceeded active-time limit; aborting`, {
-			limitMs: this.deps.config.config.loop.runTimeoutMs,
-			activeMs: Date.now() - since,
-		});
-		void this.session.abort();
+		const watch = this.watch?.runId === run.id ? this.watch : undefined;
+		if (!watch) return;
+		const loop = this.deps.config.config.loop;
+		const activeMs = runActiveMs(run, now);
+
+		// Explicitly configured hard stop: unchanged behaviour, opt-in only.
+		if (loop.runTimeoutMs > 0 && activeMs >= loop.runTimeoutMs) {
+			if (this.timedOutRunId === run.id) return;
+			this.timedOutRunId = run.id;
+			this.deps.log.warn(`run #${run.index} exceeded active-time limit; aborting`, {
+				limitMs: loop.runTimeoutMs,
+				activeMs,
+			});
+			void this.session.abort();
+			return;
+		}
+
+		// Soft warning: at most one per `runWarnMs` window of active work. A late
+		// check that sees several windows at once still sends exactly one message
+		// (and marks them all seen), so a busy scheduler never produces a burst.
+		if (loop.runWarnMs > 0) {
+			const windows = Math.floor(activeMs / loop.runWarnMs);
+			if (windows > watch.warningsSent) {
+				watch.warningsSent = windows;
+				this.emitAnomaly(run, { type: "run_long", now, activeMs, limitMs: loop.runWarnMs });
+				void this.steerLongRunWarning(run, activeMs);
+			}
+		}
+
+		// A run that burns many turns without saying anything to anyone.
+		if (
+			loop.runNoOutboundTurns > 0 &&
+			!watch.noOutboundFlagged &&
+			run.outbound.length === 0 &&
+			run.turns > loop.runNoOutboundTurns
+		) {
+			watch.noOutboundFlagged = true;
+			this.emitAnomaly(run, {
+				type: "run_no_outbound",
+				now,
+				activeMs,
+				limitTurns: loop.runNoOutboundTurns,
+			});
+		}
+
+		// A run that has been actively working for hours.
+		if (loop.runVeryLongMs > 0 && !watch.veryLongFlagged && activeMs >= loop.runVeryLongMs) {
+			watch.veryLongFlagged = true;
+			this.emitAnomaly(run, { type: "run_very_long", now, activeMs, limitMs: loop.runVeryLongMs });
+		}
+	}
+
+	/**
+	 * Steer the one built-in long-run warning into the working agent (#127).
+	 *
+	 * It is a hint, not a stop: the run keeps going and the agent decides whether
+	 * to wrap up, send what it has, or explain itself.
+	 */
+	private async steerLongRunWarning(run: RunHandle, activeMs: number): Promise<void> {
+		try {
+			await this.session.steer(
+				renderLongRunWarning({ activeMs, turns: run.turns, outbound: run.outbound.length }),
+			);
+			this.deps.log.info(`run #${run.index} long-run warning steered`, {
+				activeMs,
+				turns: run.turns,
+				outbound: run.outbound.length,
+			});
+		} catch (err) {
+			this.deps.log.warn("long-run warning failed", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+
+	/**
+	 * Record one anomaly event: durably through the sink (when wired) and in the
+	 * structured log, which is the primary observability surface. Counters only —
+	 * never prompt, message or tool-argument text.
+	 */
+	private emitAnomaly(
+		run: RunHandle,
+		input: {
+			type: RunAnomalyEvent["type"];
+			now: number;
+			activeMs: number;
+			limitMs?: number;
+			limitTurns?: number;
+			tool?: string;
+			repeats?: number;
+		},
+	): void {
+		const event: RunAnomalyEvent = {
+			ts: input.now,
+			type: input.type,
+			agent: this.deps.config.config.name,
+			runId: run.id,
+			runIndex: run.index,
+			activeMs: Math.round(input.activeMs),
+			durationMs: Math.max(0, input.now - run.startedAt),
+			idleMs: Math.round(run.idleMs),
+			turns: run.turns,
+			outbound: run.outbound.length,
+			events: run.events.length,
+			limitMs: input.limitMs,
+			limitTurns: input.limitTurns,
+			tool: input.tool,
+			repeats: input.repeats,
+		};
+		this.deps.runEvents?.append(event);
+		this.deps.log.warn(event.type, { ...event });
 	}
 
 	/**
@@ -158,6 +309,14 @@ export class AgentRunner {
 			retainedThisRun: false,
 		};
 		this.deps.setRun(run);
+		this.watch = {
+			runId: run.id,
+			warningsSent: 0,
+			noOutboundFlagged: false,
+			veryLongFlagged: false,
+			repeatCount: 0,
+			repeatFlagged: false,
+		};
 		store.beginRun(run.id);
 
 		// Opening batch: everything pending that the policy does not mute.
@@ -285,6 +444,7 @@ export class AgentRunner {
 		this.timedOutRunId = null;
 		this.budgetRunId = null;
 		this.aborting = false;
+		this.watch = undefined;
 
 		log.info(`run #${run.index} end`, {
 			stopReason: record.stopReason,
@@ -394,9 +554,10 @@ export class AgentRunner {
 			if (previous && (await previous(context))) return true;
 			const run = this.deps.getRun();
 			if (!run) return false;
-			// Turns are counted for telemetry only. There is deliberately no turn
-			// limit: a run may work for as long as it needs, and only the budget
-			// guard (and the runtime's active-time watchdog) can stop it.
+			// Turns are counted for telemetry and anomaly detection only. There is
+			// deliberately no turn limit: a run may work for as long as it needs.
+			// Only the budget guard and an explicitly configured `runTimeoutMs`
+			// can stop it; a long run is warned about, not killed (#127).
 			run.turns += 1;
 			if (this.deps.isBudgetExhausted()) {
 				this.budgetRunId = run.id;
@@ -438,6 +599,7 @@ export class AgentRunner {
 				break;
 			}
 			case "tool_execution_start": {
+				this.trackRepeatedTool(event.toolName, event.args);
 				const label = oneLine(JSON.stringify(event.args ?? {}), 160);
 				if (this.deps.config.config.verbose) {
 					this.deps.log.raw(`${term.dim(stamp())} ${term.cyan(`→ ${event.toolName}`)} ${term.gray(label)}`);
@@ -476,6 +638,38 @@ export class AgentRunner {
 			default:
 				break;
 		}
+	}
+
+	/**
+	 * Detect the same tool call repeated with identical arguments (#127).
+	 *
+	 * Only the tool name and a canonical fingerprint of its arguments are kept,
+	 * so this can never store prompt or message text. Fires once per run when the
+	 * streak reaches `RUN_REPEAT_TOOL_THRESHOLD`; a different call resets it.
+	 */
+	private trackRepeatedTool(toolName: string | undefined, args: unknown): void {
+		const run = this.deps.getRun();
+		const watch = this.watch;
+		if (!run || !watch || watch.runId !== run.id || typeof toolName !== "string") return;
+		// Hash keeps the memory bounded even when a tool argument carries a file.
+		const key = `${toolName}\u0000${createHash("sha1").update(stableJson(args)).digest("hex")}`;
+		if (key === watch.lastToolKey) {
+			watch.repeatCount += 1;
+		} else {
+			watch.lastToolKey = key;
+			watch.repeatCount = 1;
+			watch.repeatFlagged = false;
+		}
+		if (watch.repeatFlagged || watch.repeatCount < RUN_REPEAT_TOOL_THRESHOLD) return;
+		watch.repeatFlagged = true;
+		const now = Date.now();
+		this.emitAnomaly(run, {
+			type: "run_repeat_tool",
+			now,
+			activeMs: runActiveMs(run, now),
+			tool: toolName,
+			repeats: watch.repeatCount,
+		});
 	}
 
 	/**
@@ -518,6 +712,15 @@ export class AgentRunner {
 			cost: delta(before.cost, after.cost),
 		};
 	}
+}
+
+/** JSON with recursively sorted object keys, so identical arguments compare equal. */
+export function stableJson(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined";
+	if (Array.isArray(value)) return `[${value.map((item) => stableJson(item)).join(",")}]`;
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record).sort();
+	return `{${keys.map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(",")}}`;
 }
 
 function assistantText(message: { content: unknown }): string {

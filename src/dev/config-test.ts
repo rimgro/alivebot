@@ -11,6 +11,10 @@ import * as path from "node:path";
 import {
 	DEFAULT_CONFIG,
 	DEFAULT_EMPTY_WAKE_BACKOFF,
+	DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS,
+	DEFAULT_LOOP_RUN_TIMEOUT_MS,
+	DEFAULT_LOOP_RUN_VERY_LONG_MS,
+	DEFAULT_LOOP_RUN_WARN_MS,
 	EMPTY_WAKE_MAX_INTERVAL_MAX_MS,
 	EMPTY_WAKE_MAX_INTERVAL_MIN_MS,
 	loadConfig,
@@ -347,6 +351,96 @@ section("loop.emptyWakeBackoff: defaults, validation and safe fallbacks (#116)")
 		"the minimum and maximum caps are a minute and a day",
 		EMPTY_WAKE_MAX_INTERVAL_MIN_MS === 60_000 && EMPTY_WAKE_MAX_INTERVAL_MAX_MS === 86_400_000,
 		{ min: EMPTY_WAKE_MAX_INTERVAL_MIN_MS, max: EMPTY_WAKE_MAX_INTERVAL_MAX_MS },
+	);
+	fs.rmSync(root, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+section("loop run-health keys: no hard stop by default, validated thresholds (#127)");
+{
+	check(
+		"the defaults are 0 / 10 min / 60 turns / 3 h",
+		DEFAULT_CONFIG.loop.runTimeoutMs === 0 &&
+			DEFAULT_LOOP_RUN_TIMEOUT_MS === 0 &&
+			DEFAULT_LOOP_RUN_WARN_MS === 10 * 60_000 &&
+			DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS === 60 &&
+			DEFAULT_LOOP_RUN_VERY_LONG_MS === 3 * 60 * 60_000,
+		DEFAULT_CONFIG.loop,
+	);
+	const root = tempRoot("runhealth");
+	const loaded = loadConfig({ cwd: root, secretLog: () => undefined, secretWarn: () => undefined });
+	check(
+		"a config file without the keys gets no hard stop and the anomaly defaults",
+		loaded.config.loop.runTimeoutMs === 0 &&
+			loaded.config.loop.runWarnMs === 10 * 60_000 &&
+			loaded.config.loop.runNoOutboundTurns === 60 &&
+			loaded.config.loop.runVeryLongMs === 3 * 60 * 60_000,
+		loaded.config.loop,
+	);
+
+	const overridden = loadConfig({
+		cwd: root,
+		secretLog: () => undefined,
+		secretWarn: () => undefined,
+		overrides: { loop: { ...DEFAULT_CONFIG.loop, runTimeoutMs: 120_000, runWarnMs: 0, runNoOutboundTurns: 0, runVeryLongMs: 0 } },
+	});
+	check(
+		"explicit values win and 0 disables each guard",
+		overridden.config.loop.runTimeoutMs === 120_000 &&
+			overridden.config.loop.runWarnMs === 0 &&
+			overridden.config.loop.runNoOutboundTurns === 0 &&
+			overridden.config.loop.runVeryLongMs === 0,
+		overridden.config.loop,
+	);
+
+	// A legacy wake-per-batch config that asked for a hard stop keeps it: the old
+	// key is renamed before defaults fill `runTimeoutMs` with 0.
+	writeConfig(root, { loop: { wakeTimeoutMs: 90_000 } });
+	const legacy = loadConfig({ cwd: root, secretLog: () => undefined, secretWarn: () => undefined });
+	check("legacy wakeTimeoutMs still becomes a positive runTimeoutMs", legacy.config.loop.runTimeoutMs === 90_000, legacy.config.loop);
+
+	const rejects: Array<[string, string, unknown]> = [
+		["a negative runTimeoutMs", "runTimeoutMs", -1],
+		["a fractional runWarnMs", "runWarnMs", 1.5],
+		["a string runNoOutboundTurns", "runNoOutboundTurns", "60"],
+		["a NaN runVeryLongMs", "runVeryLongMs", Number.NaN],
+		["an infinite runWarnMs", "runWarnMs", Number.POSITIVE_INFINITY],
+	];
+	for (const [label, key, value] of rejects) {
+		let message = "";
+		try {
+			validateLoopConfig({ ...DEFAULT_CONFIG.loop, [key]: value } as LoopConfig);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		check(`${label} is rejected`, message.startsWith(`loop.${key}`), message || "accepted");
+	}
+	const zeroed = validateLoopConfig({
+		...DEFAULT_CONFIG.loop,
+		runTimeoutMs: 0,
+		runWarnMs: 0,
+		runNoOutboundTurns: 0,
+		runVeryLongMs: 0,
+	});
+	check(
+		"0 is accepted for every key, meaning disabled",
+		zeroed.runTimeoutMs === 0 && zeroed.runWarnMs === 0 && zeroed.runNoOutboundTurns === 0 && zeroed.runVeryLongMs === 0,
+		zeroed,
+	);
+	const partial = validateLoopConfig({
+		...DEFAULT_CONFIG.loop,
+		runTimeoutMs: undefined,
+		runWarnMs: null,
+		runNoOutboundTurns: undefined,
+		runVeryLongMs: null,
+	} as unknown as LoopConfig);
+	check(
+		"missing or null keys fall back to the defaults, not undefined",
+		partial.runTimeoutMs === 0 &&
+			partial.runWarnMs === 10 * 60_000 &&
+			partial.runNoOutboundTurns === 60 &&
+			partial.runVeryLongMs === 3 * 60 * 60_000,
+		partial,
 	);
 	fs.rmSync(root, { recursive: true, force: true });
 }
