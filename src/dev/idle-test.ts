@@ -23,6 +23,7 @@ import { ThreadStore } from "../store/threads.js";
 import { HistoryStore } from "../store/history.js";
 import { createAliveTools, type RunHandle, type ToolDeps } from "../runtime/tools.js";
 import { hasWakeWorthyPending } from "../runtime/wake.js";
+import { runActiveMs } from "../runtime/agent.js";
 
 let failures = 0;
 function check(name: string, condition: boolean, detail?: unknown): void {
@@ -45,6 +46,9 @@ const config = loadConfig({
 			pollIntervalMs: 10,
 			sleepAfterMs: 120,
 			runTimeoutMs: 60_000,
+			runWarnMs: 10 * 60_000,
+			runNoOutboundTurns: 60,
+			runVeryLongMs: 3 * 60 * 60_000,
 			maxEventsPerIdle: 8,
 			maxNudges: 3,
 			maxNudgesPerRun: 5,
@@ -161,6 +165,15 @@ section("idle wakes on an event that arrives while it is already waiting");
 	const waiting = call(idle, { reason: "nothing yet" });
 	await new Promise((resolve) => setTimeout(resolve, 40));
 	check("idle is blocking", run.idling === true);
+	// The run-health guards (#127) count active time only: the clock is frozen
+	// for as long as the agent is blocked inside `idle`.
+	const activeDuringIdle = runActiveMs(run, Date.now());
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	check(
+		"active run time does not grow while the agent is idling (#127)",
+		runActiveMs(run, Date.now()) === activeDuringIdle && activeDuringIdle === run.activeMs,
+		{ before: activeDuringIdle, after: runActiveMs(run, Date.now()), activeMs: run.activeMs },
+	);
 	event("late arrival", "alice");
 	const result = await waiting;
 	check("new idle batch replaces the previous routing scope", run.currentThreads?.join() === "alice");

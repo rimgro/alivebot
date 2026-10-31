@@ -29,7 +29,8 @@ try {
 		contract: readContract(path.join(child.directory, "CONTRACT.md")),
 		workspace: child.directory,
 		stateDir: path.join(child.directory, "state"),
-		runTimeoutMs: 60_000,
+		runTimeoutMs: 0,
+		runWarnMs: 600_000,
 		sleepAfterMs: 600_000,
 	});
 	assert.ok(prompt.includes("# Your contract"));

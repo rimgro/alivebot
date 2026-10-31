@@ -14,6 +14,8 @@ export interface SystemPromptInput {
 	workspace: string;
 	stateDir: string;
 	runTimeoutMs: number;
+	/** Active-time soft warning threshold (0 = disabled). */
+	runWarnMs: number;
 	sleepAfterMs: number;
 	/** Present only when the operator enabled host coding workers. */
 	workers?: {
@@ -33,6 +35,18 @@ export interface SystemPromptInput {
  * cache-friendly across a long life.
  */
 export function buildSystemPrompt(input: SystemPromptInput): string {
+	const runBudget =
+		input.runTimeoutMs > 0
+			? `roughly ${formatDuration(input.runTimeoutMs)} of active (non-idle) work per run`
+			: "no active-time limit — a run lasts as long as it needs";
+	const warnLine =
+		input.runWarnMs > 0
+			? `\nIf a run stays actively working for ${formatDuration(input.runWarnMs)}, the runtime reminds you to wrap up\nor to explain why it takes that long. That is a hint, not a stop${
+				input.runTimeoutMs > 0
+					? `, although a configured ${formatDuration(input.runTimeoutMs)} active-time limit still stops a very long run`
+					: ": nothing aborts your run"
+			}.`
+			: "";
 	return `You are ${input.name}.
 
 ${input.soul.trim()}
@@ -205,9 +219,8 @@ thought is a thought you have to resume.
 5. If you wrote something durable, put it in the \`journal\` (or \`note\` for short state).
 6. When there is nothing left to do, \`idle\`.
 
-Budget: roughly ${formatDuration(input.runTimeoutMs)} of active (non-idle) work per run. There is no
-step limit — a run lasts as long as it needs. Do the important thing first and
-schedule the rest.
+Budget: ${runBudget}. There is no
+step limit. Do the important thing first and schedule the rest.${warnLine}
 
 # Conduct
 
@@ -472,4 +485,23 @@ export function renderInterruptPrompt(events: AliveEvent[], secrets: SecretsConf
 	const context = new MaskContext();
 	const body = events.map((event) => eventLine(event, { redelivered: false }, secrets, context)).join("\n\n");
 	return `## NOTIFICATION — new ${events.length === 1 ? "event" : "events"} arrived and your policy let ${events.length === 1 ? "it" : "them"} through\n\n${body}\n\nFold this in without abandoning what you were doing, then continue. Reply via send_message if a human is waiting.`;
+}
+
+/**
+ * The one built-in soft warning for a long run (#127).
+ *
+ * Steered into the working agent instead of aborting it: a run is never cut by
+ * a wall clock any more. Deliberately carries no event or message text — only
+ * the counters the agent already owns — so it can never leak conversation
+ * content or look like a user turn.
+ */
+export function renderLongRunWarning(input: { activeMs: number; turns: number; outbound: number }): string {
+	return (
+		`## ВНИМАНИЕ РАНТАЙМА — работаешь долго\n\n` +
+		`работаешь долго — закругляйся или объясни, зачем столько\n\n` +
+		`Активной работы в этом run: ${formatDuration(input.activeMs)} · turns: ${input.turns} · outbound: ${input.outbound}. ` +
+		`Если задача правда большая — сделай главное, ответь человеку, если он ждёт, и уйди в \`idle\`; ` +
+		`остальное запланируй через \`remind\`. Если застрял — смени подход или скажи, где застрял. ` +
+		`Это предупреждение, а не остановка: run продолжается.`
+	);
 }

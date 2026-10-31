@@ -59,10 +59,33 @@ export interface LoopConfig {
 	sleepAfterMs: number;
 	/**
 	 * Active (non-idle) wall-clock limit for one run. Waiting inside `idle` does
-	 * not count: a long-lived agent may idle for hours but may not burn the model
-	 * for hours without ever yielding.
+	 * not count.
+	 *
+	 * **0 (the default) = no limit**: the runtime never aborts a run for taking
+	 * long. A positive value is honoured for operators who still want the old hard
+	 * stop: the session is aborted and the run is recorded as `timeout`. Soft
+	 * `runWarnMs` steering plus the `run_*` anomaly events are the normal signal
+	 * (#127).
 	 */
 	runTimeoutMs: number;
+	/**
+	 * Active-time soft warning. When a run crosses this much active work, the agent
+	 * is steered one built-in "wrap up or explain" message and the runtime emits a
+	 * `run_long` event. Repeated at most once per `runWarnMs` window of active time,
+	 * never while the agent is inside `idle`. 0 = disabled. Default 10 minutes.
+	 */
+	runWarnMs: number;
+	/**
+	 * Anomaly threshold: after this many model turns with **zero** outbound
+	 * messages the runtime emits one `run_no_outbound` event for the run. It never
+	 * stops the run. 0 = disabled. Default 60 turns.
+	 */
+	runNoOutboundTurns: number;
+	/**
+	 * Anomaly threshold: a run that stays active (non-idle) for this long emits one
+	 * `run_very_long` event. It never stops the run. 0 = disabled. Default 3 hours.
+	 */
+	runVeryLongMs: number;
 	/** Max events returned by one `idle` call. The rest are delivered on the next idle. */
 	maxEventsPerIdle: number;
 	/** How many times an unanswered user message is carried over before we stop nudging. */
@@ -108,11 +131,27 @@ export const EMPTY_WAKE_MAX_INTERVAL_MIN_MS = 60_000;
 export const EMPTY_WAKE_MAX_INTERVAL_MAX_MS = 24 * 60 * 60_000;
 
 /**
+ * Run-health defaults (#127).
+ *
+ * A run is no longer cut by a wall clock. `runTimeoutMs: 0` disables the hard
+ * stop; a run that takes long is answered with soft steering after
+ * `runWarnMs` of active work plus `run_*` anomaly events. The remaining values
+ * are anomaly thresholds, not limits.
+ */
+export const DEFAULT_LOOP_RUN_TIMEOUT_MS = 0;
+export const DEFAULT_LOOP_RUN_WARN_MS = 10 * 60_000;
+export const DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS = 60;
+export const DEFAULT_LOOP_RUN_VERY_LONG_MS = 3 * 60 * 60_000;
+
+/**
  * Validate the loop block's structured settings and fill safe defaults.
  *
- * Only `emptyWakeBackoff` is validated here: it is the one part of the loop with
- * a shape that can be wrong in a way the runtime cannot recover from (a zero
- * interval would spin, a missing cap would stretch to hours). Scalars such as
+ * `emptyWakeBackoff` and the run-health scalars are validated here because a
+ * wrong shape is unrecoverable at runtime: a zero or negative watchdog silently
+ * disables the guard, a fractional one never matches, and a missing block would
+ * leave the scheduler comparing against `undefined`. Each of the run-health
+ * values accepts 0 ("disabled") and any non-negative whole number, so the
+ * historical permissive `runTimeoutMs` still works. Other scalars such as
  * `pollIntervalMs` keep their historical permissive behaviour.
  */
 export function validateLoopConfig(value: LoopConfig): LoopConfig {
@@ -139,12 +178,29 @@ export function validateLoopConfig(value: LoopConfig): LoopConfig {
 	}
 	return {
 		...value,
+		runTimeoutMs: runHealthMs(value.runTimeoutMs, "runTimeoutMs", DEFAULT_LOOP_RUN_TIMEOUT_MS),
+		runWarnMs: runHealthMs(value.runWarnMs, "runWarnMs", DEFAULT_LOOP_RUN_WARN_MS),
+		runNoOutboundTurns: runHealthMs(value.runNoOutboundTurns, "runNoOutboundTurns", DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS),
+		runVeryLongMs: runHealthMs(value.runVeryLongMs, "runVeryLongMs", DEFAULT_LOOP_RUN_VERY_LONG_MS),
 		emptyWakeBackoff: {
 			enabled: backoff.enabled,
 			afterWakes: backoff.afterWakes,
 			maxIntervalMs: backoff.maxIntervalMs,
 		},
 	};
+}
+
+/**
+ * Validate one run-health scalar: a whole number of milliseconds (or turns),
+ * `>= 0`, where 0 means "disabled". Missing or null falls back to the default so
+ * a partial block cannot leave the runtime comparing against `undefined`.
+ */
+function runHealthMs(value: unknown, key: string, fallback: number): number {
+	if (value === undefined || value === null) return fallback;
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+		throw new Error(`loop.${key} must be a whole number >= 0 (0 disables it), got "${String(value)}"`);
+	}
+	return value;
 }
 
 export interface BudgetConfig {
@@ -587,7 +643,12 @@ export const DEFAULT_CONFIG: AliveConfig = {
 	loop: {
 		pollIntervalMs: 750,
 		sleepAfterMs: 15 * 60_000,
-		runTimeoutMs: 4 * 60_000,
+		// No hard active-time stop by default (#127): a long run is warned about,
+		// not killed. Set a positive value to restore the old watchdog.
+		runTimeoutMs: DEFAULT_LOOP_RUN_TIMEOUT_MS,
+		runWarnMs: DEFAULT_LOOP_RUN_WARN_MS,
+		runNoOutboundTurns: DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS,
+		runVeryLongMs: DEFAULT_LOOP_RUN_VERY_LONG_MS,
 		maxEventsPerIdle: 8,
 		maxNudges: 3,
 		maxNudgesPerRun: 5,
@@ -816,6 +877,11 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	}
 	const fileConfig = fs.existsSync(configPath) ? readJson<Partial<AliveConfig>>(configPath, {}) : {};
 	const localConfig = fs.existsSync(localConfigPath) ? readJson<Partial<AliveConfig>>(localConfigPath, {}) : {};
+	// Rename legacy loop keys *before* the merge: defaults fill the new keys, so
+	// after the merge an old `wakeTimeoutMs` would look like "the new key is
+	// present" and be dropped. That mattered once `runTimeoutMs` defaulted to 0
+	// (#127): an old config that asked for a hard stop must keep it.
+	for (const raw of [fileConfig, localConfig, options.overrides]) migrateRawLoopConfig(raw);
 	const merged = deepMerge(deepMerge(deepMerge(defaults, fileConfig), localConfig), options.overrides);
 	// Env fills fields the file no longer carries; an explicit plaintext value the
 	// migration refused to move keeps winning, so a conflicting shared variable
@@ -832,6 +898,14 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	merged.piAgentDir = expandHome(merged.piAgentDir);
 	const paths = resolvePaths(path.dirname(configPath), merged);
 	return { config: merged, paths };
+}
+
+/** Apply `migrateLoopConfig` to the raw `loop` block of one config layer, if any. */
+function migrateRawLoopConfig(raw: Partial<AliveConfig> | undefined): void {
+	const loop = (raw as { loop?: unknown } | undefined)?.loop;
+	if (loop && typeof loop === "object" && !Array.isArray(loop)) {
+		migrateLoopConfig(loop as Record<string, unknown>);
+	}
 }
 
 /**

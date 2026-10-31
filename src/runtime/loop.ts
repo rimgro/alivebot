@@ -20,6 +20,7 @@ import {
 	type RuntimeStateFile,
 	type RuntimeStatusKind,
 } from "../store/runs.js";
+import { RunEventLog } from "../store/run-events.js";
 import { ThreadStore } from "../store/threads.js";
 import { buildAgent, readSoul } from "./session.js";
 import { hasWakeWorthyPending, WakeScheduler } from "./wake.js";
@@ -73,6 +74,7 @@ export class AliveRuntime {
 	private policy!: PolicyStore;
 	private history!: HistoryStore;
 	private runs!: RunLog;
+	private runEvents!: RunEventLog;
 	private runner!: AgentRunner;
 	private sandbox?: SandboxManager;
 	private workers?: WorkerManager;
@@ -133,6 +135,7 @@ export class AliveRuntime {
 		this.policy = new PolicyStore(paths.stateDir);
 		this.history = HistoryStore.open(paths.stateDir);
 		this.runs = new RunLog(paths.stateDir);
+		this.runEvents = new RunEventLog(paths.stateDir);
 		// The idle-wake gate (#116): a run starts only when there is something to
 		// do, so an empty idle interval costs an inbox check, not a model call.
 		this.wake = new WakeScheduler({
@@ -194,6 +197,7 @@ export class AliveRuntime {
 			toolDeps: this.toolDeps,
 			log: this.log.child("agent"),
 			thoughtsFile: paths.thoughtsFile,
+			runEvents: this.runEvents,
 			getRun: () => this.currentRun,
 			setRun: (run) => {
 				this.currentRun = run;
@@ -436,7 +440,7 @@ export class AliveRuntime {
 	private schedulerTick(): void {
 		try {
 			this.fireDueReminders();
-			this.runner.checkActiveTimeout();
+			this.runner.checkRunGuards();
 			this.writeState();
 			this.keepHeartbeatFresh();
 		} catch (err) {
@@ -620,6 +624,7 @@ export class AliveRuntime {
 			modules: this.host?.status(),
 			moduleErrors: this.moduleErrors.length > 0 ? this.moduleErrors : undefined,
 			workers: this.workers?.summary(),
+			runAnomalies: this.runEvents.list(10),
 			workerCostTodayUsd: this.workers ? Number(this.workers.usageToday().toFixed(6)) : undefined,
 		};
 	}
