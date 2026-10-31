@@ -52,6 +52,7 @@ import {
 	loadDashboard,
 	loadRootConfig,
 	loadRunDetail,
+	parseTimelineQuery,
 	readAgentSummary,
 	type DashboardProfile,
 } from "./state.js";
@@ -84,6 +85,13 @@ const SETTINGS_CSP =
 const LOGIN_CSP = SETTINGS_CSP;
 /** Authenticated pages carry only the logout form, so form actions stay same-origin. */
 const AUTH_PAGE_CSP = SETTINGS_CSP;
+/**
+ * The agent page carries one GET-only filter form (the timeline search box).
+ * Its action is the same page, and no route accepts a write there, so a
+ * same-origin form action is safe.
+ */
+const AGENT_PAGE_CSP =
+	"default-src 'none'; style-src 'unsafe-inline'; img-src data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 /** Unauthenticated non-GET checks are enabled only while a public tunnel origin is attached. */
 
 /** The dashboard can be reached on loopback only, and that is the only origin its form may target. */
@@ -853,13 +861,17 @@ export function createDashboardServer(options: DashboardServerOptions): Dashboar
 							send(res, 404, renderErrorPage(404, `unknown agent: ${route.agentId}`, renderContext), headOnly, authHeaders());
 							return;
 						}
-						const detail = loadAgentDetail(profile, { now: now() });
+						const searchParams = new URL(req.url ?? "/", "http://127.0.0.1").searchParams;
+						const detail = loadAgentDetail(profile, {
+							now: now(),
+							timelineQuery: parseTimelineQuery(searchParams),
+						});
 						send(res, 200, renderAgentPage(detail, {
 							secrets: profile.config.config.secrets,
 							env,
 							now: now(),
 							...(auth ? { auth } : {}),
-						}), headOnly, authHeaders());
+						}), headOnly, { "content-security-policy": AGENT_PAGE_CSP });
 						return;
 					}
 					case "memory": {
