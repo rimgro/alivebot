@@ -57,7 +57,7 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 	if (isolated && !options.sandbox) throw new Error("An isolated session requires a runtime-scoped SandboxManager");
 	if (isolated && cfg.extensions.length) throw new Error("Host pi extensions are disabled for isolated profiles; remove extensions or explicitly disable sandboxing");
 	const workspace = isolated ? options.sandbox!.workspaceDir : paths.workspaceDir;
-	const sandboxTools = isolated ? createSandboxTools(options.sandbox!, config) : [];
+	const sandboxTools = isolated ? createSandboxTools(options.sandbox!, config, { log }) : [];
 	// Only the explicitly configured shared-browser module may cross this boundary.
 	// Its scoped protocol is a trusted host service; the legacy host browser and
 	// dedicated engines remain unavailable to isolated profiles.

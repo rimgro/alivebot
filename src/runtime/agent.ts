@@ -12,9 +12,18 @@ import type { ThreadStore } from "../store/threads.js";
 import { renderAwakePrompt, renderInterruptPrompt, renderNudgePrompt } from "./prompt.js";
 import { TurnTraceRecorder } from "./run-trace.js";
 import { hasWakeWorthyPending } from "./wake.js";
+import { classifyNetworkError, withRetries } from "../retry.js";
 import { maskSecrets } from "../secrets.js";
 import { privateMemoryScope } from "./memory-access.js";
 import type { RunHandle, ToolDeps } from "./tools.js";
+
+/**
+ * A prompt may be retried only when the failure happened before any tool ran or
+ * any token was spent, so replaying it cannot duplicate work or billing.
+ */
+const AGENT_PROVIDER_RETRY_ATTEMPTS = 3;
+const AGENT_PROVIDER_RETRY_BASE_MS = 1_000;
+const AGENT_PROVIDER_RETRY_MAX_DELAY_MS = 15_000;
 
 export interface AgentRunnerDeps {
 	config: LoadedConfig;
@@ -55,6 +64,10 @@ export class AgentRunner {
 	private budgetRunId: string | null = null;
 	private aborting = false;
 	private interruptInFlight = false;
+	/** Interrupts an in-flight provider-retry backoff when the run is stopped. */
+	private promptRetryAbort?: AbortController;
+	/** Tool executions started in the current run; a retry must never replay past one. */
+	private toolCallsThisRun = 0;
 	/** Per-turn usage of the current run, persisted on its record (#121). */
 	private readonly turnTrace = new TurnTraceRecorder();
 
@@ -74,6 +87,12 @@ export class AgentRunner {
 	/** Set by AliveRuntime.stop() so the run record can distinguish abort from error. */
 	markAborting(): void {
 		this.aborting = true;
+		this.abortRetryDelay();
+	}
+
+	/** Interrupt a scheduled backoff, but leave an in-flight prompt to session.abort(). */
+	private abortRetryDelay(): void {
+		if (!this.session.isStreaming) this.promptRetryAbort?.abort();
 	}
 
 	/** Install listeners and the turn guard on the current session. */
@@ -115,6 +134,7 @@ export class AgentRunner {
 			limitMs: this.deps.config.config.loop.runTimeoutMs,
 			activeMs: Date.now() - since,
 		});
+		this.abortRetryDelay();
 		void this.session.abort();
 	}
 
@@ -131,8 +151,11 @@ export class AgentRunner {
 		if (options.requireEvents && !hasWakeWorthyPending(store)) return null;
 
 		const statsBefore = this.session.getSessionStats();
+		const retryAbort = new AbortController();
+		this.promptRetryAbort = retryAbort;
 		const startedAt = Date.now();
 		this.turnTrace.reset();
+		this.toolCallsThisRun = 0;
 		const run: RunHandle = {
 			id: `run_${startedAt.toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
 			index: runs.nextIndex(),
@@ -184,7 +207,31 @@ export class AgentRunner {
 					: await this.renderNudge(run, options.redeliveryRange);
 				first = false;
 				run.promptChars += prompt.length;
-				await this.session.prompt(prompt, { expandPromptTemplates: false, source: "extension" });
+				const tokensBeforePrompt = sessionTokenTotal(this.session);
+				const turnsBeforePrompt = run.turns;
+				const toolCallsBeforePrompt = this.toolCallsThisRun;
+				await withRetries(
+					() => this.session.prompt(prompt, { expandPromptTemplates: false, source: "extension" }),
+					{
+						attempts: AGENT_PROVIDER_RETRY_ATTEMPTS,
+						baseDelayMs: AGENT_PROVIDER_RETRY_BASE_MS,
+						maxDelayMs: AGENT_PROVIDER_RETRY_MAX_DELAY_MS,
+						label: `agent ${run.id} provider`,
+						log,
+						signal: retryAbort.signal,
+						// Never replay a prompt after a tool call or token spend: the provider
+						// already did (and billed) work that a retry would duplicate. Permanent
+						// classes (auth, quota, invalid request) are rejected by the classifier.
+						shouldRetry: (caught) =>
+							!retryAbort.signal.aborted &&
+							!this.aborting &&
+							!this.deps.isStopping() &&
+							run.turns === turnsBeforePrompt &&
+							this.toolCallsThisRun === toolCallsBeforePrompt &&
+							sessionTokenTotal(this.session) <= tokensBeforePrompt &&
+							classifyNetworkError(caught).transient,
+					},
+				);
 			} catch (err) {
 				error = maskSecrets(err instanceof Error ? err.message : String(err), this.deps.config.config.secrets);
 				log.error(`run #${run.index} session error`, { error });
@@ -285,6 +332,7 @@ export class AgentRunner {
 		this.timedOutRunId = null;
 		this.budgetRunId = null;
 		this.aborting = false;
+		this.promptRetryAbort = undefined;
 
 		log.info(`run #${run.index} end`, {
 			stopReason: record.stopReason,
@@ -438,6 +486,7 @@ export class AgentRunner {
 				break;
 			}
 			case "tool_execution_start": {
+				if (run) this.toolCallsThisRun += 1;
 				const label = oneLine(JSON.stringify(event.args ?? {}), 160);
 				if (this.deps.config.config.verbose) {
 					this.deps.log.raw(`${term.dim(stamp())} ${term.cyan(`→ ${event.toolName}`)} ${term.gray(label)}`);
@@ -517,6 +566,14 @@ export class AgentRunner {
 			total: delta(before.tokens.total, after.tokens.total),
 			cost: delta(before.cost, after.cost),
 		};
+	}
+}
+
+function sessionTokenTotal(session: AgentSession): number {
+	try {
+		return session.getSessionStats().tokens?.total ?? 0;
+	} catch {
+		return 0;
 	}
 }
 

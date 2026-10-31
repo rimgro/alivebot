@@ -223,15 +223,18 @@ run**.
   остановленный или завершаемый run не повторяется;
 - профиль с `workers.providerRetries: 0`.
 
-Backoff линейный: `providerRetryDelayMs × attempt`, но не больше 60 секунд
-(при базе 5s это 5s, 10s, 15s, …). Ожидание между попытками считается
-активностью: idle-таймер на это время сбрасывается, а `stop`/shutdown прерывают
-его немедленно.
+Backoff экспоненциальный с full jitter: `providerRetryDelayMs × 2^(attempt-1)`,
+случайная величина в `[0, cap]`, не больше 60 секунд (при базе 5s это до 5s,
+10s, 20s, …). Его считает общий helper `src/retry.ts`; классификация ошибок —
+`classifyNetworkError()`, которая использует `src/workers/retry.ts`. Каждый повтор
+пишет одну строку `retry 2/4 after 1.8s: ECONNRESET` (errno или HTTP-статус, без
+URL и токенов). Ожидание между попытками считается активностью: idle-таймер на
+это время сбрасывается, а `stop`/shutdown прерывают его немедленно.
 
 | ключ | по умолчанию | смысл |
 |---|---|---|
 | `providerRetries` | `2` | дополнительные попытки внутри одного run (0 — выключить) |
-| `providerRetryDelayMs` | `5000` | база линейного backoff, мс |
+| `providerRetryDelayMs` | `5000` | база экспоненциального backoff, мс |
 
 Оба значения валидируются: `providerRetries` — целое от 0 до 10,
 `providerRetryDelayMs` — от 0 до 60000.

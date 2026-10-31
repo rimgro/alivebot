@@ -2,6 +2,7 @@ import { Type } from "typebox";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { LoadedConfig } from "../config.js";
 import { appProfileFor, getScopedInstallationToken } from "./app-auth.js";
+import { withRetries, type RetryLogger } from "../retry.js";
 
 const REPOSITORY = "rimgro/alivebot";
 const API = "https://api.github.com";
@@ -25,7 +26,7 @@ function compactPull(value: any) {
 		head: value.head?.ref, base: value.base?.ref, url: value.html_url, updated_at: value.updated_at };
 }
 
-export function createGitHubApiTool(loaded: LoadedConfig): ToolDefinition | undefined {
+export function createGitHubApiTool(loaded: LoadedConfig, log?: RetryLogger): ToolDefinition | undefined {
 	if (!appProfileFor(loaded)) return undefined;
 	return defineTool({
 		name: "github_api",
@@ -51,8 +52,8 @@ export function createGitHubApiTool(loaded: LoadedConfig): ToolDefinition | unde
 		async execute(_id, params, signal) {
 			signal?.throwIfAborted();
 			const action = params.action as Action;
-			const { token } = await getScopedInstallationToken(loaded, signal);
-			const request = async (endpoint: string, method = "GET", payload?: Record<string, unknown>) => {
+			const { token } = await getScopedInstallationToken(loaded, signal, log);
+			const send = async (endpoint: string, method: string, payload?: Record<string, unknown>) => {
 				const response = await fetch(`${API}${endpoint}`, {
 					method,
 					headers: { accept: "application/vnd.github+json", authorization: `Bearer ${token}`, "user-agent": "alive-github-api-tool", "x-github-api-version": "2022-11-28", ...(payload ? { "content-type": "application/json" } : {}) },
@@ -62,10 +63,19 @@ export function createGitHubApiTool(loaded: LoadedConfig): ToolDefinition | unde
 				const data = await response.json().catch((): Record<string, any> => ({})) as Record<string, any>;
 				if (!response.ok) {
 					const message = typeof data.message === "string" ? data.message.slice(0, 500) : "unknown GitHub API error";
-					throw new Error(`GitHub ${method} ${endpoint} failed (${response.status}): ${message}`);
+					const error = new Error(`GitHub ${method} ${endpoint} failed (${response.status}): ${message}`);
+					// Status lets the shared classifier retry 5xx/429 and stop on 401/403/422.
+					Object.assign(error, { status: response.status });
+					throw error;
 				}
 				return data;
 			};
+			// Reads are safe to repeat; a repeated write could create a duplicate issue,
+			// PR or comment, so only GET stays retryable.
+			const request = async (endpoint: string, method = "GET", payload?: Record<string, unknown>) =>
+				method === "GET"
+					? withRetries(() => send(endpoint, method, payload), { attempts: 3, baseDelayMs: 500, maxDelayMs: 5_000, label: "github api", log, signal })
+					: send(endpoint, method, payload);
 			const number = params.number as number | undefined;
 			const requireNumber = () => { if (!Number.isSafeInteger(number) || number! < 1) throw new Error(`${action} requires a positive issue/PR number`); return number!; };
 			const issueEndpoint = (n: number) => `/repos/${REPOSITORY}/issues/${n}`;
