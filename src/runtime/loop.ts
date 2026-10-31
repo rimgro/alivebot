@@ -121,6 +121,7 @@ export class AliveRuntime {
 			embeddingModel: memoryConfig.embeddingModel,
 			embeddingDimensions: memoryConfig.embeddingDimensions,
 			revisionThreshold: memoryConfig.revisionThreshold,
+			log: this.log,
 		});
 		await this.memory.init();
 		this.journal = new Journal(paths.stateDir);

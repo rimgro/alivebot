@@ -778,6 +778,87 @@ workers/usage.jsonl     расход worker-run'ов (учитывается в 
 - Telegram не имеет серверного idempotency-key, поэтому модуль ведёт durable-леджер по `deliveryKey` + номеру части. Часть, помеченная `sending` перед вызовом API, после краха не отправляется повторно (выбираем «без дубля», а не «без потери»); явные отказы API и сетевые ошибки до отправки помечаются `failed` и повторяются;
 - inbox работает в режиме at-least-once: недедуплицированное событие, попавшее в незавершённый run, будет переотдано. Продюсерам внешних событий следует задавать `dedupeKey`.
 
+## Сетевые повторы (retries)
+
+Все исходящие сетевые вызовы runtime идут через один helper — `src/retry.ts`:
+
+```ts
+withRetries(operation, {
+  attempts: 4,            // всего попыток, включая первую
+  baseDelayMs: 500,       // задержка перед второй попыткой
+  maxDelayMs: 15_000,     // потолок одной задержки
+  jitter: "full",         // full = uniform в [0, cap]; none = ровно cap
+  shouldRetry,            // дополнительный фильтр (например, «только идемпотентные вызовы»)
+  label: "telegram getUpdates",
+  log,
+  signal,                 // abort не повторяется и прерывает backoff
+  onAttempt: ({ attempt, attempts }) => { /* счётчик попыток в записи run */ },
+});
+```
+
+Задержка растёт экспоненциально (`base × 2^(n-1)`), ограничивается `maxDelayMs`
+и разыгрывается в полном jitter'е. Если провайдер прислал `Retry-After` или
+Telegram `retry_after`, он важнее расчётной задержки, но не больше 60 секунд.
+Abort (остановка runtime, `stop` worker'а, таймаут запроса) не повторяется:
+сигнал прерывает и сам backoff.
+
+Классификация одна на весь проект: `classifyNetworkError()` разворачивает
+цепочку `fetch failed <- read ECONNRESET [ECONNRESET]`, добавляет HTTP-статус и
+передаёт текст в существующий `src/workers/retry.ts`. Транзиентными считаются
+таймауты, `ECONNRESET` / `ECONNREFUSED` / `EPIPE` / `ETIMEDOUT` / `EAI_AGAIN` /
+`ENOTFOUND`, `socket hang up`, `fetch failed`, `429`, `408`, `425` и `5xx`
+(включая `529 overloaded`).
+
+**Формат лога.** На каждый повтор — ровно одна warn-строка; в ней нет URL,
+токена и тела ответа, только errno/статус:
+
+```
+retry 2/4 after 1.8s: ECONNRESET
+retry 2/2 after 500ms: HTTP 500
+retry 3/4 after 3.2s: HTTP 429
+```
+
+`label` попадает в структурированное поле JSONL-записи (`data.label`), поэтому по логу
+видно и call site, и номер попытки.
+
+**Где применено:**
+
+| Call site | Политика |
+| --- | --- |
+| Worker provider prompt (`src/workers/manager.ts`) | `workers.providerRetries` + экспоненциальный backoff до 60s; только транзиентная ошибка без tool call и без новых токенов |
+| Telegram `getUpdates` (`src/modules/telegram/module.ts`) | 2 попытки внутри цикла (сеть/429/5xx); `409` не повторяется, для него отдельное ожидание |
+| Telegram `sendMessage` / `sendFile` | 3 попытки, только transport failure или `429` (с `retry_after`) |
+| Telegram `getFile` / `downloadFile` | 2 попытки: чтение без побочных эффектов |
+| Memory embeddings (`src/store/memory.ts`) | 3 попытки, 429/5xx/сеть |
+| GitHub App и GitHub API (`src/github/*`) | 3 попытки только для `GET` (чтение) |
+
+**Никогда не повторяется:**
+
+- `400`, `401`, `403`, `404`, `422` и остальные 4xx (кроме `408`, `425`, `429`);
+- квоты и биллинг (`insufficient_quota`, `billing limit`), даже если они пришли
+  как `429`/`5xx`;
+- `model not found`, неизвестная модель, `invalid request`, `content policy`,
+  `context_length_exceeded`;
+- любой abort (остановка процесса, `stop`, таймаут вызывающего кода);
+- отправка сообщения после `5xx`: ответ мог потеряться уже после записи, поэтому
+  леджер доставки оставляет часть в `sending` («без дубля» важнее);
+- пишущие запросы GitHub (`POST`/`PATCH`/комментарии): повтор мог бы создать
+  вторую issue/PR/комментарий.
+
+**Telegram 409 на старте.** `409` означает, что токен уже поллит другой процесс
+(или остался webhook). Вместо шторма `deleteWebhook`/`getUpdates` модуль один раз
+за эпизод проверяет и снимает webhook (существующий обработчик конфликта не откатывается), а
+затем ждёт освобождения токена ограниченно, ~30 секунд (1s → 2s → 4s → 8s → 15s).
+Каждое ожидание — warn с номером попытки
+(`telegram is blocked by another poller; waiting for it to release the token`,
+`attempt: 1`). Если за 30 секунд конфликт не снят, polling возвращается к обычному
+backoff и продолжает попытки.
+
+Не входят в эту политику локальные health-probe браузерного слоя
+(`/json/version`, shared-browser `/v1/status`) и входящие HTTP-серверы
+dashboard/grafana: у первых свои короткие таймауты и циклы проверки, вторые
+ничего не отправляют наружу.
+
 ## Конфиг цикла
 
 ```json
@@ -910,9 +991,10 @@ idle for 600000 ms and was aborted"`. `workers.maxRuntimeMs` (по умолча�
 последний run; оно же упоминается в completion-событии. Транзиентные сбои
 провайдера (timeout, `ECONNRESET`, `429`, `5xx`) повторяются внутри того же run:
 `workers.providerRetries` (по умолчанию 2) и `workers.providerRetryDelayMs`
-(по умолчанию 5000, линейный backoff до 60s). Повтор невозможен после tool call
-или потраченных токенов, а также после `stop`/shutdown. Подробности — в
-[WORKERS.md](./WORKERS.md).
+(по умолчанию 5000; экспоненциальный backoff с full jitter до 60s, общий helper
+из `src/retry.ts`). Повтор невозможен после tool call или потраченных токенов,
+а также после `stop`/shutdown. Подробности — в [WORKERS.md](./WORKERS.md) и в
+разделе «Сетевые повторы».
 
 Конфиг, workflow (start → событие → send → diff → pr → remove), состояние и границы
 описаны в [WORKERS.md](./WORKERS.md).

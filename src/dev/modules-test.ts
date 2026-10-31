@@ -1793,6 +1793,178 @@ section("telegram module: outage is reported once, not spammed");
 }
 
 // ---------------------------------------------------------------------------
+section("telegram polling retries: 500 recovers, 401 stops immediately, 409 waits for the poller");
+{
+	interface PollHarness {
+		telegram: TelegramModule;
+		host: ModuleHost;
+		store: EventStore;
+		pollCalls: () => number;
+		logRecords: () => Array<{ msg?: string; data?: Record<string, unknown> }>;
+	}
+	/** Keep the poll loop parked instead of spinning on immediate empty responses. */
+	const pendingPoll = (signal?: AbortSignal | null): Promise<Response> =>
+		new Promise<Response>((_resolve, reject) => {
+			if (!signal) return;
+			const fail = () => reject(signal.reason instanceof Error ? signal.reason : new Error("getUpdates aborted"));
+			if (signal.aborted) return fail();
+			signal.addEventListener("abort", fail, { once: true });
+		});
+	const startPollHarness = async (
+		name: string,
+		getUpdates: (call: number) => Promise<Response | undefined> | Response | undefined,
+	): Promise<PollHarness> => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), `alive-telegram-retry-${name}-`));
+		const logFile = path.join(dir, "alive.log");
+		const log = new Logger({ console: false, level: "error", scope: `retry-${name}`, file: logFile });
+		const store = EventStore.open(dir);
+		const history = HistoryStore.open(dir);
+		const outbox = new Outbox(dir);
+		let pollCalls = 0;
+		const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+			const method = String(input).slice(String(input).lastIndexOf("/") + 1);
+			if (method === "getMe") return jsonResponse({ ok: true, result: { id: 1, is_bot: true, first_name: "Alive", username: "alive_bot" } });
+			if (method === "deleteWebhook") return jsonResponse({ ok: true, result: true });
+			if (method === "getUpdates") {
+				pollCalls += 1;
+				const response = await getUpdates(pollCalls);
+				return response ?? pendingPoll(init?.signal);
+			}
+			return jsonResponse({ ok: true, result: true });
+		}) as unknown as typeof fetch;
+		const config = loadConfig({
+			cwd: dir,
+			overrides: {
+				chat: { console: false, http: { enabled: false, host: "127.0.0.1", port: 0, token: "" } },
+				modules: {
+					telegram: {
+						...DEFAULT_CONFIG.modules.telegram,
+						enabled: true,
+						token: "tok",
+						tokenEnv: "ALIVE_TEST_TELEGRAM_TOKEN_UNSET",
+						allowedUserIds: ["7"],
+						pollTimeoutSec: 0,
+						typingIndicator: false,
+						ackReaction: "",
+					},
+					grafana: { ...DEFAULT_CONFIG.modules.grafana, enabled: false },
+					external: [],
+				},
+			},
+		});
+		const telegram = new TelegramModule(config.config.modules.telegram);
+		const host = new ModuleHost({
+			config,
+			log,
+			transports: [],
+			modules: [telegram],
+			ingest: (event) => store.append(event),
+			outbox: (limit) => outbox.list(limit),
+			history,
+			runtimeStatus: () => ({}),
+		});
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = fetchImpl;
+		try {
+			await host.init();
+		} finally {
+			globalThis.fetch = realFetch;
+		}
+		return {
+			telegram,
+			host,
+			store,
+			pollCalls: () => pollCalls,
+			logRecords: () =>
+				fs.existsSync(logFile)
+					? fs
+							.readFileSync(logFile, "utf8")
+							.split("\n")
+							.filter((line) => line.trim().length > 0)
+							.map((line) => JSON.parse(line) as { msg?: string; data?: Record<string, unknown> })
+					: [],
+		};
+	};
+	const updateEnvelope = (updateId: number, messageId: number) =>
+		jsonResponse({
+			ok: true,
+			result: [
+				{
+					update_id: updateId,
+					message: {
+						message_id: messageId,
+						date: 1_700_000_000,
+						chat: { id: 42, type: "private", first_name: "Alice", username: "alice" },
+						from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
+						text: "are you there?",
+					},
+				},
+			],
+		});
+	const apiError = (status: number, description: string) => jsonResponse({ ok: false, error_code: status, description });
+
+	// 500 → 200: one transient Bot API failure is retried inside the same poll.
+	{
+		const harness = await startPollHarness("500", async (call) => {
+			if (call === 1) return apiError(500, "Internal Server Error");
+			if (call === 2) return updateEnvelope(300, 21);
+			return undefined;
+		});
+		try {
+			const delivered = await waitFor(() => harness.store.peekPending(10).length > 0, 4_000);
+			const retryLine = harness.logRecords().find((record) => record.msg?.startsWith("retry 2/2 after "));
+			check("a 500 from getUpdates is retried and recovers", delivered, harness.logRecords().map((record) => record.msg));
+			check("the retry log line names the attempt and the status", retryLine?.msg?.endsWith(": HTTP 500") === true, retryLine?.msg);
+			check("the retry log record labels the call site", retryLine?.data?.label === "telegram getUpdates", retryLine?.data);
+			check("a recovered poll has no error", (harness.telegram.status() as { lastError?: string }).lastError === undefined, harness.telegram.status());
+		} finally {
+			await harness.host.stop();
+		}
+	}
+
+	// 401 → immediate stop: an invalid token is never retried.
+	{
+		const harness = await startPollHarness("401", async () => apiError(401, "Unauthorized"));
+		try {
+			await new Promise((resolve) => setTimeout(resolve, 250));
+			check("a 401 is never retried", harness.pollCalls() === 1, harness.pollCalls());
+			check(
+				"no retry line is logged for a 401",
+				!harness.logRecords().some((record) => record.msg?.startsWith("retry ")),
+				harness.logRecords().map((record) => record.msg),
+			);
+			check(
+				"the invalid token is reported as fatal",
+				harness.logRecords().some((record) => record.msg === "telegram rejected the bot token; polling stopped"),
+				harness.logRecords().map((record) => record.msg),
+			);
+		} finally {
+			await harness.host.stop();
+		}
+	}
+
+	// 409 → 200: another poller holds the token; wait for it, then resume.
+	{
+		const harness = await startPollHarness("409", async (call) => {
+			if (call === 1) return apiError(409, "Conflict: terminated by other getUpdates request");
+			if (call === 2) return updateEnvelope(400, 22);
+			return undefined;
+		});
+		try {
+			const delivered = await waitFor(() => harness.store.peekPending(10).length > 0, 6_000);
+			const warn = harness.logRecords().find((record) => record.msg === "telegram is blocked by another poller; waiting for it to release the token");
+			check("a 409 waits for the other poller instead of failing the poll", delivered, harness.logRecords().map((record) => record.msg));
+			check("the 409 warning names the attempt", warn?.data?.attempt === 1, warn?.data);
+			check("the 409 wait is bounded", warn?.data?.maxWaitMs === 30_000, warn?.data);
+			check("polling resumed after the other poller released the token", harness.pollCalls() >= 2, harness.pollCalls());
+			check("the recovered module has no error", (harness.telegram.status() as { lastError?: string }).lastError === undefined, harness.telegram.status());
+		} finally {
+			await harness.host.stop();
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 section("modules config and loader");
 {
 	const configRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-modules-config-"));

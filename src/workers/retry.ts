@@ -105,11 +105,25 @@ const TRANSIENT_PATTERNS: readonly RegExp[] = [
 	/gateway time-?out/i,
 ];
 
+/**
+ * True when the text describes a request/account problem no retry can fix
+ * (auth, invalid request, unknown model, quota/billing).
+ *
+ * Exported so the generic `src/retry.ts` classifier can keep non-retryable
+ * failures non-retryable even when a `5xx`-looking status accompanies them
+ * (e.g. a provider that reports quota exhaustion as HTTP 500).
+ */
+export function isPermanentProviderError(message: string | undefined | null): boolean {
+	const text = typeof message === "string" ? message.trim() : "";
+	if (!text) return false;
+	return NON_RETRYABLE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 /** True when another prompt in the same run may succeed where this one failed. */
 export function isTransientProviderError(message: string | undefined | null): boolean {
 	const text = typeof message === "string" ? message.trim() : "";
 	if (!text) return false;
-	if (NON_RETRYABLE_PATTERNS.some((pattern) => pattern.test(text))) return false;
+	if (isPermanentProviderError(text)) return false;
 	return TRANSIENT_PATTERNS.some((pattern) => pattern.test(text));
 }
 

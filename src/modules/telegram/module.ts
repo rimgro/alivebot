@@ -42,12 +42,16 @@ import { formatThread, isTelegramTarget, parseThread, resolveThreadRef } from ".
 import type { TelegramChat, TelegramSentMessage, TelegramUpdate } from "./types.js";
 import { normalizeUpdate, type NormalizedInbound } from "./update.js";
 import { acceptBrowserPairing } from "../browser/operator.js";
+import { classifyNetworkError, withRetries } from "../../retry.js";
 import {
 	GroqTranscriptionError,
 	transcribeWithGroq,
 } from "./voice-transcription.js";
 
 const DEFAULT_ALLOWED_UPDATES = ["message", "edited_message", "channel_post", "edited_channel_post", "callback_query"];
+
+/** A duplicate poller (409) gets a bounded wait instead of tight getUpdates retries. */
+const POLLER_CONFLICT_WAIT_MS = 30_000;
 
 /** A validated attachment, loaded and ready for one Bot API upload. */
 interface PreparedUpload {
@@ -112,6 +116,10 @@ export class TelegramModule implements AliveModule {
 	private outageStartedAt?: number;
 	private lastErrorAt?: number;
 	private lastSuccessAt?: number;
+	/** Consecutive 409s in the current conflict episode; reset by a successful poll. */
+	private pollerConflictAttempts = 0;
+	/** When the current 409 conflict episode started; bounds the wait to ~30 s. */
+	private pollerWaitStartedAt?: number;
 
 	constructor(config: TelegramConfig) {
 		this.config = config;
@@ -245,13 +253,27 @@ export class TelegramModule implements AliveModule {
 		while (!this.stopped && !this.abort.signal.aborted) {
 			try {
 				const current = state.load();
-				const updates = await api.getUpdates({
-					offset: current.offset > 0 ? current.offset : undefined,
-					limit: 100,
-					timeout: this.config.pollTimeoutSec,
-					allowed_updates: this.config.allowedUpdates.length > 0 ? this.config.allowedUpdates : DEFAULT_ALLOWED_UPDATES,
-					signal: this.abort.signal,
-				});
+				const updates = await withRetries(
+					() =>
+						api.getUpdates({
+							offset: current.offset > 0 ? current.offset : undefined,
+							limit: 100,
+							timeout: this.config.pollTimeoutSec,
+							allowed_updates: this.config.allowedUpdates.length > 0 ? this.config.allowedUpdates : DEFAULT_ALLOWED_UPDATES,
+							signal: this.abort.signal,
+						}),
+					{
+						attempts: 2,
+						baseDelayMs: 500,
+						maxDelayMs: 3_000,
+						label: "telegram getUpdates",
+						log: ctx.log,
+						signal: this.abort.signal,
+						// 409 is a duplicate-poller conflict, not a transient hiccup: it has
+						// its own bounded wait below instead of a quick retry.
+						shouldRetry: (error) => !isPollerConflict(error) && classifyNetworkError(error).transient,
+					},
+				);
 				let highest = current.offset - 1;
 				for (const update of updates) {
 					await this.handleUpdate(update);
@@ -273,6 +295,8 @@ export class TelegramModule implements AliveModule {
 				}
 				this.consecutiveFailures = 0;
 				this.outageStartedAt = undefined;
+				this.pollerConflictAttempts = 0;
+				this.pollerWaitStartedAt = undefined;
 			} catch (err) {
 				if (this.stopped || this.abort.signal.aborted) break;
 				this.counters.errors += 1;
@@ -288,13 +312,41 @@ export class TelegramModule implements AliveModule {
 				}
 				// A leftover webhook makes every getUpdates fail with 409. Startup could not
 				// clear it (offline), so retry here instead of staying deaf forever.
-				if (err instanceof TelegramApiError && err.errorCode === 409) {
-					try {
-						await api.deleteWebhook({ drop_pending_updates: false });
-						ctx.log.warn("telegram cleared a conflicting webhook; resuming polling", { error: this.lastError });
-					} catch {
-						// keep the normal backoff path below
+				// The same 409 is what a second live poller produces. The existing webhook
+				// handler is preserved (probe/clear a leftover webhook), but it runs once
+				// per conflict episode instead of on every cycle, and is followed by a
+				// bounded wait for the other poller to release the token.
+				if (isPollerConflict(err)) {
+					if (this.pollerConflictAttempts === 0) {
+						try {
+							await api.deleteWebhook({ drop_pending_updates: false });
+							ctx.log.warn("telegram cleared a conflicting webhook; resuming polling", { error: this.lastError });
+						} catch {
+							// keep the bounded wait below
+						}
 					}
+					this.pollerConflictAttempts += 1;
+					this.pollerWaitStartedAt ??= this.lastErrorAt;
+					const waitedMs = this.lastErrorAt - this.pollerWaitStartedAt;
+					if (waitedMs < POLLER_CONFLICT_WAIT_MS) {
+						const waitMs = Math.min(pollerConflictWaitMs(this.pollerConflictAttempts), POLLER_CONFLICT_WAIT_MS - waitedMs);
+						ctx.log.warn("telegram is blocked by another poller; waiting for it to release the token", {
+							attempt: this.pollerConflictAttempts,
+							maxWaitMs: POLLER_CONFLICT_WAIT_MS,
+							waitedMs,
+							waitMs,
+							error: this.lastError,
+						});
+						await sleep(waitMs, this.abort.signal);
+						if (this.stopped || this.abort.signal.aborted) break;
+						backoff = 1000;
+						continue;
+					}
+					ctx.log.warn("telegram polling is still blocked by another poller after waiting", {
+						attempt: this.pollerConflictAttempts,
+						waitedMs,
+						error: this.lastError,
+					});
 				}
 				const retryAfter = err instanceof TelegramApiError ? err.retryAfterSec : undefined;
 				const waitMs = retryAfter !== undefined ? retryAfter * 1000 : jitter(backoff);
@@ -554,11 +606,17 @@ export class TelegramModule implements AliveModule {
 		const mime = imageMime(photo);
 		// One budget for the metadata call and the streamed download, aborted with the module.
 		const signal = AbortSignal.any([this.abort.signal, AbortSignal.timeout(TELEGRAM_IMAGE_TIMEOUT_MS)]);
+		const fileId = photo.fileId;
 		try {
-			const file = await api.getFile({ file_id: photo.fileId }, { timeoutMs: TELEGRAM_IMAGE_TIMEOUT_MS, signal });
+			const file = await this.retryRead("telegram getFile", signal, () =>
+				api.getFile({ file_id: fileId }, { timeoutMs: TELEGRAM_IMAGE_TIMEOUT_MS, signal }),
+			);
 			if (file.file_size !== undefined && file.file_size > TELEGRAM_IMAGE_MAX_BYTES) return { status: "too_large" };
-			if (!file.file_path) return { status: "failed", reason: "Telegram did not provide a file path" };
-			const data = await api.downloadFile(file.file_path, { maxBytes: TELEGRAM_IMAGE_MAX_BYTES, signal });
+			const filePath = file.file_path;
+			if (!filePath) return { status: "failed", reason: "Telegram did not provide a file path" };
+			const data = await this.retryRead("telegram downloadFile", signal, () =>
+				api.downloadFile(filePath, { maxBytes: TELEGRAM_IMAGE_MAX_BYTES, signal }),
+			);
 			const relativePath = imageRelativePath(messageId, photo.fileUniqueId, mime);
 			if (ctx.workspaceFiles) {
 				await ctx.workspaceFiles.writeFile(path.posix.join(ctx.workspaceFiles.rootDir, relativePath), data);
@@ -593,11 +651,17 @@ export class TelegramModule implements AliveModule {
 		if (voice.size !== undefined && voice.size > config.maxBytes) return { status: "too_large" };
 
 		const signal = AbortSignal.any([this.abort.signal, AbortSignal.timeout(config.timeoutMs)]);
+		const fileId = voice.fileId;
 		try {
-			const file = await api.getFile({ file_id: voice.fileId }, { timeoutMs: config.timeoutMs, signal });
+			const file = await this.retryRead("telegram getFile", signal, () =>
+				api.getFile({ file_id: fileId }, { timeoutMs: config.timeoutMs, signal }),
+			);
 			if (file.file_size !== undefined && file.file_size > config.maxBytes) return { status: "too_large" };
-			if (!file.file_path) return { status: "failed", reason: "Telegram did not provide a file path" };
-			const audio = await api.downloadFile(file.file_path, { maxBytes: config.maxBytes, signal });
+			const filePath = file.file_path;
+			if (!filePath) return { status: "failed", reason: "Telegram did not provide a file path" };
+			const audio = await this.retryRead("telegram downloadFile", signal, () =>
+				api.downloadFile(filePath, { maxBytes: config.maxBytes, signal }),
+			);
 			const text = await transcribeWithGroq({
 				apiKey,
 				audio,
@@ -770,7 +834,19 @@ export class TelegramModule implements AliveModule {
 		}
 		ledger?.markSending(key, chatId);
 		try {
-			const sent = await send();
+			// A send is retried only when Telegram certainly did not accept it
+			// (transport failure) or explicitly asked to slow down (429): repeating a
+			// 5xx after a possible write could post a duplicate. `retry_after` is
+			// honoured by the helper's classifier.
+			const sent = await withRetries(send, {
+				attempts: 3,
+				baseDelayMs: 500,
+				maxDelayMs: 5_000,
+				label: "telegram sendMessage",
+				log: this.ctx?.log,
+				signal: this.abort.signal,
+				shouldRetry: shouldRetryTelegramSend,
+			});
 			ledger?.markSent(key, chatId, sent.message_id);
 			return sent;
 		} catch (err) {
@@ -781,6 +857,23 @@ export class TelegramModule implements AliveModule {
 			if (network || rejected) ledger?.markFailed(key, chatId, message(err));
 			throw err;
 		}
+	}
+
+	/**
+	 * Retry a read-only Bot API call (`getFile`, `downloadFile`).
+	 *
+	 * Reads have no side effects, so network hiccups, 429 and 5xx are repeatable.
+	 * Abort (module stop or the per-call timeout) is never retried.
+	 */
+	private retryRead<T>(label: string, signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+		return withRetries(operation, {
+			attempts: 2,
+			baseDelayMs: 500,
+			maxDelayMs: 2_000,
+			label,
+			log: this.ctx?.log,
+			signal,
+		});
 	}
 
 	/** One text chunk of an outbound message, with the plain-text fallback for broken markup. */
@@ -908,15 +1001,27 @@ export class TelegramModule implements AliveModule {
 		const caption = input.caption === undefined
 			? undefined
 			: maskSecrets(input.caption, ctx.config.secrets, process.env, new MaskContext());
-		const sent = await api.sendFile({
-			chat_id: ref.chatId,
-			file: { data, name, mime: mimeForFile(name) },
-			field,
-			caption,
-			parse_mode: this.config.parseMode || undefined,
-			message_thread_id: ref.topicId !== undefined ? Number(ref.topicId) : undefined,
-			reply_to_message_id: replyTo,
-		});
+		const sent = await withRetries(
+			() =>
+				api.sendFile({
+					chat_id: ref.chatId,
+					file: { data, name, mime: mimeForFile(name) },
+					field,
+					caption,
+					parse_mode: this.config.parseMode || undefined,
+					message_thread_id: ref.topicId !== undefined ? Number(ref.topicId) : undefined,
+					reply_to_message_id: replyTo,
+				}),
+			{
+				attempts: 3,
+				baseDelayMs: 500,
+				maxDelayMs: 5_000,
+				label: "telegram sendFile",
+				log: ctx.log,
+				signal: this.abort.signal,
+				shouldRetry: shouldRetryTelegramSend,
+			},
+		);
 		this.stopTyping(input.thread);
 		ctx.history.append({
 			id: `telegram:${ref.chatId}:${sent.message_id}`,
@@ -1121,6 +1226,27 @@ function voiceAnnotation(result: VoiceTranscriptionResult, config: TelegramTrans
 		case "failed":
 			return `voice transcription unavailable: ${result.reason}`;
 	}
+}
+
+/** Telegram returns 409 when another poller or a leftover webhook owns the token. */
+function isPollerConflict(err: unknown): boolean {
+	return err instanceof TelegramApiError && err.errorCode === 409;
+}
+
+/**
+ * A Bot API write may be repeated only when it certainly did not take effect:
+ * a transport failure ("never reached Telegram") or an explicit 429. A 5xx is
+ * ambiguous (the message may have been accepted before the response was lost),
+ * so it is left `sending` by the delivery ledger and never re-sent here.
+ */
+function shouldRetryTelegramSend(err: unknown): boolean {
+	if (!(err instanceof TelegramApiError)) return false;
+	return err.network || err.errorCode === 429;
+}
+
+/** Bounded 409 wait: 1s, 2s, 4s, 8s, 15s ≈ 30s in total. */
+function pollerConflictWaitMs(attempt: number): number {
+	return Math.min(1000 * 2 ** Math.min(Math.max(attempt, 1) - 1, 4), 15_000);
 }
 
 function mibLabel(bytes: number): string {

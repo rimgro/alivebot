@@ -10,6 +10,7 @@ import { guestPath as resolveGuestPath, type SandboxManager, type VirtualFiles }
 import type { LoadedConfig } from "../config.js";
 import { createGitHubAuthTool } from "../github/app-auth.js";
 import { createGitHubApiTool } from "../github/api-tool.js";
+import type { RetryLogger } from "../retry.js";
 
 const result = (text: string, details: unknown = undefined) => ({ content: [{ type: "text" as const, text }], details });
 
@@ -20,6 +21,8 @@ const result = (text: string, details: unknown = undefined) => ({ content: [{ ty
 export interface SandboxToolsOptions {
 	/** Guest root the tools operate in. Defaults to the agent workspace. */
 	rootDir?: string;
+	/** Retry log sink for network tools; absent in unit tests. */
+	log?: RetryLogger;
 }
 
 export function createSandboxTools(manager: SandboxManager, loaded?: LoadedConfig, options: SandboxToolsOptions = {}): ToolDefinition[] {
@@ -230,7 +233,7 @@ export function createSandboxTools(manager: SandboxManager, loaded?: LoadedConfi
 			return result(JSON.stringify(status, null, 2), status);
 		},
 	});
-	const githubAuth = loaded ? createGitHubAuthTool(manager, loaded) : undefined;
-	const githubApi = loaded ? createGitHubApiTool(loaded) : undefined;
+	const githubAuth = loaded ? createGitHubAuthTool(manager, loaded, options.log) : undefined;
+	const githubApi = loaded ? createGitHubApiTool(loaded, options.log) : undefined;
 	return [read, ...guarded, bash, ls, ...searchTools, fileTool, control, ...(githubAuth ? [githubAuth] : []), ...(githubApi ? [githubApi] : [])] as ToolDefinition[];
 }
