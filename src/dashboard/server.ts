@@ -226,6 +226,12 @@ export interface DashboardTunnelOptions {
 	enabled?: boolean;
 	start?: (url: string, signal: AbortSignal) => Promise<QuickTunnel>;
 	cloudflared?: string;
+	/**
+	 * An externally terminated HTTPS origin (reverse proxy / rathole on a VPS).
+	 * When set, cloudflared is not started: the loopback server simply trusts
+	 * this origin for Origin/Host checks and ticket links.
+	 */
+	publicUrl?: string;
 }
 
 export interface DashboardRunOptions extends DashboardServerOptions {
@@ -440,8 +446,27 @@ function clientIp(req: http.IncomingMessage, exposed: boolean): string {
 function originAndHostAllowed(req: http.IncomingMessage, publicOrigin: string): boolean {
 	const host = headerValue(req.headers.host)?.trim().toLowerCase();
 	if (!host) return false;
+	let publicHost: string;
+	try {
+		publicHost = new URL(publicOrigin).host.toLowerCase();
+	} catch {
+		return false;
+	}
 	const rawOrigin = headerValue(req.headers.origin);
 	if (!rawOrigin) return false;
+	// Chrome serialises the Origin of a same-origin form POST as the literal
+	// "null" whenever the document was served with `Referrer-Policy: no-referrer`
+	// (every dashboard page is), so the serialised origin cannot carry the host.
+	// The browser still labels the request: `Sec-Fetch-Site: same-origin` is set by
+	// the user agent and a cross-site form can never produce it, so it is the
+	// trustworthy signal. Fail closed when it is missing (old clients, curl).
+	if (rawOrigin.trim().toLowerCase() === "null") {
+		const site = headerValue(req.headers["sec-fetch-site"])?.trim().toLowerCase();
+		if (site !== "same-origin") return false;
+		const mode = headerValue(req.headers["sec-fetch-mode"])?.trim().toLowerCase();
+		if (mode !== undefined && mode !== "navigate" && mode !== "same-origin") return false;
+		return host === publicHost || isLoopbackHostHeader(host);
+	}
 	let origin: URL;
 	try {
 		origin = new URL(rawOrigin);
@@ -451,12 +476,6 @@ function originAndHostAllowed(req: http.IncomingMessage, publicOrigin: string): 
 	if (origin.protocol !== "http:" && origin.protocol !== "https:") return false;
 	if (origin.username || origin.password) return false;
 	if (origin.host.toLowerCase() !== host) return false;
-	let publicHost: string;
-	try {
-		publicHost = new URL(publicOrigin).host.toLowerCase();
-	} catch {
-		return false;
-	}
 	if (host === publicHost) return origin.protocol === "https:";
 	return isLoopbackHostHeader(host);
 }
@@ -1005,7 +1024,9 @@ export async function runDashboard(options: DashboardRunOptions): Promise<void> 
 	const safeLog = (line: string): void => {
 		log(maskSecrets(line, DEFAULT_SECRETS_CONFIG, env, createMaskContext()));
 	};
-	const tunnelRequested = options.tunnel?.enabled === true;
+	const externalPublicUrl =
+		options.tunnel?.publicUrl === undefined ? undefined : validateDashboardPublicUrl(options.tunnel.publicUrl);
+	const tunnelRequested = options.tunnel?.enabled === true || externalPublicUrl !== undefined;
 	const host = options.host ?? DEFAULT_DASHBOARD_HOST;
 	if (tunnelRequested) {
 		if (!isLoopbackDashboardHost(host)) {
@@ -1027,7 +1048,16 @@ export async function runDashboard(options: DashboardRunOptions): Promise<void> 
 	externalSignal?.addEventListener("abort", abort, { once: true });
 	let tunnel: QuickTunnel | undefined;
 	try {
-		if (tunnelRequested) {
+		if (externalPublicUrl !== undefined) {
+			validateTunnelAccess({
+				host,
+				publicUrl: externalPublicUrl,
+				hasPassword: options.auth ? hasDashboardPassword(options.auth.stateDir) : false,
+			});
+			dashboard.setPublicOrigin(externalPublicUrl);
+			safeLog(`dashboard public HTTPS URL: ${externalPublicUrl} (externally terminated; no quick tunnel)`);
+			safeLog("press Ctrl+C to stop");
+		} else if (tunnelRequested) {
 			const start = options.tunnel?.start
 				?? ((url: string, signal: AbortSignal) => startQuickTunnel(url, signal, options.tunnel?.cloudflared));
 			tunnel = await start(localUrl, controller.signal);

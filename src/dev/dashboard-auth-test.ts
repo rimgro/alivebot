@@ -7,6 +7,7 @@
  * quick-tunnel factory. No network and no cloudflared process.
  */
 import * as fs from "node:fs";
+import * as http from "node:http";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -250,6 +251,40 @@ async function main(): Promise<void> {
 			redirect: "manual",
 		});
 		check("foreign Origin on non-GET is 403 even with a valid session + CSRF", foreign.status === 403, foreign.status);
+
+		// Chrome serialises the Origin of a same-origin form post as "null" on pages
+		// served with Referrer-Policy: no-referrer (every dashboard page is). The check
+		// must accept exactly that case — and nothing broader. `fetch` strips Sec-*
+		// headers (forbidden header names), so drive these with node:http instead.
+		const rawPost = (headers: Record<string, string>, value = "definitely wrong"): Promise<{ status: number; location?: string }> =>
+			new Promise((resolve, reject) => {
+				const payload = new URLSearchParams({ password: value }).toString();
+				const request = http.request(
+					{
+						host: "127.0.0.1",
+						port: address.port,
+						path: "/login",
+						method: "POST",
+						headers: {
+							"content-type": "application/x-www-form-urlencoded",
+							"content-length": String(Buffer.byteLength(payload)),
+							...headers,
+						},
+					},
+					(response) => {
+						response.resume();
+						resolve({ status: response.statusCode ?? 0, location: response.headers.location });
+					},
+				);
+				request.on("error", reject);
+				request.end(payload);
+			});
+		const nullSameOrigin = await rawPost({ origin: "null", "sec-fetch-site": "same-origin", "sec-fetch-mode": "navigate" });
+		check("Origin:null + Sec-Fetch-Site:same-origin is accepted", nullSameOrigin.status === 401, nullSameOrigin.status);
+		const nullCrossSite = await rawPost({ origin: "null", "sec-fetch-site": "cross-site", "sec-fetch-mode": "navigate" });
+		check("Origin:null from a cross-site document is 403", nullCrossSite.status === 403, nullCrossSite.status);
+		const nullNoSite = await rawPost({ origin: "null" });
+		check("Origin:null without Sec-Fetch-Site fails closed", nullNoSite.status === 403, nullNoSite.status);
 
 		const noCsrf = await fetch(`${baseUrl}/logout`, {
 			method: "POST",

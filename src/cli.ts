@@ -1443,6 +1443,8 @@ const DASHBOARD_USAGE =
 	"  --serve             serve the dashboard (also the default with no action flag)\n" +
 	"  --tunnel            serve and expose the loopback dashboard through a temporary\n" +
 	"                      HTTPS quick tunnel (implies --serve; requires a password)\n" +
+	"  --public-url URL    serve and attach a permanent HTTPS origin terminated elsewhere\n" +
+	"                      (reverse proxy / rathole; no cloudflared is started)\n" +
 	"  --port PORT         TCP port (default 7777)\n" +
 	"  --host HOST         127.0.0.1 or localhost; any other host is refused\n" +
 	"  --config FILE       profile config (default ./alive.config.json)\n" +
@@ -1468,6 +1470,7 @@ async function dashboardCommand(cwd: string, flags: Record<string, string | bool
 		"config",
 		"serve",
 		"tunnel",
+		"public-url",
 		"ttl-hours",
 		"set-password",
 		"revoke-sessions",
@@ -1495,7 +1498,15 @@ async function dashboardCommand(cwd: string, flags: Record<string, string | bool
 
 	const setPasswordFlag = flags["set-password"];
 	const revokeSessions = flagBool(flags, "revoke-sessions");
-	const tunnelRequested = flagBool(flags, "tunnel");
+	const publicUrlFlag = flagString(flags, "public-url");
+	if (flags["public-url"] === true) throw new Error("--public-url requires a value (an https origin)");
+	if (publicUrlFlag !== undefined && flagBool(flags, "tunnel")) {
+		throw new Error("--public-url and --tunnel are mutually exclusive: pick a permanent origin or a quick tunnel");
+	}
+	if (publicUrlFlag !== undefined && flagString(flags, "cloudflared")) {
+		throw new Error("--cloudflared does not apply to --public-url (no tunnel is started)");
+	}
+	const tunnelRequested = flagBool(flags, "tunnel") || publicUrlFlag !== undefined;
 	const explicitServe = flagBool(flags, "serve") || tunnelRequested;
 	const actionOnly = setPasswordFlag !== undefined || revokeSessions;
 	const serveRequested = explicitServe || !actionOnly;
@@ -1555,7 +1566,13 @@ async function dashboardCommand(cwd: string, flags: Record<string, string | bool
 			}
 			: {}),
 		...(tunnelRequested
-			? { tunnel: { enabled: true, ...(flagString(flags, "cloudflared") ? { cloudflared: flagString(flags, "cloudflared") } : {}) } }
+			? {
+				tunnel: {
+					enabled: true,
+					...(flagString(flags, "cloudflared") ? { cloudflared: flagString(flags, "cloudflared") } : {}),
+					...(publicUrlFlag === undefined ? {} : { publicUrl: publicUrlFlag }),
+				},
+			}
 			: {}),
 	});
 	return 0;
