@@ -1,6 +1,6 @@
 {
 	"name": "alive",
-	"version": "0.17.0",
+	"version": "0.18.0",
 	"private": true,
 	"description": "A long-lived agent runtime built on @earendil-works/pi-coding-agent: system prompt -> poll -> tool calls -> outbound messages as tool use -> poll",
 	"type": "module",
