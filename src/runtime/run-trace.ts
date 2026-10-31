@@ -90,11 +90,19 @@ export class TurnTraceRecorder {
 
 	constructor(private readonly now: () => number = Date.now) {}
 
-	/** Called when a run starts. */
-	reset(): void {
-		this.buffer = [];
+	/**
+	 * Called when a run starts. A resumed run seeds the recorder with its prior
+	 * traces and turn count so new steps continue at the next absolute index.
+	 */
+	reset(previous: { turns?: RunTurnTrace[]; count?: number } = {}): void {
+		this.buffer = (previous.turns ?? []).map((trace) => ({
+			...trace,
+			usage: { ...trace.usage },
+			tools: [...trace.tools],
+		}));
 		this.startedAt = undefined;
-		this.count = 0;
+		const lastIndex = this.buffer[this.buffer.length - 1]?.index ?? 0;
+		this.count = Math.max(previous.count ?? 0, lastIndex, this.buffer.length);
 	}
 
 	/** `turn_start`: remember when the turn began. */

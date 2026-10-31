@@ -54,7 +54,14 @@ export interface RunHandle {
 	startedAt: number;
 	/** Every event delivered to this run (opening prompt, idle returns, interrupts). */
 	events: AliveEvent[];
-	outbound: Array<{ thread: string; text: string; delivered: boolean }>;
+	/**
+	 * Messages delivered by this run. `deliveryKey` is the outbox idempotency
+	 * key; a resumed run seeds this array from its previous record so the send
+	 * path can refuse to repeat a message (#124).
+	 */
+	outbound: Array<{ thread: string; text: string; delivered: boolean; deliveryKey?: string; recipientAgentId?: string }>;
+	/** Set on a resumed run: already-recorded outbound messages must not be re-sent. */
+	dedupeOutbound?: boolean;
 	reminderIds: string[];
 	noteKeys: string[];
 	journalEntries: number;
@@ -133,6 +140,39 @@ export const ALIVE_TOOL_NAMES = [
 ] as const;
 
 type ToolResult = AgentToolResult<Record<string, unknown>>;
+
+/**
+ * Stable identity of a recorded outbound message: thread + text + delivery key.
+ * Legacy records have no key; they still compare on thread + text.
+ */
+export function outboundDeliveryKey(message: {
+	thread: string;
+	text: string;
+	deliveryKey?: string;
+}): string {
+	return `${message.thread}\u0000${message.text}\u0000${message.deliveryKey ?? ""}`;
+}
+
+/**
+ * True when `candidate` is already present in the run's outbound record.
+ *
+ * The comparison is the stored thread + text, with the delivery key used as an
+ * additional identity when both sides carry one. A candidate without a key (a
+ * fresh `send_message`) therefore still matches an earlier attempt, which is
+ * exactly what a resumed run must not send again.
+ */
+export function isOutboundRecorded(
+	outbound: ReadonlyArray<{ thread: string; text: string; deliveryKey?: string }>,
+	candidate: { thread: string; text: string; deliveryKey?: string },
+): boolean {
+	return outbound.some((recorded) =>
+		recorded.thread === candidate.thread &&
+		recorded.text === candidate.text &&
+		(candidate.deliveryKey === undefined ||
+			recorded.deliveryKey === undefined ||
+			recorded.deliveryKey === candidate.deliveryKey),
+	);
+}
 
 function ok(text: string, details: Record<string, unknown> = {}, terminate = false): ToolResult {
 	return { content: [{ type: "text", text }], details, ...(terminate ? { terminate: true } : {}) };
@@ -315,6 +355,22 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		}),
 		execute: async (_toolCallId, params): Promise<ToolResult> => {
 			const run = requireRun(deps, "message_agent");
+			if (run.dedupeOutbound) {
+				const recipient = params.to.trim();
+				const recorded = run.outbound.find(
+					(message) =>
+						message.text === params.text &&
+						(message.recipientAgentId === recipient ||
+							(message.recipientAgentId === undefined && message.thread.includes(recipient))),
+				);
+				if (recorded) {
+					log.info("resume suppressed duplicate agent message", { to: params.to, deliveryKey: recorded.deliveryKey });
+					return ok(`Message to agent ${params.to} was already delivered before the restart; not sending it again.`, {
+						deduplicated: true,
+						deliveryKey: recorded.deliveryKey,
+					});
+				}
+			}
 			let message: OutgoingMessage;
 			try {
 				message = await sendLocalAgentMessage({
@@ -334,7 +390,13 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 				log.warn("message_agent delivery failed", { to: params.to, reason });
 				throw new Error(`message_agent could not deliver to ${params.to}: ${reason}`);
 			}
-			run.outbound.push({ thread: message.thread, text: message.text, delivered: true });
+			run.outbound.push({
+				thread: message.thread,
+				text: message.text,
+				delivered: true,
+				deliveryKey: message.deliveryKey ?? message.id,
+				recipientAgentId: message.recipientAgentId,
+			});
 			deps.threads.recordOutbound(message.thread, message.ts);
 			return ok(`Message ${message.id} delivered to agent ${message.recipientAgentId}.`, {
 				delivered: true,
@@ -673,6 +735,17 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 			const run = requireRun(deps, "send_message");
 			if (!params.text.trim()) throw new Error("send_message requires non-empty text");
 			const thread = params.thread ?? defaultThread(run) ?? "console";
+			// Resume safety (#124): the run record is the source of truth. If this
+			// exact thread+text (with its stored delivery key) is already there, do
+			// not create another outbox record or send it again.
+			if (run.dedupeOutbound && isOutboundRecorded(run.outbound, { thread, text: params.text })) {
+				const recorded = run.outbound.find((message) => message.thread === thread && message.text === params.text);
+				log.info("resume suppressed duplicate outbound", { thread, deliveryKey: recorded?.deliveryKey });
+				return ok(`Already sent to ${thread} before the restart (message ${recorded?.deliveryKey ?? "recorded"}); not sending it again.`, {
+					deduplicated: true,
+					deliveryKey: recorded?.deliveryKey,
+				});
+			}
 			// Validate before the outbox record and before any delivery attempt: an
 			// escaping or oversize file, or an invalid/oversized button, must fail as a
 			// tool error, not a half-sent message.
@@ -708,7 +781,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 				ts: message.ts,
 				replyTo: params.reply_to,
 			});
-			run.outbound.push({ thread, text: params.text, delivered: message.delivered ?? false });
+			run.outbound.push({ thread, text: params.text, delivered: message.delivered ?? false, deliveryKey: message.deliveryKey ?? message.id });
 			deps.threads.recordOutbound(thread, message.ts);
 			// Log only the button shape, never callback data values.
 			log.info("outbound message", {

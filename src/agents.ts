@@ -333,7 +333,9 @@ export async function restartManagedAgent(base: LoadedConfig, idInput: string): 
 
 async function stopManagedAgentUnlocked(base: LoadedConfig, agent: ManagedAgent): Promise<void> {
 	const config = loadAgentConfig(base, agent);
-	const result = await stopRuntime(config.paths.stateDir);
+	const result = await stopRuntime(config.paths.stateDir, {
+		timeoutMs: config.config.loop.shutdownGraceMs + 5_000,
+	});
 	if (!result.stopped) throw new Error(result.error ?? `agent ${agent.id} could not be stopped`);
 }
 

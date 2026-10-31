@@ -61,7 +61,7 @@
         │      idle:      блокируется, возвращает события как вывод    │
         │                                                            │
         │  stop: sleep | stalled | timeout | budget | error |    │
-        │        aborted                                          │
+        │        interrupted | aborted                            │
         └──────────────────────────┬─────────────────────────────────┘
                                    │
               ┌────────────────────┴─────────────────────┐
@@ -257,6 +257,47 @@ awake/nudge/idle-сообщениях.
 - `maxNudgesPerRun` — предохранитель от модели, которая упорно заканчивает ход
   без `idle`/`sleep`.
 
+### 5.8.1 Плановый рестарт: drain, `interrupted` и resume (#124)
+
+**Проблема.** Остановка harness (SIGTERM/SIGINT, `alive stop`, update-watchdog)
+раньше сразу вызывала `session.abort()`: run закрывался как `aborted`, терял
+хвост работы, а следующий run перестраивал контекст с нуля. На плановые
+рестарты приходилась заметная доля spend'а.
+
+**Drain.** `AliveRuntime.stop()` больше не абортит активный run мгновенно:
+
+- `stopping` выставляется сразу, поэтому новый run не начнётся, а блокирующий
+  `idle` возвращает управление;
+- `AgentRunner.drain()` выставляет флаг `draining`: текущий tool call
+  доигрывается, `shouldStopAfterTurn` завершает pi-цикл **после** текущего шага и
+  не даёт начать следующий;
+- run пишет обычную запись `runs.jsonl` с `stopReason: "interrupted"` и
+  человекочитаемым `summary` (та же строка дописывается в journal как
+  `[interrupted] ...`);
+- всё это ограничено `loop.shutdownGraceMs` (по умолчанию 30 s, `0` = аборт
+  сразу). Если бюджет истёк, вызывается прежний `session.abort()` и run
+  закрывается как `aborted`.
+
+**Resume.** При старте, если последняя запись — `interrupted` и с её
+`finishedAt` прошло меньше `loop.resumeWindowMs` (по умолчанию 10 минут), рантайм:
+
+- переоткрывает **ту же** запись run (`id`, `index`, `startedAt` не меняются,
+  `runs.jsonl` обновляется на месте, а не дублируется) и тот же pi transcript
+  (`sessionFile` из записи; `SessionManager.open`, не новый файл);
+- отправляет служебный prompt `продолжай` с напоминанием не повторять уже
+  сделанное;
+- сохраняет и приращивает `turns`, `turnCount`, токены, `cost`, `outbound` и
+  события; дневные счётчики получают только дельту, счётчик run'ов не растёт;
+- перед продолжением перечитывает `outbound` записи: `send_message`/`message_agent`
+  не отправляют сообщение, если пара thread+text уже есть в записи (delivery key
+  сохраняется для аудита и идемпотентных повторов). Это enforced в tool-слое, а не
+  только в промпте.
+
+Если окно истекло, запись переклассифицируется в `aborted` и старт ведёт себя
+как раньше. `interrupted` — **не ошибка** в dashboard/usage: `runOutcome()`
+маппит его в отдельный outcome `interrupted`; в failed/aborted отчёт попадают
+только `error`/`timeout`/`budget`/`aborted`.
+
 ### 5.9 Изоляция от интерактивного pi
 
 **Решение.** Свой `agentDir` (`.alive/agent`), свой `SettingsManager` (in-memory),
@@ -365,7 +406,10 @@ worker'а и его pi-сессия лежат в `.alive/workers/<id>/`; при
 events[], outbound[], remindersCreated[], notesTouched[], journalEntries, idleReturns,
 interruptDeliveries, nudges, turnCount, promptChars, usage, turns?[], sleep?`
 
-`stopReason`: `slept | stalled | timeout | budget | error | aborted`.
+`stopReason`: `slept | stalled | timeout | budget | error | interrupted | aborted`.
+`interrupted` — плановый рестарт harness; такая запись может быть продолжена
+(см. 5.8.1). `sessionFile` хранит pi transcript, `summary` — краткое описание
+прерванного run'а; `outbound[]` хранит `deliveryKey` для dedupe при resume.
 Это одновременно аудит, телеметрия и «сонник» для секции `Recent runs` в промпте.
 
 `turns` — необязательный per-turn разрез стоимости, который пишется новыми

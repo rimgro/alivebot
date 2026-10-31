@@ -3,12 +3,12 @@ import * as fs from "node:fs";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { LoadedConfig } from "../config.js";
 import type { Logger } from "../log.js";
-import { appendJsonl, formatDuration, oneLine, truncate } from "../util.js";
+import { appendJsonl, formatDuration, oneLine, sleep, truncate } from "../util.js";
 import { term, stamp } from "../term.js";
 import type { AliveEvent } from "../store/events.js";
 import type { EventStore } from "../store/events.js";
 import type { PolicyStore } from "../store/policy.js";
-import type { RunLog, RunRecord, RunStopReason } from "../store/runs.js";
+import { runTurnCount, type RunLog, type RunRecord, type RunStopReason } from "../store/runs.js";
 import type { ThreadStore } from "../store/threads.js";
 import { renderAwakePrompt, renderInterruptPrompt, renderLongRunWarning, renderNudgePrompt } from "./prompt.js";
 import { TurnTraceRecorder } from "./run-trace.js";
@@ -26,6 +26,23 @@ import type { RunHandle, ToolDeps } from "./tools.js";
 const AGENT_PROVIDER_RETRY_ATTEMPTS = 3;
 const AGENT_PROVIDER_RETRY_BASE_MS = 1_000;
 const AGENT_PROVIDER_RETRY_MAX_DELAY_MS = 15_000;
+
+export interface ExecuteOptions {
+	redeliveryRange?: { fromSeq: number; toSeq: number };
+	requireEvents?: boolean;
+	/**
+	 * Continue this run instead of starting a fresh one. The record keeps its id,
+	 * index and startedAt; usage/turn/outbound counters are seeded from it and the
+	 * session gets a `продолжай` service prompt.
+	 */
+	resume?: RunRecord;
+}
+
+export interface DrainResult {
+	/** `idle`: no active execution; `drained`: finished inside the grace budget. */
+	outcome: "idle" | "drained" | "aborted";
+	durationMs: number;
+}
 
 export interface AgentRunnerDeps {
 	config: LoadedConfig;
@@ -110,6 +127,14 @@ export class AgentRunner {
 	private readonly turnTrace = new TurnTraceRecorder();
 	/** Soft run-health state for the current run (#127); reset by every `execute`. */
 	private watch: RunWatch | undefined;
+	/**
+	 * Set by a deliberate shutdown: existing work may finish its current step,
+	 * but `shouldStopAfterTurn` and the post-prompt checks end the run instead of
+	 * starting another model step.
+	 */
+	private draining = false;
+	/** Resolves when the active `execute` has written its record. */
+	private executionSettled: { promise: Promise<void>; resolve: () => void } | undefined;
 
 	constructor(deps: AgentRunnerDeps) {
 		this.deps = deps;
@@ -133,6 +158,37 @@ export class AgentRunner {
 	/** Interrupt a scheduled backoff, but leave an in-flight prompt to session.abort(). */
 	private abortRetryDelay(): void {
 		if (!this.session.isStreaming) this.promptRetryAbort?.abort();
+	}
+
+	/**
+	 * Graceful shutdown for an active run (#124).
+	 *
+	 * Sets the drain flag so the current tool call may finish and
+	 * `shouldStopAfterTurn` ends the session loop instead of starting another
+	 * model step. Waits for `execute` to write its `interrupted` record. If the
+	 * grace budget expires, falls back to the historical abort path.
+	 */
+	async drain(graceMs = this.deps.config.config.loop.shutdownGraceMs): Promise<DrainResult> {
+		const startedAt = Date.now();
+		this.draining = true;
+		this.abortRetryDelay();
+		const execution = this.executionSettled?.promise;
+		if (!execution) return { outcome: "idle", durationMs: 0 };
+		const budget = Math.max(0, graceMs);
+		const drained = await Promise.race([
+			execution.then(() => true),
+			sleep(budget).then(() => false),
+		]);
+		if (drained) return { outcome: "drained", durationMs: Date.now() - startedAt };
+		this.deps.log.warn("graceful shutdown budget expired; aborting the run", { graceMs: budget });
+		this.markAborting();
+		try {
+			await this.session.abort();
+		} catch (err) {
+			this.deps.log.warn("abort failed", { error: err instanceof Error ? err.message : String(err) });
+		}
+		await execution;
+		return { outcome: "aborted", durationMs: Date.now() - startedAt };
 	}
 
 	/** Install listeners and the turn guard on the current session. */
@@ -293,219 +349,272 @@ export class AgentRunner {
 	 * Run the agent until it sleeps or a safety limit stops it. Returns null when
 	 * `requireEvents` is set and there is nothing pending.
 	 */
-	async execute(options: { redeliveryRange?: { fromSeq: number; toSeq: number }; requireEvents?: boolean } = {}): Promise<RunRecord | null> {
+	async execute(options: ExecuteOptions = {}): Promise<RunRecord | null> {
 		const { config, store, runs, log } = this.deps;
 		if (this.deps.getRun()) throw new Error("a run is already active");
+		// A stop that lands between loop iterations must not start a new run.
+		if (this.deps.isStopping()) return null;
 
 		// An empty inbox is not a wake: no run, no model call, no spend (#116).
 		// `wake: false` events (unaddressed group chatter) count as no work here too.
-		if (options.requireEvents && !hasWakeWorthyPending(store)) return null;
+		// A resumed run is always allowed to continue: it has its own context.
+		if (options.requireEvents && !options.resume && !hasWakeWorthyPending(store)) return null;
 
-		const statsBefore = this.session.getSessionStats();
-		const retryAbort = new AbortController();
-		this.promptRetryAbort = retryAbort;
-		const startedAt = Date.now();
-		this.turnTrace.reset();
-		this.toolCallsThisRun = 0;
-		const run: RunHandle = {
-			id: `run_${startedAt.toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
-			index: runs.nextIndex(),
-			startedAt,
-			events: [],
-			outbound: [],
-			reminderIds: [],
-			noteKeys: [],
-			journalEntries: 0,
-			idleReturns: 0,
-			interruptDeliveries: 0,
-			nudges: 0,
-			turns: 0,
-			promptChars: 0,
-			inboundThreads: new Set(),
-			idling: false,
-			idleMs: 0,
-			activeSince: startedAt,
-			activeMs: 0,
-			sleepOffered: false,
-			sleepRequested: false,
-			sleepForced: false,
-			retainedThisRun: false,
-		};
-		this.deps.setRun(run);
-		this.watch = {
-			runId: run.id,
-			warningsSent: 0,
-			noOutboundFlagged: false,
-			veryLongFlagged: false,
-			repeatCount: 0,
-			repeatFlagged: false,
-		};
-		store.beginRun(run.id);
-
-		// Opening batch: everything pending that the policy does not mute.
-		const opening = this.claimDeliverable();
-		this.trackEvents(run, opening);
-
-		log.info(`run #${run.index} start`, {
-			runId: run.id,
-			events: opening.length,
-			kinds: opening.map((e) => e.kind),
-			pendingAfterClaim: store.pendingCount(),
-			resumed: Boolean(options.redeliveryRange),
+		let settle!: () => void;
+		const settled = new Promise<void>((resolve) => {
+			settle = resolve;
 		});
+		this.executionSettled = { promise: settled, resolve: settle };
+		try {
+			const previous = options.resume;
+			const statsBefore = this.session.getSessionStats();
+			const retryAbort = new AbortController();
+			this.promptRetryAbort = retryAbort;
+			this.draining = false;
+			const startedAt = Date.now();
+			this.turnTrace.reset({ turns: previous?.turns, count: previous ? runTurnCount(previous) : 0 });
+			this.toolCallsThisRun = 0;
+			const run: RunHandle = {
+				id: previous?.id ?? `run_${startedAt.toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+				index: previous?.index ?? runs.nextIndex(),
+				startedAt: previous?.startedAt ?? startedAt,
+				events: [],
+				outbound: previous ? previous.outbound.map((message) => ({ ...message })) : [],
+				reminderIds: previous ? [...previous.remindersCreated] : [],
+				noteKeys: previous ? [...previous.notesTouched] : [],
+				journalEntries: previous?.journalEntries ?? 0,
+				idleReturns: previous?.idleReturns ?? 0,
+				interruptDeliveries: previous?.interruptDeliveries ?? 0,
+				nudges: previous?.nudges ?? 0,
+				turns: previous ? runTurnCount(previous) : 0,
+				promptChars: previous?.promptChars ?? 0,
+				inboundThreads: new Set<string>(),
+				idling: false,
+				idleMs: previous?.idleMs ?? 0,
+				activeSince: startedAt,
+				activeMs: previous?.activeMs ?? 0,
+				sleepOffered: false,
+				sleepRequested: false,
+				sleepForced: false,
+				retainedThisRun: false,
+				dedupeOutbound: Boolean(previous),
+			};
+			this.deps.setRun(run);
+			this.watch = {
+				runId: run.id,
+				warningsSent: 0,
+				noOutboundFlagged: false,
+				veryLongFlagged: false,
+				repeatCount: 0,
+				repeatFlagged: false,
+			};
+			store.beginRun(run.id);
 
-		let stopReason: RunStopReason | undefined;
-		let error: string | undefined;
-		let first = true;
+			// Opening batch: everything pending that the policy does not mute.
+			const opening = this.claimDeliverable();
+			this.trackEvents(run, opening);
 
-		while (true) {
-			if (!first) this.trackEvents(run, this.claimDeliverable());
-			try {
-				const prompt = first
-					? await this.renderAwake(run, options.redeliveryRange)
-					: await this.renderNudge(run, options.redeliveryRange);
-				first = false;
-				run.promptChars += prompt.length;
-				const tokensBeforePrompt = sessionTokenTotal(this.session);
-				const turnsBeforePrompt = run.turns;
-				const toolCallsBeforePrompt = this.toolCallsThisRun;
-				await withRetries(
-					() => this.session.prompt(prompt, { expandPromptTemplates: false, source: "extension" }),
-					{
-						attempts: AGENT_PROVIDER_RETRY_ATTEMPTS,
-						baseDelayMs: AGENT_PROVIDER_RETRY_BASE_MS,
-						maxDelayMs: AGENT_PROVIDER_RETRY_MAX_DELAY_MS,
-						label: `agent ${run.id} provider`,
-						log,
-						signal: retryAbort.signal,
-						// Never replay a prompt after a tool call or token spend: the provider
-						// already did (and billed) work that a retry would duplicate. Permanent
-						// classes (auth, quota, invalid request) are rejected by the classifier.
-						shouldRetry: (caught) =>
-							!retryAbort.signal.aborted &&
-							!this.aborting &&
-							!this.deps.isStopping() &&
-							run.turns === turnsBeforePrompt &&
-							this.toolCallsThisRun === toolCallsBeforePrompt &&
-							sessionTokenTotal(this.session) <= tokensBeforePrompt &&
-							classifyNetworkError(caught).transient,
-					},
-				);
-			} catch (err) {
-				error = maskSecrets(err instanceof Error ? err.message : String(err), this.deps.config.config.secrets);
-				log.error(`run #${run.index} session error`, { error });
-				stopReason = "error";
-				break;
-			}
-
-			if (run.sleepRequested) {
-				stopReason = "slept";
-				break;
-			}
-			if (this.timedOutRunId === run.id) {
-				stopReason = "timeout";
-				break;
-			}
-			if (this.budgetRunId === run.id) {
-				stopReason = "budget";
-				break;
-			}
-			if (this.aborting || this.deps.isStopping()) {
-				stopReason = "aborted";
-				break;
-			}
-			if (run.lastStopReason === "error" || run.lastError) {
-				error = run.lastError ?? "model error";
-				stopReason = "error";
-				break;
-			}
-
-			// The model ended its turn with plain text and no idle/sleep. It is not
-			// done — it just forgot to wait. Nudge it back.
-			run.nudges += 1;
-			log.warn(`run #${run.index} stopped without idling`, { nudge: run.nudges });
-			if (run.nudges > config.config.loop.maxNudgesPerRun) {
-				stopReason = "stalled";
-				break;
-			}
-			await new Promise((resolve) => setTimeout(resolve, 250));
-		}
-
-		const finishedAt = Date.now();
-		const statsAfter = this.session.getSessionStats();
-		const usage = this.diffUsage(statsBefore, statsAfter);
-		if (!run.idling) run.activeMs += Math.max(0, finishedAt - (run.activeSince ?? finishedAt));
-
-		const reachedModel = run.lastStopReason !== undefined || run.turns > 0 || run.idleReturns > 0;
-		const redeliver = stopReason === "error" || stopReason === "timeout" || stopReason === "aborted";
-		this.deps.setRun(undefined);
-		if (reachedModel && !redeliver) {
-			store.endRun();
-		} else {
-			store.rollbackClaim();
-			log.warn(`run #${run.index} left events unacknowledged; they will be redelivered`, {
-				stopReason,
-				events: run.events.length,
-				preflight: !reachedModel,
+			log.info(`run #${run.index} start`, {
+				runId: run.id,
+				events: opening.length,
+				kinds: opening.map((e) => e.kind),
+				pendingAfterClaim: store.pendingCount(),
+				resumed: Boolean(previous || options.redeliveryRange),
 			});
-		}
 
-		if (reachedModel) {
-			const answeredThreads = [...new Set(run.outbound.map((m) => m.thread))];
-			this.deps.threads.settle(run.id, answeredThreads, [...run.inboundThreads]);
-		}
+			let stopReason: RunStopReason | undefined;
+			let error: string | undefined;
+			let first = true;
 
-		const record: RunRecord = {
-			id: run.id,
-			index: run.index,
-			startedAt: run.startedAt,
-			finishedAt,
-			durationMs: finishedAt - run.startedAt,
-			activeMs: run.activeMs,
-			idleMs: run.idleMs,
-			stopReason: stopReason ?? "stalled",
-			error,
-				events: run.events.map((e) => ({
+			while (true) {
+				if (this.draining || this.aborting || this.deps.isStopping()) {
+					stopReason = this.draining && !this.aborting ? "interrupted" : "aborted";
+					break;
+				}
+				if (!first) this.trackEvents(run, this.claimDeliverable());
+				try {
+					const awake = first
+						? await this.renderAwake(run, options.redeliveryRange)
+						: await this.renderNudge(run, options.redeliveryRange);
+					const prompt = first && previous ? resumePrompt(previous, awake) : awake;
+					first = false;
+					run.promptChars += prompt.length;
+					const tokensBeforePrompt = sessionTokenTotal(this.session);
+					const turnsBeforePrompt = run.turns;
+					const toolCallsBeforePrompt = this.toolCallsThisRun;
+					await withRetries(
+						() => this.session.prompt(prompt, { expandPromptTemplates: false, source: "extension" }),
+						{
+							attempts: AGENT_PROVIDER_RETRY_ATTEMPTS,
+							baseDelayMs: AGENT_PROVIDER_RETRY_BASE_MS,
+							maxDelayMs: AGENT_PROVIDER_RETRY_MAX_DELAY_MS,
+							label: `agent ${run.id} provider`,
+							log,
+							signal: retryAbort.signal,
+							// Never replay a prompt after a tool call or token spend: the provider
+							// already did (and billed) work that a retry would duplicate. Permanent
+							// classes (auth, quota, invalid request) are rejected by the classifier.
+							shouldRetry: (caught) =>
+								!retryAbort.signal.aborted &&
+								!this.aborting &&
+								!this.deps.isStopping() &&
+								run.turns === turnsBeforePrompt &&
+								this.toolCallsThisRun === toolCallsBeforePrompt &&
+								sessionTokenTotal(this.session) <= tokensBeforePrompt &&
+								classifyNetworkError(caught).transient,
+						},
+					);
+				} catch (err) {
+					if (this.aborting || this.draining || this.deps.isStopping()) {
+						// The fallback abort after the grace budget, or an abort raced by a
+						// stop: this is a deliberate stop, not a model failure.
+						stopReason = this.draining && !this.aborting ? "interrupted" : "aborted";
+						log.info(`run #${run.index} session stopped during shutdown`, { stopReason });
+						break;
+					}
+					error = maskSecrets(err instanceof Error ? err.message : String(err), this.deps.config.config.secrets);
+					log.error(`run #${run.index} session error`, { error });
+					stopReason = "error";
+					break;
+				}
+
+				if (run.sleepRequested) {
+					stopReason = "slept";
+					break;
+				}
+				if (this.timedOutRunId === run.id) {
+					stopReason = "timeout";
+					break;
+				}
+				if (this.budgetRunId === run.id) {
+					stopReason = "budget";
+					break;
+				}
+				if (this.draining || this.aborting || this.deps.isStopping()) {
+					stopReason = this.draining && !this.aborting ? "interrupted" : "aborted";
+					break;
+				}
+				if (run.lastStopReason === "error" || run.lastError) {
+					error = run.lastError ?? "model error";
+					stopReason = "error";
+					break;
+				}
+
+				// The model ended its turn with plain text and no idle/sleep. It is not
+				// done — it just forgot to wait. Nudge it back.
+				run.nudges += 1;
+				log.warn(`run #${run.index} stopped without idling`, { nudge: run.nudges });
+				if (run.nudges > config.config.loop.maxNudgesPerRun) {
+					stopReason = "stalled";
+					break;
+				}
+				await new Promise((resolve) => setTimeout(resolve, 250));
+			}
+
+			const finishedAt = Date.now();
+			const statsAfter = this.session.getSessionStats();
+			const segmentUsage = this.diffUsage(statsBefore, statsAfter);
+			const usage = previous ? addUsage(previous.usage, segmentUsage) : segmentUsage;
+			if (!run.idling) run.activeMs += Math.max(0, finishedAt - (run.activeSince ?? finishedAt));
+
+			const reachedModel = run.lastStopReason !== undefined || run.turns > 0 || run.idleReturns > 0;
+			const redeliver = stopReason === "error" || stopReason === "timeout" || stopReason === "aborted";
+			this.deps.setRun(undefined);
+			if (reachedModel && !redeliver) {
+				store.endRun();
+			} else {
+				store.rollbackClaim();
+				log.warn(`run #${run.index} left events unacknowledged; they will be redelivered`, {
+					stopReason,
+					events: run.events.length,
+					preflight: !reachedModel,
+				});
+			}
+
+			if (reachedModel) {
+				const answeredThreads = [...new Set(run.outbound.map((m) => m.thread))];
+				this.deps.threads.settle(run.id, answeredThreads, [...run.inboundThreads]);
+			}
+
+			// The run record itself is the durable summary. When a deliberate restart
+			// drains the run, also write an episodic line to the journal so the next
+			// context sees why the run ended without a sleep summary.
+			const summary = stopReason === "interrupted"
+				? `run #${run.index} interrupted by a planned harness restart after ${formatDuration(finishedAt - run.startedAt)}: ` +
+					`${run.events.length} event(s), ${run.turns} turn(s), ${run.outbound.length} outbound message(s); ` +
+					`resume continues the same session.`
+				: undefined;
+			if (summary) {
+				this.deps.toolDeps.journal.append(`[interrupted] ${summary}`);
+				run.journalEntries += 1;
+			}
+
+			const priorEvents = previous?.events ?? [];
+			const currentSeqs = new Set(run.events.map((event) => event.seq));
+			const events = [
+				...priorEvents.filter((event) => !currentSeqs.has(event.seq)),
+				...run.events.map((e) => ({
 					seq: e.seq,
 					kind: e.kind,
 					thread: e.thread,
 					title: e.title,
 					redelivered: this.isRedelivered(e.seq, options.redeliveryRange),
 				})),
-			outbound: run.outbound,
-			remindersCreated: run.reminderIds,
-			notesTouched: run.noteKeys,
-			journalEntries: run.journalEntries,
-			idleReturns: run.idleReturns,
-			interruptDeliveries: run.interruptDeliveries,
-			nudges: run.nudges,
-			turnCount: run.turns,
-			// Bounded per-turn trace: the page checks its sum against `usage`.
-			turns: this.turnTrace.snapshot(),
-			promptChars: run.promptChars,
-			usage,
-			sleep: run.sleepRequested ? { forced: run.sleepForced, summaryChars: run.sleepSummary?.length ?? 0 } : undefined,
-		};
+			];
+			const record: RunRecord = {
+				id: run.id,
+				index: run.index,
+				startedAt: run.startedAt,
+				finishedAt,
+				durationMs: finishedAt - run.startedAt,
+				activeMs: run.activeMs,
+				idleMs: run.idleMs,
+				stopReason: stopReason ?? "stalled",
+				error,
+				sessionFile: this.session.sessionFile,
+				summary,
+				events,
+				outbound: run.outbound,
+				remindersCreated: run.reminderIds,
+				notesTouched: run.noteKeys,
+				journalEntries: run.journalEntries,
+				idleReturns: run.idleReturns,
+				interruptDeliveries: run.interruptDeliveries,
+				nudges: run.nudges,
+				turnCount: run.turns,
+				// Bounded per-turn trace: the page checks its sum against `usage`.
+				turns: this.turnTrace.snapshot(),
+				promptChars: run.promptChars,
+				usage,
+				sleep: run.sleepRequested ? { forced: run.sleepForced, summaryChars: run.sleepSummary?.length ?? 0 } : undefined,
+			};
 
-		this.deps.runs.record(record);
-		this.timedOutRunId = null;
-		this.budgetRunId = null;
-		this.aborting = false;
-		this.watch = undefined;
-		this.promptRetryAbort = undefined;
+			this.deps.runs.record(record);
+			this.timedOutRunId = null;
+			this.budgetRunId = null;
+			this.watch = undefined;
+			this.promptRetryAbort = undefined;
 
-		log.info(`run #${run.index} end`, {
-			stopReason: record.stopReason,
-			durationMs: record.durationMs,
-			activeMs: record.activeMs,
-			idleMs: record.idleMs,
-			turns: record.turns,
-			outbound: record.outbound.length,
-			usage: usage.cost,
-		});
+			log.info(`run #${run.index} end`, {
+				stopReason: record.stopReason,
+				durationMs: record.durationMs,
+				activeMs: record.activeMs,
+				idleMs: record.idleMs,
+				turns: record.turns,
+				outbound: record.outbound.length,
+				usage: usage.cost,
+				resumed: Boolean(previous),
+			});
 
-		if (stopReason === "slept") await this.rebuildSession();
-		return record;
+			if (stopReason === "slept") await this.rebuildSession();
+			return record;
+		} finally {
+			this.aborting = false;
+			this.draining = false;
+			this.deps.setRun(undefined);
+			if (this.executionSettled?.promise === settled) this.executionSettled = undefined;
+			settle();
+		}
 	}
 
 	private get isFreshContext(): boolean {
@@ -607,6 +716,12 @@ export class AgentRunner {
 			// Only the budget guard and an explicitly configured `runTimeoutMs`
 			// can stop it; a long run is warned about, not killed (#127).
 			run.turns += 1;
+			// A deliberate shutdown lets the current tool result finish, then stops
+			// the session loop here instead of starting another model step (#124).
+			if (this.draining) {
+				this.deps.log.info(`run #${run.index} stopping after the current step (graceful shutdown)`);
+				return true;
+			}
 			if (this.deps.isBudgetExhausted()) {
 				this.budgetRunId = run.id;
 				this.deps.log.warn(`run #${run.index} stopped: budget exhausted`);
@@ -761,6 +876,33 @@ export class AgentRunner {
 			cost: delta(before.cost, after.cost),
 		};
 	}
+}
+
+function addUsage(left: RunRecord["usage"], right: RunRecord["usage"]): RunRecord["usage"] {
+	return {
+		input: left.input + right.input,
+		output: left.output + right.output,
+		cacheRead: left.cacheRead + right.cacheRead,
+		cacheWrite: left.cacheWrite + right.cacheWrite,
+		total: left.total + right.total,
+		cost: left.cost + right.cost,
+	};
+}
+
+/**
+ * The service prompt that reopens an interrupted run (#124).
+ *
+ * It is deliberately explicit about context preservation and the outbound
+ * dedupe rule: the model must continue rather than replay work it already did.
+ */
+export function resumePrompt(previous: RunRecord, awake: string): string {
+	const interruptedAt = new Date(previous.finishedAt).toISOString();
+	return [
+		`продолжай — предыдущий run #${previous.index} был прерван плановым рестартом harness (${interruptedAt}).`,
+		`Его контекст сохранён: это та же запись run и та же pi-сессия. Не начинай заново и не повторяй уже сделанное.`,
+		`В записи уже ${previous.outbound.length} outbound-сообщени(й); не отправляй их повторно.`,
+		``, awake,
+	].join("\n");
 }
 
 /** JSON with recursively sorted object keys, so identical arguments compare equal. */

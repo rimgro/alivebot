@@ -15,6 +15,8 @@ import {
 	DEFAULT_LOOP_RUN_TIMEOUT_MS,
 	DEFAULT_LOOP_RUN_VERY_LONG_MS,
 	DEFAULT_LOOP_RUN_WARN_MS,
+	DEFAULT_LOOP_RESUME_WINDOW_MS,
+	DEFAULT_LOOP_SHUTDOWN_GRACE_MS,
 	EMPTY_WAKE_MAX_INTERVAL_MAX_MS,
 	EMPTY_WAKE_MAX_INTERVAL_MIN_MS,
 	loadConfig,
@@ -443,6 +445,44 @@ section("loop run-health keys: no hard stop by default, validated thresholds (#1
 		partial,
 	);
 	fs.rmSync(root, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+section("loop shutdown/resume keys are validated (#124)");
+{
+	check(
+		"the defaults are 30 s grace and a 10 min resume window",
+		DEFAULT_CONFIG.loop.shutdownGraceMs === DEFAULT_LOOP_SHUTDOWN_GRACE_MS &&
+			DEFAULT_CONFIG.loop.resumeWindowMs === DEFAULT_LOOP_RESUME_WINDOW_MS &&
+			DEFAULT_LOOP_SHUTDOWN_GRACE_MS === 30_000 &&
+			DEFAULT_LOOP_RESUME_WINDOW_MS === 10 * 60_000,
+		DEFAULT_CONFIG.loop,
+	);
+	const overridden = validateLoopConfig({ ...DEFAULT_CONFIG.loop, shutdownGraceMs: 5_000, resumeWindowMs: 60_000 });
+	check("explicit values win", overridden.shutdownGraceMs === 5_000 && overridden.resumeWindowMs === 60_000, overridden);
+	for (const key of ["shutdownGraceMs", "resumeWindowMs"] as const) {
+		const zero = validateLoopConfig({ ...DEFAULT_CONFIG.loop, [key]: 0 });
+		check(`${key}=0 is accepted (immediate abort / no resume)`, zero[key] === 0, zero[key]);
+		for (const value of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "30000"]) {
+			let message = "";
+			try {
+				validateLoopConfig({ ...DEFAULT_CONFIG.loop, [key]: value } as never);
+			} catch (error) {
+				message = error instanceof Error ? error.message : String(error);
+			}
+			check(`${key}=${String(value)} is rejected`, message.startsWith(`loop.${key}`), message || "accepted");
+		}
+	}
+	const partial = validateLoopConfig({
+		...DEFAULT_CONFIG.loop,
+		shutdownGraceMs: undefined,
+		resumeWindowMs: null,
+	} as unknown as LoopConfig);
+	check(
+		"missing/null keys fall back to the defaults",
+		partial.shutdownGraceMs === 30_000 && partial.resumeWindowMs === 10 * 60_000,
+		partial,
+	);
 }
 
 process.stdout.write(`\n${failures === 0 ? "all config tests passed" : `${failures} config test(s) failed`}\n`);

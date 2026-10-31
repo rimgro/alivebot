@@ -94,6 +94,22 @@ export interface LoopConfig {
 	maxNudgesPerRun: number;
 	/** Allow interrupt-notification events to be steered into a running agent. */
 	interrupt: boolean;
+	/**
+	 * Hard ceiling for a graceful shutdown drain, in milliseconds.
+	 *
+	 * On SIGTERM/SIGINT/`alive stop` the runtime stops starting new steps and
+	 * waits for the in-flight tool result so the run can be closed as
+	 * `interrupted`. When this budget expires it falls back to the old abort
+	 * path (`aborted`). 0 = abort immediately. Default 30 s.
+	 */
+	shutdownGraceMs: number;
+	/**
+	 * How long an `interrupted` run may be resumed after the process restarts, in
+	 * milliseconds. A newer interrupted run reopens the same run/session and gets
+	 * a `продолжай` service prompt. Outside the window it is closed as `aborted`.
+	 * 0 = never resume. Default 10 minutes.
+	 */
+	resumeWindowMs: number;
 	/** Stretch the idle-wake interval while nothing happens (see `EmptyWakeBackoffConfig`). */
 	emptyWakeBackoff: EmptyWakeBackoffConfig;
 }
@@ -143,6 +159,10 @@ export const DEFAULT_LOOP_RUN_WARN_MS = 10 * 60_000;
 export const DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS = 60;
 export const DEFAULT_LOOP_RUN_VERY_LONG_MS = 3 * 60 * 60_000;
 
+/** Graceful-shutdown and resume defaults (#124). */
+export const DEFAULT_LOOP_SHUTDOWN_GRACE_MS = 30_000;
+export const DEFAULT_LOOP_RESUME_WINDOW_MS = 10 * 60_000;
+
 /**
  * Validate the loop block's structured settings and fill safe defaults.
  *
@@ -182,6 +202,8 @@ export function validateLoopConfig(value: LoopConfig): LoopConfig {
 		runWarnMs: runHealthMs(value.runWarnMs, "runWarnMs", DEFAULT_LOOP_RUN_WARN_MS),
 		runNoOutboundTurns: runHealthMs(value.runNoOutboundTurns, "runNoOutboundTurns", DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS),
 		runVeryLongMs: runHealthMs(value.runVeryLongMs, "runVeryLongMs", DEFAULT_LOOP_RUN_VERY_LONG_MS),
+		shutdownGraceMs: runHealthMs(value.shutdownGraceMs, "shutdownGraceMs", DEFAULT_LOOP_SHUTDOWN_GRACE_MS),
+		resumeWindowMs: runHealthMs(value.resumeWindowMs, "resumeWindowMs", DEFAULT_LOOP_RESUME_WINDOW_MS),
 		emptyWakeBackoff: {
 			enabled: backoff.enabled,
 			afterWakes: backoff.afterWakes,
@@ -649,6 +671,8 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		runWarnMs: DEFAULT_LOOP_RUN_WARN_MS,
 		runNoOutboundTurns: DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS,
 		runVeryLongMs: DEFAULT_LOOP_RUN_VERY_LONG_MS,
+		shutdownGraceMs: DEFAULT_LOOP_SHUTDOWN_GRACE_MS,
+		resumeWindowMs: DEFAULT_LOOP_RESUME_WINDOW_MS,
 		maxEventsPerIdle: 8,
 		maxNudges: 3,
 		maxNudgesPerRun: 5,

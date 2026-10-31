@@ -1174,7 +1174,14 @@ async function main(): Promise<void> {
 	check("cacheRead/cacheWrite summed", totals.cacheRead === 120 && totals.cacheWrite === 18, { cacheRead: totals.cacheRead, cacheWrite: totals.cacheWrite });
 	check("cost summed", Math.abs(totals.cost - 0.06) < 1e-9, totals.cost);
 	check("duration/active/idle summed", totals.durationMs === 32_000 && totals.activeMs === 20_000 && totals.idleMs === 12_000, totals);
-	check("outcomes map to sleep/idle/error", runOutcome("slept").key === "sleep" && runOutcome("stalled").key === "idle" && runOutcome("error").key === "error");
+	check(
+		"outcomes map to sleep/idle/interrupted/error",
+		runOutcome("slept").key === "sleep" &&
+			runOutcome("stalled").key === "idle" &&
+			runOutcome("interrupted").key === "interrupted" &&
+			runOutcome("interrupted").key !== "error" &&
+			runOutcome("error").key === "error",
+	);
 
 	section("prompt extraction");
 	const runDetail = loadRunDetail(main, "run_c")!;

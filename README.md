@@ -1034,14 +1034,31 @@ dashboard/grafana: у первых свои короткие таймауты и
     "enabled": true,          // false = всегда ждать базовый интервал
     "afterWakes": 2,          // после стольких пустых пробуждений интервал удваивается
     "maxIntervalMs": 3600000  // потолок растянутого интервала: 60 минут
-  }
+  },
+  "shutdownGraceMs": 30000,   // плановый рестарт: до 30 с ждать текущий tool result (#124)
+  "resumeWindowMs": 600000    // окно, в котором interrupted-run продолжается после старта
 }
 ```
 
 `loop.emptyWakeBackoff` проверяется при загрузке: `afterWakes` — целое от 1 до 100,
 `maxIntervalMs` — целое от 1 минуты до 24 часов. Отсутствующий или `null` блок
 заполняется значениями по умолчанию (`enabled: true`, `afterWakes: 2`,
-`maxIntervalMs: 3600000`), а не остаётся `undefined`.
+`maxIntervalMs: 3600000`), а не остаётся `undefined`. `shutdownGraceMs` и
+`resumeWindowMs` тоже проверяются как целые `>= 0`; `0` означает «абортить сразу»
+и «не возобновлять» соответственно.
+
+### Плановый рестарт не теряет run (#124)
+
+SIGTERM/SIGINT, `alive stop` и рестарт update-watchdog больше не абортят активный
+run мгновенно. Рантайм перестаёт начинать новые шаги, ждёт результат текущего
+tool call (не дольше `shutdownGraceMs`) и закрывает запись как `interrupted` с
+summary в `runs.jsonl` и journal. Если бюджет истёк — прежний `aborted`. При
+следующем старте `interrupted`-запись моложе `resumeWindowMs` переоткрывается:
+тот же `id/index/startedAt`, та же pi-сессия, служебный prompt `продолжай`,
+накопленные turns/токены/cost/outbound. Уже записанные outbound-сообщения не
+отправляются повторно (thread+text+delivery key). Более старая запись
+переклассифицируется в `aborted`. В dashboard/usage `interrupted` — отдельный
+не-error outcome.
 
 ### Run не обрывается по стенным часам (#127)
 

@@ -13,8 +13,10 @@ import { ReminderStore } from "../store/reminders.js";
 import { ThreadStore } from "../store/threads.js";
 import { NoteStore } from "../store/notes.js";
 import { Journal } from "../store/journal.js";
-import { RunLog } from "../store/runs.js";
+import { interruptedResumeDecision, RunLog, runTurnCount, type RunRecord } from "../store/runs.js";
 import { DEFAULT_POLICY, PolicyStore } from "../store/policy.js";
+import { DEFAULT_CONFIG, validateLoopConfig } from "../config.js";
+import { runOutcome } from "../dashboard/state.js";
 
 let failures = 0;
 
@@ -206,6 +208,93 @@ section("notification policy: specificity and recency win");
 	check("remove works", aliceRule !== undefined && policy.remove(aliceRule.id)?.id === aliceRule.id);
 	policy.reset();
 	check("reset restores the seed", policy.load().rules.length === DEFAULT_POLICY.rules.length, policy.load());
+}
+
+
+section("run log: a resumed record replaces its line and accumulates usage (#124)");
+{
+	const resumeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-run-resume-test-"));
+	const runs = new RunLog(resumeRoot);
+	const finishedAt = Date.now();
+	const first: RunRecord = {
+		id: "run_resume",
+		index: 7,
+		startedAt: finishedAt - 60_000,
+		finishedAt,
+		durationMs: 60_000,
+		activeMs: 55_000,
+		idleMs: 5_000,
+		stopReason: "interrupted",
+		sessionFile: "/tmp/session.jsonl",
+		summary: "interrupted by a planned harness restart",
+		events: [{ seq: 10, kind: "user_message", thread: "alice", title: "one" }],
+		outbound: [{ thread: "alice", text: "already sent", delivered: true, deliveryKey: "msg_1" }],
+		remindersCreated: [],
+		notesTouched: [],
+		journalEntries: 1,
+		idleReturns: 0,
+		interruptDeliveries: 0,
+		nudges: 0,
+		turnCount: 1,
+		promptChars: 100,
+		usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, total: 110, cost: 0.01 },
+		turns: [{ index: 1, startedAt: finishedAt - 50_000, durationMs: 1_000, usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, total: 110, cost: 0.01 }, tools: [] }],
+	};
+	runs.record(first);
+	const afterFirst = runs.usageToday();
+	const resumed: RunRecord = {
+		...first,
+		finishedAt: finishedAt + 30_000,
+		durationMs: 90_000,
+		turnCount: 2,
+		outbound: [...first.outbound, { thread: "alice", text: "after restart", delivered: true, deliveryKey: "msg_2" }],
+		events: [...first.events, { seq: 11, kind: "user_message", thread: "bob", title: "two" }],
+		usage: { input: 150, output: 15, cacheRead: 0, cacheWrite: 0, total: 165, cost: 0.015 },
+		turns: [...(first.turns ?? []), { index: 2, startedAt: finishedAt + 20_000, durationMs: 1_000, usage: { input: 50, output: 5, cacheRead: 0, cacheWrite: 0, total: 55, cost: 0.005 }, tools: [] }],
+		stopReason: "slept",
+	};
+	runs.record(resumed);
+	const all = runs.list(10);
+	const usage = runs.usageToday();
+	check("the resumed run is one line, not a duplicate", all.length === 1 && all[0]?.id === first.id && all[0]?.index === 7, all);
+	check("startedAt and outbound survive the resume", all[0]?.startedAt === first.startedAt && all[0]?.outbound.length === 2, all[0]);
+	check("usage is the accumulated total", usage.runs === afterFirst.runs && usage.turns === afterFirst.turns + 1 && usage.input === 150 && Math.abs(usage.cost - 0.015) < 1e-9, { afterFirst, usage });
+	runs.reclassify(first.id, "interrupted", "slept");
+	check("reclassify closes an expired interrupted run as aborted", runs.reclassify(first.id, "aborted", "interrupted")?.stopReason === "aborted" && runs.last()?.stopReason === "aborted", runs.last());
+	check("reclassify refuses a non-matching stop reason", runs.reclassify(first.id, "aborted", "interrupted") === undefined);
+	runs.reclassify(first.id, "interrupted", "aborted");
+	check("resume decision: recent resumes", interruptedResumeDecision(runs.last(), finishedAt + 1_000, 10 * 60_000) === "resume");
+	check("resume decision: outside the window expires", interruptedResumeDecision(runs.last(), (runs.last()?.finishedAt ?? 0) + 10 * 60_000, 10 * 60_000) === "expire");
+	check("resume decision: 0 disables", interruptedResumeDecision(runs.last(), finishedAt + 1, 0) === "expire");
+	check("runTurnCount reads the current shape", runTurnCount(runs.last()!) === 2, runs.last());
+	fs.rmSync(resumeRoot, { recursive: true, force: true });
+}
+
+section("loop shutdown/resume config is validated and interrupted is not an error (#124)");
+{
+	check(
+		"the defaults are 30 s and 10 min",
+		DEFAULT_CONFIG.loop.shutdownGraceMs === 30_000 && DEFAULT_CONFIG.loop.resumeWindowMs === 10 * 60_000,
+		DEFAULT_CONFIG.loop,
+	);
+	const accepted = validateLoopConfig({ ...DEFAULT_CONFIG.loop, shutdownGraceMs: 5_000, resumeWindowMs: 0 });
+	check("explicit values are accepted, 0 disables resume", accepted.shutdownGraceMs === 5_000 && accepted.resumeWindowMs === 0, accepted);
+	for (const key of ["shutdownGraceMs", "resumeWindowMs"] as const) {
+		for (const value of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, "30000"]) {
+			let message = "";
+			try {
+				validateLoopConfig({ ...DEFAULT_CONFIG.loop, [key]: value } as never);
+			} catch (error) {
+				message = error instanceof Error ? error.message : String(error);
+			}
+			check(`invalid ${key}=${String(value)} is rejected`, message.startsWith(`loop.${key}`), message || "accepted");
+		}
+	}
+	const partial = validateLoopConfig({ ...DEFAULT_CONFIG.loop, shutdownGraceMs: undefined, resumeWindowMs: null } as never);
+	check("missing keys fall back to the defaults", partial.shutdownGraceMs === 30_000 && partial.resumeWindowMs === 10 * 60_000, partial);
+	check("interrupted is its own successful outcome, not an error", runOutcome("interrupted").key === "interrupted" && runOutcome("interrupted").key !== "error", runOutcome("interrupted"));
+	check("aborted still maps to error", runOutcome("aborted").key === "error");
+	check("slept/stalled mappings are unchanged", runOutcome("slept").key === "sleep" && runOutcome("stalled").key === "idle");
 }
 
 process.stdout.write(

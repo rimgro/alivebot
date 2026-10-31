@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { appendJsonl, ensureDir, localDay, readJson, readJsonl, writeJsonAtomic } from "../util.js";
+import { appendJsonl, ensureDir, localDay, readJson, readJsonl, writeJsonAtomic, writeJsonlAtomic } from "../util.js";
 
 export interface RunEventSummary {
 	seq: number;
@@ -15,7 +15,25 @@ export type RunStopReason =
 	| "timeout"
 	| "budget"
 	| "error"
+	/** A deliberate harness stop (SIGTERM/SIGINT/`alive stop`/update restart). */
+	| "interrupted"
 	| "aborted";
+
+/**
+ * One message the run delivered.
+ *
+ * `deliveryKey` is the outbox idempotency key (`OutgoingMessage.deliveryKey`)
+ * written with the message. The resume path uses it together with `thread` and
+ * `text` to prove a message is already in this run before sending it again.
+ */
+export interface RunOutbound {
+	thread: string;
+	text: string;
+	delivered: boolean;
+	deliveryKey?: string;
+	/** Local agent recipient, used by resume dedupe for `message_agent`. */
+	recipientAgentId?: string;
+}
 
 export interface RunUsage {
 	input: number;
@@ -56,8 +74,12 @@ export interface RunRecord {
 	idleMs: number;
 	stopReason: RunStopReason;
 	error?: string;
+	/** Pi session file backing this run, so a resume can reopen the exact session. */
+	sessionFile?: string;
+	/** Human-readable interruption summary, written when a harness restart drains the run. */
+	summary?: string;
 	events: RunEventSummary[];
-	outbound: Array<{ thread: string; text: string; delivered: boolean }>;
+	outbound: RunOutbound[];
 	remindersCreated: string[];
 	notesTouched: string[];
 	journalEntries: number;
@@ -96,6 +118,25 @@ export function runTurnCount(record: { turnCount?: unknown; turns?: unknown }): 
 	return Array.isArray(record.turns) ? record.turns.length : 0;
 }
 
+/** What startup should do with the last persisted run (#124). */
+export type InterruptedResumeDecision = "none" | "resume" | "expire";
+
+/**
+ * Decide whether the last run is resumable. Pure clock test seam: `resume` for
+ * a recent `interrupted` run, `expire` when the window has passed (the caller
+ * closes it as `aborted`), `none` for any other stop reason or no record.
+ */
+export function interruptedResumeDecision(
+	record: RunRecord | undefined,
+	now: number,
+	windowMs: number,
+): InterruptedResumeDecision {
+	if (!record || record.stopReason !== "interrupted") return "none";
+	if (!(windowMs > 0)) return "expire";
+	const ageMs = Math.max(0, now - record.finishedAt);
+	return ageMs < windowMs ? "resume" : "expire";
+}
+
 export interface UsageBucket {
 	cost: number;
 	runs: number;
@@ -131,9 +172,46 @@ export class RunLog {
 		return this.index;
 	}
 
+	/**
+	 * Persist a run. A resumed run keeps its original id: the existing line is
+	 * replaced in place (never duplicated) and only the usage delta is added to
+	 * the daily counters, so index, startedAt, turns, tokens, cost and outbound
+	 * accumulate instead of resetting.
+	 */
 	record(record: RunRecord): void {
-		appendJsonl(this.file, record);
-		this.bumpUsage(record);
+		const all = readJsonl<RunRecord>(this.file);
+		const previousIndex = all.findIndex((candidate) => candidate.id === record.id);
+		if (previousIndex === -1) {
+			appendJsonl(this.file, record);
+			this.applyUsage(record, 1);
+			return;
+		}
+		const previous = all[previousIndex]!;
+		all[previousIndex] = record;
+		writeJsonlAtomic(this.file, all);
+		this.applyUsage(previous, -1);
+		this.applyUsage(record, 1);
+	}
+
+	/**
+	 * Close a run whose stop reason became stale (an `interrupted` run that is
+	 * older than the resume window). Usage and timing stay untouched: only the
+	 * audit outcome changes.
+	 */
+	reclassify(id: string, to: RunStopReason, from?: RunStopReason): RunRecord | undefined {
+		const all = readJsonl<RunRecord>(this.file);
+		const index = all.findIndex((candidate) => candidate.id === id && (from === undefined || candidate.stopReason === from));
+		if (index === -1) return undefined;
+		const updated = { ...all[index]!, stopReason: to };
+		all[index] = updated;
+		writeJsonlAtomic(this.file, all);
+		return updated;
+	}
+
+	/** Most recent run that ended `interrupted`, if it is the last record. */
+	lastInterrupted(): RunRecord | undefined {
+		const last = this.last();
+		return last?.stopReason === "interrupted" ? last : undefined;
 	}
 
 	list(limit = 20): RunRecord[] {
@@ -157,17 +235,33 @@ export class RunLog {
 		return (usage.runTimes ?? []).filter((ts) => ts > cutoff).length;
 	}
 
-	private bumpUsage(record: RunRecord): void {
+	/**
+	 * Add (`direction = 1`) or subtract (`direction = -1`) one record's
+	 * contribution to the daily/hourly counters. Subtracting the previous version
+	 * before adding the resumed version makes a resume a delta, not a new run.
+	 */
+	private applyUsage(record: RunRecord, direction: 1 | -1): void {
 		const usage = readJson<UsageFile>(this.usageFile, { days: {} });
 		const day = localDay(record.finishedAt);
 		const bucket = usage.days[day] ?? { cost: 0, runs: 0, turns: 0, input: 0, output: 0 };
-		bucket.cost += record.usage.cost;
-		bucket.runs += 1;
-		bucket.turns += runTurnCount(record);
-		bucket.input += record.usage.input;
-		bucket.output += record.usage.output;
-		usage.days[day] = bucket;
-		usage.runTimes = [...(usage.runTimes ?? []), record.finishedAt].filter((ts) => ts > Date.now() - 3_600_000);
+		bucket.cost += direction * record.usage.cost;
+		bucket.runs += direction;
+		bucket.turns += direction * runTurnCount(record);
+		bucket.input += direction * record.usage.input;
+		bucket.output += direction * record.usage.output;
+		if (bucket.runs <= 0 && bucket.turns <= 0 && bucket.cost <= 0 && bucket.input <= 0 && bucket.output <= 0) {
+			delete usage.days[day];
+		} else {
+			usage.days[day] = bucket;
+		}
+		const recent = (usage.runTimes ?? []).filter((ts) => ts > Date.now() - 3_600_000);
+		if (direction === 1) {
+			recent.push(record.finishedAt);
+		} else {
+			const index = recent.lastIndexOf(record.finishedAt);
+			if (index !== -1) recent.splice(index, 1);
+		}
+		usage.runTimes = recent;
 		const days = Object.keys(usage.days).sort();
 		for (const old of days.slice(0, Math.max(0, days.length - 30))) delete usage.days[old];
 		writeJsonAtomic(this.usageFile, usage);
