@@ -19,8 +19,11 @@ import {
 	type MemoryView,
 } from "./memory.js";
 import {
+	TIMELINE_KINDS,
 	formatCost,
 	formatTimestamp,
+	hasTimelineFilters,
+	timelineQueryString,
 	type AgentDetail,
 	type AgentStatus,
 	type AgentSummary,
@@ -28,6 +31,11 @@ import {
 	type RunView,
 	type SessionTurn,
 	type TimelineItem,
+	type TimelineKind,
+	type TimelinePage,
+	type TimelinePeriod,
+	type TimelineQuery,
+	type TimelineQueryOverrides,
 	type ToolCallView,
 } from "./state.js";
 import type { SettingsView } from "./settings.js";
@@ -174,6 +182,38 @@ table.mini th { color: var(--muted); font-weight: 500; white-space: nowrap; }
 .feed time { color: var(--muted); font-family: var(--mono); font-size: 11px; }
 .feed .feed-title { margin: 3px 0 2px; }
 .feed .feed-detail { color: var(--muted); font-size: 12px; margin: 0; }
+.filters {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  padding: 10px 14px;
+  margin: 0 0 18px;
+}
+.filters .filter-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; margin: 0 0 6px; }
+.filters .filter-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; min-width: 62px; }
+.filters .chip {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--link);
+  border: 1px solid var(--line);
+  padding: 1px 8px;
+  text-decoration: none;
+}
+.filters .chip.active { border-color: #5a564c; color: var(--text); background: var(--panel); }
+.filters form.filter-search { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0 2px; }
+.filters form.filter-search input[type=text] { flex: 1; min-width: 220px; width: auto; }
+.filters .filter-count { margin-left: auto; color: var(--muted); font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+.filters .filter-active { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+.filters .filter-active .reset { margin-left: 8px; }
+.feed .feed-row { display: flex; gap: 10px; align-items: baseline; }
+.feed .feed-row .feed-summary { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.feed .feed-row .feed-meta { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.feed details.feed-full { margin: 6px 0 0; padding: 0 0 0 12px; border: none; border-left: 1px solid var(--line); background: transparent; }
+.feed details.feed-full > summary { color: var(--muted); font-size: 11px; }
+.feed details.feed-full .feed-detail { margin: 6px 0; }
+.more { margin: 16px 0 0; }
 pre { font-family: var(--mono); font-size: 12px; line-height: 1.55; background: var(--panel); border: 1px solid var(--line); padding: 14px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; margin: 0 0 14px; }
 pre.prompt { max-height: 70vh; overflow-y: auto; }
 details { border: 1px solid var(--line); padding: 10px 14px; margin: 0 0 14px; background: var(--panel); }
@@ -303,21 +343,113 @@ function renderRunFacts(run: RunView, masker: Masker): string {
 </table>`;
 }
 
-function renderTimeline(items: TimelineItem[], masker: Masker): string {
-	if (items.length === 0) return `<p class="empty">No runs, sleeps, reminders or key events recorded yet.</p>`;
-	const rows = items.map((item) => {
-		const when = `<time datetime="${masker.text(Number.isFinite(item.at) ? new Date(item.at).toISOString() : "")}">${masker.text(formatTimestamp(item.at))}</time>`;
-		const badge = `<span class="badge">${masker.text(item.badge)}</span>`;
-		const link = item.href ? ` <a href="${masker.text(item.href)}">run details</a>` : "";
-		const detail = item.detail ? `<p class="feed-detail">${masker.text(item.detail)}</p>` : "";
-		const facts = item.kind === "run" && item.run ? renderRunFacts(item.run, masker) : "";
-		return `<li class="feed-item ${item.kind}">
-<div class="feed-head">${when}${badge}${link}</div>
-<div class="feed-title">${masker.text(item.title)}</div>
-${detail}${facts}
+const TIMELINE_KIND_LABELS: Record<TimelineKind, string> = {
+	run: "run",
+	sleep: "sleep",
+	reminder: "reminder",
+	event: "key event",
+};
+
+const TIMELINE_PERIOD_LABELS: Array<{ period: TimelinePeriod; label: string }> = [
+	{ period: "today", label: "today" },
+	{ period: "7d", label: "7d" },
+	{ period: "all", label: "all" },
+];
+
+/** `/agent/<id>` plus the canonical filter query string. */
+function timelineHref(
+	agentId: string,
+	query: TimelineQuery,
+	overrides: TimelineQueryOverrides,
+	masker: Masker,
+): string {
+	return `${agentHref(agentId, masker)}${masker.text(timelineQueryString(query, overrides))}`;
+}
+
+/**
+ * The sticky filter panel: kind/period links, a plain GET search form and the
+ * "shown N of M" counter. Every control is a URL, so no client JS is needed.
+ */
+function renderTimelineFilters(page: TimelinePage, agentId: string, masker: Masker): string {
+	const { query } = page;
+	const noneActive = query.kinds.length === 0;
+	const kindChips = [
+		`<a class="chip${noneActive ? " active" : ""}" href="${timelineHref(agentId, query, { kinds: [], page: 1 }, masker)}">все</a>`,
+		...TIMELINE_KINDS.map((kind) => {
+			const active = query.kinds.includes(kind);
+			const kinds = active
+				? query.kinds.filter((candidate) => candidate !== kind)
+				: TIMELINE_KINDS.filter((candidate) => candidate === kind || query.kinds.includes(candidate));
+			return `<a class="chip${active ? " active" : ""}" href="${timelineHref(agentId, query, { kinds, page: 1 }, masker)}">${masker.text(TIMELINE_KIND_LABELS[kind])}</a>`;
+		}),
+	].join("");
+	const periodChips = TIMELINE_PERIOD_LABELS.map(({ period, label }) => {
+		const active = query.period === period;
+		return `<a class="chip${active ? " active" : ""}" href="${timelineHref(agentId, query, { period, page: 1 }, masker)}">${masker.text(label)}</a>`;
+	}).join("");
+	const hidden = [
+		...query.kinds.map((kind) => `<input type="hidden" name="kind" value="${masker.text(kind)}">`),
+		query.period === "all" ? "" : `<input type="hidden" name="period" value="${masker.text(query.period)}">`,
+	].join("");
+	const active: string[] = [];
+	if (query.kinds.length > 0) {
+		active.push(`тип: ${query.kinds.map((kind) => TIMELINE_KIND_LABELS[kind]).join(", ")}`);
+	}
+	if (query.period !== "all") active.push(`период: ${query.period}`);
+	if (query.q) active.push(`поиск: «${query.q}»`);
+	const activeText = active.length > 0 ? active.join(" · ") : "не заданы — показаны все события";
+	const pageText = page.pageCount > 1
+		? ` · страница ${masker.num(page.page)} из ${masker.num(page.pageCount)}`
+		: "";
+	return `<section class="filters" aria-label="фильтры таймлайна">
+<div class="filter-row"><span class="filter-label">тип</span>${kindChips}</div>
+<div class="filter-row"><span class="filter-label">период</span>${periodChips}</div>
+<form class="filter-search" method="get" action="${agentHref(agentId, masker)}">
+${hidden}<input type="text" name="q" value="${masker.text(query.q)}" placeholder="поиск: заголовок, текст, триггер" aria-label="поиск по событиям">
+<button type="submit">найти</button>
+<span class="filter-count">показано ${masker.num(page.shown)} из ${masker.num(page.total)}${pageText}</span>
+</form>
+<p class="filter-active">активные фильтры: ${masker.text(activeText)} <a class="reset" href="${agentHref(agentId, masker)}">сбросить</a></p>
+</section>`;
+}
+
+/** One compact line per event; the old per-run table moves behind `<details>`. */
+function renderTimelineItem(item: TimelineItem, masker: Masker): string {
+	const when = `<time datetime="${masker.text(Number.isFinite(item.at) ? new Date(item.at).toISOString() : "")}">${masker.text(formatTimestamp(item.at))}</time>`;
+	const badge = `<span class="badge">${masker.text(item.badge)}</span>`;
+	const meta = item.run
+		? `<span class="feed-meta mono">${masker.text(formatCost(item.run.usage.cost))} · ${masker.num(item.run.usage.total)} tok</span>`
+		: "";
+	const detail = item.detail ? `<p class="feed-detail">${masker.text(item.detail)}</p>` : "";
+	const facts = item.kind === "run" && item.run ? renderRunFacts(item.run, masker) : "";
+	const runSummary = item.kind === "run" && item.run
+		? `<p class="feed-detail">${masker.text(
+			`${formatDuration(item.run.durationMs)} · ${item.run.turns} turns · ${item.run.triggers.length} events · ${item.run.outcome.label}`,
+		)}</p>`
+		: "";
+	const link = item.href ? `<p class="sub"><a href="${masker.text(item.href)}">run details →</a></p>` : "";
+	const full = `${runSummary}${detail}${facts}${link}`;
+	const details = full
+		? `<details class="feed-full"><summary>подробности</summary>${full}</details>`
+		: "";
+	return `<li class="feed-item ${item.kind}">
+<div class="feed-row">${when}${badge}<span class="feed-summary">${masker.text(item.title)}</span>${meta}</div>
+${details}
 </li>`;
-	});
-	return `<ol class="feed">\n${rows.join("\n")}\n</ol>`;
+}
+
+function renderTimeline(page: TimelinePage, agentId: string, masker: Masker): string {
+	if (page.total === 0) {
+		return hasTimelineFilters(page.query)
+			? `<p class="empty">по фильтрам ничего не найдено</p>`
+			: `<p class="empty">No runs, sleeps, reminders or key events recorded yet.</p>`;
+	}
+	const rows = page.items.map((item) => renderTimelineItem(item, masker));
+	const remaining = page.total - page.offset - page.shown;
+	const more = page.hasMore && page.nextPage !== undefined
+		? `<p class="more"><a href="${timelineHref(agentId, page.query, { page: page.nextPage }, masker)}">показать ещё</a> <span class="sub">осталось ${masker.num(remaining)}</span></p>`
+		: "";
+	return `<ol class="feed">\n${rows.join("\n")}\n</ol>\n${more}`;
 }
 
 export function renderIndexPage(agents: AgentSummary[], context: RenderContext): string {
@@ -362,8 +494,9 @@ export function renderAgentPage(detail: AgentDetail, context: RenderContext): st
 </table>
 
 <h2>timeline (newest first)</h2>
-<p class="note">key events are inbox events with high/interrupt priority, or runtime system/worker events; normal chat messages appear as run triggers</p>
-${renderTimeline(detail.timeline, masker)}
+<p class="note">key events are inbox events with high/interrupt priority, or runtime system/worker events; normal chat messages appear as run triggers. filters are plain GET parameters (kind, period, q, page), no JavaScript.</p>
+${renderTimelineFilters(detail.timelinePage, summary.id, masker)}
+${renderTimeline(detail.timelinePage, summary.id, masker)}
 
 <h2>pending reminders</h2>
 ${pending.length === 0 ? `<p class="empty">No pending reminders.</p>` : `<table>

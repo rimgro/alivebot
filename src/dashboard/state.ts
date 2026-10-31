@@ -424,6 +424,22 @@ export function readAgentSummary(
 
 export type TimelineKind = "run" | "sleep" | "reminder" | "event";
 
+/** Canonical order for kind filters and the filter panel. */
+export const TIMELINE_KINDS: readonly TimelineKind[] = ["run", "sleep", "reminder", "event"];
+
+export const TIMELINE_PERIODS = ["today", "7d", "all"] as const;
+export type TimelinePeriod = (typeof TIMELINE_PERIODS)[number];
+/** One page of the timeline; the page parameter is a plain GET parameter. */
+export const TIMELINE_PAGE_SIZE = 50;
+/** The search term is capped before it is compared with every item. */
+export const TIMELINE_MAX_QUERY_CHARS = 200;
+/**
+ * Upper bound on the feed built in memory. Pagination keeps the rendered page
+ * at `TIMELINE_PAGE_SIZE` rows; this cap only protects against a pathological
+ * state file, so filters still see an agent's whole recent history.
+ */
+export const TIMELINE_MAX_ITEMS = 5_000;
+
 export interface TimelineItem {
 	kind: TimelineKind;
 	at: number;
@@ -435,6 +451,180 @@ export interface TimelineItem {
 	href?: string;
 	badge: string;
 	run?: RunView;
+	/**
+	 * Untruncated text the search looks at (event text, reminder text, run
+	 * triggers). Rendered titles are shortened, so searching them alone would
+	 * miss matches past the cut.
+	 */
+	searchText?: string;
+}
+
+/**
+ * Parsed view of the timeline's GET parameters.
+ *
+ * `kind` may repeat (`?kind=run&kind=sleep`); `event` is the feed's name for
+ * a key event. `period` defaults to `all`, `q` is a case-insensitive substring
+ * search and `page` is 1-based.
+ */
+export interface TimelineQuery {
+	kinds: TimelineKind[];
+	period: TimelinePeriod;
+	q: string;
+	page: number;
+	pageSize: number;
+}
+
+export interface TimelineQueryOverrides {
+	kinds?: TimelineKind[];
+	period?: TimelinePeriod;
+	q?: string;
+	page?: number;
+}
+
+const TIMELINE_KIND_ALIASES: Record<string, TimelineKind> = {
+	run: "run",
+	sleep: "sleep",
+	reminder: "reminder",
+	event: "event",
+	"key-event": "event",
+	key_event: "event",
+};
+
+function parseTimelineKinds(params: URLSearchParams): TimelineKind[] {
+	const selected = new Set<TimelineKind>();
+	for (const raw of params.getAll("kind")) {
+		// Repeated params are canonical; comma-separated values are accepted too.
+		for (const part of raw.split(",")) {
+			const kind = TIMELINE_KIND_ALIASES[part.trim().toLowerCase()];
+			if (kind) selected.add(kind);
+		}
+	}
+	return TIMELINE_KINDS.filter((kind) => selected.has(kind));
+}
+
+export function parseTimelineQuery(
+	params: URLSearchParams,
+	options: { pageSize?: number } = {},
+): TimelineQuery {
+	const periodInput = (params.get("period") ?? "").trim().toLowerCase();
+	const period = (TIMELINE_PERIODS as readonly string[]).includes(periodInput)
+		? (periodInput as TimelinePeriod)
+		: "all";
+	const pageInput = Number.parseInt(params.get("page") ?? "", 10);
+	const page = Number.isFinite(pageInput) ? Math.min(10_000, Math.max(1, Math.trunc(pageInput))) : 1;
+	const pageSize = options.pageSize && options.pageSize > 0
+		? Math.max(1, Math.trunc(options.pageSize))
+		: TIMELINE_PAGE_SIZE;
+	return {
+		kinds: parseTimelineKinds(params),
+		period,
+		q: (params.get("q") ?? "").trim().slice(0, TIMELINE_MAX_QUERY_CHARS),
+		page,
+		pageSize,
+	};
+}
+
+/** The canonical query string for a timeline view (empty when nothing is filtered). */
+export function timelineQueryString(
+	query: TimelineQuery,
+	overrides: TimelineQueryOverrides = {},
+): string {
+	const params = new URLSearchParams();
+	for (const kind of overrides.kinds ?? query.kinds) params.append("kind", kind);
+	const period = overrides.period ?? query.period;
+	if (period !== "all") params.set("period", period);
+	const q = (overrides.q ?? query.q).trim();
+	if (q) params.set("q", q);
+	const page = overrides.page ?? query.page;
+	if (page > 1) params.set("page", String(page));
+	const encoded = params.toString();
+	return encoded ? `?${encoded}` : "";
+}
+
+export function hasTimelineFilters(query: TimelineQuery): boolean {
+	return query.kinds.length > 0 || query.period !== "all" || query.q.trim() !== "";
+}
+
+/** Local midnight, the start of "today" for `period=today`. */
+export function startOfLocalDay(ts: number): number {
+	const day = new Date(ts);
+	day.setHours(0, 0, 0, 0);
+	return day.getTime();
+}
+
+/** Everything the text search compares, lowercased. */
+export function timelineSearchText(item: TimelineItem): string {
+	const parts = [item.title, item.detail ?? "", item.badge, item.searchText ?? ""];
+	if (item.run) {
+		for (const trigger of item.run.triggers) {
+			parts.push(trigger.kind, trigger.title, trigger.thread ?? "");
+		}
+	}
+	return parts.join("\n").toLowerCase();
+}
+
+/** Apply `kind`, `period` and `q` to the feed (newest first). */
+export function filterTimeline(
+	items: TimelineItem[],
+	query: TimelineQuery,
+	options: { now?: number } = {},
+): TimelineItem[] {
+	const now = options.now ?? Date.now();
+	// `today` is the local day; `7d` is a rolling seven-day window.
+	const since = query.period === "today"
+		? startOfLocalDay(now)
+		: query.period === "7d"
+			? now - 7 * 24 * 3_600_000
+			: Number.NEGATIVE_INFINITY;
+	const kinds = new Set(query.kinds);
+	const needle = query.q.trim().toLowerCase();
+	return items.filter((item) => {
+		if (item.at < since) return false;
+		if (kinds.size > 0 && !kinds.has(item.kind)) return false;
+		if (needle && !timelineSearchText(item).includes(needle)) return false;
+		return true;
+	});
+}
+
+export interface TimelinePage {
+	/** Items on this page only (at most `pageSize`). */
+	items: TimelineItem[];
+	/** The query with the page clamped to the available range. */
+	query: TimelineQuery;
+	/** Number of items after filtering. */
+	total: number;
+	/** Items rendered on this page (`items.length`). */
+	shown: number;
+	page: number;
+	pageSize: number;
+	pageCount: number;
+	/** Index of the first item on this page. */
+	offset: number;
+	hasMore: boolean;
+	nextPage?: number;
+}
+
+/** Slice an already filtered feed into a 1-based page of `query.pageSize` items. */
+export function paginateTimeline(items: TimelineItem[], query: TimelineQuery): TimelinePage {
+	const pageSize = Math.max(1, Math.trunc(query.pageSize) || TIMELINE_PAGE_SIZE);
+	const total = items.length;
+	const pageCount = Math.max(1, Math.ceil(total / pageSize));
+	const page = Math.min(Math.max(1, Math.trunc(query.page) || 1), pageCount);
+	const offset = (page - 1) * pageSize;
+	const pageItems = items.slice(offset, offset + pageSize);
+	const hasMore = page < pageCount;
+	return {
+		items: pageItems,
+		query: { ...query, page, pageSize },
+		total,
+		shown: pageItems.length,
+		page,
+		pageSize,
+		pageCount,
+		offset,
+		hasMore,
+		nextPage: hasMore ? page + 1 : undefined,
+	};
 }
 
 export interface ReminderView {
@@ -488,6 +678,9 @@ export function buildTimeline(profile: DashboardProfile, options: TimelineOption
 			badge: `run #${run.index}`,
 			href: `/run/${profile.id}/${encodeURIComponent(run.id)}`,
 			run,
+			// The run item searches its triggers, not just the shortened title.
+			searchText: run.triggers.map((event) =>
+				`${event.kind} ${event.thread ?? ""} ${event.title}`).join("\n"),
 		});
 		if (run.stopReason === "slept" || run.sleep) {
 			items.push({
@@ -512,6 +705,7 @@ export function buildTimeline(profile: DashboardProfile, options: TimelineOption
 			title: `reminder scheduled: ${oneLine(reminder.text, 120)}`,
 			detail: `due ${formatTimestamp(reminder.dueAt)}${reminder.thread ? ` · thread ${reminder.thread}` : ""}`,
 			badge: "reminder",
+			searchText: reminder.text,
 		});
 		if (reminder.firedAt) {
 			items.push({
@@ -521,6 +715,7 @@ export function buildTimeline(profile: DashboardProfile, options: TimelineOption
 				title: `reminder fired: ${oneLine(reminder.text, 120)}`,
 				detail: `due ${formatTimestamp(reminder.dueAt)}`,
 				badge: "reminder",
+				searchText: reminder.text,
 			});
 		}
 		if (reminder.cancelledAt) {
@@ -531,6 +726,7 @@ export function buildTimeline(profile: DashboardProfile, options: TimelineOption
 				title: `reminder cancelled: ${oneLine(reminder.text, 120)}`,
 				detail: `due ${formatTimestamp(reminder.dueAt)}`,
 				badge: "reminder",
+				searchText: reminder.text,
 			});
 		}
 	}
@@ -544,32 +740,46 @@ export function buildTimeline(profile: DashboardProfile, options: TimelineOption
 			title: `${event.kind}: ${oneLine(event.title, 120)}`,
 			detail: `priority ${event.priority} · source ${event.source}${event.thread ? ` · thread ${event.thread}` : ""} — ${oneLine(event.text, 240)}`,
 			badge: `event ${event.kind}`,
+			// The detail paragraph shortens the event text; search the full text.
+			searchText: `${event.title}\n${event.text}\n${event.source} ${event.kind}`,
 		});
 	}
 
 	items.sort((left, right) => right.at - left.at);
-	return items.slice(0, options.limit ?? 200);
+	return items.slice(0, options.limit ?? TIMELINE_MAX_ITEMS);
 }
 
 export interface AgentDetail {
 	summary: AgentSummary;
 	runtime: RuntimeStateFile | null;
+	/** Items on the current timeline page (filtered and paginated). */
 	timeline: TimelineItem[];
+	/** Counts and the clamped query for the timeline page. */
+	timelinePage: TimelinePage;
 	runs: RunView[];
 	totals: RunTotals;
 	reminders: ReminderView[];
 }
 
+export interface AgentDetailOptions extends AgentSummaryOptions {
+	/** Parsed `kind` / `period` / `q` / `page` parameters; defaults to all, page 1. */
+	timelineQuery?: TimelineQuery;
+}
+
 export function loadAgentDetail(
 	profile: DashboardProfile,
-	options: AgentSummaryOptions & TimelineOptions = {},
+	options: AgentDetailOptions = {},
 ): AgentDetail {
 	const records = readRunRecords(profile.stateDir);
 	const runs = records.map(toRunView);
+	const query = options.timelineQuery ?? parseTimelineQuery(new URLSearchParams());
+	const filtered = filterTimeline(buildTimeline(profile), query, { now: options.now });
+	const timelinePage = paginateTimeline(filtered, query);
 	return {
 		summary: readAgentSummary(profile, options),
 		runtime: readRuntimeStateFile(profile.stateDir),
-		timeline: buildTimeline(profile, options),
+		timeline: timelinePage.items,
+		timelinePage,
 		// Newest first, bounded: the detail page is an overview, not an export.
 		runs: runs.slice(-30).reverse(),
 		totals: sumRuns(runs),

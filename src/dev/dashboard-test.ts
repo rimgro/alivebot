@@ -37,17 +37,23 @@ import { formatDuration, localDay } from "../util.js";
 import {
 	buildTimeline,
 	deriveAgentStatus,
+	filterTimeline,
 	findProfile,
+	hasTimelineFilters,
 	loadAgentDetail,
 	loadDashboard,
 	loadRootConfig,
 	loadRunDetail,
+	paginateTimeline,
+	parseTimelineQuery,
 	readAgentSummary,
 	readSessionTurns,
 	runOutcome,
 	sumRuns,
+	timelineQueryString,
 	toRunView,
 	turnsForRun,
+	TIMELINE_PAGE_SIZE,
 	type DashboardProfile,
 	type RunView,
 } from "../dashboard/state.js";
@@ -429,6 +435,48 @@ writeJson(path.join(writerDir, "state", "runtime.json"), {
 
 const memoryDbPath = path.join(stateDir, "memory.sqlite");
 
+// Timeline filtering/pagination fixture: one managed profile with 120 key
+// events spread over today, three days ago and forty days ago.
+const bulkDir = path.join(stateDir, "agents", "bulk");
+const BULK_EVENT_COUNT = 120;
+
+/** Created inside `main()` so the profiles fixture above keeps its two agents. */
+function createBulkTimelineFixture(): void {
+	writeJson(path.join(bulkDir, "alive.config.json"), {
+		name: "Bulk",
+		model: "openai/gpt-test",
+		stateDir: "state",
+		workspace: "workspace",
+		sandbox: { enabled: false },
+	});
+	const events = Array.from({ length: BULK_EVENT_COUNT }, (_, index) => {
+		// 40 today, 40 three days ago, 40 forty days ago: today/7d/all differ.
+		const daysAgo = index < 40 ? 0 : index < 80 ? 3 : 40;
+		const ts = base - daysAgo * 86_400_000 + (index % 40) * 1_000;
+		return {
+			seq: index + 1,
+			id: `bulk_${index + 1}`,
+			ts,
+			kind: "observability",
+			source: "grafana",
+			priority: "high",
+			title: index === 7 ? `leaked ${TELEGRAM_TOKEN}` : `alert ${index + 1}: deploy wave ${(index % 5) + 1}`,
+			text: index === 7 ? "a token slipped into an alert title" : `deploy wave ${(index % 5) + 1} needs attention`,
+		};
+	});
+	appendJsonl(path.join(bulkDir, "state", "inbox", "events.jsonl"), events);
+}
+
+/** Decode the few entities the renderer emits inside `href` values. */
+function decodeHref(value: string): string {
+	return value.replace(/&amp;/g, "&").replace(/&#39;/g, "'").replace(/&quot;/g, '"');
+}
+
+/** Number of compact timeline rows in a rendered page. */
+function feedRows(html: string): number {
+	return (html.match(/<li class="feed-item /g) ?? []).length;
+}
+
 // Settings fixtures: a managed profile whose SOUL.md path is configured under
 // `prompts/` (so a hardcoded "SOUL.md" in the project root would be wrong), and
 // one whose soul path escapes its own directory so writes must be refused.
@@ -566,6 +614,207 @@ async function main(): Promise<void> {
 	check("reminder inbox events are represented by the reminder store", !eventItems.some((item) => item.title.includes("reminder fired")), eventItems.map((item) => item.title));
 	check("run timeline item links to the run page", runItems[0]!.href === "/run/main/run_c", runItems[0]!.href);
 	check("run timeline item carries the trigger", runItems[0]!.title.startsWith("trigger: reminder"), runItems[0]);
+
+	// ------------------------------------------------------------------
+	// timeline filters / pagination
+	// ------------------------------------------------------------------
+	createBulkTimelineFixture();
+	const bulk = reloadProfile("bulk");
+	const timelineView = (profile: DashboardProfile, raw: string) =>
+		loadAgentDetail(profile, { now, timelineQuery: parseTimelineQuery(new URLSearchParams(raw)) });
+	const filterContext = { secrets: DEFAULT_SECRETS_CONFIG, env: {}, now };
+
+	section("timeline filters");
+	const kindRuns = timelineView(main, "kind=run");
+	check(
+		"kind=run keeps only run items",
+		kindRuns.timelinePage.total === 3 && kindRuns.timeline.every((item) => item.kind === "run"),
+		kindRuns.timeline.map((item) => item.kind),
+	);
+	const kindMulti = timelineView(main, "kind=run&kind=sleep");
+	check(
+		"repeated kind params are a multi-select",
+		kindMulti.timelinePage.total === 4 && kindMulti.timeline.every((item) => item.kind === "run" || item.kind === "sleep"),
+		kindMulti.timeline.map((item) => item.kind),
+	);
+	check(
+		"kind=event selects key events",
+		timelineView(main, "kind=event").timelinePage.total === 2,
+		parseTimelineQuery(new URLSearchParams("kind=event")),
+	);
+	check(
+		"unknown kind values are ignored",
+		parseTimelineQuery(new URLSearchParams("kind=bogus")).kinds.length === 0,
+		parseTimelineQuery(new URLSearchParams("kind=bogus")),
+	);
+	check("period=today keeps today's events", timelineView(bulk, "period=today").timelinePage.total === 40);
+	check("period=7d keeps the rolling week", timelineView(bulk, "period=7d").timelinePage.total === 80);
+	check("period=all keeps every event", timelineView(bulk, "period=all").timelinePage.total === BULK_EVENT_COUNT);
+	check("period defaults to all", parseTimelineQuery(new URLSearchParams("")).period === "all");
+	const titleSearch = timelineView(bulk, "q=DEPLOY WAVE 2");
+	check(
+		"q searches event titles case-insensitively",
+		titleSearch.timelinePage.total === 24 && titleSearch.timeline.every((item) => item.title.includes("deploy wave 2")),
+		{ total: titleSearch.timelinePage.total, first: titleSearch.timeline[0]?.title },
+	);
+	const textSearch = timelineView(bulk, "q=token slipped");
+	check(
+		"q searches the event text, not only the shortened title",
+		textSearch.timelinePage.total === 1 && textSearch.timeline[0]?.ref === "bulk_8",
+		textSearch.timeline.map((item) => item.ref),
+	);
+	const triggerSearch = timelineView(main, "q=check deploy");
+	check(
+		"q matches a run's trigger",
+		triggerSearch.timeline.some((item) => item.kind === "run" && item.ref === "run_c"),
+		triggerSearch.timeline.map((item) => `${item.kind}:${item.ref}`),
+	);
+	const detailSearch = timelineView(main, "q=the deploy failed");
+	check(
+		"q matches the event text of a key event",
+		detailSearch.timeline.some((item) => item.kind === "event" && item.ref === "evt_2"),
+		detailSearch.timeline.map((item) => `${item.kind}:${item.ref}`),
+	);
+	check(
+		"filters combine (kind + period + q)",
+		timelineView(main, "kind=run&kind=reminder&period=today&q=deploy").timelinePage.total === 3,
+		timelineView(main, "kind=run&kind=reminder&period=today&q=deploy").timeline.map((item) => item.title),
+	);
+
+	section("timeline pagination");
+	const pageOne = timelineView(bulk, "");
+	check("the default page is 1", pageOne.timelinePage.page === 1);
+	check(
+		"one page renders 50 items",
+		pageOne.timeline.length === TIMELINE_PAGE_SIZE && pageOne.timelinePage.shown === TIMELINE_PAGE_SIZE,
+		{ rows: pageOne.timeline.length, shown: pageOne.timelinePage.shown },
+	);
+	check("the page reports the filtered total", pageOne.timelinePage.total === BULK_EVENT_COUNT, pageOne.timelinePage.total);
+	check(
+		"pagination offers the next page",
+		pageOne.timelinePage.hasMore === true && pageOne.timelinePage.nextPage === 2,
+		pageOne.timelinePage,
+	);
+	const pageTwo = timelineView(bulk, "page=2");
+	check(
+		"page 2 returns the next 50 items",
+		pageTwo.timeline.length === TIMELINE_PAGE_SIZE && pageTwo.timelinePage.offset === TIMELINE_PAGE_SIZE,
+		{ rows: pageTwo.timeline.length, offset: pageTwo.timelinePage.offset },
+	);
+	check(
+		"pages do not overlap",
+		!pageTwo.timeline.some((item) => pageOne.timeline.some((first) => first.ref === item.ref)),
+		pageTwo.timeline[0]?.ref,
+	);
+	const pageThree = timelineView(bulk, "page=3");
+	check(
+		"the last page holds the remainder and has no next page",
+		pageThree.timeline.length === 20 && pageThree.timelinePage.hasMore === false,
+		{ rows: pageThree.timeline.length, hasMore: pageThree.timelinePage.hasMore },
+	);
+	check("a page beyond the end clamps to the last page", timelineView(bulk, "page=99").timelinePage.page === 3);
+	check(
+		"invalid page values fall back to page 1",
+		parseTimelineQuery(new URLSearchParams("page=0")).page === 1 &&
+			parseTimelineQuery(new URLSearchParams("page=abc")).page === 1,
+		parseTimelineQuery(new URLSearchParams("page=abc")),
+	);
+	check(
+		"filtered totals paginate independently of the raw feed",
+		timelineView(bulk, "period=7d&page=2").timelinePage.total === 80 &&
+			timelineView(bulk, "period=7d&page=2").timeline.length === 30,
+		timelineView(bulk, "period=7d&page=2").timelinePage,
+	);
+	const pageQuery = parseTimelineQuery(new URLSearchParams("kind=event&kind=run&period=7d&q=deploy&page=2"));
+	check(
+		"the filter query round-trips through its canonical URL",
+		timelineQueryString(pageQuery) === "?kind=run&kind=event&period=7d&q=deploy&page=2",
+		timelineQueryString(pageQuery),
+	);
+	check(
+		"the default query has no query string and no active filters",
+		timelineQueryString(parseTimelineQuery(new URLSearchParams())) === "" &&
+			!hasTimelineFilters(parseTimelineQuery(new URLSearchParams())),
+	);
+	check(
+		"filterTimeline and paginateTimeline are usable without loadAgentDetail",
+		paginateTimeline(filterTimeline(buildTimeline(bulk), parseTimelineQuery(new URLSearchParams("kind=event")), { now }), parseTimelineQuery(new URLSearchParams("kind=event"))).total === BULK_EVENT_COUNT,
+	);
+
+	section("timeline page markup");
+	const mainTimelineHtml = renderAgentPage(detail, filterContext);
+	const bulkPageOneHtml = renderAgentPage(pageOne, filterContext);
+	check(
+		"the filter panel is sticky and carries the reset link",
+		bulkPageOneHtml.includes("position: sticky") && /<a class="reset" href="\/agent\/bulk">сбросить<\/a>/.test(bulkPageOneHtml),
+	);
+	check(
+		"the counter is always visible",
+		bulkPageOneHtml.includes("показано 50 из 120"),
+		/показано[^<]*/.exec(bulkPageOneHtml)?.[0],
+	);
+	check("the filter form is a plain GET form to the agent page", bulkPageOneHtml.includes('method="get"') && bulkPageOneHtml.includes('action="/agent/bulk"'));
+	check(
+		"only 50 rows render for the 120-event fixture",
+		(bulkPageOneHtml.match(/<li class="feed-item /g) ?? []).length === TIMELINE_PAGE_SIZE,
+		(bulkPageOneHtml.match(/<li class="feed-item /g) ?? []).length,
+	);
+	check("the page does not render the whole fixture", !bulkPageOneHtml.includes("alert 120") && !bulkPageOneHtml.includes("alert 119"));
+	check(
+		"the show-more link points at the next page",
+		bulkPageOneHtml.includes("показать ещё") && decodeHref(/<a href="([^"]+)">показать ещё<\/a>/.exec(bulkPageOneHtml)?.[1] ?? "") === "/agent/bulk?page=2",
+		/<a href="([^"]+)">показать ещё<\/a>/.exec(bulkPageOneHtml)?.[1],
+	);
+	check(
+		"each row is one compact line followed by a details block",
+		/class="feed-row"><time[^>]*>[^<]+<\/time><span class="badge">[^<]+<\/span><span class="feed-summary">[^<]+<\/span>/.test(mainTimelineHtml) &&
+			(mainTimelineHtml.match(/<details class="feed-full">/g) ?? []).length === detail.timeline.length,
+		(mainTimelineHtml.match(/<details class="feed-full">/g) ?? []).length,
+	);
+	check(
+		"runs show cost and tokens on their row",
+		/<span class="feed-meta mono">\$0\.0300 · 94 tok<\/span>/.test(mainTimelineHtml),
+		/<span class="feed-meta mono">[^<]+<\/span>/.exec(mainTimelineHtml)?.[0],
+	);
+	check(
+		"the full per-run table stays behind the details block",
+		/<details class="feed-full"><summary>подробности<\/summary><p class="feed-detail">[^<]*<\/p><table class="mini">/.test(mainTimelineHtml),
+	);
+	const filteredPage = timelineView(bulk, "kind=event&period=7d&q=deploy&page=1");
+	const filteredHtml = renderAgentPage(filteredPage, filterContext);
+	const showMoreHref = decodeHref(/<a href="([^"]+)">показать ещё<\/a>/.exec(filteredHtml)?.[1] ?? "");
+	check(
+		"the show-more link keeps the current filters",
+		showMoreHref.startsWith("/agent/bulk?") &&
+			showMoreHref.includes("kind=event") &&
+			showMoreHref.includes("period=7d") &&
+			showMoreHref.includes("q=deploy") &&
+			showMoreHref.includes("page=2"),
+		showMoreHref,
+	);
+	check(
+		"the panel shows the active filters",
+		filteredHtml.includes("тип: key event") && filteredHtml.includes("период: 7d") && filteredHtml.includes("поиск: «deploy»"),
+		/активные фильтры:[^<]*/.exec(filteredHtml)?.[0],
+	);
+	check(
+		"the reset link drops every filter and returns to the defaults",
+		/<a class="reset" href="\/agent\/bulk">сбросить<\/a>/.test(filteredHtml) &&
+			timelineView(bulk, "").timelinePage.total === BULK_EVENT_COUNT,
+	);
+	const secretPage = timelineView(bulk, "q=leaked");
+	const secretHtml = renderAgentPage(secretPage, filterContext);
+	check(
+		"a secret in an event title stays masked on a filtered page",
+		secretPage.timelinePage.total === 1 && !secretHtml.includes(TELEGRAM_TOKEN) && /\[telegram-bot#\d+\]/.test(secretHtml),
+		{ total: secretPage.timelinePage.total, masked: /\[telegram-bot#\d+\]/.test(secretHtml) },
+	);
+	const emptyFilteredHtml = renderAgentPage(timelineView(bulk, "q=no-such-event-xyz"), filterContext);
+	check(
+		"a filtered miss renders an empty state and the zero counter",
+		emptyFilteredHtml.includes("по фильтрам ничего не найдено") && emptyFilteredHtml.includes("показано 0 из 0"),
+		/показано[^<]*/.exec(emptyFilteredHtml)?.[0],
+	);
 
 	section("run totals");
 	const allRuns: RunView[] = [toRunView(runA), toRunView(runB), toRunView(runC)];
@@ -958,6 +1207,60 @@ async function main(): Promise<void> {
 		const searchResponse = await fetch(`${baseUrl}/agent/main/memory?q=DEPLOY`);
 		const searchBody = await searchResponse.text();
 		check("GET /agent/main/memory?q= filters case-insensitively", searchResponse.status === 200 && searchBody.includes("deploy window is Friday 15:30") && !searchBody.includes("unrelated coffee fact"), searchResponse.status);
+
+		section("timeline filters over HTTP");
+		const filteredResponse = await fetch(`${baseUrl}/agent/bulk?kind=event&period=7d&page=1`);
+		const filteredBody = await filteredResponse.text();
+		check(
+			"GET /agent/bulk with filters is 200",
+			filteredResponse.status === 200 && filteredBody.includes("timeline"),
+			filteredResponse.status,
+		);
+		check("the filtered page renders 50 rows", feedRows(filteredBody) === 50, feedRows(filteredBody));
+		check(
+			"the filtered page shows the counter",
+			filteredBody.includes("показано 50 из 80"),
+			/показано[^<]*/.exec(filteredBody)?.[0],
+		);
+		check(
+			"the filtered page carries the sticky filter panel and reset link",
+			filteredBody.includes("position: sticky") && filteredBody.includes("сбросить") && filteredBody.includes("активные фильтры"),
+		);
+		const moreHref = decodeHref(/<a href="([^"]+)">показать ещё<\/a>/.exec(filteredBody)?.[1] ?? "");
+		check(
+			"the HTTP show-more link keeps the filters",
+			moreHref.includes("kind=event") && moreHref.includes("period=7d") && moreHref.includes("page=2"),
+			moreHref,
+		);
+		const filteredPageTwo = await fetch(`${baseUrl}${moreHref}`);
+		const filteredPageTwoBody = await filteredPageTwo.text();
+		check(
+			"following the show-more link keeps the filter and shows the remainder",
+			filteredPageTwo.status === 200 && feedRows(filteredPageTwoBody) === 30 && filteredPageTwoBody.includes("показано 30 из 80"),
+			{ status: filteredPageTwo.status, rows: feedRows(filteredPageTwoBody) },
+		);
+		const secretSearch = await fetch(`${baseUrl}/agent/bulk?q=leaked`);
+		const secretSearchBody = await secretSearch.text();
+		check(
+			"a filtered HTTP page masks a secret in an event title",
+			secretSearch.status === 200 && !secretSearchBody.includes(TELEGRAM_TOKEN) && /\[telegram-bot#\d+\]/.test(secretSearchBody),
+			{ status: secretSearch.status, masked: /\[telegram-bot#\d+\]/.test(secretSearchBody) },
+		);
+		const resetUrl = decodeHref(/<a class="reset" href="([^"]+)">сбросить<\/a>/.exec(filteredBody)?.[1] ?? "");
+		check("the reset link points at the unfiltered page", resetUrl === "/agent/bulk", resetUrl);
+		const resetResponse = await fetch(`${baseUrl}${resetUrl}`);
+		const resetBody = await resetResponse.text();
+		check(
+			"reset returns the default paginated view",
+			resetResponse.status === 200 && resetBody.includes("показано 50 из 120") && feedRows(resetBody) === 50,
+			{ status: resetResponse.status, rows: feedRows(resetBody) },
+		);
+		const badPage = await fetch(`${baseUrl}/agent/bulk?page=not-a-number`);
+		check("an invalid page parameter is still 200", badPage.status === 200, badPage.status);
+		await badPage.text();
+		const postAgentPage = await fetch(`${baseUrl}/agent/bulk`, { method: "POST" });
+		check("POST on an agent page is still 405", postAgentPage.status === 405, postAgentPage.status);
+		await postAgentPage.text();
 		const missingMemory = await fetch(`${baseUrl}/agent/nobody/memory`);
 		check("unknown agent memory page is 404", missingMemory.status === 404, missingMemory.status);
 		const missing = await fetch(`${baseUrl}/agent/nobody`);
@@ -996,8 +1299,14 @@ async function main(): Promise<void> {
 			settingsPage.headers.get("content-security-policy"),
 		);
 		check(
-			"read-only pages still forbid form actions",
-			(agentResponse.headers.get("content-security-policy") ?? "").includes("form-action 'none'"),
+			"read-only pages without a filter form still forbid form actions",
+			(indexResponse.headers.get("content-security-policy") ?? "").includes("form-action 'none'"),
+			indexResponse.headers.get("content-security-policy"),
+		);
+		check(
+			"the agent page CSP allows only its same-origin GET filter form",
+			(agentResponse.headers.get("content-security-policy") ?? "").includes("form-action 'self'") &&
+				!agentBody.includes('method="post"'),
 			agentResponse.headers.get("content-security-policy"),
 		);
 		const rootSettingsPage = await fetch(`${baseUrl}/agent/main/settings`);
