@@ -45,6 +45,14 @@ export function appendJsonl(file: string, value: unknown): void {
 	fs.appendFileSync(file, `${JSON.stringify(value)}\n`, "utf8");
 }
 
+/** Replace a JSONL file atomically. Used when a record is updated in place. */
+export function writeJsonlAtomic(file: string, values: unknown[]): void {
+	ensureDir(path.dirname(file));
+	const tmp = `${file}.${process.pid}.tmp`;
+	fs.writeFileSync(tmp, values.map((value) => `${JSON.stringify(value)}\n`).join(""), "utf8");
+	fs.renameSync(tmp, file);
+}
+
 export function readJsonl<T>(file: string): T[] {
 	try {
 		const raw = fs.readFileSync(file, "utf8");

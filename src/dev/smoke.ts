@@ -35,6 +35,8 @@ const config = loadConfig({
 			runWarnMs: 10 * 60_000,
 			runNoOutboundTurns: 60,
 			runVeryLongMs: 3 * 60 * 60_000,
+			shutdownGraceMs: 30_000,
+			resumeWindowMs: 10 * 60_000,
 			maxEventsPerIdle: 4,
 			maxNudges: 3,
 			maxNudgesPerRun: 5,

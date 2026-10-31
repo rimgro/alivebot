@@ -35,6 +35,11 @@ export interface BuildAgentOptions {
 	soul: string;
 	/** Ignore `config.session` and start a brand-new transcript (used after a sleep). */
 	forceNewSession?: boolean;
+	/**
+	 * Explicit session file to reopen (resume after a deliberate restart, #124).
+	 * When absent the configured `continue`/`create` behaviour is used.
+	 */
+	sessionFile?: string;
 	/** Runtime-scoped owner; must be reused across context resets. */
 	sandbox?: SandboxManager;
 }
@@ -155,9 +160,11 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 	});
 
 	const sessionManager =
-		cfg.session === "continue" && !options.forceNewSession
-			? SessionManager.continueRecent(paths.workspaceDir, paths.sessionsDir)
-			: SessionManager.create(paths.workspaceDir, paths.sessionsDir);
+		options.sessionFile && !options.forceNewSession
+			? SessionManager.open(options.sessionFile, paths.sessionsDir, paths.workspaceDir)
+			: cfg.session === "continue" && !options.forceNewSession
+				? SessionManager.continueRecent(paths.workspaceDir, paths.sessionsDir)
+				: SessionManager.create(paths.workspaceDir, paths.sessionsDir);
 
 	const { session, modelFallbackMessage } = await createAgentSession({
 		cwd: paths.workspaceDir,

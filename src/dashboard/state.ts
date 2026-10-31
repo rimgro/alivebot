@@ -122,7 +122,7 @@ export function readRunRecords(stateDir: string): RunRecord[] {
 	return readJsonl<RunRecord>(path.join(stateDir, "runs", "runs.jsonl"));
 }
 
-export type RunOutcomeClass = "sleep" | "idle" | "error";
+export type RunOutcomeClass = "sleep" | "idle" | "interrupted" | "error";
 
 export interface RunOutcome {
 	/** Stable machine key used for CSS classes and tests. */
@@ -147,6 +147,10 @@ export function runOutcome(stopReason: RunStopReason): RunOutcome {
 			return { key: "error", label: "error: active-time limit" };
 		case "budget":
 			return { key: "error", label: "error: budget exhausted" };
+		case "interrupted":
+			// A deliberate harness restart is not a crash: the run keeps its context
+			// and is resumed on the next start (#124).
+			return { key: "interrupted", label: "interrupted (harness restart)" };
 		case "aborted":
 			return { key: "error", label: "error: aborted" };
 		default:

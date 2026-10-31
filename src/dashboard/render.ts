@@ -174,6 +174,7 @@ table.mini th { color: var(--muted); font-weight: 500; white-space: nowrap; }
 .st.sleeping { color: var(--sleeping); }
 .outcome.sleep { color: var(--sleep); }
 .outcome.idle { color: var(--waiting); }
+.outcome.interrupted { color: var(--working); }
 .outcome.error { color: var(--error); }
 .badge { font-family: var(--mono); font-size: 11px; color: var(--muted); border: 1px solid var(--line); padding: 1px 6px; }
 .feed { list-style: none; margin: 0; padding: 0 0 0 16px; border-left: 1px solid var(--line); }

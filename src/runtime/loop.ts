@@ -12,6 +12,7 @@ import { PolicyStore } from "../store/policy.js";
 import { dispatchDueReminders, ReminderStore } from "../store/reminders.js";
 import { AgentRunner, describeRunRecord } from "./agent.js";
 import {
+	interruptedResumeDecision,
 	readRuntimeState,
 	runTurnCount,
 	RunLog,
@@ -98,6 +99,10 @@ export class AliveRuntime {
 	private lastStateWriteAt = 0;
 	private lastHeartbeatAt = 0;
 	private lastBudgetNotice = "";
+	/** Last run record to reopen on startup (#124), consumed by `loop()`. */
+	private pendingResume: RunRecord | undefined;
+	/** Session file to continue across a graceful restart; set before `runner.init()`. */
+	private resumeSessionFile: string | undefined;
 
 	private constructor(options: AliveRuntimeOptions) {
 		this.config = options.config;
@@ -247,6 +252,10 @@ export class AliveRuntime {
 			log: this.log.child("agent"),
 			soul: readSoul(this.config.paths.soulPath),
 			forceNewSession: forceNew,
+			// Reopen the exact transcript of an interrupted run. `forceNew` after a
+			// sleep deliberately ignores it, and a normal start keeps respecting
+			// `config.session` (new vs continue).
+			sessionFile: forceNew || !this.pendingResume ? undefined : this.resumeSessionFile,
 			sandbox: this.sandbox,
 		});
 		this.sandbox?.startMonitoring();
@@ -265,9 +274,46 @@ export class AliveRuntime {
 	// lifecycle
 	// ---------------------------------------------------------------------
 
+	/**
+	 * Decide what to do with the last run at startup (#124).
+	 *
+	 * A recent `interrupted` run is reopened instead of waiting for the inbox;
+	 * an older one is closed as `aborted`, which is the historical behaviour.
+	 */
+	private resolveStartupResume(): RunRecord | undefined {
+		const last = this.runs.last();
+		const windowMs = this.config.config.loop.resumeWindowMs;
+		const decision = interruptedResumeDecision(last, Date.now(), windowMs);
+		if (decision === "none" || !last) return undefined;
+		const ageMs = Math.max(0, Date.now() - last.finishedAt);
+		if (decision === "resume") {
+			if (last.sessionFile) this.resumeSessionFile = last.sessionFile;
+			this.log.info("interrupted run is resumable; reopening the same run and session", {
+				runId: last.id,
+				runIndex: last.index,
+				ageMs,
+				windowMs,
+			});
+			return last;
+		}
+		this.runs.reclassify(last.id, "aborted", "interrupted");
+		this.log.warn("interrupted run is outside the resume window; closed as aborted", {
+			runId: last.id,
+			runIndex: last.index,
+			ageMs,
+			windowMs,
+		});
+		return undefined;
+	}
+
 	async init(): Promise<void> {
 		if (this.initialized) return;
 		this.assertSingleInstance();
+		// Read the previous process state *before* overwriting runtime.json: it
+		// names the pi transcript that an interrupted run must reopen (#124).
+		const previousState = readRuntimeState(this.config.paths.stateDir);
+		this.resumeSessionFile = previousState?.sessionFile;
+		this.pendingResume = this.resolveStartupResume();
 		this.startedAt = Date.now();
 		// Claim the state file immediately: `alive status` and the daemon readiness
 		// wait both key off it, and it narrows the window where a second instance
@@ -365,6 +411,13 @@ export class AliveRuntime {
 	async runOnce(): Promise<RunRecord | null> {
 		await this.init();
 		this.fireDueReminders();
+		if (this.pendingResume) {
+			const resume = this.pendingResume;
+			this.pendingResume = undefined;
+			const record = await this.runner.execute({ resume });
+			if (record) this.finishRun(record);
+			return record;
+		}
 		const range = this.redeliveryRange;
 		this.redeliveryRange = undefined;
 		const record = await this.runner.execute({ redeliveryRange: range, requireEvents: true });
@@ -376,21 +429,25 @@ export class AliveRuntime {
 		if (this.stopping) return;
 		this.stopping = true;
 		this.log.info("stopping", { reason });
+		// Wake the loop from `WakeScheduler`/backoff without touching an in-flight
+		// tool. The session is only aborted if the drain budget expires.
 		this.abortController.abort();
 		if (this.schedulerTimer) {
 			clearInterval(this.schedulerTimer);
 			this.schedulerTimer = undefined;
 		}
-		this.runner.markAborting();
-		const session = this.runner?.currentSession;
-		if (session?.isStreaming) {
-			try {
-				await session.abort();
-			} catch (err) {
-				this.log.warn("abort failed", { error: err instanceof Error ? err.message : String(err) });
-			}
+		const graceMs = this.config.config.loop.shutdownGraceMs;
+		const drained = await this.runner.drain(graceMs);
+		if (drained.outcome === "drained") {
+			this.log.info("graceful shutdown drained the active run", { durationMs: drained.durationMs, graceMs });
+		} else if (drained.outcome === "aborted") {
+			this.log.warn("graceful shutdown did not finish within the budget; run aborted", {
+				durationMs: drained.durationMs,
+				graceMs,
+			});
 		}
 		await this.loopPromise?.catch(() => undefined);
+		const session = this.runner?.currentSession;
 		await this.workers?.close().catch((error) => this.log.warn("worker shutdown failed", { error: String(error) }));
 		await this.host?.stop().catch(() => undefined);
 		await this.memory?.close().catch(() => undefined);
@@ -410,6 +467,15 @@ export class AliveRuntime {
 			try {
 				if (!this.budgetAllowsRun()) {
 					await this.waitForBudget();
+					continue;
+				}
+				// A recent interrupted run is continued before the inbox gate: the
+				// agent must finish what it was doing, not start from scratch (#124).
+				if (this.pendingResume) {
+					const resume = this.pendingResume;
+					this.pendingResume = undefined;
+					const record = await this.runner.execute({ resume });
+					if (record) this.finishRun(record);
 					continue;
 				}
 				// Block until something actually needs the agent. `nextRun` never
@@ -547,7 +613,7 @@ export class AliveRuntime {
 			status: this.effectiveStatus(),
 			runIndex: run?.index ?? this.runs.last()?.index ?? 0,
 			runId: run?.id,
-			sessionFile: this.runner?.currentSession?.sessionFile,
+			sessionFile: this.runner?.currentSession?.sessionFile ?? this.pendingResume?.sessionFile ?? this.resumeSessionFile,
 			model: this.sessionModel(),
 			pending: this.store.pendingCount(),
 			openThreads: this.threads.unsettled(this.config.config.loop.maxNudges).length,
@@ -620,7 +686,7 @@ export class AliveRuntime {
 			tokensToday: { input: usage.input, output: usage.output },
 			lastRun: lastRun ? { ...lastRun, summary: describeRunRecord(lastRun) } : undefined,
 			model: this.sessionModel(),
-			sessionFile: this.runner?.currentSession?.sessionFile,
+			sessionFile: this.runner?.currentSession?.sessionFile ?? this.pendingResume?.sessionFile ?? this.resumeSessionFile,
 			history: this.history.stats(),
 			modules: this.host?.status(),
 			moduleErrors: this.moduleErrors.length > 0 ? this.moduleErrors : undefined,

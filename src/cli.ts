@@ -124,7 +124,7 @@ const SERVICE_USAGE: Record<"stop" | "restart" | "status", string> = {
 	stop:
 		"usage: alive stop [--timeout DURATION] [--force] [--config CONFIG]\n" +
 		"\n" +
-		"  --timeout DURATION  graceful SIGTERM window before SIGKILL (default 15s)\n" +
+		"  --timeout DURATION  graceful SIGTERM window before SIGKILL (default loop.shutdownGraceMs + 5s)\n" +
 		"  --force, --kill     skip SIGTERM and kill immediately\n" +
 		"  --config CONFIG     config file (default ./alive.config.json)\n" +
 		"\n" +
@@ -135,7 +135,7 @@ const SERVICE_USAGE: Record<"stop" | "restart" | "status", string> = {
 		"usage: alive restart [--yes] [--timeout DURATION] [--force] [--config CONFIG] [--model MODEL] [--verbose]\n" +
 		"\n" +
 		"  --yes, -y           restart even from inside the harness (ends this run)\n" +
-		"  --timeout DURATION  graceful SIGTERM window before SIGKILL (default 15s)\n" +
+		"  --timeout DURATION  graceful SIGTERM window before SIGKILL (default loop.shutdownGraceMs + 5s)\n" +
 		"  --force, --kill     skip SIGTERM and kill the old runtime immediately\n" +
 		"  --config CONFIG     config file (default ./alive.config.json)\n" +
 		"  --model MODEL       model for the restarted runtime\n" +
@@ -170,8 +170,12 @@ export function createServiceControl(): ServiceControl {
 	return {
 		stop: (config, flags) => {
 			const timeoutFlag = flagString(flags, "timeout");
+			// Give the runtime's graceful drain (`loop.shutdownGraceMs`) room to
+			// finish before this command escalates to SIGKILL. An explicit --timeout
+			// still wins.
+			const drainTimeoutMs = config.config.loop.shutdownGraceMs + 5_000;
 			return stopRuntime(config.paths.stateDir, {
-				timeoutMs: timeoutFlag ? parseDurationMs(timeoutFlag) : undefined,
+				timeoutMs: timeoutFlag ? parseDurationMs(timeoutFlag) : drainTimeoutMs,
 				force: flagBool(flags, "force") || flagBool(flags, "kill"),
 			});
 		},

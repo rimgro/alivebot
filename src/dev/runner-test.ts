@@ -17,7 +17,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentSession, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { loadConfig } from "../config.js";
+import { DEFAULT_CONFIG, loadConfig } from "../config.js";
 import { Logger } from "../log.js";
 import { EventStore } from "../store/events.js";
 import { Journal } from "../store/journal.js";
@@ -26,11 +26,12 @@ import { FakeMemoryStore } from "./fake-memory.js";
 import { Outbox } from "../store/outbox.js";
 import { PolicyStore } from "../store/policy.js";
 import { ReminderStore } from "../store/reminders.js";
-import { RUN_TURN_TRACE_LIMIT, RunLog } from "../store/runs.js";
+import { interruptedResumeDecision, RUN_TURN_TRACE_LIMIT, RunLog, type RunRecord } from "../store/runs.js";
 import { ThreadStore } from "../store/threads.js";
 import { HistoryStore } from "../store/history.js";
 import { RunEventLog } from "../store/run-events.js";
 import { AgentRunner, runActiveMs } from "../runtime/agent.js";
+import { isOutboundRecorded } from "../runtime/tools.js";
 import { TurnTraceRecorder } from "../runtime/run-trace.js";
 import { hasWakeWorthyPending, WakeScheduler, wakeIntervalMs } from "../runtime/wake.js";
 import { createAliveTools, type RunHandle, type ToolDeps } from "../runtime/tools.js";
@@ -59,6 +60,8 @@ const config = loadConfig({
 			runWarnMs: 10 * 60_000,
 			runNoOutboundTurns: 60,
 			runVeryLongMs: 3 * 60 * 60_000,
+			shutdownGraceMs: 30_000,
+			resumeWindowMs: 10 * 60_000,
 			maxEventsPerIdle: 8,
 			maxNudges: 3,
 			maxNudgesPerRun: 2,
@@ -121,6 +124,7 @@ class FakeSession {
 	aborted = false;
 	disposed = false;
 	prompts: string[] = [];
+	onAbort?: () => void;
 	private stats = {
 		sessionFile: undefined,
 		sessionId: "fake",
@@ -148,7 +152,10 @@ class FakeSession {
 		for (const listener of this.listeners) listener(event);
 	}
 	getSessionStats(): typeof this.stats {
-		return this.stats;
+		return {
+			...this.stats,
+			tokens: { ...this.stats.tokens },
+		};
 	}
 	async prompt(text: string): Promise<void> {
 		this.prompts.push(text);
@@ -160,6 +167,13 @@ class FakeSession {
 	}
 	async abort(): Promise<void> {
 		this.aborted = true;
+		this.onAbort?.();
+	}
+	addUsage(input: number, output: number, cost: number): void {
+		this.stats.tokens.input += input;
+		this.stats.tokens.output += output;
+		this.stats.tokens.total += input + output;
+		this.stats.cost += cost;
 	}
 	dispose(): void {
 		this.disposed = true;
@@ -738,6 +752,277 @@ section("empty wakes: two quiet hours cost nothing, events wake and reset the ba
 	const addressedTitles = (addressedRun?.events ?? []).map((event) => event.title).join(",");
 	check("the addressed run delivers the chatter too, nothing is dropped", addressedTitles === "group chatter,@alive status?", addressedTitles);
 	check("the run counted only the event it was woken for as new work", addressedRun?.stopReason === "slept", addressedRun?.stopReason);
+}
+
+
+// ---------------------------------------------------------------------------
+// graceful shutdown / resume (#124)
+// ---------------------------------------------------------------------------
+
+interface ShutdownWorld {
+	root: string;
+	config: ReturnType<typeof loadConfig>;
+	store: EventStore;
+	journal: Journal;
+	outbox: Outbox;
+	runs: RunLog;
+	runner: AgentRunner;
+	sessions: FakeSession[];
+	sessionFile: string;
+	handler: Handler;
+	tool: (name: string) => ToolDefinition;
+	getRun: () => RunHandle | undefined;
+}
+
+function makeShutdownWorld(
+	label: string,
+	options: { root?: string; shutdownGraceMs?: number; resumeWindowMs?: number } = {},
+): ShutdownWorld {
+	const worldRoot = options.root ?? fs.mkdtempSync(path.join(os.tmpdir(), `alive-${label}-`));
+	const worldConfig = loadConfig({
+		cwd: worldRoot,
+		overrides: {
+			loop: {
+				...DEFAULT_CONFIG.loop,
+				pollIntervalMs: 10,
+				shutdownGraceMs: options.shutdownGraceMs ?? 500,
+				resumeWindowMs: options.resumeWindowMs ?? 60_000,
+				maxNudgesPerRun: 2,
+			},
+		},
+	});
+	const worldLog = new Logger({ console: false, level: "error", scope: label });
+	const worldStore = EventStore.open(worldConfig.paths.stateDir);
+	const worldReminders = new ReminderStore(worldConfig.paths.stateDir);
+	const worldNotes = new NoteStore(worldConfig.paths.stateDir);
+	const worldJournal = new Journal(worldConfig.paths.stateDir);
+	const worldThreads = new ThreadStore(worldConfig.paths.stateDir);
+	const worldOutbox = new Outbox(worldConfig.paths.stateDir);
+	const worldPolicy = new PolicyStore(worldConfig.paths.stateDir);
+	const worldHistory = HistoryStore.open(worldConfig.paths.stateDir);
+	const worldRuns = new RunLog(worldConfig.paths.stateDir);
+	const sessionFile = path.join(worldConfig.paths.stateDir, "sessions", "fake-session.jsonl");
+
+	const world: ShutdownWorld = {
+		root: worldRoot,
+		config: worldConfig,
+		store: worldStore,
+		journal: worldJournal,
+		outbox: worldOutbox,
+		runs: worldRuns,
+		runner: undefined as unknown as AgentRunner,
+		sessions: [],
+		sessionFile,
+		handler: async () => undefined,
+		tool: () => {
+			throw new Error("tools are not ready");
+		},
+		getRun: () => undefined,
+	};
+	let worldRun: RunHandle | undefined;
+	const worldDeps: ToolDeps = {
+		config: worldConfig,
+		store: worldStore,
+		reminders: worldReminders,
+		notes: worldNotes,
+		memory: new FakeMemoryStore(),
+		journal: worldJournal,
+		threads: worldThreads,
+		outbox: worldOutbox,
+		policy: worldPolicy,
+		history: worldHistory,
+		moduleTools: [],
+		deliver: async () => undefined,
+		getRun: () => worldRun,
+		runtimeStatus: () => ({}),
+		isStopping: () => false,
+		log: worldLog,
+	};
+	const worldTools = createAliveTools(worldDeps);
+	world.tool = (name) => {
+		const found = worldTools.find((tool) => tool.name === name);
+		if (!found) throw new Error(`missing tool ${name}`);
+		return found;
+	};
+	world.getRun = () => worldRun;
+	world.runner = new AgentRunner({
+		config: worldConfig,
+		createSession: async () => {
+			const session = new FakeSession(`s${world.sessions.length + 1}`, (current, prompt) => world.handler(current, prompt));
+			session.sessionFile = world.sessionFile;
+			world.sessions.push(session);
+			return session as unknown as AgentSession;
+		},
+		store: worldStore,
+		runs: worldRuns,
+		threads: worldThreads,
+		policy: worldPolicy,
+		toolDeps: worldDeps,
+		log: worldLog,
+		thoughtsFile: worldConfig.paths.thoughtsFile,
+		getRun: () => worldRun,
+		setRun: (run) => {
+			worldRun = run;
+		},
+		runtimeStatus: () => ({}),
+		isStopping: () => false,
+		isBudgetExhausted: () => false,
+	});
+	return world;
+}
+
+function emitAssistantTurn(session: FakeSession, usage: { input: number; output: number; cost: number }, text: string): void {
+	session.emit({ type: "turn_start" });
+	session.emit({
+		type: "turn_end",
+		message: {
+			role: "assistant",
+			content: [{ type: "text", text }],
+			usage: {
+				input: usage.input,
+				output: usage.output,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: usage.input + usage.output,
+				cost: { total: usage.cost },
+			},
+			stopReason: "endTurn",
+		},
+		toolResults: [],
+	});
+}
+
+let interruptedRecord: RunRecord | undefined;
+
+section("graceful shutdown drains the in-flight tool, writes a summary and records interrupted (#124)");
+{
+	const world = makeShutdownWorld("graceful", { shutdownGraceMs: 500 });
+	await world.runner.init();
+	const session = world.sessions[0]!;
+	world.store.append({ kind: "user_message", source: "test", priority: "normal", title: "before restart", text: "work before restart", thread: "alice", expectsReply: true });
+	let toolStartedResolve!: () => void;
+	const toolStarted = new Promise<void>((resolve) => {
+		toolStartedResolve = resolve;
+	});
+	let releaseTool!: () => void;
+	const toolResult = new Promise<void>((resolve) => {
+		releaseTool = resolve;
+	});
+	let steps = 0;
+	let duplicateResult = "";
+	world.handler = async (current) => {
+		steps += 1;
+		current.addUsage(100, 10, 0.01);
+		current.emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "working" }], stopReason: "toolUse" } });
+		const sent = await call(world.tool("send_message"), { thread: "alice", text: "hello from before restart" });
+		duplicateResult = sent.content[0]?.text ?? "";
+		current.emit({ type: "tool_execution_start", toolName: "bash", args: { command: "sleep 60" } });
+		toolStartedResolve();
+		await toolResult;
+		current.emit({ type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "tool finished" }] } });
+		emitAssistantTurn(current, { input: 100, output: 10, cost: 0.01 }, "tool finished");
+		const stop = await current.turn();
+		if (stop) return;
+		steps += 1;
+		current.addUsage(999, 999, 9);
+	};
+	const execution = world.runner.execute();
+	await toolStarted;
+	const drainStartedAt = Date.now();
+	const drainPromise = world.runner.drain(500);
+	setTimeout(releaseTool, 25);
+	const drain = await drainPromise;
+	const record = await execution;
+	interruptedRecord = record ?? undefined;
+	check("the drain finished inside the grace ceiling", drain.outcome === "drained" && Date.now() - drainStartedAt < 500, { drain, elapsed: Date.now() - drainStartedAt });
+	check("the run is recorded as interrupted, not aborted", record?.stopReason === "interrupted", record?.stopReason);
+	check("the in-flight tool result was awaited", duplicateResult.includes("Delivered") && record?.outbound.length === 1, { duplicateResult, outbound: record?.outbound });
+	check("the outbound record keeps the delivery key", Boolean(record?.outbound[0]?.deliveryKey), record?.outbound[0]);
+	check("no second model step was started", steps === 1 && session.prompts.length === 1, { steps, prompts: session.prompts.length });
+	check("the run summary is written to the record", (record?.summary ?? "").includes("interrupted by a planned harness restart"), record?.summary);
+	check("the run summary is written to the journal", world.journal.tail(20).some((line) => line.includes("[interrupted] run #")), world.journal.tail(3));
+	check("the interrupted record names its session file", record?.sessionFile === world.sessionFile, { record: record?.sessionFile, sessionFile: world.sessionFile });
+	check("the interrupted record keeps its events and usage", record?.events.length === 1 && record?.usage.input === 100, { events: record?.events, usage: record?.usage });
+	check("events consumed by the drained run are acknowledged", world.store.openRunId === null, world.store.status());
+}
+
+section("grace expiry falls back to aborting the run (#124)");
+{
+	const world = makeShutdownWorld("grace-expiry", { shutdownGraceMs: 40 });
+	await world.runner.init();
+	const session = world.sessions[0]!;
+	let startedResolve!: () => void;
+	const started = new Promise<void>((resolve) => {
+		startedResolve = resolve;
+	});
+	world.handler = async (current) => {
+		current.emit({ type: "tool_execution_start", toolName: "bash", args: { command: "sleep forever" } });
+		startedResolve();
+		await new Promise<void>((resolve) => {
+			current.onAbort = resolve;
+		});
+		throw new Error("session aborted");
+	};
+	const execution = world.runner.execute();
+	await started;
+	const drainStartedAt = Date.now();
+	const drain = await world.runner.drain(40);
+	const record = await execution;
+	check("the drain reports the abort fallback", drain.outcome === "aborted" && Date.now() - drainStartedAt >= 39, { drain, elapsed: Date.now() - drainStartedAt });
+	check("the session was aborted after the budget", session.aborted === true);
+	check("the run is recorded as aborted, not interrupted", record?.stopReason === "aborted", record?.stopReason);
+}
+
+section("startup decision: a recent interrupted run resumes, an old one expires (#124)");
+{
+	const record = interruptedRecord!;
+	check("a recent interrupted run is resumable", interruptedResumeDecision(record, record.finishedAt + 1_000, 10 * 60_000) === "resume");
+	check("an interrupted run outside the window expires", interruptedResumeDecision(record, record.finishedAt + 10 * 60_000, 10 * 60_000) === "expire");
+	check("a non-interrupted run is not resumed", interruptedResumeDecision({ ...record, stopReason: "slept" }, record.finishedAt + 1, 10 * 60_000) === "none");
+	check("resumeWindowMs = 0 disables resume", interruptedResumeDecision(record, record.finishedAt + 1, 0) === "expire");
+}
+
+section("resume reopens the same record/session, dedupes outbound and accumulates counters (#124)");
+{
+	// The synthetic resume world has its own inbox, whose sequence numbers start
+	// at 1; shift the carried-over summary so the two events cannot collide by seq.
+	const first: RunRecord = {
+		...interruptedRecord!,
+		events: interruptedRecord!.events.map((event) => ({ ...event, seq: event.seq + 100 })),
+	};
+	const world = makeShutdownWorld("resume", { root: fs.mkdtempSync(path.join(os.tmpdir(), "alive-resume-root-")), resumeWindowMs: 60_000 });
+	// The same pi session file is what a real restart reopens.
+	world.sessionFile = first.sessionFile ?? world.sessionFile;
+	// Carry the interrupted record into this fresh RunLog so the resume operates
+	// on the same on-disk shape as production.
+	world.runs.record(first);
+	const usageBefore = world.runs.usageToday();
+	await world.runner.init();
+	world.store.append({ kind: "user_message", source: "test", priority: "normal", title: "new event", text: "new event after restart", thread: "bob", expectsReply: true });
+	let duplicateResult = "";
+	world.handler = async (current) => {
+		current.addUsage(50, 5, 0.005);
+		const duplicate = await call(world.tool("send_message"), { thread: "alice", text: "hello from before restart" });
+		duplicateResult = duplicate.content[0]?.text ?? "";
+		await call(world.tool("send_message"), { thread: "alice", text: "new after restart" });
+		emitAssistantTurn(current, { input: 50, output: 5, cost: 0.005 }, "resumed work");
+		await current.turn();
+		await call(world.tool("retain"), { facts: [], scopes: [] });
+		await call(world.tool("sleep"), { summary: "resumed run complete", summary_md: "# Resumed\n" });
+	};
+	const resumed = await world.runner.execute({ resume: first });
+	const records = world.runs.list(100).filter((record) => record.id === first.id);
+	const usageAfter = world.runs.usageToday();
+	check("the same run record is reopened, not duplicated", resumed?.id === first.id && resumed?.index === first.index && records.length === 1, { id: resumed?.id, index: resumed?.index, records: records.length });
+	check("startedAt and session are preserved", resumed?.startedAt === first.startedAt && resumed?.sessionFile === first.sessionFile, { startedAt: resumed?.startedAt, sessionFile: resumed?.sessionFile });
+	check("the resume prompt says продолжай", (world.sessions[0]?.prompts[0] ?? "").includes("продолжай"), world.sessions[0]?.prompts[0]?.slice(0, 120));
+	check("the previous outbound message is never re-sent", duplicateResult.includes("not sending it again") && world.outbox.list(10).length === 1, { duplicateResult, outbox: world.outbox.list(10).length });
+	check("outbound accumulates instead of resetting", resumed?.outbound.length === 2 && resumed?.outbound[1]?.text === "new after restart", resumed?.outbound);
+	check("events accumulate across the resume", resumed?.events.length === 2, resumed?.events.map((event) => event.title));
+	check("tokens and cost accumulate", resumed?.usage.input === 150 && resumed?.usage.output === 15 && Math.abs((resumed?.usage.cost ?? 0) - 0.015) < 1e-9, resumed?.usage);
+	check("turns accumulate and keep absolute indexes", resumed?.turnCount === 2 && resumed?.turns?.[1]?.index === 2, { turnCount: resumed?.turnCount, turns: resumed?.turns?.map((turn) => turn.index) });
+	check("daily usage keeps one run and accumulates the resumed delta", usageAfter.runs === usageBefore.runs && usageAfter.turns === usageBefore.turns + 1 && Math.abs(usageAfter.cost - usageBefore.cost - 0.005) < 1e-9, { before: usageBefore, after: usageAfter });
+	check("outbound identity matches on thread+text+delivery key", isOutboundRecorded([{ thread: "alice", text: "x", deliveryKey: "msg_1" }], { thread: "alice", text: "x" }) && !isOutboundRecorded([{ thread: "alice", text: "x", deliveryKey: "msg_1" }], { thread: "alice", text: "y" }));
 }
 
 process.stdout.write(
