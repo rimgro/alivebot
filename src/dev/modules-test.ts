@@ -1679,8 +1679,248 @@ section("telegram voice transcription: bounded retries, one line, quota stop (#1
 		check("voice events are still the only ones with transcription payloads", voiceEvents(harness).length === 1, voiceEvents(harness).map((event) => event.id));
 		await harness.close();
 		harness = undefined;
+
+		// 6. #136: any 429 — not only the daily quota — pauses the provider until `retry-after`.
+		harness = await createHarness("ratelimit", {
+			voices: [
+				{ fileId: "voice-asph", marker: 8 },
+				{ fileId: "voice-during", marker: 9 },
+				{ fileId: "voice-after", marker: 10 },
+			],
+			retries: 2,
+			retryDelayMs: 10,
+			provider: (marker) => {
+				if (marker === 8) {
+					return jsonResponse(
+						{
+							error: {
+								message:
+									"Rate limit reached for audio seconds per hour (ASH): Limit 7200, Used 7200, Requested 106. Please try again in 52m.",
+								type: "tokens",
+								code: "rate_limit_exceeded",
+							},
+						},
+						429,
+						{ "retry-after": "3120" },
+					);
+				}
+				return jsonResponse({ text: "transcript after the pause" });
+			},
+		});
+		harness.queue([voiceUpdate(350, 351, "voice-asph")]);
+		const rateLimited = await harness.waitForEvent("351");
+		await harness.settle(80);
+		harness.queue([voiceUpdate(351, 352, "voice-during")]);
+		const pausedEvent = await harness.waitForEvent("352");
+		await harness.settle(200);
+		check("a 429 beyond the retry budget is not retried", harness.groqAttempts(8) === 1, harness.groqAttempts(8));
+		check("the rate-limited message is still delivered", rateLimited !== undefined && rateLimited.text.includes("voice transcription postponed") === true, rateLimited?.text);
+		check(
+			"the rate-limited payload records the pause",
+			(rateLimited?.payload as { transcription?: { status?: string } })?.transcription?.status === "rate_limited",
+			rateLimited?.payload,
+		);
+		check(
+			"no provider or Telegram file request is made while the cooldown is active",
+			harness.providerCalls() === 1 && harness.getFileCalls() === 1,
+			{ providerCalls: harness.providerCalls(), getFileCalls: harness.getFileCalls() },
+		);
+		check("the skipped voice note is still delivered with the pause note", pausedEvent?.text.includes("voice transcription postponed") === true, pausedEvent?.text);
+		const cooldownMarker = harness.state.load().transcriptionCooldown;
+		check(
+			"the cooldown marker is persisted with the provider's retry-after",
+			cooldownMarker?.kind === "rate_limit" && typeof cooldownMarker.until === "number" && cooldownMarker.until - Date.now() > 50 * 60_000,
+			cooldownMarker,
+		);
+		check(
+			"module status reports the cooldown until",
+			typeof (harness.telegram.status().transcription as { rateLimitedUntil?: number })?.rateLimitedUntil === "number",
+			harness.telegram.status().transcription,
+		);
+		const cooldownWarnings = transcriptionLogs(harness).filter((record) => record.level === "warn");
+		check("the cooldown is logged loudly exactly once", cooldownWarnings.length === 1, cooldownWarnings);
+		check("the loud line names the rate limit and the wait", cooldownWarnings[0]?.data?.class === "rate_limit" && Number(cooldownWarnings[0]?.data?.waitMs) > 0, cooldownWarnings[0]);
+
+		// The pause ends at `retry-after`: the next voice note goes to the provider again.
+		harness.state.patch({ transcriptionCooldown: { ...cooldownMarker!, until: Date.now() - 1 } });
+		harness.queue([voiceUpdate(352, 353, "voice-after")]);
+		const afterCooldown = await harness.waitForEvent("353");
+		await harness.settle(150);
+		check("transcription resumes once the cooldown expired", afterCooldown?.text.includes("transcript after the pause") === true, afterCooldown?.text);
+		check("the provider is asked again after the cooldown", harness.providerCalls() === 2, harness.providerCalls());
+		check("the expired marker is cleared from the module state", harness.state.load().transcriptionCooldown === undefined, harness.state.load().transcriptionCooldown);
+		check("no extra warning is logged for the expiry", transcriptionLogs(harness).filter((record) => record.level === "warn").length === 1);
+		await harness.close();
+		harness = undefined;
 	} finally {
 		if (harness) await harness.close().catch(() => undefined);
+		if (previousGroqKey === undefined) delete process.env.GROQ_API_KEY;
+		else process.env.GROQ_API_KEY = previousGroqKey;
+	}
+}
+
+// ---------------------------------------------------------------------------
+section("telegram polling: the offset advances per update and stale updates are ignored (#136)");
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-offset-test-"));
+	const logFile = path.join(root, "offset.jsonl");
+	const log = new Logger({ console: false, level: "debug", file: logFile, scope: "telegram-offset-test" });
+	const store = EventStore.open(root);
+	const history = HistoryStore.open(root);
+	const outbox = new Outbox(root);
+	const batches: TelegramUpdate[][] = [];
+	const offsets: Array<number | undefined> = [];
+	const getFileIds: string[] = [];
+	let groqCalls = 0;
+
+	const voiceUpdate = (updateId: number, messageId: number, fileId: string): TelegramUpdate => ({
+		update_id: updateId,
+		message: {
+			message_id: messageId,
+			date: 1_700_000_000 + updateId,
+			chat: { id: 42, type: "private", first_name: "Alice", username: "alice" },
+			from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
+			voice: { file_id: fileId, file_unique_id: `${fileId}-unique`, file_size: 3, duration: 2, mime_type: "audio/ogg" },
+		},
+	});
+	// A second update in the batch that throws inside handleUpdate: it must not pin
+	// the offset, and the update after it must still be processed.
+	const brokenUpdate = { update_id: 501, message: {} } as unknown as TelegramUpdate;
+
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		if (url === GROQ_TRANSCRIPTION_ENDPOINT) {
+			groqCalls += 1;
+			return jsonResponse({ text: "offset transcript" });
+		}
+		if (url.includes("/file/bot")) return new Response(Uint8Array.from([1, 2, 3]), { status: 200, headers: { "content-type": "audio/ogg" } });
+		const method = url.slice(url.lastIndexOf("/") + 1);
+		const params = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+		if (method === "getMe") return jsonResponse({ ok: true, result: { id: 999, is_bot: true, first_name: "Alive", username: "alive_bot" } });
+		if (method === "deleteWebhook") return jsonResponse({ ok: true, result: true });
+		if (method === "getUpdates") {
+			offsets.push(params.offset as number | undefined);
+			const batch = batches.shift();
+			// Avoid a hot poll loop in the fake API; the real one long-polls.
+			await new Promise((resolve) => setTimeout(resolve, batch ? 0 : 20));
+			return jsonResponse({ ok: true, result: batch ?? [] });
+		}
+		if (method === "getFile") {
+			const fileId = String(params.file_id ?? "");
+			getFileIds.push(fileId);
+			return jsonResponse({ ok: true, result: { file_id: fileId, file_unique_id: `${fileId}-unique`, file_path: `${fileId}.oga`, file_size: 3 } });
+		}
+		return jsonResponse({ ok: true, result: true });
+	}) as unknown as typeof fetch;
+
+	const config = loadConfig({
+		cwd: root,
+		overrides: {
+			chat: { console: false, http: { enabled: false, host: "127.0.0.1", port: 0, token: "" } },
+			modules: {
+				telegram: {
+					enabled: true,
+					token: "test-token",
+					tokenEnv: "ALIVE_TEST_TELEGRAM_TOKEN_UNSET",
+					managedBotTtlMs: DEFAULT_CONFIG.modules.telegram.managedBotTtlMs,
+					apiBase: "https://api.telegram.org",
+					allowedChatIds: [],
+					allowedUserIds: ["7"],
+					allowedBotIds: [],
+					requireMentionInGroups: false,
+					pollTimeoutSec: 0,
+					allowedUpdates: ["message"],
+					parseMode: "",
+					linkPreview: true,
+					allowUrlButtonsInGroups: false,
+					typingIndicator: false,
+					ackReaction: "",
+					ingestEdits: true,
+					editDebounceMs: 3000,
+					editExpectsReply: false,
+					historyLimitPerThread: 0,
+					maxMessageChars: 4096,
+					transcription: { ...DEFAULT_CONFIG.modules.telegram.transcription },
+					transcriptionRetries: 0,
+					transcriptionRetryDelayMs: DEFAULT_CONFIG.modules.telegram.transcriptionRetryDelayMs,
+				},
+				grafana: { enabled: false, host: "127.0.0.1", port: 0, path: "/grafana", token: "", firingPriority: "high", resolvedPriority: "low" },
+				external: [],
+			},
+		},
+	});
+
+	const telegram = new TelegramModule(config.config.modules.telegram);
+	const state = new TelegramStateStore(path.join(config.paths.modulesDir, "telegram"));
+	const realFetch = globalThis.fetch;
+	const previousGroqKey = process.env.GROQ_API_KEY;
+	process.env.GROQ_API_KEY = "test-groq-key";
+	globalThis.fetch = fetchImpl;
+	const host = new ModuleHost({
+		config,
+		log,
+		transports: [],
+		modules: [telegram],
+		ingest: (event) => store.append(event),
+		outbox: (limit) => outbox.list(limit),
+		history,
+		runtimeStatus: () => ({}),
+	});
+
+	const eventFor = async (messageId: string, timeoutMs = 5_000): Promise<AliveEvent | undefined> => {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			const event = store.peekPending(50).find((candidate) => (candidate.payload as { messageId?: string })?.messageId === messageId);
+			if (event) return event;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		return undefined;
+	};
+	const settle = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+	const logs = () => readJsonl<{ level: string; msg: string; data?: Record<string, unknown> }>(logFile);
+
+	try {
+		batches.push([voiceUpdate(500, 9001, "voice-a"), brokenUpdate, voiceUpdate(502, 9002, "voice-b")]);
+		await host.init();
+		const first = await eventFor("9001");
+		const second = await eventFor("9002");
+		await settle(150);
+
+		check("the update before the failing one is processed", first !== undefined, store.peekPending(50).map((event) => event.title));
+		check("the update after the failing one is still processed", second !== undefined, store.peekPending(50).map((event) => event.title));
+		check("the offset advances past every update in the batch, including the failing one", state.load().offset === 503, state.load().offset);
+		check(
+			"the failing update is logged once and the batch is not replayed",
+			logs().filter((record) => record.level === "warn" && record.msg === "telegram update failed; skipped without replaying the batch").length === 1,
+			logs().filter((record) => record.msg === "telegram update failed; skipped without replaying the batch"),
+		);
+		check(
+			"the poll cycle is logged with its update ids, offset and highest",
+			logs().some((record) => record.msg === "telegram poll cycle" && record.data?.count === 3 && record.data?.offset === 0 && record.data?.highest === 502),
+			logs().filter((record) => record.msg === "telegram poll cycle"),
+		);
+		check("the next getUpdates resumes from the advanced offset", offsets.includes(503), offsets.slice(-5));
+
+		// Telegram re-delivers an already confirmed batch: it must be dropped, not
+		// transcribed again (this is exactly the #136 loop).
+		const filesBefore = getFileIds.length;
+		const providerCallsBefore = groqCalls;
+		const eventsBefore = store.peekPending(50).length;
+		batches.push([voiceUpdate(500, 9001, "voice-a2"), brokenUpdate, voiceUpdate(502, 9002, "voice-b2")]);
+		await settle(250);
+
+		check("stale updates buy no Telegram file download", getFileIds.length === filesBefore, getFileIds);
+		check("stale updates buy no provider request", groqCalls === providerCallsBefore, groqCalls);
+		check("stale updates add no events", store.peekPending(50).length === eventsBefore, store.peekPending(50).length);
+		check("the offset does not move backwards", state.load().offset === 503, state.load().offset);
+		check(
+			"the stale replay is visible in the poll debug line",
+			logs().some((record) => record.msg === "telegram poll cycle" && record.data?.stale === 3),
+			logs().filter((record) => record.msg === "telegram poll cycle").slice(-3),
+		);
+	} finally {
+		await host.stop();
+		globalThis.fetch = realFetch;
 		if (previousGroqKey === undefined) delete process.env.GROQ_API_KEY;
 		else process.env.GROQ_API_KEY = previousGroqKey;
 	}

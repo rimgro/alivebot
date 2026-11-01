@@ -130,7 +130,11 @@ telegram:<chatId>/<topicId>    тема в форуме (message_thread_id)
 ### Входящие
 
 Модуль держит long polling `getUpdates` с durable-offset (`.alive/modules/telegram/state.json`),
-поэтому после перезапуска старые апдейты не переигрываются. Каждый апдейт:
+поэтому после перезапуска старые апдейты не переигрываются. Offset сохраняется **после каждого
+апдейта**: упавшая обработка логируется (`telegram update failed; skipped without replaying the
+batch`), апдейт пропускается, а вся пачка не переигрывается. Апдейты со `update_id < offset`
+(Telegram их переотдал) отбрасываются без обработки; каждый непустой цикл пишет debug-строку
+`telegram poll cycle` с `count`, `firstUpdateIds`, `offset`, `highest`, `stale` (#136). Каждый апдейт:
 
 - фильтруется (свои сообщения игнорируются; bot-authored сообщения принимаются только от `allowedBotIds` и только при явном упоминании/ответе этому боту; user allowlist проверяется отдельно);
 - превращается в `user_message` в durable-инбоксе с `dedupeKey`
@@ -195,7 +199,8 @@ Callback-кнопки (`callback_query`) приходят как `user_message` 
 
 Расшифровка добавляется к тексту события и к записи истории; исходное вложение и caption
 сохраняются. В `payload.transcription` есть `provider`, `model`, `status` и `text`. `status` —
-одно из `transcribed`, `failed`, `too_large`, `quota_exhausted`, `disabled`, `not_configured`.
+одно из `transcribed`, `failed`, `too_large`, `rate_limited`, `quota_exhausted`, `disabled`,
+`not_configured`.
 В историю попадает только сам транскрипт: подсказки про настройку и разовые ошибки провайдера
 остаются только в тексте события, чтобы не засорять поиск по истории.
 
@@ -211,18 +216,32 @@ Callback-кнопки (`callback_query`) приходят как `user_message` 
 следующие апдейты ждут. Если это мешает, уменьшите `timeoutMs`/`transcriptionRetries` или
 выключите `transcription.enabled`.
 
-#### Повторы, дневная квота и логи (#117)
+#### Повторы, пауза по 429 и логи (#117, #136)
 
 Голосовое распознаётся с ограниченным числом попыток: `1 + transcriptionRetries` (по умолчанию
 три; настройка допускает не больше двух повторов, то есть не больше трёх попыток) и только при
 **временных** сбоях — таймаут, обрыв соединения/DNS, HTTP 5xx и 429 с коротким `retry-after`
-(≤ 10 секунд). Пауза между попытками растёт экспоненциально от `transcriptionRetryDelayMs`
+(≤ 30 секунд). Пауза между попытками растёт экспоненциально от `transcriptionRetryDelayMs`
 (×2, не больше 30 секунд) и размывается джиттером ±20%; если провайдер прислал `retry-after`,
-используется его значение.
+используется его значение (не больше 30 секунд).
 
 Никогда не повторяются: 401/403 (неверный ключ), исчерпанная квота (`rate_limit`/`daily`,
 маркеры RPD/TPD, `insufficient_quota`), неподдерживаемый формат (остальные 4xx) и слишком
 большой файл. Такая ошибка завершает распознавание с первой попытки.
+
+Любой 429 — не только дневная квота — включает **общий на процесс** cooldown: маркер
+`transcriptionCooldown` в `<stateDir>/modules/telegram/state.json` живёт до `retry-after`
+(если провайдер его не прислал — 60 секунд). Пока пауза активна, голосовые не скачиваются и не
+отправляются в API вообще: сообщение приходит с пометкой и
+`payload.transcription.status = "rate_limited"`, а `status.transcription.rateLimitedUntil`
+показывает, когда можно снова. Cooldown снимается сам по истечении срока, при успешном ответе
+провайдера или при изменении настроек распознавания. Это защищает от повторной обработки одной
+и той же пачки: в #136 одно голосовое ушло в Groq ~3000 раз и выжгло часовой лимит аудио.
+
+Одно и то же вложение не расшифровывается дважды: результат попытки (успех или ошибка) кешируется
+в памяти на 10 минут по `(chatId, messageId)` и по `fileId`, поэтому повторная доставка апдейта
+не даёт ни нового скачивания, ни нового запроса к провайдеру. Исход «пауза» (`rate_limited`,
+`quota_exhausted`) не кешируется: после снятия паузы запись можно расшифровать снова.
 
 Если провайдер ответил ошибкой **дневной** квоты, модуль пишет маркер в
 `<stateDir>/modules/telegram/state.json` (`transcriptionQuota`) и до конца суток (UTC) больше
@@ -233,9 +252,11 @@ Callback-кнопки (`callback_query`) приходят как `user_message` 
 
 Контракт логов: на одно голосовое — не больше одной строки `warn`
 (`telegram voice transcription failed` с `attempts`, `class` и `reason`; для квоты —
-`telegram voice transcription paused until the provider quota resets`). Детали каждой попытки
-пишутся только на уровне `debug` (`telegram voice transcription attempt failed`). Ни ключ, ни
-тело ответа провайдера, ни аудио в лог не попадают.
+`telegram voice transcription paused until the provider quota resets`; для 429 —
+`telegram voice transcription paused by the provider rate limit`). При активной паузе
+пропуски логируются на уровне `debug`, а `warn` повторяется не чаще раза в 10 минут. Детали
+каждой попытки пишутся только на уровне `debug` (`telegram voice transcription attempt failed`).
+Ни ключ, ни тело ответа провайдера, ни аудио в лог не попадают.
 
 Ключ — секрет: задайте его в окружении хост-процесса (например, в gitignored `.env`), а не
 в Telegram, tracked config или PR. `GROQ_API_KEY` читается при обработке каждого голосового,
