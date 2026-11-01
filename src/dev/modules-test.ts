@@ -78,8 +78,8 @@ function section(name: string): void {
 	process.stdout.write(`\n${name}\n`);
 }
 
-function jsonResponse(value: unknown, status = 200): Response {
-	return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
+function jsonResponse(value: unknown, status = 200, headers: Record<string, string> = {}): Response {
+	return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json", ...headers } });
 }
 
 /** Long-poll stand-in: stay pending until the module aborts the request. */
@@ -761,6 +761,34 @@ section("Groq Whisper transcription client");
 	);
 	const longRateLimit = await failureFor(failingFetch(() => new Response("slow down", { status: 429, headers: { "retry-after": "3600" } })));
 	check("a 429 with a long retry-after is not worth another attempt", longRateLimit?.retryable === false, longRateLimit);
+
+	// #135: Groq's hourly audio budget resets within the hour, so a 10–30 s wait is
+	// worth taking instead of dropping the recording.
+	const hourlyLimit = await failureFor(
+		failingFetch(() =>
+			jsonResponse(
+				{
+					error: {
+						message: "Rate limit reached for audio seconds per hour (ASH): Limit 7200, Used 7200, Requested 19.",
+						type: "tokens",
+						code: "rate_limit_exceeded",
+					},
+				},
+				429,
+				{ "retry-after": "20" },
+			),
+		),
+	);
+	check(
+		"an hourly audio limit with a 20 s retry-after stays retryable (#135)",
+		hourlyLimit?.class === "rate_limit" && hourlyLimit.retryable === true && hourlyLimit.retryAfterMs === 20_000,
+		hourlyLimit,
+	);
+	check(
+		"the hourly limit is named in the reason, not confused with the daily quota",
+		hourlyLimit?.reason?.includes("hourly") === true && hourlyLimit?.dailyQuota !== true,
+		hourlyLimit,
+	);
 
 	const serverFailure = await failureFor(failingFetch(() => new Response("boom", { status: 503 })));
 	check("a 5xx is transient", serverFailure?.class === "provider_unavailable" && serverFailure.retryable === true, serverFailure);
