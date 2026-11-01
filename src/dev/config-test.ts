@@ -11,6 +11,8 @@ import * as path from "node:path";
 import {
 	DEFAULT_CONFIG,
 	DEFAULT_EMPTY_WAKE_BACKOFF,
+	DEFAULT_LOOP_CONTEXT_WARN_STEP_TOKENS,
+	DEFAULT_LOOP_CONTEXT_WARN_TOKENS,
 	DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS,
 	DEFAULT_LOOP_RUN_TIMEOUT_MS,
 	DEFAULT_LOOP_RUN_VERY_LONG_MS,
@@ -442,6 +444,80 @@ section("loop run-health keys: no hard stop by default, validated thresholds (#1
 			partial.runWarnMs === 10 * 60_000 &&
 			partial.runNoOutboundTurns === 60 &&
 			partial.runVeryLongMs === 3 * 60 * 60_000,
+		partial,
+	);
+	fs.rmSync(root, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+section("loop context-size hint keys are validated (#123)");
+{
+	check(
+		"the defaults are 150k tokens with a 50k re-arm step",
+		DEFAULT_CONFIG.loop.contextWarnTokens === 150_000 &&
+			DEFAULT_CONFIG.loop.contextWarnStepTokens === 50_000 &&
+			DEFAULT_LOOP_CONTEXT_WARN_TOKENS === 150_000 &&
+			DEFAULT_LOOP_CONTEXT_WARN_STEP_TOKENS === 50_000,
+		DEFAULT_CONFIG.loop,
+	);
+	const root = tempRoot("contextwarn");
+	const loaded = loadConfig({ cwd: root, secretLog: () => undefined, secretWarn: () => undefined });
+	check(
+		"a config file without the keys gets the defaults",
+		loaded.config.loop.contextWarnTokens === 150_000 && loaded.config.loop.contextWarnStepTokens === 50_000,
+		loaded.config.loop,
+	);
+
+	const overridden = loadConfig({
+		cwd: root,
+		secretLog: () => undefined,
+		secretWarn: () => undefined,
+		overrides: { loop: { ...DEFAULT_CONFIG.loop, contextWarnTokens: 90_000, contextWarnStepTokens: 10_000 } },
+	});
+	check(
+		"explicit values win",
+		overridden.config.loop.contextWarnTokens === 90_000 && overridden.config.loop.contextWarnStepTokens === 10_000,
+		overridden.config.loop,
+	);
+
+	const disabled = validateLoopConfig({ ...DEFAULT_CONFIG.loop, contextWarnTokens: 0, contextWarnStepTokens: 0 });
+	check(
+		"contextWarnTokens = 0 disables the hint and accepts step 0 too",
+		disabled.contextWarnTokens === 0 && disabled.contextWarnStepTokens === 0,
+		disabled,
+	);
+
+	const rejects: Array<[string, LoopConfig, string]> = [
+		["a negative contextWarnTokens", { ...DEFAULT_CONFIG.loop, contextWarnTokens: -1 }, "loop.contextWarnTokens"],
+		["a fractional contextWarnTokens", { ...DEFAULT_CONFIG.loop, contextWarnTokens: 1.5 }, "loop.contextWarnTokens"],
+		["a string contextWarnTokens", { ...DEFAULT_CONFIG.loop, contextWarnTokens: "150000" as unknown as number }, "loop.contextWarnTokens"],
+		["a negative contextWarnStepTokens", { ...DEFAULT_CONFIG.loop, contextWarnStepTokens: -1 }, "loop.contextWarnStepTokens"],
+		["a fractional contextWarnStepTokens", { ...DEFAULT_CONFIG.loop, contextWarnStepTokens: 1.5 }, "loop.contextWarnStepTokens"],
+		["an infinite contextWarnStepTokens", { ...DEFAULT_CONFIG.loop, contextWarnStepTokens: Number.POSITIVE_INFINITY }, "loop.contextWarnStepTokens"],
+		[
+			"a zero step while warnings are enabled",
+			{ ...DEFAULT_CONFIG.loop, contextWarnTokens: 150_000, contextWarnStepTokens: 0 },
+			"loop.contextWarnStepTokens must be > 0",
+		],
+	];
+	for (const [label, value, expected] of rejects) {
+		let message = "";
+		try {
+			validateLoopConfig(value);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		check(`${label} is rejected`, message.startsWith(expected), message || "accepted");
+	}
+
+	const partial = validateLoopConfig({
+		...DEFAULT_CONFIG.loop,
+		contextWarnTokens: undefined,
+		contextWarnStepTokens: null,
+	} as unknown as LoopConfig);
+	check(
+		"missing or null context keys fall back to the defaults",
+		partial.contextWarnTokens === 150_000 && partial.contextWarnStepTokens === 50_000,
 		partial,
 	);
 	fs.rmSync(root, { recursive: true, force: true });
