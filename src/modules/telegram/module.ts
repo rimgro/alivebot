@@ -1148,7 +1148,7 @@ export class TelegramModule implements AliveModule {
 				if (!retrying) break;
 				const waitMs =
 					retryAfterMs !== undefined
-						? Math.max(retryAfterMs, 0)
+						? Math.min(Math.max(retryAfterMs, 0), GROQ_TRANSCRIPTION_MAX_RETRY_AFTER_MS)
 						: jitter(Math.min(baseDelayMs * 2 ** (attempt - 1), TRANSCRIPTION_BACKOFF_MAX_MS));
 				// Per-attempt detail is debug-only: the incident was 7959 identical
 				// warning lines for one recording.

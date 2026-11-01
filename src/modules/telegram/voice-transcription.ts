@@ -7,7 +7,14 @@ export const GROQ_TRANSCRIPTION_TIMEOUT_MS = 30_000;
  * budget. "Try again in 2h" is not a transient failure: retrying it burns the
  * daily quota for nothing (incident #117).
  */
-export const GROQ_TRANSCRIPTION_MAX_RETRY_AFTER_MS = 10_000;
+/**
+ * Longest `retry-after` we are willing to sit out for one attempt.
+ *
+ * Groq enforces an hourly audio budget (`audio seconds per hour`, ASH) that
+ * resets within the hour: a 10–30 s wait is worth taking, while waiting minutes
+ * blocks the polling loop for no benefit (#135).
+ */
+export const GROQ_TRANSCRIPTION_MAX_RETRY_AFTER_MS = 30_000;
 /** Error bodies are read only to classify the failure; never logged, never kept. */
 const GROQ_ERROR_BODY_LIMIT = 2_048;
 
@@ -145,11 +152,16 @@ function classifyProviderRejection(status: number, headers: Headers, body: strin
 		return { class: "daily_quota", reason: "Groq daily quota exhausted", retryable: false, dailyQuota: true, retryAfterMs };
 	}
 	if (status === 429) {
-		// A long retry-after is not a transient failure: do not spend attempts on it.
+		// An hourly audio budget (#135) is a wait, not a lost message: name it so the
+		// agent knows the recording can be retried later instead of silently dropped.
+		const reason = hasHourlyQuotaMarker(body)
+			? "Groq hourly audio limit (audio seconds per hour)"
+			: "Groq returned HTTP 429 (rate limit)";
+		// A wait longer than the retry budget is not worth blocking the poll loop for.
 		if (retryAfterMs !== undefined && retryAfterMs > GROQ_TRANSCRIPTION_MAX_RETRY_AFTER_MS) {
-			return { class: "rate_limit", reason: "Groq rate limit (retry-after exceeds the retry budget)", retryable: false, retryAfterMs };
+			return { class: "rate_limit", reason: `${reason}; retry-after exceeds the retry budget`, retryable: false, retryAfterMs };
 		}
-		return { class: "rate_limit", reason: "Groq returned HTTP 429 (rate limit)", retryable: true, retryAfterMs };
+		return { class: "rate_limit", reason, retryable: true, retryAfterMs };
 	}
 	if (status === 408) return { class: "timeout", reason: "Groq returned HTTP 408 (timeout)", retryable: true };
 	if (status >= 500) return { class: "provider_unavailable", reason: `Groq returned HTTP ${status}`, retryable: true };
@@ -158,6 +170,13 @@ function classifyProviderRejection(status: number, headers: Headers, body: strin
 
 /** Marker list covers Groq/OpenAI daily limits ("requests per day (RPD)", TPD, insufficient_quota). */
 const DAILY_QUOTA_MARKER = /insufficient_quota|exceeded your current quota|requests per day|\brpd\b|\btpd\b|\bdaily\b|per[- ]day/i;
+
+/** Hourly audio budget markers: `audio seconds per hour`, `(ASH)`, `per hour`. */
+const HOURLY_QUOTA_MARKER = /per[- ]hour|\(\s*ash\s*\)|\bash\b/i;
+
+function hasHourlyQuotaMarker(body: string): boolean {
+	return HOURLY_QUOTA_MARKER.test(body);
+}
 
 function hasDailyQuotaMarker(body: string): boolean {
 	return DAILY_QUOTA_MARKER.test(body);
