@@ -422,6 +422,12 @@ export interface TelegramConfig {
 	transcriptionRetries: number;
 	/** Base delay for the exponential backoff between transcription attempts, in milliseconds. */
 	transcriptionRetryDelayMs: number;
+	/**
+	 * #139: how many updates the persisted offset may be ahead of the largest
+	 * update id in a fetched batch before it is treated as a foreign/restored
+	 * feed and reset to that id + 1. Smaller gaps only warn. Default 1000.
+	 */
+	offsetGapReset: number;
 }
 
 /**
@@ -440,6 +446,14 @@ export const MAX_TRANSCRIPTION_RETRY_DELAY_MS = 60_000;
 export const MANAGED_BOT_TTL_MIN_MS = 10 * 60_000;
 export const MANAGED_BOT_TTL_MAX_MS = 15 * 60_000;
 export const DEFAULT_MANAGED_BOT_TTL_MS = 12 * 60_000;
+
+/**
+ * #139: a stored offset this far ahead of the API batch is not a re-delivery,
+ * it is a foreign feed (or state restored from another bot) and is reset.
+ */
+export const DEFAULT_TELEGRAM_OFFSET_GAP_RESET = 1_000;
+export const MIN_TELEGRAM_OFFSET_GAP_RESET = 0;
+export const MAX_TELEGRAM_OFFSET_GAP_RESET = 1_000_000;
 
 /** Validate Telegram settings whose bad values must fail loudly, not silently. */
 export function validateTelegramConfig(value: TelegramConfig): TelegramConfig {
@@ -471,6 +485,15 @@ export function validateTelegramConfig(value: TelegramConfig): TelegramConfig {
 	) {
 		throw new Error(
 			`modules.telegram.transcriptionRetryDelayMs must be an integer between ${MIN_TRANSCRIPTION_RETRY_DELAY_MS} and ${MAX_TRANSCRIPTION_RETRY_DELAY_MS} ms, got "${String(value.transcriptionRetryDelayMs)}"`,
+		);
+	}
+	if (
+		!Number.isSafeInteger(value.offsetGapReset) ||
+		value.offsetGapReset < MIN_TELEGRAM_OFFSET_GAP_RESET ||
+		value.offsetGapReset > MAX_TELEGRAM_OFFSET_GAP_RESET
+	) {
+		throw new Error(
+			`modules.telegram.offsetGapReset must be an integer between ${MIN_TELEGRAM_OFFSET_GAP_RESET} and ${MAX_TELEGRAM_OFFSET_GAP_RESET} updates, got "${String(value.offsetGapReset)}"`,
 		);
 	}
 	return value;
@@ -783,6 +806,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 			},
 			transcriptionRetries: DEFAULT_TRANSCRIPTION_RETRIES,
 			transcriptionRetryDelayMs: DEFAULT_TRANSCRIPTION_RETRY_DELAY_MS,
+			offsetGapReset: DEFAULT_TELEGRAM_OFFSET_GAP_RESET,
 		},
 		grafana: {
 			enabled: false,
