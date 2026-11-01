@@ -368,8 +368,18 @@ check(
 	report.split.workers.turns === null &&
 		report.split.workers.cacheRead === null &&
 		report.split.workers.cacheWrite === null &&
-		report.split.workers.note.includes("no turns"),
+		report.split.workers.note.includes("model/turns"),
 	report.split.workers.note,
+);
+check(
+	"worker entries without a model are grouped as unknown, not invented",
+	report.split.workers.byModel.length === 1 && report.split.workers.byModel[0]?.model === "unknown",
+	report.split.workers.byModel,
+);
+check(
+	"worker top runs list only entries with a cost",
+	report.split.workers.workerTopRuns.every((run) => run.cost > 0),
+	report.split.workers.workerTopRuns,
 );
 
 section("model / provider split");
