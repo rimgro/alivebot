@@ -32,7 +32,6 @@
   "loop": {
     "pollIntervalMs": 750,
     "sleepAfterMs": 900000,
-    "runTimeoutMs": 240000,
     "maxEventsPerIdle": 8,
     "maxNudges": 3,
     "maxNudgesPerRun": 5,
