@@ -379,6 +379,8 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 					to: params.to,
 					text: params.text,
 					runId: run.id,
+					// Routing trace: sender, recipient, inbox and event id (never the text).
+					log,
 				});
 			} catch (error) {
 				const reason = error instanceof Error ? error.message : String(error);

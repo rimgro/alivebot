@@ -8,7 +8,7 @@ import { loadConfig, writeDefaultConfig } from "../config.js";
 import { EventStore } from "../store/events.js";
 import { HistoryStore } from "../store/history.js";
 import { Outbox } from "../store/outbox.js";
-import { sendLocalAgentMessage } from "../runtime/agent-messaging.js";
+import { sendLocalAgentMessage, managedAgentId, resolveRootProfile } from "../runtime/agent-messaging.js";
 import { createAliveTools, type RunHandle, type ToolDeps } from "../runtime/tools.js";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-agent-messaging-"));
@@ -198,6 +198,13 @@ try {
 	// --- message_agent tool: delivered only after the recipient inbox stored the event ---
 	const run = { id: "run-tool", outbound: [] } as unknown as RunHandle;
 	const recorded: Array<{ thread: string; ts: number }> = [];
+	const logEntries: Array<{ level: string; msg: string; data?: Record<string, unknown> }> = [];
+	const captureLog = {
+		debug: (msg: string, data?: Record<string, unknown>) => logEntries.push({ level: "debug", msg, data }),
+		info: (msg: string, data?: Record<string, unknown>) => logEntries.push({ level: "info", msg, data }),
+		warn: (msg: string, data?: Record<string, unknown>) => logEntries.push({ level: "warn", msg, data }),
+		error: () => {},
+	};
 	const deps = {
 		config: senderConfig,
 		outbox: new Outbox(senderConfig.paths.stateDir),
@@ -205,7 +212,7 @@ try {
 		threads: { recordOutbound: (thread: string, ts: number) => recorded.push({ thread, ts }) },
 		moduleTools: [],
 		getRun: () => run,
-		log: { child: () => ({ info: () => {}, warn: () => {}, error: () => {} }) },
+		log: { child: () => captureLog },
 	} as unknown as ToolDeps;
 	const messageTool = createAliveTools(deps).find((tool) => tool.name === "message_agent");
 	assert.ok(messageTool, "message_agent is registered");
@@ -219,8 +226,106 @@ try {
 	assert.equal(run.outbound[0]?.delivered, true);
 	assert.equal(recorded.length, 1);
 
+	// The routing trace names both ids, the absolute inbox and the event id, never the text.
+	const routed = logEntries.find((entry) => entry.msg === "message_agent resolved local delivery");
+	assert.ok(routed, "every message_agent resolution is logged");
+	assert.equal(routed.level, "info");
+	assert.equal(routed.data?.to, "main");
+	assert.equal(routed.data?.senderId, "researcher");
+	assert.equal(routed.data?.recipientId, "main");
+	assert.equal(routed.data?.inbox, path.join(mainConfig.paths.stateDir, "inbox"), "the log names the absolute inbox that received the event");
+	assert.equal(routed.data?.eventId, deliveredId);
+	assert.equal(routed.data?.thread, "local:agent:researcher:agent:main");
+	assert.equal(JSON.stringify(logEntries).includes("Tool-delivered reply to main."), false, "the routing log never contains message text");
+
 	await assert.rejects(() => messageTool.execute("call-2", { to: "nobody", text: "lost" }, undefined, undefined, undefined as never), /could not deliver to nobody: unknown managed agent: nobody/);
 	assert.equal(run.outbound.length, 1, "a failed delivery is not recorded as delivered");
+	const failed = logEntries.filter((entry) => entry.msg === "message_agent resolution failed").at(-1);
+	assert.ok(failed, "a failed resolution is logged with its reason");
+	assert.equal(failed.level, "warn");
+	assert.equal(failed.data?.to, "nobody");
+	assert.equal(failed.data?.senderId, "researcher", "the failed trace still names the resolved sender");
+	assert.equal(failed.data?.recipientId, undefined);
+	assert.equal(failed.data?.inbox, undefined);
+	assert.match(String(failed.data?.reason), /unknown managed agent: nobody/);
+	assert.equal(JSON.stringify(logEntries).includes("lost"), false, "a failed routing log never contains message text");
+
+	// --- #148: a managed profile that lives in a registry messages the root, not itself ---
+	const registryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-agent-messaging-registry-"));
+	try {
+		const registryInit = writeDefaultConfig(registryRoot);
+		const registryRaw = JSON.parse(fs.readFileSync(registryInit.configPath, "utf8"));
+		// The shared registry lives at `<root>/agents`, so the root profile declares it.
+		registryRaw.agentsDirectory = "agents";
+		fs.writeFileSync(registryInit.configPath, `${JSON.stringify(registryRaw, null, 2)}\n`);
+		const registryMain = loadConfig({ cwd: registryRoot, configPath: registryInit.configPath });
+
+		// A managed profile as it exists in the field: only its private state directory
+		// is configured locally, so `agentsDirectory` stays at the state-dir default and
+		// `agentsRoot()` points inside the profile. That hid the registry it lives in (#148).
+		const farmDirectory = path.join(registryRoot, "agents", "farm-analyst");
+		fs.mkdirSync(farmDirectory, { recursive: true });
+		const farmConfigPath = path.join(farmDirectory, "alive.config.json");
+		const farmRaw = {
+			...registryRaw,
+			name: "Farm Analyst",
+			stateDir: "state",
+			agentsDirectory: "",
+			rootConfigPath: registryInit.configPath,
+		};
+		fs.writeFileSync(farmConfigPath, `${JSON.stringify(farmRaw, null, 2)}\n`);
+		const farmConfig = loadConfig({ cwd: farmDirectory, configPath: farmConfigPath });
+		const writerDirectory = path.join(registryRoot, "agents", "writer");
+		fs.mkdirSync(writerDirectory, { recursive: true });
+		const writerConfigPath = path.join(writerDirectory, "alive.config.json");
+		fs.writeFileSync(writerConfigPath, `${JSON.stringify({ ...farmRaw, name: "Writer" }, null, 2)}\n`);
+		const fixtureWriter = loadConfig({ cwd: writerDirectory, configPath: writerConfigPath });
+		assert.equal(managedAgentId(farmConfig), "farm-analyst", "the profile identity comes from the registry that contains it");
+		assert.equal(
+			path.resolve(resolveRootProfile(farmConfig)?.paths.configPath ?? ""),
+			path.resolve(registryMain.paths.configPath),
+			"the root is the profile that owns the registry, never the managed profile itself",
+		);
+
+		const farmToMain = await sendLocalAgentMessage({
+			config: farmConfig,
+			outbox: new Outbox(farmConfig.paths.stateDir),
+			to: "main",
+			text: "Farm report for the root agent.",
+			runId: "run-farm-main",
+		});
+		assert.equal(farmToMain.senderId, "farm-analyst", "the managed sender keeps its own identity, not main");
+		assert.equal(farmToMain.recipientAgentId, "main");
+		assert.equal(farmToMain.thread, "local:agent:farm-analyst:agent:main", "the farm -> main thread is not reversed");
+
+		const farmEvent = EventStore.open(registryMain.paths.stateDir).peekPending(20).find((item) => item.id === farmToMain.id);
+		assert.ok(farmEvent, "the event lands in the root profile inbox, not the sender inbox");
+		assert.equal(farmEvent.source, "local-messenger");
+		assert.equal(farmEvent.thread, "local:agent:farm-analyst:agent:main");
+		assert.equal(farmEvent.meta?.senderId, "farm-analyst");
+		assert.equal(farmEvent.meta?.recipientAgentId, "main");
+		assert.equal(
+			EventStore.open(farmConfig.paths.stateDir).peekPending(20).some((item) => item.id === farmToMain.id),
+			false,
+			"the message is not delivered back into the sender's own inbox",
+		);
+		const farmOutbox = new Outbox(farmConfig.paths.stateDir).list(5).find((message) => message.id === farmToMain.id);
+		assert.equal(farmOutbox?.recipientAgentId, "main", "the sender outbox records the addressed root recipient");
+		assert.equal(farmOutbox?.senderId, "farm-analyst");
+
+		// Peers in the same registry stay addressable from a registry-resident profile.
+		const farmToWriter = await sendLocalAgentMessage({
+			config: farmConfig,
+			outbox: new Outbox(farmConfig.paths.stateDir),
+			to: "writer",
+			text: "Farm notes for the writer.",
+			runId: "run-farm-writer",
+		});
+		assert.equal(farmToWriter.thread, "local:agent:farm-analyst:agent:writer");
+		assert.ok(EventStore.open(fixtureWriter.paths.stateDir).peekPending(20).some((item) => item.id === farmToWriter.id), "managed peers are resolved through the same registry");
+	} finally {
+		fs.rmSync(registryRoot, { recursive: true, force: true });
+	}
 
 	// --- CLI operator send still routes to a managed agent inbox ---
 	const originalCwd = process.cwd();
