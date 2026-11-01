@@ -2,7 +2,7 @@ import * as path from "node:path";
 import { appendJsonl, ensureDir, readJsonl } from "../util.js";
 
 /**
- * Run-anomaly events the runtime records about its own runs (#127).
+ * Run-anomaly events the runtime records about its own runs (#127, #123).
  *
  * These replace the old habit of killing a run at a wall clock. The runtime
  * keeps working and, when something looks wrong, writes one structured event
@@ -11,9 +11,19 @@ import { appendJsonl, ensureDir, readJsonl } from "../util.js";
  * many messages it sent. **No prompt, message or tool-argument text is ever
  * stored** — arguments can contain conversation content.
  *
+ * `context_high` (#123) is the one event that is also a hint: it records that
+ * the session context crossed `loop.contextWarnTokens` and the agent was asked
+ * to sleep only if the task is finished or it is switching to unrelated work.
+ * It is recorded once per crossing, not per turn.
+ *
  * One file per profile: `<stateDir>/runs/events.jsonl`, next to `runs.jsonl`.
  */
-export type RunAnomalyType = "run_long" | "run_no_outbound" | "run_repeat_tool" | "run_very_long";
+export type RunAnomalyType =
+	| "run_long"
+	| "run_no_outbound"
+	| "run_repeat_tool"
+	| "run_very_long"
+	| "context_high";
 
 export interface RunAnomalyEvent {
 	/** Wall clock of the event. */
@@ -38,6 +48,13 @@ export interface RunAnomalyEvent {
 	limitMs?: number;
 	/** `run_no_outbound`: the turn threshold that fired, for reference. */
 	limitTurns?: number;
+	/**
+	 * `context_high`: current context size in tokens. This is pi's prompt/context
+	 * estimate (`contextUsage.tokens`), never cumulative billing.
+	 */
+	contextTokens?: number;
+	/** `context_high`: the configured `loop.contextWarnTokens` threshold. */
+	limitTokens?: number;
 	/** `run_repeat_tool`: the tool name. Arguments are deliberately not recorded. */
 	tool?: string;
 	/** `run_repeat_tool`: how many times in a row the same call was repeated. */

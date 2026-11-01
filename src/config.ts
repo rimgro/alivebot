@@ -86,6 +86,26 @@ export interface LoopConfig {
 	 * `run_very_long` event. It never stops the run. 0 = disabled. Default 3 hours.
 	 */
 	runVeryLongMs: number;
+	/**
+	 * Context-size hint (#123). When the estimated context of the pi session crosses
+	 * this many tokens, the agent is steered one service message: finish the current
+	 * coherent task, and if it is finished or you are switching to unrelated work,
+	 * go to `sleep` (sleep keeps memory through summary.md).
+	 *
+	 * This is only a hint: the runtime never sleeps the agent on its own and never
+	 * compacts the context. The size comes from pi's context estimate
+	 * (`contextUsage.tokens` — prompt/context tokens, not cumulative billing).
+	 * 0 = disabled. Default 150 000 tokens.
+	 */
+	contextWarnTokens: number;
+	/**
+	 * Re-arm the context hint only after the context has grown another this many
+	 * tokens (`contextWarnTokens`, then +1×step, +2×step, …). A flat or slowly
+	 * growing context is never hinted again. Must be > 0 whenever
+	 * `contextWarnTokens` is enabled; ignored when warnings are off.
+	 * Default 50 000 tokens.
+	 */
+	contextWarnStepTokens: number;
 	/** Max events returned by one `idle` call. The rest are delivered on the next idle. */
 	maxEventsPerIdle: number;
 	/** How many times an unanswered user message is carried over before we stop nudging. */
@@ -159,6 +179,10 @@ export const DEFAULT_LOOP_RUN_WARN_MS = 10 * 60_000;
 export const DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS = 60;
 export const DEFAULT_LOOP_RUN_VERY_LONG_MS = 3 * 60 * 60_000;
 
+/** Context-size hint defaults (#123): warn at 150k tokens, re-arm every +50k. */
+export const DEFAULT_LOOP_CONTEXT_WARN_TOKENS = 150_000;
+export const DEFAULT_LOOP_CONTEXT_WARN_STEP_TOKENS = 50_000;
+
 /** Graceful-shutdown and resume defaults (#124). */
 export const DEFAULT_LOOP_SHUTDOWN_GRACE_MS = 30_000;
 export const DEFAULT_LOOP_RESUME_WINDOW_MS = 10 * 60_000;
@@ -171,8 +195,10 @@ export const DEFAULT_LOOP_RESUME_WINDOW_MS = 10 * 60_000;
  * disables the guard, a fractional one never matches, and a missing block would
  * leave the scheduler comparing against `undefined`. Each of the run-health
  * values accepts 0 ("disabled") and any non-negative whole number, so the
- * historical permissive `runTimeoutMs` still works. Other scalars such as
- * `pollIntervalMs` keep their historical permissive behaviour.
+ * historical permissive `runTimeoutMs` still works. The context-size hint adds
+ * one cross-field rule: its re-arm step must be positive whenever warnings are
+ * enabled. Other scalars such as `pollIntervalMs` keep their historical
+ * permissive behaviour.
  */
 export function validateLoopConfig(value: LoopConfig): LoopConfig {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("loop must be an object");
@@ -196,12 +222,25 @@ export function validateLoopConfig(value: LoopConfig): LoopConfig {
 			`loop.emptyWakeBackoff.maxIntervalMs must be a whole number between ${EMPTY_WAKE_MAX_INTERVAL_MIN_MS} and ${EMPTY_WAKE_MAX_INTERVAL_MAX_MS} ms (1 minute to 24 hours), got "${String(backoff.maxIntervalMs)}"`,
 		);
 	}
+	const contextWarnTokens = runHealthMs(value.contextWarnTokens, "contextWarnTokens", DEFAULT_LOOP_CONTEXT_WARN_TOKENS);
+	const contextWarnStepTokens = runHealthMs(
+		value.contextWarnStepTokens,
+		"contextWarnStepTokens",
+		DEFAULT_LOOP_CONTEXT_WARN_STEP_TOKENS,
+	);
+	if (contextWarnTokens > 0 && contextWarnStepTokens === 0) {
+		throw new Error(
+			"loop.contextWarnStepTokens must be > 0 when loop.contextWarnTokens is enabled (set contextWarnTokens = 0 to disable the hint)",
+		);
+	}
 	return {
 		...value,
 		runTimeoutMs: runHealthMs(value.runTimeoutMs, "runTimeoutMs", DEFAULT_LOOP_RUN_TIMEOUT_MS),
 		runWarnMs: runHealthMs(value.runWarnMs, "runWarnMs", DEFAULT_LOOP_RUN_WARN_MS),
 		runNoOutboundTurns: runHealthMs(value.runNoOutboundTurns, "runNoOutboundTurns", DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS),
 		runVeryLongMs: runHealthMs(value.runVeryLongMs, "runVeryLongMs", DEFAULT_LOOP_RUN_VERY_LONG_MS),
+		contextWarnTokens,
+		contextWarnStepTokens,
 		shutdownGraceMs: runHealthMs(value.shutdownGraceMs, "shutdownGraceMs", DEFAULT_LOOP_SHUTDOWN_GRACE_MS),
 		resumeWindowMs: runHealthMs(value.resumeWindowMs, "resumeWindowMs", DEFAULT_LOOP_RESUME_WINDOW_MS),
 		emptyWakeBackoff: {
@@ -671,6 +710,8 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		runWarnMs: DEFAULT_LOOP_RUN_WARN_MS,
 		runNoOutboundTurns: DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS,
 		runVeryLongMs: DEFAULT_LOOP_RUN_VERY_LONG_MS,
+		contextWarnTokens: DEFAULT_LOOP_CONTEXT_WARN_TOKENS,
+		contextWarnStepTokens: DEFAULT_LOOP_CONTEXT_WARN_STEP_TOKENS,
 		shutdownGraceMs: DEFAULT_LOOP_SHUTDOWN_GRACE_MS,
 		resumeWindowMs: DEFAULT_LOOP_RESUME_WINDOW_MS,
 		maxEventsPerIdle: 8,

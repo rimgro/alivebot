@@ -30,7 +30,7 @@ import { interruptedResumeDecision, RUN_TURN_TRACE_LIMIT, RunLog, type RunRecord
 import { ThreadStore } from "../store/threads.js";
 import { HistoryStore } from "../store/history.js";
 import { RunEventLog } from "../store/run-events.js";
-import { AgentRunner, runActiveMs } from "../runtime/agent.js";
+import { AgentRunner, CONTEXT_WARN_MESSAGE, runActiveMs } from "../runtime/agent.js";
 import { isOutboundRecorded } from "../runtime/tools.js";
 import { TurnTraceRecorder } from "../runtime/run-trace.js";
 import { hasWakeWorthyPending, WakeScheduler, wakeIntervalMs } from "../runtime/wake.js";
@@ -60,6 +60,8 @@ const config = loadConfig({
 			runWarnMs: 10 * 60_000,
 			runNoOutboundTurns: 60,
 			runVeryLongMs: 3 * 60 * 60_000,
+			contextWarnTokens: 150_000,
+			contextWarnStepTokens: 50_000,
 			shutdownGraceMs: 30_000,
 			resumeWindowMs: 10 * 60_000,
 			maxEventsPerIdle: 8,
@@ -135,6 +137,8 @@ class FakeSession {
 		totalMessages: 0,
 		tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		cost: 0,
+		// Pi's prompt/context estimate, distinct from the cumulative `tokens` above.
+		contextUsage: { tokens: 0 as number | null, contextWindow: 200_000, percent: 0 as number | null },
 	};
 
 	constructor(
@@ -155,7 +159,13 @@ class FakeSession {
 		return {
 			...this.stats,
 			tokens: { ...this.stats.tokens },
+			contextUsage: { ...this.stats.contextUsage },
 		};
+	}
+	/** Simulate the context growing (or shrinking) without touching billing counters. */
+	setContextTokens(tokens: number | null): void {
+		this.stats.contextUsage.tokens = tokens;
+		this.stats.contextUsage.percent = tokens === null ? null : (tokens / this.stats.contextUsage.contextWindow) * 100;
 	}
 	async prompt(text: string): Promise<void> {
 		this.prompts.push(text);
@@ -294,6 +304,12 @@ function resetRunHealth(): void {
 		runNoOutboundTurns: 60,
 		runVeryLongMs: 3 * 60 * 60_000,
 	});
+}
+function setContextWarn(patch: { contextWarnTokens?: number; contextWarnStepTokens?: number }): void {
+	Object.assign(config.config.loop, patch);
+}
+function resetContextWarn(): void {
+	setContextWarn({ contextWarnTokens: 150_000, contextWarnStepTokens: 50_000 });
 }
 
 section("a 20-minute active run is warned, never killed, with runTimeoutMs = 0 (#127)");
@@ -474,6 +490,132 @@ section("run_repeat_tool fires on the third identical call in a row");
 	};
 	const record = await runner.execute();
 	check("the anomaly did not stop the run", record?.stopReason === "slept", record?.stopReason);
+}
+
+// ---------------------------------------------------------------------------
+// context-size hint (#123): hint when the context is big, never sleep on our own
+// ---------------------------------------------------------------------------
+
+section("context threshold: one hint at 150k, re-armed only on +50k growth (#123)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	handler = async (session) => {
+		const run = currentRun!;
+		// Cumulative billing is huge, the actual context is tiny: the hint must
+		// only look at pi's prompt estimate, never at `tokens.total`.
+		session.setContextTokens(10_000);
+		session.addUsage(10_000_000, 1_000_000, 5);
+		await session.turn();
+		check(
+			"cumulative billing tokens never trigger the hint",
+			session.steered.length === 0 && anomaliesOf(run.id, "context_high").length === 0,
+			{ steered: session.steered, events: anomaliesOf(run.id, "context_high") },
+		);
+
+		session.setContextTokens(149_999);
+		await session.turn();
+		check(
+			"just below the threshold: no hint and no event",
+			session.steered.length === 0 && anomaliesOf(run.id, "context_high").length === 0,
+			{ steered: session.steered, events: anomaliesOf(run.id, "context_high") },
+		);
+
+		session.setContextTokens(150_000);
+		await session.turn();
+		const first = anomaliesOf(run.id, "context_high");
+		check(
+			"crossing 150k steers exactly one service message",
+			session.steered.length === 1 && session.steered[0] === CONTEXT_WARN_MESSAGE,
+			session.steered,
+		);
+		check(
+			"one context_high event with context tokens, threshold and turn",
+			first.length === 1 &&
+				first[0]?.runId === run.id &&
+				first[0]?.agent === config.config.name &&
+				first[0]?.contextTokens === 150_000 &&
+				first[0]?.limitTokens === 150_000 &&
+				first[0]?.turns === run.turns,
+			first[0],
+		);
+		check(
+			"the context hint stores no prompt or message text",
+			first.every((event) => !("text" in event) && !("prompt" in event) && !("message" in event)),
+			first[0],
+		);
+
+		session.setContextTokens(150_000);
+		await session.turn();
+		check(
+			"flat context does not repeat the hint on the next turn",
+			session.steered.length === 1 && anomaliesOf(run.id, "context_high").length === 1,
+			{ steered: session.steered.length, events: anomaliesOf(run.id, "context_high").length },
+		);
+
+		session.setContextTokens(190_000);
+		await session.turn();
+		check(
+			"growth below the step does not repeat it either",
+			session.steered.length === 1 && anomaliesOf(run.id, "context_high").length === 1,
+			{ steered: session.steered.length, events: anomaliesOf(run.id, "context_high").length },
+		);
+
+		session.setContextTokens(200_000);
+		await session.turn();
+		check(
+			"another +50k of context steers another hint",
+			session.steered.length === 2 && anomaliesOf(run.id, "context_high").length === 2,
+			{ steered: session.steered.length, events: anomaliesOf(run.id, "context_high").length },
+		);
+
+		session.setContextTokens(210_000);
+		await session.turn();
+		check(
+			"the re-armed hint waits for the next +50k",
+			session.steered.length === 2 && anomaliesOf(run.id, "context_high").length === 2,
+			{ steered: session.steered.length, events: anomaliesOf(run.id, "context_high").length },
+		);
+
+		check(
+			"the runtime neither slept the agent nor aborted the run on its own",
+			session.aborted === false && currentRun?.id === run.id,
+			{ aborted: session.aborted },
+		);
+
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "context hint test", summary_md: "# context hint test\n" });
+	};
+	const record = await runner.execute();
+	check("the run ended only when the agent chose sleep", record?.stopReason === "slept", record?.stopReason);
+	check(
+		"both context_high events are persisted next to the run records",
+		anomaliesOf(record?.id ?? "", "context_high").length === 2,
+		anomaliesFor(record?.id ?? ""),
+	);
+}
+
+section("contextWarnTokens = 0 disables both the hint and context_high (#123)");
+{
+	policy.reset();
+	setContextWarn({ contextWarnTokens: 0, contextWarnStepTokens: 50_000 });
+	handler = async (session) => {
+		const run = currentRun!;
+		session.setContextTokens(1_000_000);
+		await session.turn();
+		await session.turn();
+		check(
+			"a huge context steers nothing and records no event when disabled",
+			session.steered.length === 0 && anomaliesOf(run.id, "context_high").length === 0,
+			{ steered: session.steered, events: anomaliesOf(run.id, "context_high") },
+		);
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "context hint disabled test", summary_md: "# context hint disabled test\n" });
+	};
+	const record = await runner.execute();
+	check("the disabled hint did not affect the run", record?.stopReason === "slept", record?.stopReason);
+	resetContextWarn();
 }
 
 // ---------------------------------------------------------------------------

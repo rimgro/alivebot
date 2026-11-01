@@ -81,6 +81,19 @@ export function runActiveMs(run: RunHandle, now = Date.now()): number {
 export const RUN_REPEAT_TOOL_THRESHOLD = 3;
 
 /**
+ * The one built-in context-size hint (#123).
+ *
+ * The runtime steers this message when the session context crosses
+ * `loop.contextWarnTokens`: sleep is the agent's own tool and remains
+ * voluntary, so the hint only tells it when sleeping is a good idea. The
+ * operator may reword this freely — keep it a hint, not an instruction to stop
+ * in the middle of a coherent task.
+ */
+export const CONTEXT_WARN_MESSAGE =
+	"Контекст стал большим. Если текущая задача завершена или ты переключаешься на несвязанную работу — " +
+	"уйди в `sleep`: сон сохраняет память через summary. Не уходи в сон посреди связной задачи.";
+
+/**
  * Per-run guard state. Nothing here knows about prompts or messages: it is
  * counters and a tool-argument fingerprint only, so an anomaly event can never
  * leak conversation content.
@@ -96,6 +109,8 @@ interface RunWatch {
 	/** Consecutive calls with the same tool and identical arguments. */
 	repeatCount: number;
 	repeatFlagged: boolean;
+	/** Context size (tokens) at the last `context_high` hint; undefined until the first. */
+	contextWarnedAt?: number;
 }
 
 /**
@@ -320,6 +335,8 @@ export class AgentRunner {
 			activeMs: number;
 			limitMs?: number;
 			limitTurns?: number;
+			contextTokens?: number;
+			limitTokens?: number;
 			tool?: string;
 			repeats?: number;
 		},
@@ -338,6 +355,8 @@ export class AgentRunner {
 			events: run.events.length,
 			limitMs: input.limitMs,
 			limitTurns: input.limitTurns,
+			contextTokens: input.contextTokens,
+			limitTokens: input.limitTokens,
 			tool: input.tool,
 			repeats: input.repeats,
 		};
@@ -407,6 +426,7 @@ export class AgentRunner {
 				veryLongFlagged: false,
 				repeatCount: 0,
 				repeatFlagged: false,
+				contextWarnedAt: undefined,
 			};
 			store.beginRun(run.id);
 
@@ -727,6 +747,9 @@ export class AgentRunner {
 				this.deps.log.warn(`run #${run.index} stopped: budget exhausted`);
 				return true;
 			}
+			// Only hint while the run is actually continuing: no steering into a
+			// run that is already being stopped or drained.
+			this.noteContextSize(run);
 			return false;
 		};
 	}
@@ -837,6 +860,66 @@ export class AgentRunner {
 	}
 
 	/**
+	 * Context-size hint (#123), checked once per turn.
+	 *
+	 * The size is pi's own estimate of the current prompt/context
+	 * (`contextUsage.tokens`), not the cumulative billed token counter: what
+	 * matters is how much the model must carry, not how much it has spent. When
+	 * it crosses `loop.contextWarnTokens`, the agent gets one service message
+	 * suggesting sleep **if** the task is finished or it is switching to
+	 * unrelated work. The hint is re-armed only after the context grows another
+	 * `loop.contextWarnStepTokens`; a flat context never repeats it. Dropping
+	 * back below the threshold (e.g. after a compaction) re-arms it for the next
+	 * crossing.
+	 *
+	 * Nothing here sleeps the agent or compacts the context: this is a hint, and
+	 * `sleep` stays the agent's own decision.
+	 */
+	private noteContextSize(run: RunHandle): void {
+		const loop = this.deps.config.config.loop;
+		if (loop.contextWarnTokens <= 0) return;
+		const watch = this.watch?.runId === run.id ? this.watch : undefined;
+		if (!watch) return;
+		const contextTokens = sessionContextTokens(this.session);
+		if (contextTokens <= 0) return;
+		if (contextTokens < loop.contextWarnTokens) {
+			// Fell back below the threshold: a later crossing deserves a fresh hint.
+			watch.contextWarnedAt = undefined;
+			return;
+		}
+		const last = watch.contextWarnedAt;
+		if (last !== undefined && contextTokens < last + loop.contextWarnStepTokens) return;
+		watch.contextWarnedAt = contextTokens;
+		const now = Date.now();
+		this.emitAnomaly(run, {
+			type: "context_high",
+			now,
+			activeMs: runActiveMs(run, now),
+			contextTokens,
+			limitTokens: loop.contextWarnTokens,
+		});
+		void this.steerContextWarning(run, contextTokens);
+	}
+
+	/**
+	 * Steer the built-in context-size hint into the working agent (#123).
+	 * `sleep` remains voluntary: the run continues if the agent decides not to.
+	 */
+	private async steerContextWarning(run: RunHandle, contextTokens: number): Promise<void> {
+		try {
+			await this.session.steer(CONTEXT_WARN_MESSAGE);
+			this.deps.log.info(`run #${run.index} context-size hint steered`, {
+				contextTokens,
+				threshold: this.deps.config.config.loop.contextWarnTokens,
+			});
+		} catch (err) {
+			this.deps.log.warn("context-size hint failed", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+
+	/**
 	 * Deliver policy-approved notifications into a running agent via pi steering.
 	 * Skipped while the agent is idling: events arriving during idle are returned
 	 * by the `idle` call itself, and steering would be stuck behind the blocked
@@ -917,6 +1000,23 @@ export function stableJson(value: unknown): string {
 function sessionTokenTotal(session: AgentSession): number {
 	try {
 		return session.getSessionStats().tokens?.total ?? 0;
+	} catch {
+		return 0;
+	}
+}
+
+/**
+ * Current context (prompt) size in tokens, from pi's own estimate.
+ *
+ * Deliberately **not** `tokens.total`: that is the cumulative billing counter
+ * over all session entries. `contextUsage.tokens` is what the model currently
+ * has to carry, and it is `null`/absent while unknown (no model, or right after
+ * a compaction) — an unknown size is not a reason to hint.
+ */
+function sessionContextTokens(session: AgentSession): number {
+	try {
+		const tokens = session.getSessionStats().contextUsage?.tokens;
+		return typeof tokens === "number" && Number.isFinite(tokens) && tokens > 0 ? Math.round(tokens) : 0;
 	} catch {
 		return 0;
 	}
