@@ -308,6 +308,12 @@ section("start, wait, completion event and session reuse");
 	check("worker used one run", first.runs === 1);
 	check("worker recorded usage", first.tokens?.total === 33);
 	check("worker cost counted today", Math.abs(manager.usageToday() - 0.001) < 1e-9, manager.usageToday());
+	const usageEntry = new WorkerStore(config.paths).usageHistory().at(-1);
+	check(
+		"worker usage records model, turns, worker id and status (#122)",
+		usageEntry?.model === "fake/model" && typeof usageEntry?.turns === "number" && usageEntry?.workerId === first.id && usageEntry?.status === "idle",
+		usageEntry,
+	);
 	check("worker session file recorded", Boolean(first.sessionFile));
 	await sleep(100);
 	const events = EventStore.open(config.paths.stateDir).peekPending(20);

@@ -89,7 +89,12 @@ export interface UsageWorkerSplit {
 	/** Worker usage entries carry none of these; `null` says so instead of guessing. */
 	cacheRead: null;
 	cacheWrite: null;
-	turns: null;
+	/** Turns summed over entries that recorded them; `null` when none did. */
+	turns: number | null;
+	/** Worker spend and entries broken down by model spec (only where recorded). */
+	byModel: Array<{ model: string; entries: number; cost: number; tokens: { input: number; output: number } }>;
+	/** Most expensive worker runs in the window (only entries with a cost). */
+	workerTopRuns: Array<{ ts: number; cost: number; workerId?: string; model?: string; turns?: number; status?: string }>;
 	note: string;
 }
 
@@ -480,6 +485,40 @@ export function buildUsageReport(profile: DashboardProfile, options: BuildUsageR
 	const workerCost = workerEntries.reduce((sum, entry) => sum + numberOr(entry.cost, 0), 0);
 	const workerInput = workerEntries.reduce((sum, entry) => sum + numberOr(entry.input, 0), 0);
 	const workerOutput = workerEntries.reduce((sum, entry) => sum + numberOr(entry.output, 0), 0);
+	const turnsRecorded = workerEntries.filter((entry) => typeof entry.turns === "number");
+	const workerTurns = turnsRecorded.length
+		? turnsRecorded.reduce((sum, entry) => sum + numberOr(entry.turns, 0), 0)
+		: null;
+	const modelBuckets = new Map<string, { entries: number; cost: number; input: number; output: number }>();
+	for (const entry of workerEntries) {
+		const model = typeof entry.model === "string" && entry.model ? entry.model : "unknown";
+		const bucket = modelBuckets.get(model) ?? { entries: 0, cost: 0, input: 0, output: 0 };
+		bucket.entries += 1;
+		bucket.cost += numberOr(entry.cost, 0);
+		bucket.input += numberOr(entry.input, 0);
+		bucket.output += numberOr(entry.output, 0);
+		modelBuckets.set(model, bucket);
+	}
+	const byModel = [...modelBuckets.entries()]
+		.map(([model, bucket]) => ({
+			model,
+			entries: bucket.entries,
+			cost: bucket.cost,
+			tokens: { input: bucket.input, output: bucket.output },
+		}))
+		.sort((left, right) => right.cost - left.cost);
+	const workerTopRuns = workerEntries
+		.filter((entry) => numberOr(entry.cost, 0) > 0)
+		.sort((left, right) => numberOr(right.cost, 0) - numberOr(left.cost, 0))
+		.slice(0, 10)
+		.map((entry) => ({
+			ts: entry.ts,
+			cost: numberOr(entry.cost, 0),
+			...(entry.workerId ? { workerId: entry.workerId } : {}),
+			...(entry.model ? { model: entry.model } : {}),
+			...(typeof entry.turns === "number" ? { turns: entry.turns } : {}),
+			...(entry.status ? { status: entry.status } : {}),
+		}));
 	const workers: UsageWorkerSplit = {
 		available: workerPresent,
 		entries: workerEntries.length,
@@ -487,9 +526,13 @@ export function buildUsageReport(profile: DashboardProfile, options: BuildUsageR
 		tokens: { input: workerInput, output: workerOutput, total: workerInput + workerOutput },
 		cacheRead: null,
 		cacheWrite: null,
-		turns: null,
+		turns: workerTurns,
+		byModel,
+		workerTopRuns,
 		note: workerPresent
-			? "worker usage.jsonl entries store ts/cost/input/output only: no turns, cache tokens or model per entry"
+			? turnsRecorded.length === workerEntries.length
+				? "worker entries now record model, turns and run status"
+				: "older worker entries predate model/turns recording; those fields are shown only where present"
 			: `no worker usage store at ${workerPath}; worker spend cannot be reported`,
 	};
 	const combinedCost = totals.cost + workerCost;
@@ -751,10 +794,32 @@ export function renderUsageReport(report: UsageReport): string {
 		`  chat      ${pad(split.chat.runs, 4, "right")} runs · ${pad(split.chat.turns, 4, "right")} turns · ${formatUsd(split.chat.cost)} · ${formatShare(split.chatCostShare)} of spend`,
 	);
 	lines.push(
-		`  workers   ${pad(split.workers.entries, 4, "right")} entries               · ${formatUsd(split.workers.cost)} · ${formatShare(split.workerCostShare)} of spend`,
+		`  workers   ${pad(split.workers.entries, 4, "right")} entries · ${split.workers.turns === null ? "   —" : pad(split.workers.turns, 4, "right")} turns · ${formatUsd(split.workers.cost)} · ${formatShare(split.workerCostShare)} of spend`,
 	);
 	lines.push(`  combined  ${formatUsd(split.combinedCost)}`);
 	if (!split.workers.available) lines.push(`  note: ${split.workers.note}`);
+
+	if (split.workers.available && split.workers.entries > 0) {
+		lines.push("");
+		lines.push("workers by model");
+		for (const item of split.workers.byModel) {
+			lines.push(
+				`  ${pad(item.model, 28)} ${pad(item.entries, 3, "right")} entries · ${formatUsd(item.cost)} · in ${item.tokens.input} / out ${item.tokens.output}`,
+			);
+		}
+		if (split.workers.workerTopRuns.length > 0) {
+			lines.push("");
+			lines.push("most expensive worker runs");
+			for (const run of split.workers.workerTopRuns.slice(0, 10)) {
+				const when = new Date(run.ts).toISOString().slice(0, 16).replace("T", " ");
+				const turns = typeof run.turns === "number" ? `${run.turns} turns` : "—";
+				lines.push(
+					`  ${when}  ${formatUsd(run.cost)}  ${pad(run.model ?? "unknown model", 26)} ${turns}${run.status ? ` · ${run.status}` : ""}${run.workerId ? ` · ${run.workerId}` : ""}`,
+				);
+			}
+		}
+		if (split.workers.note.startsWith("older")) lines.push(`  note: ${split.workers.note}`);
+	}
 
 	lines.push("");
 	lines.push("model / provider split");

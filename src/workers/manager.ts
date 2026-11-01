@@ -72,6 +72,8 @@ interface WorkerHandle {
 	sessionError?: string;
 	/** Tool executions started during the current run. */
 	toolCalls: number;
+	/** Assistant turns started during the current run. */
+	turns: number;
 	/** Aborts an in-flight provider-retry backoff (stop, shutdown, run limits). */
 	retryAbort?: AbortController;
 	/** Timers bounding the current run; absent when no run is active. */
@@ -339,7 +341,7 @@ export class WorkerManager {
 			notifyOnFinish: options.notify ?? this.cfg.notifyOnFinish,
 		};
 		this.store.save(record);
-		const handle: WorkerHandle = { record, waiters: new Set(), toolCalls: 0 };
+		const handle: WorkerHandle = { record, waiters: new Set(), toolCalls: 0, turns: 0 };
 		this.handles.set(id, handle);
 		this.log.info("worker starting", { id, model, isolation, branch, pullRequest: options.pullRequest });
 		handle.runPromise = this.launch(handle, this.initialPrompt(task))
@@ -637,6 +639,7 @@ export class WorkerManager {
 				handle.toolCalls += 1;
 			} else if (event.type === "turn_start") {
 				handle.activity = "thinking";
+				handle.turns += 1;
 			} else if (event.type === "turn_end" || event.type === "agent_end") {
 				this.captureSessionError(handle, event);
 			}
@@ -685,6 +688,7 @@ export class WorkerManager {
 		const startedAt = record.lastRunStartedAt;
 		handle.sessionError = undefined;
 		handle.toolCalls = 0;
+		handle.turns = 0;
 		const tokensBefore = this.tokenTotal(session);
 		const textBefore = session.getLastAssistantText()?.trim();
 		const previousAbortReason = handle.abortReason;
@@ -791,6 +795,10 @@ export class WorkerManager {
 					cost: record.lastRunCostUsd ?? 0,
 					input: record.tokens?.input ?? 0,
 					output: record.tokens?.output ?? 0,
+					model: record.model,
+					workerId: record.id,
+					status,
+					...(handle.turns > 0 ? { turns: handle.turns } : {}),
 				});
 			}
 			this.log.info("worker run finished", {
@@ -1095,7 +1103,7 @@ export class WorkerManager {
 		const existing = this.handles.get(normalized);
 		if (existing) return existing;
 		const record = this.requireRecord(normalized);
-		const handle: WorkerHandle = { record, waiters: new Set(), toolCalls: 0 };
+		const handle: WorkerHandle = { record, waiters: new Set(), toolCalls: 0, turns: 0 };
 		this.handles.set(normalized, handle);
 		return handle;
 	}

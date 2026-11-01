@@ -17,6 +17,14 @@ export interface WorkerUsageEntry {
 	cost: number;
 	input: number;
 	output: number;
+	/** Model spec the worker actually ran, when known. */
+	model?: string;
+	/** Turns the run took, when the session reported them. */
+	turns?: number;
+	/** Worker id, so a usage line can be traced back to its record. */
+	workerId?: string;
+	/** Run status at the end of the run (`idle`, `failed`, …). */
+	status?: string;
 }
 
 export interface WorkerRecord {
