@@ -40,6 +40,26 @@ export interface TelegramTranscriptionQuota {
 	reason: string;
 }
 
+/**
+ * A provider-requested pause for voice transcription (#136).
+ *
+ * Any 429 starts it — not only the daily-quota one — for the whole process, so
+ * a replayed batch, a restarted worker or the next voice note cannot spend a
+ * request while the limit is still live.
+ */
+export interface TelegramTranscriptionCooldown {
+	/** Epoch ms when the provider may be asked again. */
+	until: number;
+	/** When the current pause started. */
+	at: number;
+	/** Classified reason (never the key or a provider body). */
+	reason: string;
+	/** Signature of the transcription configuration that recorded the pause. */
+	signature: string;
+	/** What started it: any rate limit or an exhausted daily quota. */
+	kind: "rate_limit" | "daily_quota";
+}
+
 export interface TelegramState {
 	/** Next getUpdates offset: last processed update_id + 1. */
 	offset: number;
@@ -48,6 +68,8 @@ export interface TelegramState {
 	pollerConflict?: TelegramPollerConflict;
 	/** Set while voice transcription is skipped after a provider daily-quota error. */
 	transcriptionQuota?: TelegramTranscriptionQuota;
+	/** Set while voice transcription is paused by a provider rate limit (#136). */
+	transcriptionCooldown?: TelegramTranscriptionCooldown;
 	lastPollAt?: number;
 	lastUpdateAt?: number;
 	lastError?: string;
