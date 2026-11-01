@@ -80,7 +80,8 @@ ID в `allowedBotIds` и только при явном упоминании/о�
       "timeoutMs": 30000
     },
     "transcriptionRetries": 2,
-    "transcriptionRetryDelayMs": 1500
+    "transcriptionRetryDelayMs": 1500,
+    "offsetGapReset": 1000
   }
 }
 ```
@@ -112,6 +113,7 @@ ID в `allowedBotIds` и только при явном упоминании/о�
 | `transcription.timeoutMs` | бюджет одной попытки: скачивание + запрос к провайдеру |
 | `transcriptionRetries` | сколько раз повторить распознавание после **временной** ошибки; `0`–`2`, по умолчанию `2` (не больше трёх попыток на голосовое) |
 | `transcriptionRetryDelayMs` | базовая пауза экспоненциального backoff между попытками, мс; `10`–`60000`, по умолчанию `1500` |
+| `offsetGapReset` | насколько сохранённый offset может опережать максимальный `update_id` в батче, прежде чем он будет сброшен к `max + 1`; `0`–`1000000`, по умолчанию `1000`. Меньший разрыв только предупреждает |
 
 ## 3. Как это работает
 
@@ -133,8 +135,19 @@ telegram:<chatId>/<topicId>    тема в форуме (message_thread_id)
 поэтому после перезапуска старые апдейты не переигрываются. Offset сохраняется **после каждого
 апдейта**: упавшая обработка логируется (`telegram update failed; skipped without replaying the
 batch`), апдейт пропускается, а вся пачка не переигрывается. Апдейты со `update_id < offset`
-(Telegram их переотдал) отбрасываются без обработки; каждый непустой цикл пишет debug-строку
-`telegram poll cycle` с `count`, `firstUpdateIds`, `offset`, `highest`, `stale` (#136). Каждый апдейт:
+(Telegram их переотдал) отбрасываются без обработки; каждый цикл пишет debug-строку
+`telegram poll cycle` с `offset`, `first`, `last`, `size` (а также `count`, `firstUpdateIds`,
+`highest`, `stale`) — #136/#139. Дополнительно #139 защищает от чужого offset:
+
+- если весь батч оказался **позади** сохранённого offset, пишется одно предупреждение
+  `telegram offset is ahead of the API feed; keeping it` с обоими числами, offset не меняется;
+- если разрыв больше `offsetGapReset`, offset сбрасывается к `max update_id + 1` с одним
+  предупреждением `telegram offset is far ahead of the API feed; resetting it`;
+- если сменился токен бота (сравнивается SHA-256, сам токен не пишется), offset и
+  сохранённая identity сбрасываются до первого `getUpdates` с одной строкой
+  `telegram bot token changed; resetting the stored offset and identity`.
+
+Каждый апдейт:
 
 - фильтруется (свои сообщения игнорируются; bot-authored сообщения принимаются только от `allowedBotIds` и только при явном упоминании/ответе этому боту; user allowlist проверяется отдельно);
 - превращается в `user_message` в durable-инбоксе с `dedupeKey`

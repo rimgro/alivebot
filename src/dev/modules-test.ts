@@ -33,7 +33,7 @@ import { Outbox, type OutgoingMessage } from "../store/outbox.js";
 import type { ChatTransport } from "../transports/types.js";
 import { GrafanaModule } from "../modules/grafana/module.js";
 import { TelegramApi, TelegramApiError, TelegramFileTooLargeError } from "../modules/telegram/client.js";
-import { resolveToken, TelegramModule } from "../modules/telegram/module.js";
+import { resolveToken, TelegramModule, telegramTokenHash } from "../modules/telegram/module.js";
 import { TelegramStateStore } from "../modules/telegram/state.js";
 import { escapeHtml, isParseModeError, splitMessage } from "../modules/telegram/text.js";
 import { formatThread, isTelegramTarget, parseThread, resolveChatTarget, resolveThreadRef } from "../modules/telegram/threads.js";
@@ -1075,6 +1075,7 @@ section("telegram module end-to-end against a fake Bot API");
 					transcription: { ...DEFAULT_CONFIG.modules.telegram.transcription },
 					transcriptionRetries: 0,
 					transcriptionRetryDelayMs: DEFAULT_CONFIG.modules.telegram.transcriptionRetryDelayMs,
+					offsetGapReset: DEFAULT_CONFIG.modules.telegram.offsetGapReset,
 				},
 				grafana: { enabled: false, host: "127.0.0.1", port: 0, path: "/grafana", token: "", firingPriority: "high", resolvedPriority: "low" },
 				external: [],
@@ -1436,6 +1437,7 @@ section("telegram voice transcription: bounded retries, one line, quota stop (#1
 						transcription: { ...DEFAULT_CONFIG.modules.telegram.transcription },
 						transcriptionRetries: options.retries,
 						transcriptionRetryDelayMs: options.retryDelayMs ?? 10,
+					offsetGapReset: DEFAULT_CONFIG.modules.telegram.offsetGapReset,
 					},
 					grafana: { enabled: false, host: "127.0.0.1", port: 0, path: "/grafana", token: "", firingPriority: "high", resolvedPriority: "low" },
 					external: [],
@@ -1843,6 +1845,7 @@ section("telegram polling: the offset advances per update and stale updates are 
 					transcription: { ...DEFAULT_CONFIG.modules.telegram.transcription },
 					transcriptionRetries: 0,
 					transcriptionRetryDelayMs: DEFAULT_CONFIG.modules.telegram.transcriptionRetryDelayMs,
+					offsetGapReset: DEFAULT_CONFIG.modules.telegram.offsetGapReset,
 				},
 				grafana: { enabled: false, host: "127.0.0.1", port: 0, path: "/grafana", token: "", firingPriority: "high", resolvedPriority: "low" },
 				external: [],
@@ -1923,6 +1926,192 @@ section("telegram polling: the offset advances per update and stale updates are 
 		globalThis.fetch = realFetch;
 		if (previousGroqKey === undefined) delete process.env.GROQ_API_KEY;
 		else process.env.GROQ_API_KEY = previousGroqKey;
+	}
+}
+
+// ---------------------------------------------------------------------------
+section("telegram polling: offset desync guard and token-change reset (#139)");
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-offset-guard-test-"));
+	const logFile = path.join(root, "offset-guard.jsonl");
+	const log = new Logger({ console: false, level: "debug", file: logFile, scope: "telegram-offset-guard-test" });
+	const store = EventStore.open(root);
+	const history = HistoryStore.open(root);
+	const outbox = new Outbox(root);
+	const batches: TelegramUpdate[][] = [];
+	const offsets: Array<number | undefined> = [];
+	let meFails = false;
+
+	const messageUpdate = (updateId: number): TelegramUpdate => ({
+		update_id: updateId,
+		message: {
+			message_id: updateId,
+			date: 1_700_000_000 + updateId,
+			chat: { id: 42, type: "private", first_name: "Alice", username: "alice" },
+			from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
+			text: `message ${updateId}`,
+		},
+	});
+
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		const method = url.slice(url.lastIndexOf("/") + 1);
+		const params = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+		if (method === "getMe") {
+			if (meFails) return jsonResponse({ ok: false, error_code: 401, description: "Unauthorized" }, 401);
+			return jsonResponse({ ok: true, result: { id: 999, is_bot: true, first_name: "Alive", username: "alive_bot" } });
+		}
+		if (method === "deleteWebhook") return jsonResponse({ ok: true, result: true });
+		if (method === "getUpdates") {
+			offsets.push(params.offset as number | undefined);
+			const batch = batches.shift();
+			// Avoid a hot poll loop in the fake API; the real one long-polls.
+			await new Promise((resolve) => setTimeout(resolve, batch ? 0 : 20));
+			return jsonResponse({ ok: true, result: batch ?? [] });
+		}
+		return jsonResponse({ ok: true, result: true });
+	}) as unknown as typeof fetch;
+
+	const configFor = (token: string) =>
+		loadConfig({
+			cwd: root,
+			overrides: {
+				chat: { console: false, http: { enabled: false, host: "127.0.0.1", port: 0, token: "" } },
+				modules: {
+					telegram: {
+						...DEFAULT_CONFIG.modules.telegram,
+						enabled: true,
+						token,
+						tokenEnv: "ALIVE_TEST_TELEGRAM_TOKEN_UNSET",
+						apiBase: "https://api.telegram.org",
+						allowedChatIds: [],
+						allowedUserIds: ["7"],
+						pollTimeoutSec: 0,
+						historyLimitPerThread: 0,
+						transcriptionRetries: 0,
+						offsetGapReset: 1000,
+					},
+					grafana: { ...DEFAULT_CONFIG.modules.grafana, enabled: false, host: "127.0.0.1", port: 0, token: "" },
+					external: [],
+				},
+			},
+		});
+
+	let config = configFor("token-a");
+	const state = new TelegramStateStore(path.join(config.paths.modulesDir, "telegram"));
+	const makeHost = (module: TelegramModule) =>
+		new ModuleHost({
+			config,
+			log,
+			transports: [],
+			modules: [module],
+			ingest: (event) => store.append(event),
+			outbox: (limit) => outbox.list(limit),
+			history,
+			runtimeStatus: () => ({}),
+		});
+	let host = makeHost(new TelegramModule(config.config.modules.telegram));
+
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = fetchImpl;
+	const settle = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+	type GuardLog = { level: string; msg: string; data?: Record<string, unknown> };
+	const logs = () => readJsonl<GuardLog>(logFile);
+	const waitFor = async (predicate: () => boolean, timeoutMs = 5_000): Promise<boolean> => {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (predicate()) return true;
+			await settle(10);
+		}
+		return predicate();
+	};
+	const warnCount = (msg: string) => logs().filter((record) => record.level === "warn" && record.msg === msg).length;
+
+	try {
+		// A normal batch keeps the #136 contract: the offset advances past every update.
+		batches.push([messageUpdate(100), messageUpdate(101), messageUpdate(102)]);
+		await host.init();
+		check("a normal batch still advances the offset per update", await waitFor(() => state.load().offset === 103), state.load().offset);
+		check(
+			"every poll cycle logs offset, first, last and batch size",
+			logs().some(
+				(record) =>
+					record.msg === "telegram poll cycle" &&
+					record.data?.offset === 0 &&
+					record.data?.first === 100 &&
+					record.data?.last === 102 &&
+					record.data?.size === 3,
+			),
+			logs().filter((record) => record.msg === "telegram poll cycle").slice(0, 2),
+		);
+		check(
+			"an empty poll cycle is still visible with size 0",
+			await waitFor(() => logs().some((record) => record.msg === "telegram poll cycle" && record.data?.size === 0)),
+			logs().filter((record) => record.msg === "telegram poll cycle").slice(-2),
+		);
+
+		// Largest update_id below the stored offset, but only by a little: warn once,
+		// keep the stored offset, do not crash.
+		batches.push([messageUpdate(100), messageUpdate(101), messageUpdate(102)]);
+		check(
+			"a batch behind the offset logs one desync warning",
+			await waitFor(() => warnCount("telegram offset is ahead of the API feed; keeping it") === 1),
+			logs().filter((record) => record.msg === "telegram offset is ahead of the API feed; keeping it"),
+		);
+		await settle(100);
+		const desync = logs().find((record) => record.msg === "telegram offset is ahead of the API feed; keeping it");
+		check("the desync warning carries the offset and the batch max", desync?.data?.offset === 103 && desync?.data?.maxUpdateId === 102, desync?.data);
+		check("a small gap keeps the stored offset", state.load().offset === 103, state.load().offset);
+		check("the small gap produces exactly one warning", warnCount("telegram offset is ahead of the API feed; keeping it") === 1);
+
+		// A gap above offsetGapReset is a foreign/restored feed: reset to max + 1.
+		// Restart so no in-flight empty poll can overwrite the seeded offset.
+		await host.stop();
+		state.patch({ offset: 5_000 });
+		batches.push([messageUpdate(100), messageUpdate(101), messageUpdate(102)]);
+		host = makeHost(new TelegramModule(config.config.modules.telegram));
+		await host.init();
+		check(
+			"a gap above offsetGapReset logs one reset warning",
+			await waitFor(() => warnCount("telegram offset is far ahead of the API feed; resetting it") === 1),
+			logs().filter((record) => record.msg === "telegram offset is far ahead of the API feed; resetting it"),
+		);
+		const reset = logs().find((record) => record.msg === "telegram offset is far ahead of the API feed; resetting it");
+		check(
+			"the reset warning explains both numbers and the new offset",
+			reset?.data?.offset === 5_000 && reset?.data?.maxUpdateId === 102 && reset?.data?.gap === 4_898 && reset?.data?.resetOffset === 103,
+			reset?.data,
+		);
+		check("the large gap resets the stored offset to max + 1", state.load().offset === 103, state.load().offset);
+		check("the large gap produces exactly one warning", warnCount("telegram offset is far ahead of the API feed; resetting it") === 1);
+
+		// A changed token must behave like a fresh bot: offset and identity reset.
+		const oldHash = state.load().tokenHash;
+		state.patch({ me: { id: 999, username: "alive_bot", firstName: "Alive", verifiedAt: Date.now() } });
+		await host.stop();
+		meFails = true;
+		config = configFor("token-b");
+		host = makeHost(new TelegramModule(config.config.modules.telegram));
+		await host.init();
+		check(
+			"a changed token logs exactly one reset line",
+			await waitFor(() => warnCount("telegram bot token changed; resetting the stored offset and identity") === 1),
+			logs().filter((record) => record.msg === "telegram bot token changed; resetting the stored offset and identity"),
+		);
+		check("a changed token resets the stored offset", state.load().offset === 0, state.load().offset);
+		check("a changed token resets the cached identity", state.load().me === undefined, state.load().me);
+		check(
+			"only a token hash is stored and it follows the new token",
+			state.load().tokenHash === telegramTokenHash("token-b") && state.load().tokenHash !== oldHash,
+			{ before: oldHash?.slice(0, 12), after: state.load().tokenHash?.slice(0, 12) },
+		);
+		check(
+			"the token itself never reaches the log",
+			!logs().some((record) => JSON.stringify(record).includes("token-a") || JSON.stringify(record).includes("token-b")),
+		);
+	} finally {
+		await host.stop();
+		globalThis.fetch = realFetch;
 	}
 }
 
@@ -2372,6 +2561,7 @@ section("telegram outbound attachments: send_message delivers a workspace file")
 					transcription: { ...DEFAULT_CONFIG.modules.telegram.transcription },
 					transcriptionRetries: 0,
 					transcriptionRetryDelayMs: DEFAULT_CONFIG.modules.telegram.transcriptionRetryDelayMs,
+					offsetGapReset: DEFAULT_CONFIG.modules.telegram.offsetGapReset,
 				},
 				grafana: { enabled: false, host: "127.0.0.1", port: 0, path: "/grafana", token: "", firingPriority: "high", resolvedPriority: "low" },
 				external: [],
@@ -3281,6 +3471,7 @@ section("telegram module: outage is reported once, not spammed");
 					transcription: { ...DEFAULT_CONFIG.modules.telegram.transcription },
 					transcriptionRetries: 0,
 					transcriptionRetryDelayMs: DEFAULT_CONFIG.modules.telegram.transcriptionRetryDelayMs,
+					offsetGapReset: DEFAULT_CONFIG.modules.telegram.offsetGapReset,
 				},
 				grafana: { enabled: false, host: "127.0.0.1", port: 0, path: "/grafana", token: "", firingPriority: "high", resolvedPriority: "low" },
 			external: [],
@@ -4000,6 +4191,22 @@ section("modules config and loader");
 			telegramError({ transcriptionRetryDelayMs: invalid }) ===
 				`modules.telegram.transcriptionRetryDelayMs must be an integer between 10 and 60000 ms, got "${String(invalid)}"`,
 			telegramError({ transcriptionRetryDelayMs: invalid }),
+		);
+	}
+	check(
+		"offsetGapReset defaults to 1000 updates",
+		config.config.modules.telegram.offsetGapReset === 1000 && DEFAULT_CONFIG.modules.telegram.offsetGapReset === 1000,
+		config.config.modules.telegram.offsetGapReset,
+	);
+	for (const valid of [0, 1000, 1_000_000]) {
+		check(`offsetGapReset ${valid} is accepted`, telegramError({ offsetGapReset: valid }) === "", telegramError({ offsetGapReset: valid }));
+	}
+	for (const invalid of [-1, 1_000_001, 1.5, "1000"]) {
+		check(
+			`offsetGapReset ${JSON.stringify(invalid)} is rejected`,
+			telegramError({ offsetGapReset: invalid }) ===
+				`modules.telegram.offsetGapReset must be an integer between 0 and 1000000 updates, got "${String(invalid)}"`,
+			telegramError({ offsetGapReset: invalid }),
 		);
 	}
 	check("grafana config merges with defaults", config.config.modules.grafana.host === "127.0.0.1" && config.config.modules.grafana.port === 5999, config.config.modules.grafana);

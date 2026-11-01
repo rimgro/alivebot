@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -248,6 +249,9 @@ export class TelegramModule implements AliveModule {
 		this.state = new TelegramStateStore(moduleDir);
 		this.deliveryLedger = new TelegramDeliveryLedger(moduleDir);
 		this.allowlist = new TelegramAllowlistStore(moduleDir);
+		// Before the first getUpdates: a token swap must look like a fresh bot, not
+		// like a poller resuming a foreign feed (#139).
+		this.resetOnTokenChange(ctx, token);
 		this.resetStaleTranscriptionQuota(ctx);
 		this.api = new TelegramApi({ token, apiBase: this.config.apiBase });
 		this.managedSweep = setInterval(() => void this.sweepManagedRequests(), 15_000);
@@ -421,13 +425,39 @@ export class TelegramModule implements AliveModule {
 						shouldRetry: (error) => !isPollerConflict(error) && classifyNetworkError(error).transient,
 					},
 				);
-				let highest = current.offset > 0 ? current.offset - 1 : -1;
+				const persistedOffset = current.offset;
+				const batchMax = updates.reduce((max, update) => Math.max(max, update.update_id), -1);
+				// #139: the API feed must be at or ahead of the stored offset. A batch that is
+				// entirely behind it means the offset belongs to a foreign bot (or was restored
+				// from another one); a small gap only warns, a large one resets.
+				let effectiveOffset = persistedOffset;
+				if (persistedOffset > 0 && updates.length > 0 && batchMax < persistedOffset) {
+					const gap = persistedOffset - batchMax;
+					if (gap > this.config.offsetGapReset) {
+						effectiveOffset = batchMax + 1;
+						ctx.log.warn("telegram offset is far ahead of the API feed; resetting it", {
+							offset: persistedOffset,
+							maxUpdateId: batchMax,
+							gap,
+							threshold: this.config.offsetGapReset,
+							resetOffset: effectiveOffset,
+						});
+					} else {
+						ctx.log.warn("telegram offset is ahead of the API feed; keeping it", {
+							offset: persistedOffset,
+							maxUpdateId: batchMax,
+							gap,
+							threshold: this.config.offsetGapReset,
+						});
+					}
+				}
+				let highest = effectiveOffset > 0 ? effectiveOffset - 1 : -1;
 				let stale = 0;
 				for (const update of updates) {
 					// #136: Telegram re-delivered an update we already confirmed. Processing it again
 					// is exactly how one voice note was transcribed 3000 times: skip it and keep the
 					// offset where it is instead of replaying the batch.
-					if (current.offset > 0 && update.update_id < current.offset) {
+					if (effectiveOffset > 0 && update.update_id < effectiveOffset) {
 						stale += 1;
 						continue;
 					}
@@ -446,16 +476,17 @@ export class TelegramModule implements AliveModule {
 					// offset (and every attachment in the batch) until the whole loop finished.
 					state.patch({ offset: highest + 1 });
 				}
-				if (updates.length > 0 || stale > 0) {
-					// #136: without this line the next stuck offset can only be guessed from counters.
-					ctx.log.debug("telegram poll cycle", {
-						count: updates.length,
-						firstUpdateIds: updates.slice(0, 5).map((update) => update.update_id),
-						offset: current.offset,
-						highest,
-						stale,
-					});
-				}
+				// #136/#139: one line per cycle, so a stuck offset is visible without guessing.
+				ctx.log.debug("telegram poll cycle", {
+					offset: persistedOffset,
+					first: updates.length > 0 ? updates[0]?.update_id : undefined,
+					last: updates.length > 0 ? batchMax : undefined,
+					size: updates.length,
+					count: updates.length,
+					firstUpdateIds: updates.slice(0, 5).map((update) => update.update_id),
+					highest,
+					stale,
+				});
 				state.patch({
 					offset: highest + 1,
 					lastPollAt: Date.now(),
@@ -554,6 +585,32 @@ export class TelegramModule implements AliveModule {
 				backoff = Math.min(backoff * 2, 60_000);
 			}
 		}
+	}
+
+	/**
+	 * #139: a changed bot token means the stored offset and identity may belong to
+	 * another bot's feed. Reset both before polling so the swapped token behaves
+	 * like a fresh bot instead of replaying foreign updates. Only a SHA-256 hash is
+	 * persisted and logged, never the token.
+	 */
+	private resetOnTokenChange(ctx: ModuleContext, token: string): void {
+		const state = this.state;
+		if (!state) return;
+		const current = state.load();
+		const tokenHash = telegramTokenHash(token);
+		if (current.tokenHash === tokenHash) return;
+		if (!current.tokenHash) {
+			// First run for this state file: record the fingerprint, there is nothing to reset.
+			state.patch({ tokenHash });
+			return;
+		}
+		state.patch({ offset: 0, me: undefined, tokenHash });
+		ctx.log.warn("telegram bot token changed; resetting the stored offset and identity", {
+			previousTokenHash: current.tokenHash.slice(0, 12),
+			tokenHash: tokenHash.slice(0, 12),
+			offset: 0,
+			identity: "reset",
+		});
 	}
 
 	/**
@@ -1992,6 +2049,11 @@ export class TelegramModule implements AliveModule {
 export function resolveToken(config: TelegramConfig, env: NodeJS.ProcessEnv = process.env): string {
 	const fromEnv = config.tokenEnv ? env[config.tokenEnv] : undefined;
 	return (fromEnv ?? "").trim() || (config.token ?? "").trim();
+}
+
+/** Non-reversible token fingerprint for token-change detection (#139); safe to persist/log. */
+export function telegramTokenHash(token: string): string {
+	return createHash("sha256").update(token).digest("hex");
 }
 
 function message(err: unknown): string {

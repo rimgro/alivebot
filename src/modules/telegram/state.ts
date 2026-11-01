@@ -63,6 +63,11 @@ export interface TelegramTranscriptionCooldown {
 export interface TelegramState {
 	/** Next getUpdates offset: last processed update_id + 1. */
 	offset: number;
+	/**
+	 * SHA-256 of the configured bot token (#139). Only the hash is stored; a
+	 * change means the state may belong to another bot, so offset/identity reset.
+	 */
+	tokenHash?: string;
 	me?: TelegramBotIdentity;
 	/** Last known duplicate-poller conflict. Cleared by the next successful poll. */
 	pollerConflict?: TelegramPollerConflict;
