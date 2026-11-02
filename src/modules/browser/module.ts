@@ -43,6 +43,11 @@ export interface BrowserDependencies {
 	connect?: BrowserType["connectOverCDP"];
 	/** Test seam; production sends to the session's configured private recipient. */
 	notify?: (url: string, reason: string) => Promise<void | { thread: string; messageId: number }>;
+	/**
+	 * A routed session with no human recipient (a local agent thread) must never
+	 * notify, not even the globally paired operator. Defaults to enabled.
+	 */
+	notifications?: boolean;
 	/** Public path of a routed private session. Contains no capability. */
 	controlPath?: string;
 	controlOrigin?: string;
@@ -128,8 +133,8 @@ export class BrowserModule implements AliveModule {
 		this.validateConfig();
 		this.ctx = ctx;
 		this.identity = this.config.signing.enabled && !this.config.sharedUrl ? new BrowserIdentity(this.config.signing) : undefined;
-		this.notify = this.deps.notify;
-		if (!this.notify && (this.config.notifyChatId || readBrowserOperator(ctx.paths.modulesDir) || ctx.config.modules.telegram.enabled)) {
+		this.notify = this.deps.notifications === false ? undefined : this.deps.notify;
+		if (this.deps.notifications !== false && !this.notify && (this.config.notifyChatId || readBrowserOperator(ctx.paths.modulesDir) || ctx.config.modules.telegram.enabled)) {
 			const telegram = ctx.config.modules.telegram;
 			if (this.config.notifyChatId && (!telegram.enabled || (telegram.allowedChatIds.length && !telegram.allowedChatIds.map(String).includes(this.config.notifyChatId)))) {
 				throw new Error("Browser notification chat must be permitted by the enabled Telegram module");
@@ -357,7 +362,7 @@ export class BrowserModule implements AliveModule {
 			}
 			if (this.operatorPointerDown) return result({ ...this.status(), error: "A human pointer gesture is in progress. Retry after release, or reclaim control." });
 			if (this.accessState === "checking") await this.probeChallenge(signal);
-			if (this.pausedReason && !(params.action === "navigate" && !this.handoff && this.handoffSuppressed)) return result({ ...this.status(), error: "Browser is paused. Wait for the operator, or reclaim to revoke their controls without closing the page." });
+			if (this.pausedReason && !(params.action === "navigate" && !this.handoff && this.handoffSuppressed)) return result({ ...this.status(), error: this.deps.notifications === false ? "Browser is paused for human assistance, but this local agent thread has no human recipient. Reclaim, then navigate away, or close the session." : "Browser is paused. Wait for the operator, or reclaim to revoke their controls without closing the page." });
 			if (params.action === "navigate" && !this.handoff) {
 				if (Date.now() < this.retryAt) throw new Error("Rate limit cooldown has not elapsed");
 				this.pausedReason = undefined; this.handoffSuppressed = false; this.expired = false; this.resetAccess();
@@ -522,7 +527,7 @@ export class BrowserModule implements AliveModule {
 				if (signal?.aborted || this.ctx!.signal.aborted || this.stopped) throw error;
 				if (this.pausedReason && !this.stopped) {
 					await this.beginHandoff(this.pausedReason);
-					return result({ ...this.status(), error: "Action stopped; the browser requires human assistance." });
+					return result({ ...this.status(), error: this.deps.notifications === false ? "Action stopped: the page needs human assistance, but this local agent thread has no human recipient. Reclaim, navigate away, or close the session." : "Action stopped; the browser requires human assistance." });
 				}
 				throw error;
 			} finally {
@@ -919,6 +924,9 @@ export class BrowserModule implements AliveModule {
 
 	private async beginHandoff(reason: string, renew = false, expiresAt?: number, announce = true): Promise<Record<string, unknown>> {
 		if (this.stopped) throw new Error("Browser is stopped");
+		// A local agent thread has no human recipient: never allocate a controller
+		// that nobody can open or that could expire into a phantom event.
+		if (this.deps.notifications === false) return { ...this.status(), handoff: undefined, error: "Browser needs human help, but this local agent thread has no human recipient. Reclaim or close the session, or navigate away from the page." };
 		this.handoffSuppressed = false; this.expired = false;
 		if (renew) { expiresAt ??= this.handoff?.expiresAt; this.endStream("Invalid access key"); this.handoff = undefined; }
 		if (this.handoff && this.handoff.expiresAt > Date.now()) {
