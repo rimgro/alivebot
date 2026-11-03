@@ -1133,15 +1133,20 @@ section("telegram module end-to-end against a fake Bot API");
 		check(
 			"a provider failure keeps the message and records the failure",
 			failedEvent !== undefined &&
+				failedEvent.text.includes("voice transcription unavailable: provider unavailable") &&
 				failedEvent.text.includes("Groq returned HTTP 500") &&
-				(failedEvent.payload as { transcription?: { status?: string } })?.transcription?.status === "failed",
+				(failedEvent.payload as { transcription?: { status?: string } })?.transcription?.status === "failed" &&
+				(failedEvent.payload as { transcription?: { reasonClass?: string } })?.transcription?.reasonClass === "provider_unavailable",
 			failedEvent?.text,
 		);
 		check("the provider error body never reaches the event", failedEvent?.text.includes("provider body must not be logged") !== true, failedEvent?.text);
 		const largeEvent = pending.find((event) => (event.payload as { messageId?: string })?.messageId === "9");
 		check(
 			"oversized voice notes are skipped as too large",
-			(largeEvent?.payload as { transcription?: { status?: string } })?.transcription?.status === "too_large" && largeEvent?.text.includes("MiB") === true,
+			(largeEvent?.payload as { transcription?: { status?: string; reasonClass?: string } })?.transcription?.status === "too_large" &&
+				(largeEvent?.payload as { transcription?: { status?: string; reasonClass?: string } })?.transcription?.reasonClass === "too_large" &&
+				largeEvent?.text.includes("voice transcription unavailable: too large") === true &&
+				largeEvent?.text.includes("MiB") === true,
 			largeEvent?.text,
 		);
 		check("an oversized voice note is never downloaded", !calls.some((call) => call.method === "getFile" && call.params.file_id === "voice-large"));
@@ -1282,14 +1287,51 @@ section("telegram module end-to-end against a fake Bot API");
 		await new Promise((resolve) => setTimeout(resolve, 80));
 		const noKeyEvent = store.peekPending(20).find((event) => (event.payload as { messageId?: string })?.messageId === "11");
 		check("a voice note without a key is still delivered", noKeyEvent !== undefined, store.peekPending(20).map((event) => event.title));
-		check("the event explains how to enable transcription", noKeyEvent?.text.includes("set GROQ_API_KEY in the host environment") === true, noKeyEvent?.text);
+		check(
+			"the event explains how to enable transcription",
+			noKeyEvent?.text.includes("voice transcription unavailable: not configured") === true &&
+				noKeyEvent?.text.includes("set GROQ_API_KEY in the host environment") === true,
+			noKeyEvent?.text,
+		);
 		check("no transcription request is sent without a key", calls.filter((call) => call.method === "groqTranscription").length === groqCallsBefore);
-		check("unconfigured history stays free of configuration hints", history.query({ thread: "telegram:42" }).every((record) => !record.text.includes("GROQ_API_KEY")));
+		check(
+			"the missing-key payload carries status and reason class",
+			(noKeyEvent?.payload as { transcription?: { status?: string; reasonClass?: string } })?.transcription?.status === "not_configured" &&
+				(noKeyEvent?.payload as { transcription?: { status?: string; reasonClass?: string } })?.transcription?.reasonClass === "not_configured",
+			noKeyEvent?.payload,
+		);
+		check(
+			"unconfigured history carries the same unavailable marker",
+			history.findByMessageId("telegram:42", "11")?.text.includes("voice transcription unavailable: not configured") === true,
+			history.findByMessageId("telegram:42", "11")?.text,
+		);
 
 		const status = telegram.status();
 		check("module status reports the bot", (status.bot as { username?: string })?.username === "alive_bot", status);
 		check("module status counts accepted inbound messages", (status.counters as { inbound?: number })?.inbound === 10, status.counters);
 		check("module status reports missing transcription credentials", (status.transcription as { configured?: boolean })?.configured === false, status.transcription);
+		const transcriptionHealth = status.transcription as {
+			attempted?: number;
+			transcribed?: number;
+			failed?: number;
+			lastFailureAt?: number;
+			lastFailureReason?: string;
+		};
+		check(
+			"module status counts voice outcomes",
+			transcriptionHealth.attempted === 4 &&
+				transcriptionHealth.transcribed === 1 &&
+				transcriptionHealth.failed === 3 &&
+				transcriptionHealth.lastFailureReason === "not_configured" &&
+				typeof transcriptionHealth.lastFailureAt === "number",
+			transcriptionHealth,
+		);
+		const statusJson = JSON.parse(JSON.stringify({ transcription: status.transcription })) as { transcription: Record<string, unknown> };
+		check(
+			"status JSON includes the transcription health fields",
+			["attempted", "transcribed", "failed", "lastFailureAt", "lastFailureReason"].every((key) => key in statusJson.transcription),
+			statusJson.transcription,
+		);
 
 		await host.stop();
 	} finally {
@@ -1323,6 +1365,7 @@ section("telegram voice transcription: bounded retries, one line, quota stop (#1
 	interface VoiceHarness {
 		config: ReturnType<typeof loadConfig>;
 		store: EventStore;
+		history: HistoryStore;
 		telegram: TelegramModule;
 		state: TelegramStateStore;
 		queue(updates: TelegramUpdate[]): void;
@@ -1465,6 +1508,7 @@ section("telegram voice transcription: bounded retries, one line, quota stop (#1
 		return {
 			config,
 			store,
+			history,
 			telegram,
 			state,
 			queue: (updates) => {
@@ -1495,6 +1539,18 @@ section("telegram voice transcription: bounded retries, one line, quota stop (#1
 	const voiceEvents = (current: VoiceHarness) =>
 		current.store.peekPending(50).filter((event) => (event.payload as { transcription?: unknown })?.transcription !== undefined);
 	const transcriptionLogs = (current: VoiceHarness) => current.logs().filter((record) => record.msg.startsWith("telegram voice transcription"));
+	type TranscriptionHealth = {
+		attempted?: number;
+		transcribed?: number;
+		failed?: number;
+		lastFailureAt?: number | null;
+		lastFailureReason?: string | null;
+	};
+	const transcriptionHealth = (current: VoiceHarness) => current.telegram.status().transcription as TranscriptionHealth;
+	const transcriptionPayload = (event: AliveEvent | undefined) =>
+		(event?.payload as { transcription?: { status?: string; reasonClass?: string; reason?: string } })?.transcription;
+	const historyText = (current: VoiceHarness, messageId: string) =>
+		current.history.findByMessageId("telegram:42", messageId)?.text ?? "";
 
 	try {
 		// 1. Transient provider error then success: retried once, silent except debug.
@@ -1508,12 +1564,25 @@ section("telegram voice transcription: bounded retries, one line, quota stop (#1
 			},
 		});
 		harness.queue([voiceUpdate(300, 301, "voice-flaky")]);
+		const freshHealth = transcriptionHealth(harness);
+		check(
+			"a fresh module process starts transcription counters at zero",
+			freshHealth.attempted === 0 && freshHealth.transcribed === 0 && freshHealth.failed === 0 && freshHealth.lastFailureAt === null && freshHealth.lastFailureReason === null,
+			freshHealth,
+		);
 		const flakyEvent = await harness.waitForEvent("301");
 		check("a transient provider error is retried and the voice is transcribed", flakyEvent?.text.includes("recovered transcript") === true, flakyEvent?.text);
 		check(
 			"the recovered message records a transcribed payload",
 			(flakyEvent?.payload as { transcription?: { status?: string } })?.transcription?.status === "transcribed",
 			flakyEvent?.payload,
+		);
+		check("the recovered transcript is recorded in history", historyText(harness, "301").includes("recovered transcript") === true, historyText(harness, "301"));
+		const flakyHealth = transcriptionHealth(harness);
+		check(
+			"a success increments attempted and transcribed but leaves failure fields untouched",
+			flakyHealth.attempted === 1 && flakyHealth.transcribed === 1 && flakyHealth.failed === 0 && flakyHealth.lastFailureAt === null && flakyHealth.lastFailureReason === null,
+			flakyHealth,
 		);
 		check("exactly two provider attempts were made", harness.groqAttempts(2) === 2, harness.groqAttempts(2));
 		await harness.settle();
@@ -1547,11 +1616,29 @@ section("telegram voice transcription: bounded retries, one line, quota stop (#1
 		await harness.settle(150);
 		check("a permanently failing transcription stops after the configured attempts", downOfficialAttempts === 2, downOfficialAttempts);
 		check("no retry happens after the event was delivered", harness.groqAttempts(3) === 2, harness.groqAttempts(3));
-		check("the message is still delivered with an unavailable note", downEvent !== undefined && downEvent.text.includes("voice transcription unavailable: Groq returned HTTP 503"), downEvent?.text);
 		check(
-			"the failed payload records the failure status",
-			(downEvent?.payload as { transcription?: { status?: string } })?.transcription?.status === "failed",
+			"the message is still delivered with a classified unavailable note",
+			downEvent !== undefined &&
+				downEvent.text.includes("voice transcription unavailable: provider unavailable") &&
+				downEvent.text.includes("Groq returned HTTP 503"),
+			downEvent?.text,
+		);
+		check(
+			"the failed payload records the failure status and reason class",
+			transcriptionPayload(downEvent)?.status === "failed" && transcriptionPayload(downEvent)?.reasonClass === "provider_unavailable",
 			downEvent?.payload,
+		);
+		check(
+			"the failure marker is recorded in history",
+			historyText(harness, "311").includes("voice transcription unavailable: provider unavailable") === true,
+			historyText(harness, "311"),
+		);
+		const downHealth = transcriptionHealth(harness);
+		check(
+			"a failed transcription increments attempted and failed and records the reason class",
+			downHealth.attempted === 1 && downHealth.transcribed === 0 && downHealth.failed === 1 &&
+				downHealth.lastFailureReason === "provider_unavailable" && typeof downHealth.lastFailureAt === "number",
+			downHealth,
 		);
 		const downAttachments = (downEvent?.payload as { attachments?: Array<{ kind?: string; fileId?: string }> })?.attachments;
 		check("the voice attachment stays intact on the event", downAttachments?.[0]?.kind === "voice" && downAttachments?.[0]?.fileId === "voice-down", downAttachments);
@@ -1585,9 +1672,29 @@ section("telegram voice transcription: bounded retries, one line, quota stop (#1
 		check("a 401 is not retried", harness.groqAttempts(4) === 1, harness.groqAttempts(4));
 		check("a 403 is not retried", harness.groqAttempts(5) === 1, harness.groqAttempts(5));
 		check("an unsupported format is not retried", harness.groqAttempts(7) === 1, harness.groqAttempts(7));
-		check("the 401 event is delivered with the unavailable note", unauthorized?.text.includes("voice transcription unavailable: Groq returned HTTP 401") === true, unauthorized?.text);
-		check("the 403 event is delivered with the unavailable note", forbidden?.text.includes("voice transcription unavailable: Groq returned HTTP 403") === true, forbidden?.text);
-		check("the unsupported-format event keeps the message", unsupported?.text.includes("voice transcription unavailable: Groq returned HTTP 400") === true, unsupported?.text);
+		check("the 401 event is delivered with an auth marker", unauthorized?.text.includes("voice transcription unavailable: auth") === true && unauthorized?.text.includes("Groq returned HTTP 401") === true, unauthorized?.text);
+		check("the 403 event is delivered with an auth marker", forbidden?.text.includes("voice transcription unavailable: auth") === true && forbidden?.text.includes("Groq returned HTTP 403") === true, forbidden?.text);
+		check("the unsupported-format event keeps the message with an unsupported marker", unsupported?.text.includes("voice transcription unavailable: unsupported") === true && unsupported?.text.includes("Groq returned HTTP 400") === true, unsupported?.text);
+		check(
+			"auth and unsupported payloads carry their reason classes",
+			transcriptionPayload(unauthorized)?.reasonClass === "auth" &&
+				transcriptionPayload(forbidden)?.reasonClass === "auth" &&
+				transcriptionPayload(unsupported)?.reasonClass === "unsupported",
+			[transcriptionPayload(unauthorized), transcriptionPayload(forbidden), transcriptionPayload(unsupported)],
+		);
+		check(
+			"auth and unsupported markers are recorded in history",
+			historyText(harness, "321").includes("voice transcription unavailable: auth") &&
+				historyText(harness, "322").includes("voice transcription unavailable: auth") &&
+				historyText(harness, "323").includes("voice transcription unavailable: unsupported"),
+			[historyText(harness, "321"), historyText(harness, "322"), historyText(harness, "323")],
+		);
+		const permanentHealth = transcriptionHealth(harness);
+		check(
+			"each failure class counts as attempted and failed and records the last reason",
+			permanentHealth.attempted === 3 && permanentHealth.failed === 3 && permanentHealth.transcribed === 0 && permanentHealth.lastFailureReason === "unsupported",
+			permanentHealth,
+		);
 		const permanentWarnings = transcriptionLogs(harness).filter((record) => record.level === "warn");
 		check("each permanent failure produces exactly one summary line", permanentWarnings.length === 3, permanentWarnings);
 		check(
@@ -1628,14 +1735,30 @@ section("telegram voice transcription: bounded retries, one line, quota stop (#1
 		const skippedEvent = await harness.waitForEvent("332");
 		await harness.settle(150);
 		check("a daily-quota error is not retried", harness.groqAttempts(6) === 1, harness.groqAttempts(6));
-		check("the quota-affected message is still delivered", quotaEvent !== undefined && quotaEvent.text.includes("provider daily quota exhausted") === true, quotaEvent?.text);
 		check(
-			"the quota-affected payload records the quota stop",
-			(quotaEvent?.payload as { transcription?: { status?: string } })?.transcription?.status === "quota_exhausted",
+			"the quota-affected message is still delivered with a quota marker",
+			quotaEvent !== undefined && quotaEvent.text.includes("voice transcription unavailable: quota") === true && quotaEvent.text.includes("daily quota exhausted") === true,
+			quotaEvent?.text,
+		);
+		check(
+			"the quota-affected payload records the quota stop and reason class",
+			transcriptionPayload(quotaEvent)?.status === "quota_exhausted" && transcriptionPayload(quotaEvent)?.reasonClass === "quota",
 			quotaEvent?.payload,
 		);
 		check("later voice notes skip the provider entirely", harness.providerCalls() === 1, harness.providerCalls());
-		check("the skipped message is still delivered with a note", skippedEvent?.text.includes("provider daily quota exhausted") === true, skippedEvent?.text);
+		check(
+			"the skipped message is still delivered with the same quota marker",
+			skippedEvent?.text.includes("voice transcription unavailable: quota") === true &&
+				transcriptionPayload(skippedEvent)?.status === "quota_exhausted" &&
+				transcriptionPayload(skippedEvent)?.reasonClass === "quota",
+			skippedEvent?.text,
+		);
+		check(
+			"quota markers are recorded in history for both messages",
+			historyText(harness, "331").includes("voice transcription unavailable: quota") &&
+				historyText(harness, "332").includes("voice transcription unavailable: quota"),
+			[historyText(harness, "331"), historyText(harness, "332")],
+		);
 		const skippedAttachments = (skippedEvent?.payload as { attachments?: Array<{ kind?: string; fileId?: string }> })?.attachments;
 		check("the skipped message keeps its voice attachment", skippedAttachments?.[0]?.kind === "voice" && skippedAttachments?.[0]?.fileId === "voice-ok", skippedAttachments);
 		const quotaWarnings = transcriptionLogs(harness).filter((record) => record.level === "warn");
@@ -1647,15 +1770,29 @@ section("telegram voice transcription: bounded retries, one line, quota stop (#1
 			quotaMarker,
 		);
 		check("module status reports the quota stop", (harness.telegram.status().transcription as { quotaExhausted?: boolean })?.quotaExhausted === true);
+		const quotaHealth = transcriptionHealth(harness);
+		check(
+			"provider and marker quota stops count as failed translations",
+			quotaHealth.attempted === 2 && quotaHealth.failed === 2 && quotaHealth.transcribed === 0 && quotaHealth.lastFailureReason === "quota",
+			quotaHealth,
+		);
 
 		// A new day resets the marker: the next voice note is transcribed again.
 		harness.state.patch({ transcriptionQuota: { ...quotaMarker!, day: "2000-01-01" } });
+		const quotaFailureAt = quotaHealth.lastFailureAt;
 		harness.queue([voiceUpdate(332, 333, "voice-ok")]);
 		const resetEvent = await harness.waitForEvent("333");
 		check("a stale quota marker no longer blocks transcription", resetEvent?.text.includes("quota is back") === true, resetEvent?.text);
 		check("the provider is called again after the marker resets", harness.providerCalls() === 2, harness.providerCalls());
 		check("the stale marker is cleared from the module state", harness.state.load().transcriptionQuota === undefined, harness.state.load().transcriptionQuota);
 		check("no extra warning is logged for the reset", transcriptionLogs(harness).filter((record) => record.level === "warn").length === 1);
+		const quotaAfterSuccess = transcriptionHealth(harness);
+		check(
+			"a success after a quota failure leaves the failure fields untouched",
+			quotaAfterSuccess.attempted === 3 && quotaAfterSuccess.transcribed === 1 && quotaAfterSuccess.failed === 2 &&
+				quotaAfterSuccess.lastFailureAt === quotaFailureAt && quotaAfterSuccess.lastFailureReason === "quota",
+			quotaAfterSuccess,
+		);
 		await harness.close();
 		harness = undefined;
 
@@ -1671,11 +1808,20 @@ section("telegram voice transcription: bounded retries, one line, quota stop (#1
 		await harness.settle();
 		check(
 			"oversized voice notes are skipped without a provider call",
-			(hugeEvent?.payload as { transcription?: { status?: string } })?.transcription?.status === "too_large" &&
+			transcriptionPayload(hugeEvent)?.status === "too_large" &&
+				transcriptionPayload(hugeEvent)?.reasonClass === "too_large" &&
+				hugeEvent?.text.includes("voice transcription unavailable: too large") === true &&
 				hugeEvent?.text.includes("MiB") === true &&
 				harness.providerCalls() === 0 &&
 				harness.getFileCalls() === 0,
 			{ text: hugeEvent?.text, providerCalls: harness.providerCalls(), getFileCalls: harness.getFileCalls() },
+		);
+		check("the size marker is recorded in history", historyText(harness, "341").includes("voice transcription unavailable: too large") === true, historyText(harness, "341"));
+		const oversizeHealth = transcriptionHealth(harness);
+		check(
+			"a size skip increments the failure health counters",
+			oversizeHealth.attempted === 1 && oversizeHealth.failed === 1 && oversizeHealth.lastFailureReason === "too_large",
+			oversizeHealth,
 		);
 		check("a size skip is not reported as a transcription failure", transcriptionLogs(harness).length === 0, transcriptionLogs(harness));
 		check("voice events are still the only ones with transcription payloads", voiceEvents(harness).length === 1, voiceEvents(harness).map((event) => event.id));
@@ -1716,10 +1862,14 @@ section("telegram voice transcription: bounded retries, one line, quota stop (#1
 		const pausedEvent = await harness.waitForEvent("352");
 		await harness.settle(200);
 		check("a 429 beyond the retry budget is not retried", harness.groqAttempts(8) === 1, harness.groqAttempts(8));
-		check("the rate-limited message is still delivered", rateLimited !== undefined && rateLimited.text.includes("voice transcription postponed") === true, rateLimited?.text);
 		check(
-			"the rate-limited payload records the pause",
-			(rateLimited?.payload as { transcription?: { status?: string } })?.transcription?.status === "rate_limited",
+			"the rate-limited message is still delivered with a rate-limit marker",
+			rateLimited !== undefined && rateLimited.text.includes("voice transcription unavailable: rate limit") === true && rateLimited.text.includes("no request is made until") === true,
+			rateLimited?.text,
+		);
+		check(
+			"the rate-limited payload records the pause and reason class",
+			transcriptionPayload(rateLimited)?.status === "rate_limited" && transcriptionPayload(rateLimited)?.reasonClass === "rate_limit",
 			rateLimited?.payload,
 		);
 		check(
@@ -1727,7 +1877,19 @@ section("telegram voice transcription: bounded retries, one line, quota stop (#1
 			harness.providerCalls() === 1 && harness.getFileCalls() === 1,
 			{ providerCalls: harness.providerCalls(), getFileCalls: harness.getFileCalls() },
 		);
-		check("the skipped voice note is still delivered with the pause note", pausedEvent?.text.includes("voice transcription postponed") === true, pausedEvent?.text);
+		check(
+			"the skipped voice note is still delivered with the same rate-limit marker",
+			pausedEvent?.text.includes("voice transcription unavailable: rate limit") === true &&
+				transcriptionPayload(pausedEvent)?.status === "rate_limited" &&
+				transcriptionPayload(pausedEvent)?.reasonClass === "rate_limit",
+			pausedEvent?.text,
+		);
+		check(
+			"rate-limit markers are recorded in history for both messages",
+			historyText(harness, "351").includes("voice transcription unavailable: rate limit") &&
+				historyText(harness, "352").includes("voice transcription unavailable: rate limit"),
+			[historyText(harness, "351"), historyText(harness, "352")],
+		);
 		const cooldownMarker = harness.state.load().transcriptionCooldown;
 		check(
 			"the cooldown marker is persisted with the provider's retry-after",
@@ -1742,9 +1904,16 @@ section("telegram voice transcription: bounded retries, one line, quota stop (#1
 		const cooldownWarnings = transcriptionLogs(harness).filter((record) => record.level === "warn");
 		check("the cooldown is logged loudly exactly once", cooldownWarnings.length === 1, cooldownWarnings);
 		check("the loud line names the rate limit and the wait", cooldownWarnings[0]?.data?.class === "rate_limit" && Number(cooldownWarnings[0]?.data?.waitMs) > 0, cooldownWarnings[0]);
+		const rateLimitHealth = transcriptionHealth(harness);
+		check(
+			"provider and cooldown rate-limit skips count as failed translations",
+			rateLimitHealth.attempted === 2 && rateLimitHealth.failed === 2 && rateLimitHealth.transcribed === 0 && rateLimitHealth.lastFailureReason === "rate_limit",
+			rateLimitHealth,
+		);
 
 		// The pause ends at `retry-after`: the next voice note goes to the provider again.
 		harness.state.patch({ transcriptionCooldown: { ...cooldownMarker!, until: Date.now() - 1 } });
+		const rateLimitFailureAt = rateLimitHealth.lastFailureAt;
 		harness.queue([voiceUpdate(352, 353, "voice-after")]);
 		const afterCooldown = await harness.waitForEvent("353");
 		await harness.settle(150);
@@ -1752,6 +1921,67 @@ section("telegram voice transcription: bounded retries, one line, quota stop (#1
 		check("the provider is asked again after the cooldown", harness.providerCalls() === 2, harness.providerCalls());
 		check("the expired marker is cleared from the module state", harness.state.load().transcriptionCooldown === undefined, harness.state.load().transcriptionCooldown);
 		check("no extra warning is logged for the expiry", transcriptionLogs(harness).filter((record) => record.level === "warn").length === 1);
+		const rateLimitAfterSuccess = transcriptionHealth(harness);
+		check(
+			"a success after a rate limit leaves the failure fields untouched",
+			rateLimitAfterSuccess.attempted === 3 && rateLimitAfterSuccess.transcribed === 1 && rateLimitAfterSuccess.failed === 2 &&
+				rateLimitAfterSuccess.lastFailureAt === rateLimitFailureAt && rateLimitAfterSuccess.lastFailureReason === "rate_limit",
+			rateLimitAfterSuccess,
+		);
+		await harness.close();
+		harness = undefined;
+
+		// 7. Timeout and network failures are also classified markers (#157).
+		harness = await createHarness("timeout-network", {
+			voices: [
+				{ fileId: "voice-timeout", marker: 13 },
+				{ fileId: "voice-network", marker: 14 },
+			],
+			retries: 0,
+			provider: async (marker) => {
+				if (marker === 13) throw Object.assign(new Error("provider timed out"), { name: "TimeoutError" });
+				throw new TypeError("fetch failed");
+			},
+		});
+		harness.queue([voiceUpdate(360, 361, "voice-timeout"), voiceUpdate(361, 362, "voice-network")]);
+		const timeoutEvent = await harness.waitForEvent("361");
+		const networkEvent = await harness.waitForEvent("362");
+		await harness.settle(150);
+		check(
+			"a timeout is delivered with a timeout marker",
+			timeoutEvent?.text.includes("voice transcription unavailable: timeout") === true &&
+				transcriptionPayload(timeoutEvent)?.status === "failed" &&
+				transcriptionPayload(timeoutEvent)?.reasonClass === "timeout",
+			timeoutEvent?.text,
+		);
+		check(
+			"a network failure is delivered with a network marker",
+			networkEvent?.text.includes("voice transcription unavailable: network") === true &&
+				transcriptionPayload(networkEvent)?.status === "failed" &&
+				transcriptionPayload(networkEvent)?.reasonClass === "network",
+			networkEvent?.text,
+		);
+		check(
+			"timeout and network markers are recorded in history",
+			historyText(harness, "361").includes("voice transcription unavailable: timeout") &&
+				historyText(harness, "362").includes("voice transcription unavailable: network"),
+			[historyText(harness, "361"), historyText(harness, "362")],
+		);
+		const timeoutNetworkHealth = transcriptionHealth(harness);
+		check(
+			"timeout and network failures increment the health counters",
+			timeoutNetworkHealth.attempted === 2 && timeoutNetworkHealth.failed === 2 && timeoutNetworkHealth.lastFailureReason === "network",
+			timeoutNetworkHealth,
+		);
+		const timeoutNetworkWarnings = transcriptionLogs(harness).filter((record) => record.level === "warn");
+		check("each timeout/network voice produces one summary line", timeoutNetworkWarnings.length === 2, timeoutNetworkWarnings);
+		check(
+			"timeout/network summary lines name their classes without secrets",
+			timeoutNetworkWarnings.some((record) => record.data?.class === "timeout") &&
+				timeoutNetworkWarnings.some((record) => record.data?.class === "network") &&
+				harness.logs().every((record) => !JSON.stringify(record).includes(GROQ_KEY)),
+			timeoutNetworkWarnings,
+		);
 		await harness.close();
 		harness = undefined;
 	} finally {
