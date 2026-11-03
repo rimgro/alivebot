@@ -211,11 +211,23 @@ Callback-кнопки (`callback_query`) приходят как `user_message` 
 аудио никуда не отправляет.
 
 Расшифровка добавляется к тексту события и к записи истории; исходное вложение и caption
-сохраняются. В `payload.transcription` есть `provider`, `model`, `status` и `text`. `status` —
-одно из `transcribed`, `failed`, `too_large`, `rate_limited`, `quota_exhausted`, `disabled`,
-`not_configured`.
-В историю попадает только сам транскрипт: подсказки про настройку и разовые ошибки провайдера
-остаются только в тексте события, чтобы не засорять поиск по истории.
+сохраняются. В `payload.transcription` есть `provider`, `model`, `status` и либо `text` (успех),
+либо `reasonClass` + `reason` (любой исход без расшифровки). `status` — одно из `transcribed`,
+`failed`, `too_large`, `rate_limited`, `quota_exhausted`, `disabled`, `not_configured`;
+`reasonClass` — стабильный класс причины (`timeout`, `network`, `auth`, `quota`, `rate_limit`,
+`unsupported`, `too_large`, `not_configured`, `disabled`, `provider_unavailable`, `aborted`,
+`unknown`).
+
+Если расшифровки нет, и событие, и запись истории содержат одну и ту же строку
+`voice transcription unavailable: <reason class> (<human-readable reason>)`; исходное
+голосовое вложение остаётся в событии. Это не даёт агенту увидеть только `(voice)` и
+додумать содержимое (#157).
+
+`status.transcription` в снапшоте модуля (`GET /status` / tool `status`, та же поверхность,
+которую показывает `alive status`) дополнительно отдаёт здоровье распознавания: `attempted`, `transcribed`, `failed`,
+`lastFailureAt` (epoch ms) и `lastFailureReason` (последний `reasonClass`). Счётчики живут
+в памяти процесса и начинаются с нуля после рестарта; успешная расшифровка не перезаписывает
+поля последней ошибки.
 
 Обрабатываются только voice notes; другие аудио (`audio`, документы) не отправляются.
 Лимит размера (`transcription.maxBytes`, по умолчанию 20 MiB) проверяется по метаданным
@@ -263,13 +275,14 @@ Callback-кнопки (`callback_query`) приходят как `user_message` 
 при изменении настроек распознавания (ключ, модель, лимиты, повторы) — тогда следующее
 голосовое снова пробует API.
 
-Контракт логов: на одно голосовое — не больше одной строки `warn`
+Контракт логов: на одно голосовое — не больше одной строки `warn` о неудаче
 (`telegram voice transcription failed` с `attempts`, `class` и `reason`; для квоты —
 `telegram voice transcription paused until the provider quota resets`; для 429 —
-`telegram voice transcription paused by the provider rate limit`). При активной паузе
-пропуски логируются на уровне `debug`, а `warn` повторяется не чаще раза в 10 минут. Детали
-каждой попытки пишутся только на уровне `debug` (`telegram voice transcription attempt failed`).
-Ни ключ, ни тело ответа провайдера, ни аудио в лог не попадают.
+`telegram voice transcription paused by the provider rate limit`), и вместе с ней обновляются
+счётчики `status.transcription`. При активной паузе пропуски логируются на уровне `debug`, а
+`warn` повторяется не чаще раза в 10 минут. Детали каждой попытки пишутся только на уровне
+`debug` (`telegram voice transcription attempt failed`). Ни ключ, ни тело ответа провайдера,
+ни аудио в лог не попадают.
 
 Ключ — секрет: задайте его в окружении хост-процесса (например, в gitignored `.env`), а не
 в Telegram, tracked config или PR. `GROQ_API_KEY` читается при обработке каждого голосового,

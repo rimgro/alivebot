@@ -115,16 +115,43 @@ interface EditBatchMeta {
 /** How often a debounced edit retries while a run is actively working on its thread. */
 const TELEGRAM_EDIT_RUN_RETRY_MS = 250;
 
+/**
+ * Stable, secret-free class for a voice note that produced no transcript (#157).
+ * The event annotation, the payload and the module counters all use this value.
+ */
+type VoiceFailureReasonClass =
+	| "disabled"
+	| "not_configured"
+	| "timeout"
+	| "network"
+	| "auth"
+	| "quota"
+	| "rate_limit"
+	| "unsupported"
+	| "too_large"
+	| "provider_unavailable"
+	| "aborted"
+	| "unknown";
+
 type VoiceTranscriptionResult =
 	| { status: "transcribed"; text: string }
-	| { status: "disabled" }
-	| { status: "not_configured" }
-	| { status: "too_large" }
+	| { status: "disabled"; reasonClass: "disabled"; reason: string }
+	| { status: "not_configured"; reasonClass: "not_configured"; reason: string }
+	| { status: "too_large"; reasonClass: "too_large"; reason: string }
 	/** The provider reported exhausted daily quota: no attempt was made (or it stopped here). */
-	| { status: "quota_exhausted" }
+	| { status: "quota_exhausted"; reasonClass: "quota"; reason: string }
 	/** A provider rate limit paused transcription until `until` (epoch ms). */
-	| { status: "rate_limited"; until: number }
-	| { status: "failed"; reason: string };
+	| { status: "rate_limited"; reasonClass: "rate_limit"; reason: string; until: number }
+	| { status: "failed"; reasonClass: VoiceFailureReasonClass; reason: string };
+
+/** In-memory transcription health (attempted/transcribed/failed), reset on process restart. */
+interface TranscriptionCounters {
+	attempted: number;
+	transcribed: number;
+	failed: number;
+	lastFailureAt?: number;
+	lastFailureReason?: VoiceFailureReasonClass;
+}
 
 /** Upper bound for one backoff wait between transcription attempts. */
 const TRANSCRIPTION_BACKOFF_MAX_MS = 30_000;
@@ -207,6 +234,11 @@ export class TelegramModule implements AliveModule {
 	private readonly recentVoiceAttempts = new Map<string, { at: number; result: VoiceTranscriptionResult }>();
 	/** Last loud line about a transcription cooldown; bounds the log to one per window. */
 	private lastTranscriptionNoticeAt = 0;
+	/**
+	 * Transcription health counters (#157). Deliberately in-memory: a restarted
+	 * process starts at zero instead of mixing old counters with the new config.
+	 */
+	private readonly transcriptionCounters: TranscriptionCounters = { attempted: 0, transcribed: 0, failed: 0 };
 
 	constructor(config: TelegramConfig) {
 		this.config = config;
@@ -384,6 +416,12 @@ export class TelegramModule implements AliveModule {
 				quotaExhausted: this.transcriptionQuotaBlock(this.config.transcription) !== undefined,
 				// #136: epoch ms until the provider may be asked again after any 429.
 				rateLimitedUntil: this.transcriptionCooldownBlock(this.config.transcription)?.until,
+				// #157: in-memory health counters; reset on process restart.
+				attempted: this.transcriptionCounters.attempted,
+				transcribed: this.transcriptionCounters.transcribed,
+				failed: this.transcriptionCounters.failed,
+				lastFailureAt: this.transcriptionCounters.lastFailureAt ?? null,
+				lastFailureReason: this.transcriptionCounters.lastFailureReason ?? null,
 			},
 			chats,
 			historyMessages: messages,
@@ -849,7 +887,7 @@ export class TelegramModule implements AliveModule {
 				const annotation = imageAnnotation(image);
 				eventText = `${eventText}\n\n${annotation}`;
 				// The saved path is durable knowledge for later searches; transient failures
-				// stay in the event text only, like voice transcription errors.
+				// stay in the event text only.
 				if (image.status === "saved") {
 					historyText = `${historyText}\n\n${annotation}`;
 					payload = { ...payload, image: { path: image.path, mime: image.mime, bytes: image.bytes } };
@@ -860,19 +898,34 @@ export class TelegramModule implements AliveModule {
 			if (voice) {
 				if (this.config.typingIndicator && inbound.expectsReply) this.startTyping(inbound.thread);
 				const transcriptionConfig = this.config.transcription;
-				const transcription = await this.transcribeVoice(voice, `${inbound.chatId}:${inbound.messageId}`, api, ctx, transcriptionConfig);
+				let transcription: VoiceTranscriptionResult;
+				try {
+					transcription = await this.transcribeVoice(voice, `${inbound.chatId}:${inbound.messageId}`, api, ctx, transcriptionConfig);
+				} catch (err) {
+					// Defence in depth: even an unexpected bug in the transcription pipeline
+					// must leave the agent a marker instead of a voiceless event (#157).
+					ctx.log.warn("telegram voice transcription failed", {
+						attempts: 0,
+						class: "unknown",
+						reason: "transcription pipeline failed",
+					});
+					transcription = { status: "failed", reasonClass: "unknown", reason: "transcription pipeline failed" };
+				}
+				this.recordTranscriptionOutcome(transcription);
 				const annotation = voiceAnnotation(transcription, transcriptionConfig);
 				eventText = `${eventText}\n\n${annotation}`;
-				// Only the transcript belongs in durable history: configuration hints and
-				// transient provider failures there would be permanent noise for search.
-				if (transcription.status === "transcribed") historyText = `${historyText}\n\n${annotation}`;
+				// #157: history must carry the same marker as the event, otherwise an agent
+				// reading the thread later sees only "(voice)" and may guess its content.
+				historyText = `${historyText}\n\n${annotation}`;
 				payload = {
 					...payload,
 					transcription: {
 						provider: "groq",
 						model: transcriptionConfig.model,
 						status: transcription.status,
-						...(transcription.status === "transcribed" ? { text: transcription.text } : {}),
+						...(transcription.status === "transcribed"
+							? { text: transcription.text }
+							: { reasonClass: transcription.reasonClass, reason: transcription.reason }),
 					},
 				};
 			}
@@ -1186,12 +1239,22 @@ export class TelegramModule implements AliveModule {
 	): Promise<VoiceTranscriptionResult> {
 		// An explicit switch plus an explicit key keep voice audio from leaving the host
 		// just because some unrelated feature happens to export the same env variable.
-		if (!config.enabled) return { status: "disabled" };
-		if (!config.apiKeyEnv) return { status: "disabled" };
+		if (!config.enabled) {
+			return { status: "disabled", reasonClass: "disabled", reason: "modules.telegram.transcription.enabled=false" };
+		}
+		if (!config.apiKeyEnv) {
+			return { status: "disabled", reasonClass: "disabled", reason: "modules.telegram.transcription.apiKeyEnv is empty" };
+		}
 		const apiKey = process.env[config.apiKeyEnv]?.trim();
-		if (!apiKey) return { status: "not_configured" };
-		if (!voice.fileId) return { status: "failed", reason: "Telegram voice attachment has no file id" };
-		if (voice.size !== undefined && voice.size > config.maxBytes) return { status: "too_large" };
+		if (!apiKey) {
+			return { status: "not_configured", reasonClass: "not_configured", reason: `set ${config.apiKeyEnv} in the host environment` };
+		}
+		if (!voice.fileId) {
+			return { status: "failed", reasonClass: "unsupported", reason: "Telegram voice attachment has no file id" };
+		}
+		if (voice.size !== undefined && voice.size > config.maxBytes) {
+			return { status: "too_large", reasonClass: "too_large", reason: `file exceeds the ${mibLabel(config.maxBytes)} limit` };
+		}
 
 		// #136: a replayed update must not buy a second download or a second request.
 		const previous = this.recentVoiceAttempt(messageKey, voice.fileId);
@@ -1209,14 +1272,14 @@ export class TelegramModule implements AliveModule {
 			ctx.log.debug("telegram voice transcription skipped: provider daily quota is exhausted", {
 				day: this.transcriptionQuotaDay(),
 			});
-			return { status: "quota_exhausted" };
+			return { status: "quota_exhausted", reasonClass: "quota", reason: "provider daily quota exhausted; skipped until the quota resets" };
 		}
 
 		// #136: any 429 pauses the provider globally, so this skip costs no request.
 		const cooldown = this.transcriptionCooldownBlock(config);
 		if (cooldown) {
 			this.noteTranscriptionCooldownSkip(ctx, cooldown);
-			return { status: "rate_limited", until: cooldown.until };
+			return { status: "rate_limited", reasonClass: "rate_limit", reason: "provider rate limit", until: cooldown.until };
 		}
 
 		const maxAttempts = 1 + Math.max(0, Math.min(this.config.transcriptionRetries, MAX_TRANSCRIPTION_RETRIES));
@@ -1236,7 +1299,9 @@ export class TelegramModule implements AliveModule {
 					const file = await this.retryRead("telegram getFile", signal, () =>
 						api.getFile({ file_id: fileId }, { timeoutMs: config.timeoutMs, signal }),
 					);
-					if (file.file_size !== undefined && file.file_size > config.maxBytes) return { status: "too_large" };
+					if (file.file_size !== undefined && file.file_size > config.maxBytes) {
+						return { status: "too_large", reasonClass: "too_large", reason: `file exceeds the ${mibLabel(config.maxBytes)} limit` };
+					}
 					const filePath = file.file_path;
 					if (!filePath) throw new VoiceAttachmentError("Telegram did not provide a file path");
 					audio = await this.retryRead("telegram downloadFile", signal, () =>
@@ -1257,7 +1322,9 @@ export class TelegramModule implements AliveModule {
 				return this.rememberVoiceAttempt(messageKey, voice.fileId, { status: "transcribed", text });
 			} catch (err) {
 				// The byte cap also fires while streaming, after the update's own size check.
-				if (err instanceof TelegramFileTooLargeError) return { status: "too_large" };
+				if (err instanceof TelegramFileTooLargeError) {
+					return { status: "too_large", reasonClass: "too_large", reason: `file exceeds the ${mibLabel(config.maxBytes)} limit` };
+				}
 				if (err instanceof VoiceAttachmentError) {
 					failure = { class: "unsupported", reason: err.message, retryable: false, dailyQuota: false };
 					break;
@@ -1266,7 +1333,7 @@ export class TelegramModule implements AliveModule {
 				if (failure.dailyQuota) {
 					// Record the stop before returning: later messages skip the provider.
 					this.markTranscriptionQuota(config, ctx, failure);
-					return { status: "quota_exhausted" };
+					return { status: "quota_exhausted", reasonClass: "quota", reason: failure.reason };
 				}
 				// #136: any 429 pauses the provider for the whole process, even when this
 				// message will not retry it.
@@ -1280,7 +1347,7 @@ export class TelegramModule implements AliveModule {
 				if (!retrying) {
 					// A rate limit is a pause, not a lost transcript: say when it can be retried.
 					if (cooldownUntil !== undefined) {
-						return { status: "rate_limited", until: cooldownUntil };
+						return { status: "rate_limited", reasonClass: "rate_limit", reason: failure.reason, until: cooldownUntil };
 					}
 					break;
 				}
@@ -1308,7 +1375,11 @@ export class TelegramModule implements AliveModule {
 			class: failure.class,
 			reason: failure.reason,
 		});
-		return this.rememberVoiceAttempt(messageKey, voice.fileId, { status: "failed", reason: failure.reason });
+		return this.rememberVoiceAttempt(messageKey, voice.fileId, {
+			status: "failed",
+			reasonClass: failureReasonClass(failure.class),
+			reason: failure.reason,
+		});
 	}
 
 	/** Classify one failed attempt: provider errors carry their own classification. */
@@ -1503,6 +1574,20 @@ export class TelegramModule implements AliveModule {
 		} catch {
 			// Best effort: the marker is re-read on the next voice note anyway.
 		}
+	}
+
+	/** Update #157 transcription health. A success never overwrites failure fields. */
+	private recordTranscriptionOutcome(result: VoiceTranscriptionResult): void {
+		if (result.status === "transcribed") {
+			this.transcriptionCounters.attempted += 1;
+			this.transcriptionCounters.transcribed += 1;
+			return;
+		}
+		if (result.status === "disabled") return;
+		this.transcriptionCounters.attempted += 1;
+		this.transcriptionCounters.failed += 1;
+		this.transcriptionCounters.lastFailureAt = Date.now();
+		this.transcriptionCounters.lastFailureReason = result.reasonClass;
 	}
 
 	/** Outcome of a recent voice attempt, keyed by message first and by file id second. */
@@ -2119,23 +2204,59 @@ function historyAttachment(upload: PreparedUpload): HistoryAttachment {
 	};
 }
 
-/** Human-readable, secret-free annotation appended to the agent-facing event text. */
+/** Map a provider failure class to the stable annotation/counter class (#157). */
+function failureReasonClass(failureClass: TranscriptionFailure["class"]): VoiceFailureReasonClass {
+	switch (failureClass) {
+		case "daily_quota":
+			return "quota";
+		case "rate_limit":
+			return "rate_limit";
+		case "provider_unavailable":
+			return "provider_unavailable";
+		case "timeout":
+		case "network":
+		case "auth":
+		case "unsupported":
+		case "too_large":
+		case "aborted":
+			return failureClass;
+		default:
+			return "unknown";
+	}
+}
+
+const VOICE_REASON_LABEL: Record<VoiceFailureReasonClass, string> = {
+	disabled: "disabled",
+	not_configured: "not configured",
+	timeout: "timeout",
+	network: "network",
+	auth: "auth",
+	quota: "quota",
+	rate_limit: "rate limit",
+	unsupported: "unsupported",
+	too_large: "too large",
+	provider_unavailable: "provider unavailable",
+	aborted: "interrupted",
+	unknown: "unknown",
+};
+
+/** Human-readable, secret-free annotation appended to the event and history text. */
 function voiceAnnotation(result: VoiceTranscriptionResult, config: TelegramTranscriptionConfig): string {
 	switch (result.status) {
 		case "transcribed":
 			return `voice transcript (${config.model} via Groq):\n${result.text || "(no speech recognized)"}`;
 		case "disabled":
-			return "voice transcription disabled: modules.telegram.transcription.enabled=false";
+			return `voice transcription unavailable: disabled (${result.reason})`;
 		case "not_configured":
-			return `voice transcription unavailable: set ${config.apiKeyEnv} in the host environment`;
+			return `voice transcription unavailable: not configured (${result.reason})`;
 		case "too_large":
-			return `voice transcription skipped: file exceeds the ${mibLabel(config.maxBytes)} limit`;
+			return `voice transcription unavailable: too large (${result.reason})`;
 		case "quota_exhausted":
-			return "voice transcription unavailable: provider daily quota exhausted (skipped until the quota resets)";
+			return `voice transcription unavailable: quota (${result.reason})`;
 		case "rate_limited":
-			return `voice transcription postponed: provider rate limit (no request is made until ${iso(result.until)}; resend or forward the recording after that)`;
+			return `voice transcription unavailable: rate limit (${result.reason}; no request is made until ${iso(result.until)}; resend or forward the recording after that)`;
 		case "failed":
-			return `voice transcription unavailable: ${result.reason}`;
+			return `voice transcription unavailable: ${VOICE_REASON_LABEL[result.reasonClass]} (${result.reason})`;
 	}
 }
 
