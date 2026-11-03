@@ -15,6 +15,7 @@ import { BrowserIdentity } from "./identity.js";
 import { sharedDirectory } from "./shared-client.js";
 import { controlPage } from "./page.js";
 import { BrowserNavigationBudget } from "./access.js";
+import { listenOn } from "./listener.js";
 
 interface Command { action: string; thread?: string; url?: string; tab?: string; selector?: string; timeoutMs?: number; text?: string; key?: string; delta?: number; reason?: string; renew?: boolean; mode?: "shared" | "assistance" }
 interface Session { id: string; thread: string; browser: BrowserModule; pending: number }
@@ -47,6 +48,8 @@ export class BrowserRouter implements AliveModule {
 	private readonly config: BrowserConfig;
 	private ctx?: ModuleContext;
 	private server?: http.Server;
+	private boundPort?: number;
+	private listenError?: string;
 	private sessions = new Map<string, Session>();
 	private serial: Promise<unknown> = Promise.resolve();
 	private upgraded = new Set<Duplex>();
@@ -75,14 +78,21 @@ export class BrowserRouter implements AliveModule {
 		const server = http.createServer((request, response) => { void this.handle(request, response).catch(() => { if (response.headersSent) response.destroy(); else { response.writeHead(502); response.end(); } }); });
 		server.maxConnections = 64; server.headersTimeout = 10_000; server.requestTimeout = 20_000;
 		server.on("upgrade", (request, socket, head) => this.upgrade(request, socket, head));
-		await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(this.config.port, this.config.host, resolve); });
-		this.server = server; this.origin = this.config.publicUrl || `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+		let bound: number;
+		try {
+			bound = await listenOn(server, this.config.host, this.config.port, (error) => ctx.log.warn("conversation browser router listener failed after start", { error: error.message }));
+		} catch (error) {
+			this.listenError = error instanceof Error ? error.message : String(error);
+			throw error;
+		}
+		this.boundPort = bound;
+		this.server = server; this.origin = this.config.publicUrl || `http://127.0.0.1:${bound}`;
 		this.stopped = false;
 		const configuredOrigin = this.configuredOrigin();
 		this.watchOrigin = !!this.config.publicUrl && !!configuredOrigin && new URL(configuredOrigin).origin === this.origin;
 		if (this.watchOrigin) { this.originMonitor = setInterval(() => { void this.refreshOrigin().catch(() => ctx.log.warn("browser relay origin update failed")); }, 1000); this.originMonitor.unref(); }
 		ctx.contributeStatus(() => this.status());
-		ctx.log.info("conversation browser router ready", { origin: this.origin });
+		ctx.log.info("conversation browser router ready", { origin: this.origin, port: this.boundPort, requestedPort: this.config.port });
 	}
 
 	async stop(): Promise<void> {
@@ -93,10 +103,10 @@ export class BrowserRouter implements AliveModule {
 		await Promise.all([...this.sessions.values()].map(session => session.browser.stop())); this.sessions.clear();
 		for (const socket of this.upgraded) socket.destroy(); this.upgraded.clear();
 		this.server?.closeAllConnections();
-		await new Promise<void>(resolve => this.server ? this.server.close(() => resolve()) : resolve()); this.server = undefined;
+		await new Promise<void>(resolve => this.server ? this.server.close(() => resolve()) : resolve()); this.server = undefined; this.boundPort = undefined; this.listenError = undefined;
 	}
 
-	status(): Record<string, unknown> { return { listening: !!this.server, routing: "conversation", sessions: [...this.sessions.values()].map(session => ({ thread: session.thread, open: session.browser.status().open, paused: session.browser.status().paused, handoff: session.browser.status().handoff, engine: session.browser.status().engine, headless: session.browser.status().headless, browserVersion: session.browser.status().browserVersion, access: session.browser.status().access })) }; }
+	status(): Record<string, unknown> { return { listening: !!this.server, port: this.boundPort, requestedPort: this.config.port, ...(this.listenError ? { error: this.listenError } : {}), routing: "conversation", sessions: [...this.sessions.values()].map(session => ({ thread: session.thread, open: session.browser.status().open, paused: session.browser.status().paused, handoff: session.browser.status().handoff, engine: session.browser.status().engine, headless: session.browser.status().headless, browserVersion: session.browser.status().browserVersion, access: session.browser.status().access })) }; }
 	localEndpoint(): string { return `http://127.0.0.1:${(this.server!.address() as { port: number }).port}`; }
 
 	tools(): ToolDefinition[] {

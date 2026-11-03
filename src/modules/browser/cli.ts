@@ -24,6 +24,7 @@ import { validateFortressImage, fortressImageInstalled } from "./fortress.js";
 import { sharedMetadata, sharedOrigin, sharedToken } from "./shared-client.js";
 import { sharedHostCommand, sharedHostTokenFile } from "./shared-cli.js";
 import { migrateSharedState } from "./shared-migrate.js";
+import { formatListenAddress } from "./listener.js";
 
 type Flags = Record<string, string | boolean>;
 const stringFlag = (flags: Flags, name: string) => typeof flags[name] === "string" ? flags[name] as string : undefined;
@@ -194,7 +195,7 @@ async function doctor(loaded: LoadedConfig, online: boolean): Promise<number> {
 	if (!endpoint && browser.engine === "chrome" && browser.headless && browser.driver === "patchright") process.stdout.write("Compatibility note: Patchright recommends headed Chrome with a persistent profile. Headless Chrome may expose HeadlessChrome in its user agent.\n");
 	const chat = browser.notifyChatId || operator?.chatId;
 	const destinationAllowed = !!chat && (!telegram.allowedChatIds.length || telegram.allowedChatIds.map(String).includes(chat));
-	process.stdout.write(`Host: ${process.platform}/${process.arch}; configuration: ${loaded.paths.configPath}\nRuntime: ${snapshot?.alive ? `running (pid ${snapshot.pid})` : "not running here"}\nBrowser: ${browser.enabled ? "enabled" : "disabled"}; ${browser.driver}/${endpoint ? `external CDP (${online ? "reachable" : "reachability unchecked"})` : `${browser.engine === "fortress" ? "fortress" : browser.channel} ${installed ? "installed" : "not found"}`}; humanization ${browser.humanization.enabled ? "enabled" : "disabled"}\nPhone HTTPS address: ${browser.publicUrl || "not configured"}\nTelegram token: ${token ? "configured" : "missing"}\nOperator: ${chat ? `${chat}${destinationAllowed ? "" : " (denied by chat allowlist)"}` : "not paired"}\n`);
+	process.stdout.write(`Host: ${process.platform}/${process.arch}; configuration: ${loaded.paths.configPath}\nRuntime: ${snapshot?.alive ? `running (pid ${snapshot.pid})` : "not running here"}\nBrowser: ${browser.enabled ? "enabled" : "disabled"}; ${browser.driver}/${endpoint ? `external CDP (${online ? "reachable" : "reachability unchecked"})` : `${browser.engine === "fortress" ? "fortress" : browser.channel} ${installed ? "installed" : "not found"}`}; humanization ${browser.humanization.enabled ? "enabled" : "disabled"}\nLocal listener: ${formatListenAddress(browser.host, browser.port)}${browser.port === 0 ? " (ephemeral; the OS assigns the real port at startup, see modules.browser.port to pin one)" : " (pinned)"}\nPhone HTTPS address: ${browser.publicUrl || "not configured"}\nTelegram token: ${token ? "configured" : "missing"}\nOperator: ${chat ? `${chat}${destinationAllowed ? "" : " (denied by chat allowlist)"}` : "not paired"}\n`);
 	if (browser.signing.enabled && browser.sharedUrl) process.stdout.write(`Web Bot Auth: delegated to the shared host; expected operator ${browser.signing.agentUrl}\n`);
 	else if (browser.signing.enabled) {
 		const identity = new BrowserIdentity(browser.signing);
@@ -289,7 +290,7 @@ async function serve(loaded: LoadedConfig, flags: Flags): Promise<number> {
 	}
 	const browser = new BrowserModule({ ...DEFAULT_BROWSER_CONFIG, ...loaded.config.modules.browser, ...(flags.headless !== undefined ? { headless: boolFlag(flags, "headless") } : {}) });
 	const browserConfig = { ...DEFAULT_BROWSER_CONFIG, ...loaded.config.modules.browser };
-	if (boolFlag(flags, "tunnel") && ((browserConfig.signing.enabled && browserConfig.signing.agentUrl === browserConfig.publicUrl) || !["127.0.0.1", "localhost", "::1"].includes(browserConfig.host) || browserConfig.port === 0)) throw new Error("Quick tunnels require a fixed loopback port. Web Bot Auth needs a separately hosted stable HTTPS identity origin.");
+	if (boolFlag(flags, "tunnel") && ((browserConfig.signing.enabled && browserConfig.signing.agentUrl === browserConfig.publicUrl) || !["127.0.0.1", "localhost", "::1"].includes(browserConfig.host))) throw new Error("Quick tunnels require a loopback listener. Web Bot Auth needs a separately hosted stable HTTPS identity origin.");
 	const telegram = loaded.config.modules.telegram;
 	const host = hostFor(loaded, [browser, ...(telegram.enabled && resolveToken(telegram) ? [new TelegramModule(telegram)] : [])]);
 	let fixture: http.Server | undefined;
@@ -305,9 +306,14 @@ async function serve(loaded: LoadedConfig, flags: Flags): Promise<number> {
 	}
 	try {
 		return await withStandalone(loaded, host, async signal => {
+			const status = (host.status().modules as Record<string, Record<string, unknown>>).browser ?? {};
+			if (typeof status.error === "string") throw new Error(status.error);
+			const port = status.port;
+			if (typeof port !== "number") throw new Error("The browser listener did not report a bound port; see the startup log for the listener error");
+			const localHost = browserConfig.host.includes(":") ? `[${browserConfig.host}]` : browserConfig.host;
+			process.stdout.write(`Local browser listener: http://${localHost}:${port}/${browserConfig.port === 0 ? " (ephemeral; pin modules.browser.port for a stable port)" : ""}\n`);
 			if (boolFlag(flags, "tunnel")) {
-				const targetHost = browserConfig.host.includes(":") ? `[${browserConfig.host}]` : browserConfig.host;
-				tunnel = await startQuickTunnel(`http://${targetHost}:${browserConfig.port}`, signal, stringFlag(flags, "cloudflared"), () => process.kill(process.pid, "SIGTERM"));
+				tunnel = await startQuickTunnel(`http://${localHost}:${port}`, signal, stringFlag(flags, "cloudflared"), () => process.kill(process.pid, "SIGTERM"));
 				browser.setPublicOrigin(tunnel.origin);
 				process.stdout.write(`Temporary HTTPS address: ${tunnel.origin} (testing only; expires when this process stops)\n`);
 			}

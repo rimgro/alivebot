@@ -32,6 +32,7 @@ export interface BrowserConfig {
 	/** null preserves native window dimensions. */
 	viewport: { width: number; height: number } | null;
 	host: string;
+	/** 0 (default) lets the OS assign an ephemeral port; pin a concrete port only when a proxy or tunnel must know it in advance. */
 	port: number;
 	/** HTTPS origin of the reverse proxy; empty uses the local listener. */
 	publicUrl: string;
@@ -102,7 +103,9 @@ export const DEFAULT_BROWSER_CONFIG: BrowserConfig = {
 	headless: false,
 	viewport: null,
 	host: "127.0.0.1",
-	port: 4323,
+	// Ephemeral by default: every agent gets its own free loopback port, so a
+	// fixed port can no longer be owned by whichever process started first.
+	port: 0,
 	publicUrl: "",
 	notifyChatId: "",
 	handoffTtlMs: 10 * 60_000,

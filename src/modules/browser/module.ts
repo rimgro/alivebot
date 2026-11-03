@@ -28,6 +28,7 @@ import { launchManagedFortress, validateFortressImage, type ManagedFortress } fr
 import { checkCanvas, type CanvasReport } from "./diagnostics.js";
 import { openSharedContext, sharedDirectory, sharedDownload, sharedOrigin, sharedToken, type SharedContext } from "./shared-client.js";
 import { ConversationAgentBrowser } from "./agent-browser.js";
+import { listenOn } from "./listener.js";
 
 /** Failure text keeps the result self-explanatory without page content. */
 const READ_FAILED_HINT = "Nothing was written to a file; retry with a scoped selector. The browser session was kept.";
@@ -65,6 +66,9 @@ export class BrowserModule implements AliveModule {
 	private readonly config: BrowserConfig;
 	private ctx?: ModuleContext;
 	private server?: http.Server;
+	/** Real port assigned by the OS; a configured port 0 means ephemeral. */
+	private boundPort?: number;
+	private listenError?: string;
 	private context?: BrowserContext;
 	private attachedBrowser?: Browser;
 	private cdpEndpoint?: string;
@@ -130,6 +134,8 @@ export class BrowserModule implements AliveModule {
 
 	async start(ctx: ModuleContext): Promise<void> {
 		this.lifecycleAbort = new AbortController();
+		this.boundPort = undefined;
+		this.listenError = undefined;
 		this.validateConfig();
 		this.ctx = ctx;
 		this.identity = this.config.signing.enabled && !this.config.sharedUrl ? new BrowserIdentity(this.config.signing) : undefined;
@@ -183,20 +189,23 @@ export class BrowserModule implements AliveModule {
 				await this.resumeOperator(true);
 			}),
 		});
-		await new Promise<void>((resolve, reject) => {
-			server.once("error", reject);
-			server.listen(this.config.port, this.config.host, resolve);
-		});
+		let bound: number;
+		try {
+			bound = await listenOn(server, this.config.host, this.config.port, (error) => this.ctx?.log.warn("browser handoff listener failed after start", { error: error.message }));
+		} catch (error) {
+			this.listenError = error instanceof Error ? error.message : String(error);
+			throw error;
+		}
+		this.boundPort = bound;
 		this.server = server;
-		const address = server.address();
-		const port = typeof address === "object" && address ? address.port : this.config.port;
+		const port = bound;
 		const host = this.config.host.includes(":") ? `[${this.config.host}]` : this.config.host;
 		this.publicOrigin = this.deps.controlOrigin || (this.config.publicUrl ? new URL(this.config.publicUrl).origin : `http://${host}:${port}`);
 		this.stopped = false;
 		this.challengeMonitor = setInterval(() => { void this.monitorChallenge(); }, 1000);
 		this.challengeMonitor.unref();
 		ctx.contributeStatus(() => this.status());
-		ctx.log.info("browser handoff listener ready", { origin: this.publicOrigin, channel: this.config.channel });
+		ctx.log.info("browser handoff listener ready", { origin: this.publicOrigin, port, requestedPort: this.config.port, channel: this.config.channel });
 	}
 
 	async stop(): Promise<void> {
@@ -211,6 +220,8 @@ export class BrowserModule implements AliveModule {
 		this.handoff = undefined;
 		const server = this.server;
 		this.server = undefined;
+		this.boundPort = undefined;
+		this.listenError = undefined;
 		if (server) {
 			server.closeAllConnections();
 			await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -253,7 +264,8 @@ export class BrowserModule implements AliveModule {
 
 	status(): Record<string, unknown> {
 		return {
-			listening: !!this.server, open: !!this.context, driver: this.config.driver, channel: this.config.channel, humanization: this.config.humanization.enabled,
+			listening: !!this.server, port: this.boundPort, requestedPort: this.config.port, ...(this.listenError ? { error: this.listenError } : {}),
+			open: !!this.context, driver: this.config.driver, channel: this.config.channel, humanization: this.config.humanization.enabled,
 			connection: this.config.sharedUrl ? "shared" : this.config.cdpEndpointEnv ? "cdp" : "managed",
 			agentAutomation: this.config.sharedUrl ? "agent-browser" : "sdk",
 			launchMode: this.sharedBrowser ? "shared-service" : this.fortressBrowser ? "fortress-container" : this.nativeBrowser ? "native" : this.config.cdpEndpointEnv ? "external" : "driver",
