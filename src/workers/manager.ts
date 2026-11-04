@@ -12,6 +12,13 @@ import {
 	WORKER_TOOL_NAMES,
 } from "./config.js";
 import {
+	resolveWorkerRunCost,
+	tokenCount,
+	type WorkerCostSource,
+	type WorkerModelPricing,
+	type WorkerTokenUsage,
+} from "./cost.js";
+import {
 	createPiWorkerSessionFactory,
 	type WorkerSession,
 	type WorkerSessionBuildInput,
@@ -139,6 +146,35 @@ class RetryableProviderFailure extends Error {
 }
 const EMPTY_RUN_ERROR = "worker produced no output: the model returned no text, no tool calls and no new tokens";
 
+/** One best-effort read of pi's cumulative session counters. */
+interface SessionUsageSnapshot {
+	/** False when `getSessionStats()` threw: nothing can be claimed about the run. */
+	ok: boolean;
+	tokens: WorkerTokenUsage & { total: number };
+	/** Cumulative reported cost, absent when the session does not report one. */
+	cost?: number;
+}
+
+function tokenValue(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.round(value) : 0;
+}
+
+function emptyTokens(): WorkerTokenUsage & { total: number } {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 };
+}
+
+/** Per-run token delta; a negative component (session reset) is clamped to 0. */
+function tokenDelta(before: WorkerTokenUsage & { total: number }, after: WorkerTokenUsage & { total: number }): WorkerTokenUsage & { total: number } {
+	const delta = (a: number, b: number): number => Math.max(0, b - a);
+	return {
+		input: delta(before.input, after.input),
+		output: delta(before.output, after.output),
+		cacheRead: delta(before.cacheRead, after.cacheRead),
+		cacheWrite: delta(before.cacheWrite, after.cacheWrite),
+		total: delta(before.total, after.total),
+	};
+}
+
 export class WorkerManager {
 	private readonly config: LoadedConfig;
 	private readonly cfg: WorkersConfig;
@@ -252,13 +288,27 @@ export class WorkerManager {
 			.map((record) => this.snapshot(record));
 	}
 
-	/** Cost recorded by worker runs finished today (survives worker removal). */
+	/**
+	 * Cost recorded by worker runs finished today (survives worker removal).
+	 * Unknown-cost entries contribute nothing: their spend is not known, so
+	 * treating them as zero would understate the day's budget (#162).
+	 */
 	usageToday(now = Date.now()): number {
+		return this.entriesToday(now).reduce(
+			(total, entry) => total + (typeof entry.cost === "number" ? entry.cost : 0),
+			0,
+		);
+	}
+
+	/** Worker runs finished today whose cost is unknown (`cost: null`). */
+	unknownCostRunsToday(now = Date.now()): number {
+		return this.entriesToday(now).filter((entry) => typeof entry.cost !== "number").length;
+	}
+
+	private entriesToday(now: number) {
 		const day = localDay(now);
 		const cutoff = now - 30 * 24 * 60 * 60_000;
-		return this.store.usageHistory(cutoff)
-			.filter((entry) => localDay(entry.ts) === day)
-			.reduce((total, entry) => total + entry.cost, 0);
+		return this.store.usageHistory(cutoff).filter((entry) => localDay(entry.ts) === day);
 	}
 
 	summary(): Record<string, unknown> {
@@ -272,6 +322,7 @@ export class WorkerManager {
 			activeCount: active.length,
 			maxConcurrent: this.cfg.maxConcurrent,
 			costTodayUsd: Number(this.usageToday().toFixed(6)),
+			unknownCostRunsToday: this.unknownCostRunsToday(),
 		};
 	}
 
@@ -689,7 +740,8 @@ export class WorkerManager {
 		handle.sessionError = undefined;
 		handle.toolCalls = 0;
 		handle.turns = 0;
-		const tokensBefore = this.tokenTotal(session);
+		const usageBefore = this.sessionUsage(session);
+		const tokensBefore = usageBefore.tokens.total;
 		const textBefore = session.getLastAssistantText()?.trim();
 		const previousAbortReason = handle.abortReason;
 		handle.abortReason = undefined;
@@ -761,23 +813,31 @@ export class WorkerManager {
 		} finally {
 			handle.retryAbort = undefined;
 			this.clearRunTimers(handle);
-			try {
-				const stats = session.getSessionStats();
-				if (stats.tokens) {
-					record.tokens = {
-						input: stats.tokens.input ?? 0,
-						output: stats.tokens.output ?? 0,
-						total: stats.tokens.total ?? 0,
-					};
-				}
-				if (typeof stats.cost === "number") {
-					const previous = record.costUsd ?? 0;
-					record.lastRunCostUsd = Math.max(0, stats.cost - previous);
-					record.costUsd = stats.cost;
-				}
-			} catch {
-				// Statistics are best-effort.
+			// The run's own delta, measured against the same live session it started
+			// on. A cumulative `stats.cost - record.costUsd` baseline goes stale when
+			// the session is rebuilt after a failed run (#61), zeroing real spend.
+			const usageAfter = this.sessionUsage(session);
+			const runTokens = tokenDelta(usageBefore.tokens, usageAfter.tokens);
+			const outcome = usageAfter.ok
+				? resolveWorkerRunCost({
+						reportedCost:
+							usageBefore.cost === undefined || usageAfter.cost === undefined
+								? undefined
+								: Math.max(0, usageAfter.cost - usageBefore.cost),
+						tokens: runTokens,
+						pricing: this.sessionPricing(session),
+					})
+				: { cost: null, costSource: "unreported" as WorkerCostSource };
+			if (usageAfter.ok) {
+				record.tokens = {
+					input: usageAfter.tokens.input,
+					output: usageAfter.tokens.output,
+					total: usageAfter.tokens.total,
+				};
 			}
+			if (usageAfter.cost !== undefined) record.costUsd = usageAfter.cost;
+			record.lastRunCostUsd = outcome.cost;
+			record.lastRunCostSource = outcome.costSource;
 			const result = status === "idle" ? session.getLastAssistantText() : undefined;
 			record.status = status;
 			record.lastResult = result ? truncate(result.trim(), MAX_RESULT_CHARS) : undefined;
@@ -789,12 +849,15 @@ export class WorkerManager {
 			handle.activity = undefined;
 			if (status !== "idle") this.disposeSession(handle);
 			this.store.save(record);
-			if ((record.lastRunCostUsd ?? 0) > 0 || (record.tokens?.total ?? 0) > 0) {
+			if ((typeof outcome.cost === "number" && outcome.cost > 0) || tokenCount(runTokens) > 0) {
 				this.store.appendUsage({
 					ts: record.lastRunFinishedAt,
-					cost: record.lastRunCostUsd ?? 0,
-					input: record.tokens?.input ?? 0,
-					output: record.tokens?.output ?? 0,
+					cost: outcome.cost,
+					costSource: outcome.costSource,
+					input: runTokens.input,
+					output: runTokens.output,
+					...(runTokens.cacheRead > 0 ? { cacheRead: runTokens.cacheRead } : {}),
+					...(runTokens.cacheWrite > 0 ? { cacheWrite: runTokens.cacheWrite } : {}),
 					model: record.model,
 					workerId: record.id,
 					status,
@@ -941,12 +1004,38 @@ export class WorkerManager {
 		return undefined;
 	}
 
-	private tokenTotal(session: WorkerSession): number {
+	private sessionUsage(session: WorkerSession): SessionUsageSnapshot {
 		try {
-			return session.getSessionStats().tokens?.total ?? 0;
+			const stats = session.getSessionStats();
+			const tokens = stats.tokens ?? {};
+			const input = tokenValue(tokens.input);
+			const output = tokenValue(tokens.output);
+			const cacheRead = tokenValue(tokens.cacheRead);
+			const cacheWrite = tokenValue(tokens.cacheWrite);
+			const cost =
+				typeof stats.cost === "number" && Number.isFinite(stats.cost) && stats.cost >= 0 ? stats.cost : undefined;
+			return {
+				ok: true,
+				tokens: { input, output, cacheRead, cacheWrite, total: tokenValue(tokens.total) || input + output + cacheRead + cacheWrite },
+				cost,
+			};
 		} catch {
-			return 0;
+			// Statistics are best-effort; an unreadable snapshot is unknown, not zero.
+			return { ok: false, tokens: emptyTokens() };
 		}
+	}
+
+	/** Prices pi has for the worker's model, or `undefined` when it has none (#162). */
+	private sessionPricing(session: WorkerSession): WorkerModelPricing | undefined {
+		try {
+			return session.getModelPricing?.();
+		} catch {
+			return undefined;
+		}
+	}
+
+	private tokenTotal(session: WorkerSession): number {
+		return this.sessionUsage(session).tokens.total;
 	}
 
 	/** True when the run left a visible trace: assistant text, a tool call, or new tokens. */
@@ -1194,8 +1283,12 @@ export function renderWorkerRecord(record: WorkerRecord, extra: { activity?: str
 		record.attempts && record.attempts > 1 ? `attempts: ${record.attempts}` : undefined,
 		record.abortReason ? `abort_reason: ${record.abortReason}` : undefined,
 		record.tokens ? `tokens: ${record.tokens.total}` : undefined,
-		typeof record.costUsd === "number" ? `cost_usd: ${record.costUsd.toFixed(4)}` : undefined,
-		typeof record.lastRunCostUsd === "number" ? `last_run_cost_usd: ${record.lastRunCostUsd.toFixed(4)}` : undefined,
+		record.lastRunCostUsd === null
+			? `last_run_cost: unknown (no price reported${record.lastRunCostSource ? `, ${record.lastRunCostSource}` : ""})`
+			: typeof record.lastRunCostUsd === "number"
+				? `last_run_cost_usd: ${record.lastRunCostUsd.toFixed(4)}${record.lastRunCostSource ? ` (${record.lastRunCostSource})` : ""}`
+				: undefined,
+		typeof record.costUsd === "number" && record.costUsd > 0 ? `cost_usd: ${record.costUsd.toFixed(4)} (session total)` : undefined,
 		extra.git ? `git: ${extra.git.branch ?? "detached"}${extra.git.clean ? " (clean)" : ` (${extra.git.changed.length} changed)`}` : undefined,
 	].filter((line): line is string => Boolean(line));
 	const text = lines.join("\n");
