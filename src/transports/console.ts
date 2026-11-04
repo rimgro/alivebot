@@ -60,6 +60,8 @@ export class ConsoleTransport implements ChatTransport {
 /** Prints nothing; used for tests and for headless deployments with an HTTP/chat transport. */
 export class NullTransport implements ChatTransport {
 	readonly name = "null";
+	/** Placeholder only: accepting a message here is not delivery. */
+	readonly delivers = false;
 	async start(): Promise<void> {}
 	async send(message: OutgoingMessage): Promise<void> {
 		void message;

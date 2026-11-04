@@ -470,10 +470,17 @@ Stdout фонового процесса пишется в `.alive/logs/stdout.l
   "pid": 4242,
   "startedAt": "2026-01-02T03:04:05.000Z",
   "version": "0.2.0",
+  "buildId": "dist/index.js:1770000000000",
   "tag": "v0.2.0",
   "ref": "master"
 }
 ```
+
+`version` берётся из `package.json` в checkout, поэтому после `alive update` он может
+показывать новую версию, пока процесс всё ещё исполняет старый код. `buildId`
+идентифицирует загруженный код (явный `dist/build-id`, иначе mtime
+`dist/index.js`/`src/index.ts`); чтобы понять, какой код реально работает,
+сравнивайте `buildId`, а не только `version`.
 
 `tag` и `ref` необязательны: это последний успешно применённый тег `alive update` и
 git-ветка (или короткий коммит), с которой запущен харнесс — насколько их можно
@@ -902,7 +909,7 @@ modules/<name>/         приватное durable-состояние модул
 outbox/messages.jsonl   всё, что агент реально отправил, + результат доставки
 runs/runs.jsonl         запись каждого run: события, idle-время, токены, стоимость
 usage.json              дневной счётчик расхода рантайма (cost/runs/turns/input/output, ~30 дней)
-heartbeat.json          признак жизни процесса: pid, startedAt, version, tag/ref
+heartbeat.json          признак жизни процесса: pid, startedAt, version, buildId, tag/ref
                         (его читает `alive heartbeat` и внешний watchdog)
 logs/alive.jsonl        структурный лог рантайма
 logs/thoughts.jsonl     приватный монолог (текст и thinking)

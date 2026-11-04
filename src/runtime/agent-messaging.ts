@@ -60,6 +60,7 @@ export async function sendLocalAgentMessage(input: LocalMessageInput): Promise<O
 	let sender: LocalSender | undefined;
 	let recipient: LocalAgentProfile | undefined;
 	let eventId: string | undefined;
+	let delivery: LocalDeliveryResult | undefined;
 	try {
 		const to = validateAgentId(rawTo);
 		const text = input.text.trim();
@@ -81,16 +82,17 @@ export async function sendLocalAgentMessage(input: LocalMessageInput): Promise<O
 			senderName: sender.name,
 		}, async (queued) => {
 			eventId = queued.id;
-			deliverLocalMessage({ config: input.config, message: queued, senderId: sender!.id, senderName: sender!.name, recipient: recipient! });
+			delivery = deliverLocalMessage({ config: input.config, message: queued, senderId: sender!.id, senderName: sender!.name, recipient: recipient! });
 		});
+		if (!delivery) throw new Error(`outbox reported delivery for ${message.id} without running the local delivery handler`);
 		// A wrong inbox was indistinguishable from a correct one (#148): every
 		// resolution states sender, recipient, absolute inbox and event id, never text.
 		input.log?.info("message_agent resolved local delivery", {
 			to,
 			senderId: sender.id,
 			recipientId: recipient.id,
-			inbox: inboxPath(recipient),
-			eventId: message.id,
+			inbox: delivery.inbox,
+			eventId: delivery.eventId,
 			thread: message.thread,
 		});
 		return message;
@@ -120,14 +122,46 @@ function inboxPath(profile: LocalAgentProfile): string {
  * idempotent: the recipient inbox dedupes on `local-message:<id>` and history
  * dedupes on the record id. A crash between the two leaves no duplicate.
  */
-export function redeliverLocalAgentMessage(config: LoadedConfig, message: OutgoingMessage): void {
+export function redeliverLocalAgentMessage(config: LoadedConfig, message: OutgoingMessage, log?: LocalMessageLogger): void {
 	const recipientId = message.recipientAgentId;
-	if (!recipientId) throw new Error(`message ${message.id} has no recipientAgentId`);
-	if (!message.senderId) throw new Error(`message ${message.id} has no senderId`);
-	const senderId = validateAgentId(message.senderId);
-	const senderName = message.senderName?.trim() || (senderId === "operator" ? "Operator" : config.config.name);
-	const recipient = resolveLocalRecipient(config, recipientId);
-	deliverLocalMessage({ config, message, senderId, senderName, recipient });
+	let recipient: LocalAgentProfile | undefined;
+	try {
+		if (!recipientId) throw new Error(`message ${message.id} has no recipientAgentId`);
+		if (!message.senderId) throw new Error(`message ${message.id} has no senderId`);
+		const senderId = validateAgentId(message.senderId);
+		const senderName = message.senderName?.trim() || (senderId === "operator" ? "Operator" : config.config.name);
+		recipient = resolveLocalRecipient(config, recipientId);
+		const delivery = deliverLocalMessage({ config, message, senderId, senderName, recipient });
+		// A replay must be as traceable as the first attempt: otherwise a recovered
+		// outbox record can report success with no "resolved local delivery" line.
+		log?.info("message_agent resolved local delivery", {
+			to: recipientId,
+			senderId,
+			recipientId: recipient.id,
+			inbox: delivery.inbox,
+			eventId: delivery.eventId,
+			thread: message.thread,
+			recovered: true,
+		});
+	} catch (error) {
+		log?.warn("message_agent resolution failed", {
+			to: recipientId,
+			senderId: message.senderId,
+			recipientId: recipient?.id,
+			inbox: recipient ? inboxPath(recipient) : undefined,
+			eventId: message.id,
+			thread: message.thread,
+			recovered: true,
+			reason: error instanceof Error ? error.message : String(error),
+		});
+		throw error;
+	}
+}
+
+interface LocalDeliveryResult {
+	/** Absolute `<stateDir>/inbox` that stored the event. */
+	inbox: string;
+	eventId: string;
 }
 
 /**
@@ -143,10 +177,23 @@ function deliverLocalMessage(input: {
 	senderId: string;
 	senderName: string;
 	recipient: LocalAgentProfile;
-}): void {
+}): LocalDeliveryResult {
 	const { config, message, senderId, senderName, recipient } = input;
 	const senderStateDir = path.resolve(config.paths.stateDir);
 	const recipientStateDir = path.resolve(recipient.config.paths.stateDir);
+	// A managed profile must never satisfy a route by writing into its own inbox:
+	// that is indistinguishable from success in the outbox while the real
+	// recipient sees nothing (#160).
+	if (
+		recipient.id === ROOT_AGENT_ID &&
+		(path.resolve(recipient.config.paths.configPath) === path.resolve(config.paths.configPath) || senderStateDir === recipientStateDir) &&
+		isManagedProfile(config)
+	) {
+		throw new Error(`managed profile ${config.paths.configPath} resolved ${ROOT_AGENT_ID} to its own inbox ${recipientStateDir}; refusing to deliver`);
+	}
+	if (senderId !== "operator" && senderId !== recipient.id && senderStateDir === recipientStateDir) {
+		throw new Error(`refusing to deliver to ${recipient.id}: recipient state directory ${recipientStateDir} is the sender's own`);
+	}
 	const thread = message.thread;
 	const meta = {
 		channel: "local",
@@ -155,21 +202,33 @@ function deliverLocalMessage(input: {
 		recipientAgentId: recipient.id,
 		messageId: message.id,
 	};
+	const inboxDir = path.join(recipientStateDir, "inbox");
+	const inboxFile = path.join(inboxDir, "events.jsonl");
 	const inbox = EventStore.open(recipientStateDir);
-	const stored = inbox.append({
-		id: message.id,
-		ts: message.ts,
-		kind: "user_message",
-		source: "local-messenger",
-		priority: "normal",
-		title: `message from ${senderName}`,
-		text: message.text,
-		thread,
-		expectsReply: true,
-		dedupeKey: `local-message:${message.id}`,
-		meta,
-	});
-	if (stored.id !== message.id) throw new Error(`recipient inbox ${recipientStateDir} did not store message ${message.id}`);
+	let stored;
+	try {
+		stored = inbox.append({
+			id: message.id,
+			ts: message.ts,
+			kind: "user_message",
+			source: "local-messenger",
+			priority: "normal",
+			title: `message from ${senderName}`,
+			text: message.text,
+			thread,
+			expectsReply: true,
+			dedupeKey: `local-message:${message.id}`,
+			meta,
+		});
+	} catch (error) {
+		throw new Error(`recipient inbox append failed at ${inboxFile}: ${error instanceof Error ? error.message : String(error)}`);
+	}
+	// A dedupe hit returns the stored event, but a handler that only claims to
+	// append must never be reported as delivered. Re-read the inbox file through
+	// the store and require the message id to be physically present.
+	if (stored.id !== message.id || !inbox.all().some((event) => event.id === message.id)) {
+		throw new Error(`recipient inbox ${inboxDir} did not store message ${message.id}`);
+	}
 
 	HistoryStore.open(recipientStateDir).append({
 		id: message.id,
@@ -192,7 +251,7 @@ function deliverLocalMessage(input: {
 	});
 	// A profile messaging itself has one history: writing both directions into
 	// the same file would misrepresent who said what.
-	if (senderStateDir === recipientStateDir) return;
+	if (senderStateDir === recipientStateDir) return { inbox: inboxDir, eventId: stored.id };
 	HistoryStore.open(senderStateDir).append({
 		id: message.id,
 		thread,
@@ -212,6 +271,7 @@ function deliverLocalMessage(input: {
 		participants: [senderId, recipient.id],
 		meta: { recipientAgentId: recipient.id },
 	});
+	return { inbox: inboxDir, eventId: stored.id };
 }
 
 /**
@@ -268,15 +328,21 @@ export function resolveRootProfile(config: LoadedConfig): LoadedConfig | undefin
  */
 function rootProfile(config: LoadedConfig): LoadedConfig | undefined {
 	const currentConfigPath = path.resolve(config.paths.configPath);
+	const structural = registryLocation(currentConfigPath);
 	const location = managedRegistryLocation(config);
 	const configured = config.config.rootConfigPath?.trim();
 	if (configured) {
 		const configPath = path.resolve(config.paths.rootDir, configured);
 		if (configPath !== currentConfigPath && fs.existsSync(configPath)) {
 			const candidate = loadConfig({ cwd: path.dirname(configPath), configPath });
-			const accepted = location
-				? ownsRegistry(candidate, location.registry)
-				: ownsStateDir(candidate, config);
+			// Validate the configured root against the registry this profile actually
+			// lives in, not merely against its own state-dir-derived agents path: that
+			// fallback accepted a stale root whose registry no longer contains us.
+			const accepted = structural
+				? ownsRegistry(candidate, structural.registry)
+				: location
+					? ownsRegistry(candidate, location.registry)
+					: ownsStateDir(candidate, config);
 			if (accepted) return candidate;
 		}
 	}
@@ -284,6 +350,12 @@ function rootProfile(config: LoadedConfig): LoadedConfig | undefined {
 		const owner = registryOwner(location.registry);
 		return owner && path.resolve(owner.paths.configPath) !== currentConfigPath ? owner : undefined;
 	}
+	// A profile that lives inside a registry is a managed profile, never the
+	// root — even when that registry cannot be validated (orphaned profile, stale
+	// absolute agents directory). Treating it as root made `message_agent to:
+	// main` append to its own inbox and report delivery while the real root inbox
+	// stayed empty (#160).
+	if (isManagedProfile(config)) return undefined;
 	// Not a managed profile: it may be the root profile itself.
 	const agentsDir = path.resolve(agentsRoot(config));
 	const rootStateDir = path.dirname(agentsDir);
@@ -295,6 +367,32 @@ function rootProfile(config: LoadedConfig): LoadedConfig | undefined {
 		if (path.resolve(candidate.paths.stateDir) === rootStateDir || path.resolve(agentsRoot(candidate)) === agentsDir) return candidate;
 	}
 	return undefined;
+}
+
+/**
+ * Whether a config belongs to the managed-agent world rather than being a root.
+ *
+ * Three independent markers, because legacy profiles predate `rootConfigPath`:
+ * a declared parent profile, a registry entry that validates, or a config that
+ * sits under a directory tree already containing a profile config. A root
+ * profile never matches: its `rootConfigPath` is empty and its own config is
+ * not *above* the path it derives from its state directory.
+ */
+function isManagedProfile(config: LoadedConfig): boolean {
+	const currentConfigPath = path.resolve(config.paths.configPath);
+	const configured = config.config.rootConfigPath?.trim();
+	if (configured && path.resolve(config.paths.rootDir, configured) !== currentConfigPath) return true;
+	if (managedRegistryLocation(config)) return true;
+	const structural = registryLocation(currentConfigPath);
+	return Boolean(structural && hasProfileConfigAbove(structural.registry));
+}
+
+/** Is there a profile config in an ancestor of `registry` (outside the registry)? */
+function hasProfileConfigAbove(registry: string): boolean {
+	for (let dir = path.dirname(path.resolve(registry)), parent = ""; dir !== parent; parent = dir, dir = path.dirname(dir)) {
+		if (fs.existsSync(path.join(dir, "alive.config.json"))) return true;
+	}
+	return false;
 }
 
 /** Location of a profile that sits inside a managed-agents registry. */
@@ -379,8 +477,18 @@ function ownsStateDir(candidate: LoadedConfig, config: LoadedConfig): boolean {
  */
 function registryConfigFor(config: LoadedConfig): LoadedConfig {
 	const location = managedRegistryLocation(config);
-	if (!location) return config;
-	return registryOwner(location.registry) ?? config;
+	if (location) return registryOwner(location.registry) ?? config;
+	// A registry-shaped profile without a validated owner may still reach its
+	// root through `rootConfigPath` (custom absolute state dirs). Resolve peers
+	// from that root instead of from the profile's own `agentsDirectory`: when the
+	// declaration is stale, that fallback silently delivered into another,
+	// possibly obsolete, registry (#160).
+	const root = rootProfile(config);
+	if (root && path.resolve(root.paths.configPath) !== path.resolve(config.paths.configPath)) return root;
+	if (isManagedProfile(config)) {
+		throw new Error(`profile ${config.paths.configPath} is not registered in the agents registry it lives in; refusing to route local messages`);
+	}
+	return config;
 }
 
 /**

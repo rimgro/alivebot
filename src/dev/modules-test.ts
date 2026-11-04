@@ -31,6 +31,7 @@ import { EventStore, type AliveEvent } from "../store/events.js";
 import { HistoryStore } from "../store/history.js";
 import { Outbox, type OutgoingMessage } from "../store/outbox.js";
 import type { ChatTransport } from "../transports/types.js";
+import { NullTransport } from "../transports/console.js";
 import { GrafanaModule } from "../modules/grafana/module.js";
 import { TelegramApi, TelegramApiError, TelegramFileTooLargeError } from "../modules/telegram/client.js";
 import { resolveToken, TelegramModule, telegramTokenHash } from "../modules/telegram/module.js";
@@ -319,6 +320,47 @@ section("module host: claimers, listeners, taps and delivery failures");
 	check("transport names are reported", host.transportNames.join(",") === "tap");
 	const status = host.status() as { modules: Record<string, unknown> };
 	check("status lists modules", Object.keys(status.modules).length === 4, status);
+
+	// No module and no transport is not "delivered": the caller must learn that
+	// the thread reached nobody (#160).
+	const silentHost = new ModuleHost({
+		config: loadConfig({ cwd: root }),
+		log,
+		transports: [],
+		modules: [],
+		ingest: (event) => store.append(event),
+		outbox: () => [],
+		history,
+		runtimeStatus: () => ({}),
+	});
+	await silentHost.init();
+	let silentFailed = false;
+	try {
+		await silentHost.deliver(message("nobody:1"));
+	} catch (error) {
+		silentFailed = String(error).includes('thread "nobody:1"');
+	}
+	check("no module and no transport fails with the thread named", silentFailed);
+
+	// NullTransport accepts everything without delivering; it must not count.
+	const nullHost = new ModuleHost({
+		config: loadConfig({ cwd: root }),
+		log,
+		transports: [new NullTransport()],
+		modules: [],
+		ingest: (event) => store.append(event),
+		outbox: () => [],
+		history,
+		runtimeStatus: () => ({}),
+	});
+	await nullHost.init();
+	let nullFailed = false;
+	try {
+		await nullHost.deliver(message("nobody:null"));
+	} catch (error) {
+		nullFailed = String(error).includes('thread "nobody:null"');
+	}
+	check("NullTransport does not count as a delivery", nullFailed);
 
 	await host.stop();
 }

@@ -15,6 +15,12 @@
  *   - every failure is swallowed and logged at warn: a watchdog signal is never
  *     worth failing startup over.
  *
+ * `version` is read from the checkout's `package.json`, so after `alive update`
+ * it can name a release the running process has not loaded yet. `buildId`
+ * identifies the code that is actually executing (an explicit build-id file or
+ * the mtime of the loaded `dist/index.js`/`src/index.ts`); compare it, not the
+ * version alone, when asking which code is running.
+ *
  * The file deliberately holds only facts about the *process*: pid, start time
  * and the harness build. Agent state (inbox, runs, memory) lives elsewhere.
  */
@@ -31,8 +37,10 @@ export interface HeartbeatRecord {
 	pid: number;
 	/** ISO timestamp of the process start. */
 	startedAt: string;
-	/** Harness package version that is actually running. */
+	/** Harness package version from the checkout's package.json. */
 	version: string;
+	/** Identity of the code loaded in this process (see `buildIdFor`). */
+	buildId: string;
 	/** Last release tag applied by `alive update`, when known. */
 	tag?: string;
 	/** Git branch or short commit the harness runs from, when known. */
@@ -50,6 +58,7 @@ export interface HeartbeatWriteOptions {
 	/** Process start time; defaults to now. */
 	startedAt?: number | Date;
 	version?: string;
+	buildId?: string;
 	tag?: string;
 	ref?: string;
 }
@@ -72,6 +81,7 @@ export function writeHeartbeat(options: HeartbeatWriteOptions): HeartbeatRecord 
 		pid: options.pid ?? process.pid,
 		startedAt: startedAt.toISOString(),
 		version: options.version ?? identity.version,
+		buildId: options.buildId ?? identity.buildId,
 	};
 	const tag = options.tag ?? identity.tag;
 	if (tag) record.tag = tag;
@@ -122,7 +132,14 @@ export function readHeartbeat(stateDir: string): HeartbeatRecord | undefined {
 	if (typeof raw.pid !== "number" || typeof raw.startedAt !== "string" || typeof raw.version !== "string") {
 		return undefined;
 	}
-	const record: HeartbeatRecord = { pid: raw.pid, startedAt: raw.startedAt, version: raw.version };
+	const record: HeartbeatRecord = {
+		pid: raw.pid,
+		startedAt: raw.startedAt,
+		version: raw.version,
+		// Heartbeats written before buildId existed still identify the process;
+		// report the code identity as unknown rather than dropping the record.
+		buildId: typeof raw.buildId === "string" && raw.buildId ? raw.buildId : "unknown",
+	};
 	if (typeof raw.tag === "string" && raw.tag) record.tag = raw.tag;
 	if (typeof raw.ref === "string" && raw.ref) record.ref = raw.ref;
 	return record;
@@ -171,9 +188,11 @@ export function readHeartbeatStatus(stateDir: string, staleAfterMs: number, now 
 	return status;
 }
 
-/** Version/tag/ref of the harness that is executing right now, best effort. */
+/** Version/tag/ref/build identity of the harness executing right now, best effort. */
 export interface HarnessIdentity {
 	version: string;
+	/** `build:<id>` from an explicit build-id file, or `<entry>:<mtimeMs>`. */
+	buildId: string;
 	tag?: string;
 	ref?: string;
 }
@@ -187,7 +206,7 @@ function harnessRoot(): string {
 }
 
 export function harnessIdentity(root = harnessRoot()): HarnessIdentity {
-	const identity: HarnessIdentity = { version: "unknown" };
+	const identity: HarnessIdentity = { version: "unknown", buildId: buildIdFor(root) };
 	try {
 		const parsed = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")) as { version?: unknown };
 		if (typeof parsed.version === "string" && parsed.version.trim()) identity.version = parsed.version.trim();
@@ -199,6 +218,33 @@ export function harnessIdentity(root = harnessRoot()): HarnessIdentity {
 	const ref = gitRef(root);
 	if (ref) identity.ref = ref;
 	return identity;
+}
+
+/**
+ * Identity of the code that is loaded, not merely the checkout metadata.
+ *
+ * An explicit `dist/build-id` (written by packaging) wins. Otherwise the mtime
+ * of the entry file that the process actually runs identifies the build well
+ * enough to distinguish "updated on disk" from "running the updated code".
+ */
+function buildIdFor(root: string): string {
+	for (const relative of ["dist/build-id", ".build-id"]) {
+		try {
+			const value = fs.readFileSync(path.join(root, relative), "utf8").trim();
+			if (value) return `build:${value.slice(0, 200)}`;
+		} catch {
+			// No explicit build id.
+		}
+	}
+	for (const relative of [path.join("dist", "index.js"), path.join("src", "index.ts"), "dist", "src"]) {
+		try {
+			const stat = fs.statSync(path.join(root, relative));
+			return `${relative.replaceAll(path.sep, "/")}:${Math.trunc(stat.mtimeMs)}`;
+		} catch {
+			// Try the next candidate.
+		}
+	}
+	return "unknown";
 }
 
 /** Tag of the last successful `alive update`, read from its root marker. */

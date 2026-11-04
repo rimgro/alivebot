@@ -17,6 +17,15 @@ export interface TransportContext {
  */
 export interface ChatTransport {
 	readonly name: string;
+	/**
+	 * Does `send()` actually hand the message to a human or external sink?
+	 *
+	 * Defaults to true. A placeholder such as `NullTransport` sets this to false
+	 * so the module host can tell "accepted without error" apart from "delivered";
+	 * otherwise an unclaimed `send_message` would be recorded as `ok:true` while
+	 * nobody received it.
+	 */
+	readonly delivers?: boolean;
 	start(ctx: TransportContext): Promise<void>;
 	send(message: OutgoingMessage): Promise<void>;
 	stop(): Promise<void>;
