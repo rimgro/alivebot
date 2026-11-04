@@ -17,6 +17,7 @@ import { hasWakeWorthyPending } from "./wake.js";
 import { classifyNetworkError, withRetries } from "../retry.js";
 import { maskSecrets } from "../secrets.js";
 import { privateMemoryScope } from "./memory-access.js";
+import { compactionMonitorFor } from "./compaction.js";
 import type { RunHandle, ToolDeps } from "./tools.js";
 
 /**
@@ -339,6 +340,12 @@ export class AgentRunner {
 			limitTokens?: number;
 			tool?: string;
 			repeats?: number;
+			reasonClass?: RunAnomalyEvent["reasonClass"];
+			attempt?: number;
+			maxAttempts?: number;
+			/** Log-only: the short reason and masked provider excerpt, never persisted. */
+			reason?: string;
+			excerpt?: string;
 		},
 	): void {
 		const event: RunAnomalyEvent = {
@@ -359,9 +366,16 @@ export class AgentRunner {
 			limitTokens: input.limitTokens,
 			tool: input.tool,
 			repeats: input.repeats,
+			reasonClass: input.reasonClass,
+			attempt: input.attempt,
+			maxAttempts: input.maxAttempts,
 		};
 		this.deps.runEvents?.append(event);
-		this.deps.log.warn(event.type, { ...event });
+		this.deps.log.warn(event.type, {
+			...event,
+			...(input.reason ? { reason: input.reason } : {}),
+			...(input.excerpt ? { excerpt: input.excerpt } : {}),
+		});
 	}
 
 	/**
@@ -607,6 +621,7 @@ export class AgentRunner {
 				promptChars: run.promptChars,
 				usage,
 				sleep: run.sleepRequested ? { forced: run.sleepForced, summaryChars: run.sleepSummary?.length ?? 0 } : undefined,
+				compaction: compactionMonitorFor(this.session)?.record(),
 			};
 
 			this.deps.runs.record(record);
@@ -815,11 +830,56 @@ export class AgentRunner {
 				break;
 			}
 			case "compaction_end": {
-				this.deps.log.info("compaction", {
-					reason: event.reason,
-					aborted: event.aborted,
-					error: event.errorMessage,
-				});
+				const monitor = compactionMonitorFor(this.session);
+				const contextTokens = sessionContextTokens(this.session);
+				monitor?.noteContextTokens(contextTokens);
+				const outcome = monitor?.last();
+				if (!event.errorMessage) {
+					this.deps.log.info("compaction", {
+						reason: event.reason,
+						aborted: event.aborted,
+						contextTokens: contextTokens || outcome?.contextTokens,
+						attempts: outcome?.attempts,
+					});
+					break;
+				}
+				const reasonClass = outcome?.reasonClass ?? "provider_error";
+				const attempt = outcome?.attempts ?? 1;
+				const tokens = contextTokens || outcome?.contextTokens;
+				if (outcome?.skipped) {
+					// The failure itself was already logged once; this turn only waited
+					// out the cross-turn backoff, so do not emit another anomaly/warn.
+					this.deps.log.info("compaction deferred by backoff", {
+						reason: event.reason,
+						reasonClass,
+						nextAttemptAt: outcome.nextAttemptAt,
+						contextTokens: tokens,
+					});
+					break;
+				}
+				if (run) {
+					this.emitAnomaly(run, {
+						type: "compaction_failed",
+						now: Date.now(),
+						activeMs: runActiveMs(run),
+						contextTokens: tokens,
+						reasonClass,
+						attempt,
+						maxAttempts: outcome?.maxAttempts,
+						reason: outcome?.reason ?? event.errorMessage,
+						excerpt: outcome?.excerpt,
+					});
+				} else {
+					this.deps.log.warn("compaction failed", {
+						reason: event.reason,
+						reasonClass,
+						attempt,
+						maxAttempts: outcome?.maxAttempts,
+						contextTokens: tokens,
+						error: maskSecrets(event.errorMessage, this.deps.config.config.secrets),
+						excerpt: outcome?.excerpt,
+					});
+				}
 				break;
 			}
 			default:

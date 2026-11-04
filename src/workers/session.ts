@@ -16,6 +16,8 @@ import { ensureDir } from "../util.js";
 import { toWorkerModelPricing, type WorkerModelPricing } from "./cost.js";
 import type { WorkerIsolation } from "./store.js";
 import type { RetryLogger } from "../retry.js";
+import { installCompactionGuard } from "../runtime/compaction.js";
+import { maskSecrets } from "../secrets.js";
 
 /** Minimal surface WorkerManager needs. Tests can substitute a fake. */
 export interface WorkerSession {
@@ -190,6 +192,12 @@ export function createPiWorkerSessionFactory(options: PiWorkerSessionFactoryOpti
 			settingsManager,
 			tools: input.tools,
 			customTools: input.sandboxed ? sandboxTools : undefined,
+		});
+		// Worker sessions compact too; the same guard keeps an HTML/error page from
+		// replacing the worker transcript with a garbage checkpoint (#167).
+		installCompactionGuard(session, {
+			log: options.log,
+			mask: (text) => maskSecrets(text, options.config.config.secrets),
 		});
 		session.setActiveToolsByName(input.tools);
 		const workerSession = session as unknown as WorkerSession;

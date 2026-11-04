@@ -11,6 +11,7 @@ import { Outbox, type OutgoingMessage } from "../store/outbox.js";
 import { PolicyStore } from "../store/policy.js";
 import { dispatchDueReminders, ReminderStore } from "../store/reminders.js";
 import { AgentRunner, describeRunRecord } from "./agent.js";
+import { compactionMonitorFor } from "./compaction.js";
 import {
 	interruptedResumeDecision,
 	readRuntimeState,
@@ -627,6 +628,7 @@ export class AliveRuntime {
 			idleSince: run?.idleStartedAt,
 			sleeps: this.sleepCount,
 			emptyWakes: this.wake?.consecutiveEmptyWakes ?? 0,
+			lastCompaction: this.lastCompactionRecord(),
 			mode: process.env.ALIVE_DAEMON === "1" ? "background" : "foreground",
 		};
 		writeRuntimeState(this.config.paths.stateDir, state);
@@ -635,6 +637,11 @@ export class AliveRuntime {
 	private sessionModel(): string | undefined {
 		const model = this.runner?.currentSession?.model;
 		return model ? `${model.provider}/${model.id}` : undefined;
+	}
+
+	/** Latest compaction outcome: live monitor first, otherwise the last run record. */
+	private lastCompactionRecord() {
+		return compactionMonitorFor(this.runner?.currentSession)?.record() ?? this.runs.last()?.compaction;
 	}
 
 	// ---------------------------------------------------------------------
@@ -691,6 +698,7 @@ export class AliveRuntime {
 			runsToday: usage.runs,
 			tokensToday: { input: usage.input, output: usage.output },
 			lastRun: lastRun ? { ...lastRun, summary: describeRunRecord(lastRun) } : undefined,
+			lastCompaction: this.lastCompactionRecord(),
 			model: this.sessionModel(),
 			sessionFile: this.runner?.currentSession?.sessionFile ?? this.pendingResume?.sessionFile ?? this.resumeSessionFile,
 			history: this.history.stats(),
