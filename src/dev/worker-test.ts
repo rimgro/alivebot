@@ -28,6 +28,8 @@ import { assertWorkerWorktreeIsSecretFree, baseBranchName, createWorktree, gitDi
 import { createHostWorkerEnvironment } from "../workers/environment.js";
 import type { SandboxManager } from "../sandbox/manager.js";
 import { createSandboxTools } from "../sandbox/tools.js";
+import { costFromPricing, toWorkerModelPricing, type WorkerModelPricing } from "../workers/cost.js";
+import { readWorkerUsage } from "../workers/store.js";
 import { sleep } from "../util.js";
 
 let failures = 0;
@@ -70,6 +72,15 @@ class FakeSession implements WorkerSession {
 	toolExecutions = 0;
 	/** While hanging, emit a tool event every N ms (a run that keeps working). */
 	heartbeatMs?: number;
+	/**
+	 * Reported cost added per successful prompt. Unset keeps the legacy flat
+	 * 0.001-per-session fake; 0 simulates a model whose provider reports no price.
+	 */
+	costPerPrompt?: number;
+	/** When false, `getSessionStats()` omits `cost` entirely. */
+	costReported = true;
+	/** Prices the fake pi registry knows for the model (undefined = unpriced). */
+	pricing?: WorkerModelPricing;
 	private heartbeat?: NodeJS.Timeout;
 	private lastText: string | undefined;
 	private successfulPrompts = 0;
@@ -138,11 +149,16 @@ class FakeSession implements WorkerSession {
 
 	getSessionStats() {
 		if (this.silent) return { tokens: { input: 0, output: 0, total: 0 }, cost: 0 };
-		return {
-			tokens: { input: 11 * this.successfulPrompts, output: 22 * this.successfulPrompts, total: 33 * this.successfulPrompts },
-			// Cost is cumulative and flat: a failed prompt (no tokens) costs nothing.
-			cost: this.successfulPrompts > 0 ? 0.001 : 0,
-		};
+		const tokens = { input: 11 * this.successfulPrompts, output: 22 * this.successfulPrompts, total: 33 * this.successfulPrompts };
+		// Cumulative, like pi: the model's reported spend for the whole session.
+		const cost = this.costPerPrompt !== undefined
+			? this.costPerPrompt * this.successfulPrompts
+			: this.successfulPrompts > 0 ? 0.001 : 0;
+		return this.costReported ? { tokens, cost } : { tokens };
+	}
+
+	getModelPricing(): WorkerModelPricing | undefined {
+		return this.pricing;
 	}
 }
 
@@ -815,6 +831,134 @@ section("provider retries: disabled and stopped");
 	check("stop during backoff never retries", sessions[0]?.prompts.length === 1, sessions[0]?.prompts.length);
 	check("stopped run reports one attempt", stopped.attempts === 1, stopped.attempts);
 	await manager.close();
+}
+
+section("run cost: delta, computed, unknown and session resets (#162)");
+{
+	// (a) A priced provider report is written as the run delta, not the session total.
+	const config = makeConfig(root);
+	const sessions: FakeSession[] = [];
+	const manager = makeManager(config, sessions, false, undefined, undefined, (session) => {
+		session.costPerPrompt = 0.001;
+	});
+	await manager.init();
+	const first = await manager.start({ task: "costed run", isolation: "shared", wait: true, waitTimeoutMs: 5_000 });
+	const second = await manager.send(first.id, "another costed run", { wait: true, waitTimeoutMs: 5_000 });
+	const store = new WorkerStore(config.paths);
+	const costed = store.usageHistory().filter((entry) => entry.workerId === first.id);
+	check(
+		"a priced session writes the run delta, not the cumulative session cost",
+		costed.length === 2 &&
+			costed.every((entry) => entry.costSource === "provider") &&
+			Math.abs((costed[0]?.cost ?? -1) - 0.001) < 1e-12 &&
+			Math.abs((costed[1]?.cost ?? -1) - 0.001) < 1e-12,
+		costed,
+	);
+	check(
+		"worker usage sums the known run deltas",
+		Math.abs(costed.reduce((sum, entry) => sum + (typeof entry.cost === "number" ? entry.cost : 0), 0) - 0.002) < 1e-12,
+		costed,
+	);
+	check(
+		"worker status shows the last cost and its source",
+		renderWorkerRecord(second).includes("last_run_cost_usd: 0.0010 (provider)"),
+		renderWorkerRecord(second),
+	);
+	await manager.close();
+}
+{
+	// (b) Tokens with zero reported cost on a priced model are recomputed from the price table.
+	const config = makeConfig(root);
+	const sessions: FakeSession[] = [];
+	const pricing: WorkerModelPricing = { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 };
+	const manager = makeManager(config, sessions, false, undefined, undefined, (session) => {
+		session.costPerPrompt = 0;
+		session.pricing = pricing;
+	});
+	await manager.init();
+	const record = await manager.start({ task: "computed cost", isolation: "shared", wait: true, waitTimeoutMs: 5_000 });
+	const entry = new WorkerStore(config.paths).usageHistory().at(-1);
+	const expected = costFromPricing(pricing, { input: 11, output: 22, cacheRead: 0, cacheWrite: 0 });
+	check("a zero report on a priced model is computed from tokens", entry?.costSource === "computed", entry);
+	check("computed cost uses the model price table", Math.abs((entry?.cost ?? -1) - expected) < 1e-12, { entry, expected });
+	check("the computed run cost is not zero", typeof entry?.cost === "number" && entry.cost > 0, entry?.cost);
+	check("worker record keeps the computed cost", record.lastRunCostUsd !== null && record.lastRunCostSource === "computed");
+	await manager.close();
+}
+{
+	// (c) No reported cost and no known price is an explicit unknown, never $0.
+	const config = makeConfig(root);
+	const sessions: FakeSession[] = [];
+	const manager = makeManager(config, sessions, false, undefined, undefined, (session) => {
+		session.costPerPrompt = 0;
+	});
+	await manager.init();
+	const record = await manager.start({ task: "unpriced cost", isolation: "shared", wait: true, waitTimeoutMs: 5_000 });
+	const mine = new WorkerStore(config.paths).usageHistory().filter((entry) => entry.workerId === record.id);
+	const entry = mine.at(-1);
+	check("an unpriced model writes cost null", entry?.cost === null, entry);
+	check("an unpriced model writes costSource unreported", entry?.costSource === "unreported", entry?.costSource);
+	check("unknown cost is still recorded with its tokens", (entry?.input ?? 0) > 0 && (entry?.output ?? 0) > 0, entry);
+	check("the worker record shows unknown, not zero", record.lastRunCostUsd === null && record.lastRunCostSource === "unreported", record);
+	check("worker status prints the unknown explicitly", renderWorkerRecord(record).includes("last_run_cost: unknown"), renderWorkerRecord(record));
+	check(
+		"an unpriced run is counted as unknown, never added as zero",
+		mine.length === 1 && mine.every((candidate) => typeof candidate.cost !== "number") && (entry?.input ?? 0) > 0,
+		mine,
+	);
+	await manager.close();
+}
+{
+	// (d) A run after the session was disposed is not zeroed by a stale baseline (#61).
+	const config = makeConfig(root);
+	const sessions: FakeSession[] = [];
+	const manager = makeManager(config, sessions, false, undefined, undefined, (session) => {
+		session.costPerPrompt = 0.001;
+	});
+	await manager.init();
+	const first = await manager.start({ task: "first run", isolation: "shared", wait: true, waitTimeoutMs: 5_000 });
+	// A failed run disposes the session; the next run gets a fresh one whose pi
+	// cost counter starts again at 0 while record.costUsd is already 0.001.
+	sessions[0]!.errorMessage = "HTTP 503 Service Unavailable";
+	const failed = await manager.send(first.id, "fail and dispose", { wait: true, waitTimeoutMs: 5_000 });
+	check("the disposing run failed", failed.status === "failed", failed.status);
+	const afterDispose = await manager.send(first.id, "fresh session run", { wait: true, waitTimeoutMs: 5_000 });
+	check("a fresh session was built", sessions.length === 2, sessions.length);
+	check("cost after a session reset is not zero", afterDispose.lastRunCostUsd === 0.001, afterDispose.lastRunCostUsd);
+	check("cost after a reset keeps its source", afterDispose.lastRunCostSource === "provider", afterDispose.lastRunCostSource);
+	const entries = new WorkerStore(config.paths).usageHistory().filter((entry) => entry.workerId === first.id);
+	check("one entry per run with cost or tokens", entries.length === 2, entries);
+	check("the post-reset entry keeps the real delta", Math.abs((entries.at(-1)?.cost ?? -1) - 0.001) < 1e-12, entries.at(-1));
+	check(
+		"no run double counts the session total",
+		Math.abs(entries.reduce((sum, entry) => sum + (typeof entry.cost === "number" ? entry.cost : 0), 0) - 0.002) < 1e-12,
+		entries,
+	);
+	await manager.close();
+}
+{
+	// (e) Legacy usage.jsonl lines (no costSource) read back compatibly.
+	const config = makeConfig(root);
+	const legacyPath = new WorkerStore(config.paths).usagePath();
+	fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+	fs.writeFileSync(
+		legacyPath,
+		[
+			{ ts: Date.now() - 2_000, cost: 0, input: 100, output: 10, model: "fake/model" },
+			{ ts: Date.now() - 1_000, cost: 0.004, input: 200, output: 20, model: "fake/model" },
+		].map((line) => `${JSON.stringify(line)}\n`).join(""),
+	);
+	const legacy = readWorkerUsage(config.paths.stateDir);
+	check("a legacy zero cost reads back as unknown", legacy[0]?.cost === null && legacy[0]?.costSource === "unreported", legacy[0]);
+	check("a legacy positive cost reads back as provider", legacy[1]?.cost === 0.004 && legacy[1]?.costSource === "provider", legacy[1]);
+	check("legacy tokens survive normalization", legacy[0]?.input === 100 && legacy[1]?.output === 20, legacy);
+}
+{
+	// The pricing table never invents prices for unknown or all-zero models.
+	check("a priced model exposes a pricing table", toWorkerModelPricing({ input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 }) !== undefined);
+	check("an all-zero cost table is unpriced", toWorkerModelPricing({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }) === undefined);
+	check("a missing cost table is unpriced", toWorkerModelPricing(undefined) === undefined && toWorkerModelPricing({}) === undefined);
+	check("a partial cost table is unpriced", toWorkerModelPricing({ input: 3, output: 15 }) === undefined);
 }
 
 fs.rmSync(root, { recursive: true, force: true });

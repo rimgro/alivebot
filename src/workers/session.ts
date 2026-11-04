@@ -13,6 +13,7 @@ import type { LoadedConfig } from "../config.js";
 import type { SandboxManager } from "../sandbox/manager.js";
 import { createSandboxTools } from "../sandbox/tools.js";
 import { ensureDir } from "../util.js";
+import { toWorkerModelPricing, type WorkerModelPricing } from "./cost.js";
 import type { WorkerIsolation } from "./store.js";
 import type { RetryLogger } from "../retry.js";
 
@@ -26,6 +27,11 @@ export interface WorkerSession {
 	dispose(): void;
 	getLastAssistantText(): string | undefined;
 	getSessionStats(): WorkerSessionStats;
+	/**
+	 * Per-million-token prices pi knows for the resolved model, or `undefined`
+	 * when the model is unknown or unpriced. Optional so test fakes stay small.
+	 */
+	getModelPricing?(): WorkerModelPricing | undefined;
 }
 
 export interface WorkerSessionEvent {
@@ -35,7 +41,20 @@ export interface WorkerSessionEvent {
 }
 
 export interface WorkerSessionStats {
-	tokens?: { input?: number; output?: number; total?: number };
+	tokens?: {
+		input?: number;
+		output?: number;
+		/** Cumulative cache-read tokens; pi reports them but the old shape omitted them. */
+		cacheRead?: number;
+		/** Cumulative cache-write tokens. */
+		cacheWrite?: number;
+		total?: number;
+	};
+	/**
+	 * Cumulative reported cost of the session. pi sets `0` both for a real zero
+	 * and for a model whose registry entry has no prices (#162), so the manager
+	 * must not treat `0` as a trustworthy measurement on its own.
+	 */
 	cost?: number;
 }
 
@@ -173,6 +192,11 @@ export function createPiWorkerSessionFactory(options: PiWorkerSessionFactoryOpti
 			customTools: input.sandboxed ? sandboxTools : undefined,
 		});
 		session.setActiveToolsByName(input.tools);
-		return session as unknown as WorkerSession;
+		const workerSession = session as unknown as WorkerSession;
+		// pi computes usage.cost from the model's registry prices; expose the same
+		// table so the manager can tell "unpriced" from "really costs zero" (#162).
+		const pricing = toWorkerModelPricing(resolved.model.cost);
+		workerSession.getModelPricing = () => pricing;
+		return workerSession;
 	};
 }

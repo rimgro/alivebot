@@ -382,6 +382,33 @@ check(
 	report.split.workers.workerTopRuns,
 );
 
+section("chat vs workers: unknown cost is not $0");
+{
+	const unknownFixture = makeProfile("unknown-cost");
+	writeJsonl(workerUsagePath(unknownFixture.stateDir), [
+		{ ts: dayAt(0, 10), cost: 0.02, costSource: "provider", input: 500, output: 50, model: "priced/model" },
+		{ ts: dayAt(0, 11), cost: null, costSource: "unreported", input: 700, output: 70, model: "unpriced/model" },
+		// Pre-#162 line: a stored zero meant "tokens spent, no price reported".
+		{ ts: dayAt(0, 12), cost: 0, input: 400, output: 40, model: "legacy/model" },
+	]);
+	const unknownReport = buildUsageReport(unknownFixture.profile, { days: 7, now: NOW });
+	const unknownTable = renderUsageReport(unknownReport);
+	const workers = unknownReport.split.workers;
+	check("known worker spend stays a sum of known costs", Math.abs(workers.cost - 0.02) < 1e-9, workers);
+	check("known and unknown worker entries are counted separately", workers.knownCostEntries === 1 && workers.unknownCostEntries === 2, workers);
+	check("unknown-cost entries keep their tokens", workers.unknownCostTokens.input === 1_100 && workers.unknownCostTokens.output === 110, workers.unknownCostTokens);
+	check("unknown cost is not folded into the combined spend", Math.abs(unknownReport.split.combinedCost - 0.02) < 1e-9, unknownReport.split.combinedCost);
+	check("the by-model split marks unpriced entries", workers.byModel.some((item) => item.model === "unpriced/model" && item.unknownEntries === 1), workers.byModel);
+	check("the worker top runs stay known-cost only", workers.workerTopRuns.every((run) => run.cost > 0), workers.workerTopRuns);
+	check("the note says the unknown spend is not zero", workers.note.includes("not counted as $0"), workers.note);
+	check(
+		"the table prints unknown-cost entries on their own line",
+		unknownTable.includes("unpriced") && unknownTable.includes("cost unknown (not counted as $0)"),
+		unknownTable.split("\n").filter((line) => line.includes("unpriced") || line.includes("workers")),
+	);
+	check("the JSON has a note about unknown worker cost", unknownReport.notes.some((note) => note.includes("unknown cost")), unknownReport.notes);
+}
+
 section("model / provider split");
 check("no model split is invented for records without a model", report.models.available === false && report.models.items.length === 0);
 check(
