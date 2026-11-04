@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Paths } from "../config.js";
 import { appendJsonl, ensureDir, readJson, readJsonl } from "../util.js";
+import type { WorkerCostSource } from "./cost.js";
 
 export type WorkerStatus = "starting" | "running" | "idle" | "failed" | "stopped" | "interrupted";
 export type WorkerIsolation = "shared" | "worktree";
@@ -14,9 +15,18 @@ export type WorkerAbortReason = "idle" | "runtime" | "stop" | "shutdown";
  */
 export interface WorkerUsageEntry {
 	ts: number;
-	cost: number;
+	/**
+	 * Run cost in USD, or `null` when no price is known (#162). `null` is not a
+	 * zero: a real zero and an unknown spend must not look identical.
+	 */
+	cost: number | null;
+	/** Where `cost` came from: provider-reported, computed from a known price, or unknown. */
+	costSource: WorkerCostSource;
+	/** Tokens this run spent (a run delta, not the session total). */
 	input: number;
 	output: number;
+	cacheRead?: number;
+	cacheWrite?: number;
 	/** Model spec the worker actually ran, when known. */
 	model?: string;
 	/** Turns the run took, when the session reported them. */
@@ -62,8 +72,12 @@ export interface WorkerRecord {
 	/** Set by the last run that was aborted: which limit or command ended it. */
 	abortReason?: WorkerAbortReason;
 	tokens?: { input: number; output: number; total: number };
+	/** Cumulative cost reported by pi for the current session, when it reports one. */
 	costUsd?: number;
-	lastRunCostUsd?: number;
+	/** Cost of the last run; `null` when the provider reported no price (#162). */
+	lastRunCostUsd?: number | null;
+	/** Provenance of `lastRunCostUsd`: provider, computed, or unreported. */
+	lastRunCostSource?: WorkerCostSource;
 	notifyOnFinish: boolean;
 }
 
@@ -85,11 +99,54 @@ export function workerUsagePath(stateDir: string): string {
 }
 
 /**
+ * Normalize one stored usage line.
+ *
+ * Entries written before #162 have no `costSource`. The store only appended an
+ * entry when it had a cost or tokens, so a stored `cost: 0` always meant
+ * "tokens were spent but no price was reported" — it is surfaced as an explicit
+ * unknown instead of a zero. A positive legacy cost is provider-reported.
+ */
+export function normalizeWorkerUsageEntry(value: unknown): WorkerUsageEntry | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const raw = value as Record<string, unknown>;
+	if (typeof raw.ts !== "number" || !Number.isFinite(raw.ts)) return undefined;
+	const storedCost = typeof raw.cost === "number" && Number.isFinite(raw.cost) ? raw.cost : undefined;
+	const storedSource =
+		raw.costSource === "provider" || raw.costSource === "computed" || raw.costSource === "unreported"
+			? (raw.costSource as WorkerCostSource)
+			: undefined;
+	const costSource: WorkerCostSource =
+		storedSource ?? (storedCost !== undefined && storedCost > 0 ? "provider" : "unreported");
+	const cost = costSource === "unreported" ? null : storedCost ?? null;
+	const count = (input: unknown): number =>
+		typeof input === "number" && Number.isFinite(input) && input >= 0 ? input : 0;
+	const entry: WorkerUsageEntry = {
+		ts: raw.ts,
+		cost,
+		costSource,
+		input: count(raw.input),
+		output: count(raw.output),
+	};
+	const cacheRead = raw.cacheRead;
+	const cacheWrite = raw.cacheWrite;
+	if (typeof cacheRead === "number" && Number.isFinite(cacheRead)) entry.cacheRead = cacheRead;
+	if (typeof cacheWrite === "number" && Number.isFinite(cacheWrite)) entry.cacheWrite = cacheWrite;
+	if (typeof raw.model === "string" && raw.model) entry.model = raw.model;
+	if (typeof raw.turns === "number" && Number.isFinite(raw.turns)) entry.turns = raw.turns;
+	if (typeof raw.workerId === "string" && raw.workerId) entry.workerId = raw.workerId;
+	if (typeof raw.status === "string" && raw.status) entry.status = raw.status;
+	return entry;
+}
+
+/**
  * Worker-run spend since `since`. Read-only and usable without a `Paths` object
- * (the usage report only has a state directory).
+ * (the usage report only has a state directory). Entries with an unknown price
+ * keep `cost: null`; callers must not add them as zero.
  */
 export function readWorkerUsage(stateDir: string, since = 0): WorkerUsageEntry[] {
-	return readJsonl<WorkerUsageEntry>(workerUsagePath(stateDir)).filter((entry) => entry.ts >= since);
+	return readJsonl<unknown>(workerUsagePath(stateDir))
+		.map(normalizeWorkerUsageEntry)
+		.filter((entry): entry is WorkerUsageEntry => entry !== undefined && entry.ts >= since);
 }
 
 export function worktreesRoot(paths: Paths, configured: string): string {
@@ -120,12 +177,16 @@ export class WorkerStore {
 	}
 
 	appendUsage(entry: WorkerUsageEntry): void {
-		if (!(entry.cost > 0) && entry.input === 0 && entry.output === 0) return;
+		const tokens = entry.input + entry.output + (entry.cacheRead ?? 0) + (entry.cacheWrite ?? 0);
+		const cost = typeof entry.cost === "number" ? entry.cost : 0;
+		if (cost <= 0 && tokens <= 0) return;
 		appendJsonl(this.usagePath(), entry);
 	}
 
 	usageHistory(since = 0): WorkerUsageEntry[] {
-		return readJsonl<WorkerUsageEntry>(this.usagePath()).filter((entry) => entry.ts >= since);
+		return readJsonl<unknown>(this.usagePath())
+			.map(normalizeWorkerUsageEntry)
+			.filter((entry): entry is WorkerUsageEntry => entry !== undefined && entry.ts >= since);
 	}
 
 	sessionDir(id: string): string {

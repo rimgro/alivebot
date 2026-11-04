@@ -572,10 +572,16 @@ export class AliveRuntime {
 		const { maxDailyCostUsd, maxWakesPerHour } = this.config.config.budget;
 		const usage = this.runs.usageToday();
 		const workerCost = this.workers?.usageToday() ?? 0;
+		const unknownWorkerCosts = this.workers?.unknownCostRunsToday() ?? 0;
 		const totalCost = usage.cost + workerCost;
 		if (maxDailyCostUsd > 0 && totalCost >= maxDailyCostUsd) {
 			const wakeAt = nextMidnight(Date.now()) + 1_000;
-			const notice = `daily cost budget reached ($${totalCost.toFixed(4)} / $${maxDailyCostUsd.toFixed(2)}); pausing until ${new Date(wakeAt).toISOString()}`;
+			// Unknown worker spend cannot be added to the total without inventing a
+			// price; say so instead of silently treating it as zero (#162).
+			const unknownNote = unknownWorkerCosts > 0
+				? `; ${unknownWorkerCosts} worker run(s) today have unknown cost and are not in this total`
+				: "";
+			const notice = `daily cost budget reached ($${totalCost.toFixed(4)} / $${maxDailyCostUsd.toFixed(2)}${unknownNote}); pausing until ${new Date(wakeAt).toISOString()}`;
 			if (this.lastBudgetNotice !== notice) {
 				this.lastBudgetNotice = notice;
 				this.log.warn(notice);
@@ -701,6 +707,7 @@ export class AliveRuntime {
 			workers: this.workers?.summary(),
 			runAnomalies: this.runEvents.list(10),
 			workerCostTodayUsd: this.workers ? Number(this.workers.usageToday().toFixed(6)) : undefined,
+			workerUnknownCostRunsToday: this.workers?.unknownCostRunsToday(),
 		};
 	}
 
