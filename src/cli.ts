@@ -981,10 +981,13 @@ function heartbeatCommand(flags: Record<string, string | boolean>, positionals: 
 	if (flagBool(flags, "help") || flagBool(flags, "h")) {
 		process.stdout.write(
 			`${usage}\n\n` +
-				"  --status   one line: fresh|stale|missing, age, pid, version and the file path\n" +
+				"  --status   one line: fresh|stale|missing, age, pid, version, build and the file path\n" +
 				"  --json     machine-readable status and heartbeat contents\n\n" +
 				"The heartbeat (<stateDir>/heartbeat.json) is written once when the runtime starts:\n" +
-				'{ "pid", "startedAt" (ISO), "version", "tag"?, "ref"? }.\n' +
+				'{ "pid", "startedAt" (ISO), "version", "buildId", "tag"?, "ref"? }.\n' +
+				"version comes from package.json on disk, so an update can change it before the\n" +
+				"running process restarts. buildId identifies the loaded code; compare it to know\n" +
+				"which build is actually running.\n" +
 				"Exit code: 0 while it is fresh, 1 when it is missing or older than\n" +
 				"updates.heartbeatStaleMs (default 300000 = 5 minutes). This is the signal an\n" +
 				"external watchdog uses to decide that the harness is down.\n",
@@ -1026,7 +1029,7 @@ function heartbeatCommand(flags: Record<string, string | boolean>, positionals: 
 	const heartbeat = status.heartbeat;
 	if (flagBool(flags, "status")) {
 		const agePart = status.state === "missing" ? "no readable heartbeat file" : `age ${age} (limit ${limit})`;
-		const detail = heartbeat ? `  pid ${heartbeat.pid}  version ${heartbeat.version}` : "";
+		const detail = heartbeat ? `  pid ${heartbeat.pid}  version ${heartbeat.version}  build ${heartbeat.buildId}` : "";
 		process.stdout.write(`${status.state}  ${agePart}${detail}  ${status.path}\n`);
 		return code;
 	}
@@ -1044,6 +1047,7 @@ function heartbeatCommand(flags: Record<string, string | boolean>, positionals: 
 		line("startedAt", heartbeat.startedAt);
 		if (status.uptimeMs !== undefined) line("running", formatDuration(status.uptimeMs));
 		line("version", heartbeat.version);
+		line("build", heartbeat.buildId);
 		line("tag", heartbeat.tag ?? "(unknown)");
 		line("ref", heartbeat.ref ?? "(unknown)");
 	}

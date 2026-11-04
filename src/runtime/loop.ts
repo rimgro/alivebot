@@ -702,8 +702,14 @@ export class AliveRuntime {
 		// the recipient's durable inbox. Both the inbox append (dedupe key) and the
 		// history append (record id) are idempotent, so recovery is safe.
 		if (message.recipientAgentId) {
-			redeliverLocalAgentMessage(this.config, message);
+			redeliverLocalAgentMessage(this.config, message, this.log);
 			return;
+		}
+		// A local thread must never fall through to chat transports: the console or
+		// NullTransport would report success while no agent inbox received the
+		// event. A queued local record without its recipient is a bug, not chat.
+		if (message.thread.startsWith("local:")) {
+			throw new Error(`queued local message ${message.id} has no recipientAgentId; refusing to send it through chat transports`);
 		}
 		await this.host.deliver(message);
 	}

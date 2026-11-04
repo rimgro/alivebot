@@ -17,6 +17,7 @@ import {
 	HEARTBEAT_FILE,
 	heartbeatPath,
 	readHeartbeat,
+	harnessIdentity,
 	readHeartbeatStatus,
 	recordHeartbeat,
 	refreshHeartbeat,
@@ -76,6 +77,7 @@ try {
 			pid: 4242,
 			startedAt,
 			version: "9.9.9",
+			buildId: "test-build-1",
 			tag: "v9.9.9",
 			ref: "feature/heartbeat",
 		});
@@ -86,18 +88,19 @@ try {
 
 		const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
 		check(
-			"the JSON shape is exactly pid, startedAt, version, tag, ref",
-			JSON.stringify(Object.keys(raw).sort()) === JSON.stringify(["pid", "ref", "startedAt", "tag", "version"]),
+			"the JSON shape is exactly pid, startedAt, version, buildId, tag, ref",
+			JSON.stringify(Object.keys(raw).sort()) === JSON.stringify(["buildId", "pid", "ref", "startedAt", "tag", "version"]),
 			raw,
 		);
 		check("pid is a number", raw.pid === 4242);
 		check("startedAt is an ISO timestamp", raw.startedAt === new Date(startedAt).toISOString(), raw.startedAt);
 		check("version is recorded", raw.version === "9.9.9");
+		check("the loaded code identity is recorded", raw.buildId === "test-build-1", raw.buildId);
 		check("tag and ref travel with the record", raw.tag === "v9.9.9" && raw.ref === "feature/heartbeat");
 		check("no temp file is left behind", fs.readdirSync(stateDir).join(",") === HEARTBEAT_FILE, fs.readdirSync(stateDir));
 
 		const before = fs.statSync(file).ino;
-		recordHeartbeat({ stateDir, pid: 4243, startedAt: Date.UTC(2026, 0, 2, 3, 5, 0), version: "9.9.10" });
+		recordHeartbeat({ stateDir, pid: 4243, startedAt: Date.UTC(2026, 0, 2, 3, 5, 0), version: "9.9.10", buildId: "test-build-2" });
 		const after = fs.statSync(file).ino;
 		const replaced = JSON.parse(fs.readFileSync(file, "utf8")) as { pid: number; version: string };
 		check(
@@ -116,6 +119,13 @@ try {
 			defaults?.version === packageJson.version && packageJson.version !== undefined,
 			{ recorded: defaults?.version, package: packageJson.version },
 		);
+		check(
+			"the running code identity is filled in by default",
+			typeof defaults?.buildId === "string" && defaults.buildId !== "unknown" && defaults.buildId.length > 0,
+			defaults?.buildId,
+		);
+		const identity = harnessIdentity();
+		check("harnessIdentity names the loaded entry, not just the package version", identity.buildId === defaults?.buildId, identity);
 
 		const malformed = path.join(root, "malformed", ".alive");
 		fs.mkdirSync(malformed, { recursive: true });
@@ -215,14 +225,22 @@ try {
 		check("--status exits 1 when the heartbeat is missing", missing.code === 1, missing);
 		check("--status says missing", missing.out.includes("missing"), missing.out);
 
-		recordHeartbeat({ stateDir, pid: process.pid, version: "0.2.0", tag: "v0.2.0", ref: "main" });
+		recordHeartbeat({ stateDir, pid: process.pid, version: "0.2.0", buildId: "cli-build-1", tag: "v0.2.0", ref: "main" });
 		const fresh = await cli("heartbeat", "--status");
 		check("--status exits 0 while the heartbeat is fresh", fresh.code === 0, fresh);
-		check("--status prints state, age, pid and version", /fresh.*age.*pid \d+.*version 0\.2\.0/.test(fresh.out), fresh.out);
+		check(
+			"--status prints state, age, pid, version and build",
+			/fresh.*age.*pid \d+.*version 0\.2\.0.*build cli-build-1/.test(fresh.out),
+			fresh.out,
+		);
 
 		const human = await cli("heartbeat");
 		check("plain output exits 0 while fresh", human.code === 0, human);
-		check("plain output prints the contents", human.out.includes("heartbeat") && human.out.includes("v0.2.0") && human.out.includes("main"), human.out);
+		check(
+			"plain output prints the contents including the build id",
+			human.out.includes("heartbeat") && human.out.includes("v0.2.0") && human.out.includes("cli-build-1") && human.out.includes("main"),
+			human.out,
+		);
 
 		const json = await cli("heartbeat", "--json");
 		check("--json exits 0 while fresh", json.code === 0, json);
@@ -237,7 +255,7 @@ try {
 		const beat = payload.heartbeat as Record<string, unknown> | null;
 		check(
 			"--json carries the heartbeat record",
-			beat !== null && beat.pid === process.pid && beat.version === "0.2.0" && beat.tag === "v0.2.0" && beat.ref === "main",
+			beat !== null && beat.pid === process.pid && beat.version === "0.2.0" && beat.buildId === "cli-build-1" && beat.tag === "v0.2.0" && beat.ref === "main",
 			beat,
 		);
 		check("--json age is a number", typeof payload.ageMs === "number" && (payload.ageMs as number) < 5_000, payload.ageMs);

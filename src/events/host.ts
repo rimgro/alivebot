@@ -49,7 +49,9 @@ interface ModuleRuntime {
  *
  * This keeps `send_message` semantics intact (the caller learns whether the
  * message reached the outside world) without any transport knowing about the
- * others.
+ * others. Absence of errors is not delivery: a message nobody claimed and no
+ * real transport/listener accepted fails with the thread named, so the outbox
+ * records `ok:false` instead of silently dropping it.
  */
 export class ModuleHost {
 	private readonly options: ModuleHostOptions;
@@ -148,9 +150,11 @@ export class ModuleHost {
 
 		if (claimers.length > 0) {
 			const failures: string[] = [];
+			let claimed = 0;
 			for (const claimer of claimers) {
 				try {
 					await claimer.handler(message);
+					claimed += 1;
 				} catch (err) {
 					failures.push(`${claimer.name}: ${errorText(err)}`);
 				}
@@ -159,21 +163,28 @@ export class ModuleHost {
 			// do not invalidate a successful, responsible delivery.
 			await this.runTaps(message, listeners);
 			if (failures.length > 0) throw new Error(`delivery failed: ${failures.join("; ")}`);
+			if (claimed === 0) throw new Error(`no module delivered message for thread "${message.thread}"`);
 			return;
 		}
 
-		const errors = await this.runTaps(message, listeners);
-		if (errors.length > 0) throw new Error(`all transports failed: ${errors.join("; ")}`);
+		const { errors, delivered } = await this.runTaps(message, listeners);
+		if (delivered === 0) {
+			const reason = errors.length > 0 ? `: ${errors.join("; ")}` : "";
+			throw new Error(`no module or transport delivered message for thread "${message.thread}"${reason}`);
+		}
 	}
 
+	/** Deliver to listeners and transport taps, counting only real successes. */
 	private async runTaps(
 		message: OutgoingMessage,
 		listeners: Array<{ name: string; handler: OutboundHandler }>,
-	): Promise<string[]> {
+	): Promise<{ errors: string[]; delivered: number }> {
 		const errors: string[] = [];
+		let delivered = 0;
 		for (const listener of listeners) {
 			try {
 				await listener.handler(message);
+				delivered += 1;
 			} catch (err) {
 				errors.push(`${listener.name}: ${errorText(err)}`);
 				this.options.log.warn(`module ${listener.name} outbound handler failed`, { error: errorText(err) });
@@ -182,12 +193,15 @@ export class ModuleHost {
 		for (const transport of this.options.transports) {
 			try {
 				await transport.send(message);
+				// A placeholder that accepts everything without reaching anyone must
+				// not make an unclaimed message look delivered.
+				if (transport.delivers !== false) delivered += 1;
 			} catch (err) {
 				errors.push(`${transport.name}: ${errorText(err)}`);
 				this.options.log.warn(`transport ${transport.name} send failed`, { error: errorText(err) });
 			}
 		}
-		return errors;
+		return { errors, delivered };
 	}
 
 	status(): Record<string, unknown> {

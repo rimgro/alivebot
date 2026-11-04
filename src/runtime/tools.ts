@@ -29,7 +29,7 @@ import type { ReminderStore } from "../store/reminders.js";
 import type { ThreadStore } from "../store/threads.js";
 import type { Logger } from "../log.js";
 import { canReadMemoryFact, retainedMemoryScopes, searchableMemoryScopes } from "./memory-access.js";
-import { managedAgentId, recordOperatorAgentReply, sendLocalAgentMessage } from "./agent-messaging.js";
+import { isOperatorAgentThread, managedAgentId, recordOperatorAgentReply, sendLocalAgentMessage } from "./agent-messaging.js";
 import { resolveOutgoingAttachment, toOutgoingAttachment } from "./attachments.js";
 import { snapshotRuntime } from "./daemon.js";
 import { requestAgentTelegram } from "../modules/telegram/managed-request.js";
@@ -737,6 +737,18 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 			const run = requireRun(deps, "send_message");
 			if (!params.text.trim()) throw new Error("send_message requires non-empty text");
 			const thread = params.thread ?? defaultThread(run) ?? "console";
+			// The operator TUI has no chat module and reads this profile's local
+			// history directly. Recording the outbound row is the delivery point for
+			// that thread; without it, the host would (correctly) report that no
+			// transport delivered anything.
+			const operatorReply = isOperatorAgentThread(deps.config, thread);
+			// Any other local agent thread is a conversation id, not an address.
+			// Routing it automatically could reverse the direction (replies reuse the
+			// inbound thread), and it used to be a silent no-op: no module claims
+			// `local:*`, so the outbox recorded ok:true while no inbox received it (#160).
+			if (thread.startsWith("local:agent:") && !operatorReply) {
+				throw new Error(`send_message cannot deliver to ${thread}: use message_agent for agent-to-agent messages (its to= is the explicit recipient)`);
+			}
 			// Resume safety (#124): the run record is the source of truth. If this
 			// exact thread+text (with its stored delivery key) is already there, do
 			// not create another outbox record or send it again.
@@ -766,6 +778,17 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 							}),
 						)
 					: undefined;
+			const deliver: (message: OutgoingMessage) => Promise<void> = operatorReply
+				? async (queued) => {
+					const recorded = recordOperatorAgentReply(deps.history, deps.config, thread, {
+						id: queued.id,
+						text: queued.text,
+						ts: queued.ts,
+						replyTo: queued.replyTo,
+					});
+					if (!recorded) throw new Error(`cannot record the operator reply on ${thread}`);
+				}
+				: deps.deliver;
 			const message = await deps.outbox.send(
 				{
 					runId: run.id,
@@ -775,7 +798,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 					attachments: attachment ? [attachment] : undefined,
 					buttons,
 				},
-				deps.deliver,
+				deliver,
 			);
 			recordOperatorAgentReply(deps.history, deps.config, thread, {
 				id: message.id,
