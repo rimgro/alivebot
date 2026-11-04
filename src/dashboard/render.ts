@@ -366,6 +366,14 @@ function renderRunFacts(run: RunView, masker: Masker): string {
 </table>`;
 }
 
+function compactionLabel(compaction: NonNullable<RunView["compaction"]>): string {
+	if (compaction.ok) return `ok · ${compaction.attempts} attempt(s)`;
+	const state = compaction.skipped ? "deferred" : "failed";
+	const reason = compaction.reason ? ` · ${compaction.reason}` : "";
+	const context = typeof compaction.contextTokens === "number" ? ` · context ${compaction.contextTokens.toLocaleString("en-US")} tokens` : "";
+	return `${state}: ${compaction.reasonClass ?? "provider_error"} (attempt ${compaction.attempts}/${compaction.maxAttempts ?? "?"})${context}${reason}`;
+}
+
 const TIMELINE_KIND_LABELS: Record<TimelineKind, string> = {
 	run: "run",
 	sleep: "sleep",
@@ -881,6 +889,7 @@ run ${masker.text(run.id)} · ${masker.text(formatTimestamp(run.startedAt))} →
 <tr><th>nudges</th><td class="mono">${masker.num(run.nudges)}</td><th>idle returns</th><td class="mono">${masker.num(run.idleReturns)}</td><th>interrupts</th><td class="mono">${masker.num(run.interruptDeliveries)}</td></tr>
 <tr><th>outbound</th><td class="mono">${masker.num(run.outboundCount)}</td><th>reminders created</th><td class="mono">${masker.num(run.remindersCreated.length)}</td><th>journal entries</th><td class="mono">${masker.num(run.journalEntries)}</td></tr>
 ${run.sleep ? `<tr><th>sleep</th><td class="mono" colspan="5">${masker.text(run.sleep.forced ? "forced by the runtime" : "requested by the agent")} · summary ${masker.num(run.sleep.summaryChars)} chars</td></tr>` : ""}
+${run.compaction ? `<tr><th>compaction</th><td class="mono" colspan="5">${masker.text(compactionLabel(run.compaction))}</td></tr>` : ""}
 </table>
 
 <h2>steps (per-turn usage)</h2>

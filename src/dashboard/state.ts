@@ -19,6 +19,7 @@ import type { Reminder } from "../store/reminders.js";
 import {
 	RUN_TURN_TRACE_LIMIT,
 	runTurnCount,
+	type CompactionRecord,
 	type RunRecord,
 	type RunStopReason,
 	type RunUsage,
@@ -249,6 +250,8 @@ export interface RunView {
 	notesTouched: string[];
 	journalEntries: number;
 	sleep?: { forced: boolean; summaryChars: number };
+	/** Last auto-compaction outcome in this run (#167). */
+	compaction?: CompactionRecord;
 }
 
 export function toRunView(record: RunRecord): RunView {
@@ -290,6 +293,7 @@ export function toRunView(record: RunRecord): RunView {
 		notesTouched: record.notesTouched ?? [],
 		journalEntries: record.journalEntries ?? 0,
 		sleep: record.sleep,
+		compaction: record.compaction,
 	};
 }
 
@@ -707,7 +711,10 @@ export interface AgentSummaryOptions extends DeriveStatusOptions {
 
 export function describeRun(record: RunRecord): string {
 	const outcome = runOutcome(record.stopReason);
-	return `#${record.index} ${formatDuration(record.durationMs)} · ${outcome.key} · ${runTurnCount(record)} turns · ${record.events?.length ?? 0} events`;
+	const compaction = record.compaction && !record.compaction.ok
+		? ` · compaction failed: ${record.compaction.reasonClass ?? "provider_error"}`
+		: "";
+	return `#${record.index} ${formatDuration(record.durationMs)} · ${outcome.key} · ${runTurnCount(record)} turns · ${record.events?.length ?? 0} events${compaction}`;
 }
 
 export function readAgentSummary(
@@ -717,6 +724,11 @@ export function readAgentSummary(
 	const now = options.now ?? Date.now();
 	const runtime = readRuntimeStateFile(profile.stateDir);
 	const status = deriveAgentStatus(runtime, options);
+	const lastCompaction = runtime?.lastCompaction;
+	if (lastCompaction && !lastCompaction.ok) {
+		const label = lastCompaction.skipped ? "deferred" : "failed";
+		status.note = `${status.note} · compaction ${label}: ${lastCompaction.reasonClass ?? "provider_error"}`;
+	}
 	const runs = readRunRecords(profile.stateDir);
 	const usage = readUsageToday(profile.stateDir, now);
 	const activeRun = runtime?.runId ? runs.find((run) => run.id === runtime.runId) : undefined;

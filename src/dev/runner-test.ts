@@ -16,6 +16,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createAssistantMessageEventStream, type AssistantMessage, type Context, type Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG, loadConfig } from "../config.js";
 import { Logger } from "../log.js";
@@ -35,6 +36,7 @@ import { isOutboundRecorded } from "../runtime/tools.js";
 import { TurnTraceRecorder } from "../runtime/run-trace.js";
 import { hasWakeWorthyPending, WakeScheduler, wakeIntervalMs } from "../runtime/wake.js";
 import { createAliveTools, type RunHandle, type ToolDeps } from "../runtime/tools.js";
+import { installCompactionGuard } from "../runtime/compaction.js";
 
 let failures = 0;
 function check(name: string, condition: boolean, detail?: unknown): void {
@@ -1165,6 +1167,79 @@ section("resume reopens the same record/session, dedupes outbound and accumulate
 	check("turns accumulate and keep absolute indexes", resumed?.turnCount === 2 && resumed?.turns?.[1]?.index === 2, { turnCount: resumed?.turnCount, turns: resumed?.turns?.map((turn) => turn.index) });
 	check("daily usage keeps one run and accumulates the resumed delta", usageAfter.runs === usageBefore.runs && usageAfter.turns === usageBefore.turns + 1 && Math.abs(usageAfter.cost - usageBefore.cost - 0.005) < 1e-9, { before: usageBefore, after: usageAfter });
 	check("outbound identity matches on thread+text+delivery key", isOutboundRecorded([{ thread: "alice", text: "x", deliveryKey: "msg_1" }], { thread: "alice", text: "x" }) && !isOutboundRecorded([{ thread: "alice", text: "x", deliveryKey: "msg_1" }], { thread: "alice", text: "y" }));
+}
+
+section("a failed compaction emits compaction_failed with the reason class (#167)");
+{
+	const session = runner.currentSession;
+	const fakeModel = {
+		id: "fake-compaction",
+		name: "Fake",
+		provider: "fake",
+		api: "openai-completions",
+		contextWindow: 200_000,
+		maxTokens: 8_192,
+	} as unknown as Model<any>;
+	const html = "<!DOCTYPE html><html><body><h1>502 Bad Gateway</h1></body></html>";
+	const htmlMessage: AssistantMessage = {
+		role: "assistant",
+		content: [{ type: "text", text: html }],
+		api: fakeModel.api,
+		provider: fakeModel.provider,
+		model: fakeModel.id,
+		usage: {
+			input: 10_000,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 10_000,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+	(session.agent as unknown as { streamFunction: unknown }).streamFunction = () => {
+		const stream = createAssistantMessageEventStream();
+		stream.push({ type: "done", reason: "stop", message: htmlMessage });
+		return stream;
+	};
+	installCompactionGuard(session, {
+		log,
+		retry: { attempts: 1, baseDelayMs: 1, maxDelayMs: 1, jitter: "none" },
+	});
+	handler = async (current) => {
+		(session as unknown as { setContextTokens: (tokens: number) => void }).setContextTokens(120_000);
+		const summarizationContext = {
+			systemPrompt: "You are a context summarization assistant. Only output the structured summary.",
+			messages: [{ role: "user", content: [{ type: "text", text: "<conversation>hello</conversation>" }], timestamp: Date.now() }],
+		} as Context;
+		try {
+			const stream = await session.agent.streamFunction(fakeModel, summarizationContext);
+			await stream.result();
+		} catch {
+			// expected: the HTML page is rejected as a compaction summary
+		}
+		current.emit({
+			type: "compaction_end",
+			reason: "threshold",
+			result: undefined,
+			aborted: false,
+			willRetry: false,
+			errorMessage: "Auto-compaction failed: provider_html",
+		});
+		await call(sleepTool, { summary: "compaction failure test", summary_md: "# Compaction failure test\n" });
+	};
+	const record = await runner.execute();
+	const anomalies = anomaliesOf(record?.id ?? "", "compaction_failed");
+	check("one compaction_failed anomaly is recorded", anomalies.length === 1, anomalies);
+	check("the anomaly carries the reason class", anomalies[0]?.reasonClass === "provider_html", anomalies[0]);
+	check("the anomaly carries the attempt", anomalies[0]?.attempt === 1, anomalies[0]);
+	check("the anomaly carries the context size", (anomalies[0]?.contextTokens ?? 0) > 0, anomalies[0]);
+	check(
+		"the run record exposes the last compaction outcome",
+		record?.compaction?.ok === false && record.compaction.reasonClass === "provider_html",
+		record?.compaction,
+	);
 }
 
 process.stdout.write(

@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { appendJsonl, ensureDir, readJsonl } from "../util.js";
+import type { CompactionFailureClass } from "./runs.js";
 
 /**
  * Run-anomaly events the runtime records about its own runs (#127, #123).
@@ -23,7 +24,8 @@ export type RunAnomalyType =
 	| "run_no_outbound"
 	| "run_repeat_tool"
 	| "run_very_long"
-	| "context_high";
+	| "context_high"
+	| "compaction_failed";
 
 export interface RunAnomalyEvent {
 	/** Wall clock of the event. */
@@ -59,6 +61,12 @@ export interface RunAnomalyEvent {
 	tool?: string;
 	/** `run_repeat_tool`: how many times in a row the same call was repeated. */
 	repeats?: number;
+	/** `compaction_failed`: why the summarization response was rejected (#167). */
+	reasonClass?: CompactionFailureClass;
+	/** `compaction_failed`: provider attempt number that failed (0 = deferred by backoff). */
+	attempt?: number;
+	/** `compaction_failed`: attempt budget for one summarization call. */
+	maxAttempts?: number;
 }
 
 /** Anything that can persist a run-anomaly event (the runtime uses `RunEventLog`). */

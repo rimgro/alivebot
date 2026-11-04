@@ -62,6 +62,45 @@ export interface RunTurnTrace {
 /** How many per-turn traces are kept on a run record (the oldest are dropped). */
 export const RUN_TURN_TRACE_LIMIT = 200;
 
+/**
+ * Why a compaction summarization response was rejected (#167).
+ *
+ * `provider_html` — the provider (or an upstream proxy/captive portal) returned
+ * an HTML page instead of a summary;
+ * `provider_json_invalid` — the body looked like JSON but was not a usable
+ * summary (an error object or malformed JSON);
+ * `provider_error` — any other provider failure, including an empty summary.
+ */
+export type CompactionFailureClass = "provider_html" | "provider_json_invalid" | "provider_error";
+
+/**
+ * The last compaction attempt, persisted on the run record and runtime status so
+ * the dashboard can explain why the context keeps growing after a failed
+ * compaction. Counters/reason classes only: the provider body itself is logged
+ * once (masked, truncated) and never persisted here.
+ */
+export interface CompactionRecord {
+	/** Wall clock of the last attempt. */
+	at: number;
+	/** True when the summary was accepted and the context was compacted. */
+	ok: boolean;
+	reasonClass?: CompactionFailureClass;
+	/** Short, secret-free reason for the log/dashboard. */
+	reason?: string;
+	/** Provider attempts used by this outcome (0 when a backoff skipped the call). */
+	attempts: number;
+	/** Attempt budget for one summarization call. */
+	maxAttempts?: number;
+	/** Context size (pi's prompt estimate) when the attempt finished. */
+	contextTokens?: number;
+	/** True when the cross-turn backoff deferred the request without calling the provider. */
+	skipped?: boolean;
+	/** Earliest wall clock for the next attempt after a transient failure. */
+	nextAttemptAt?: number;
+	/** Wall clock spent on the provider call(s). */
+	durationMs?: number;
+}
+
 export interface RunRecord {
 	id: string;
 	index: number;
@@ -99,6 +138,8 @@ export interface RunRecord {
 	 */
 	turns?: RunTurnTrace[];
 	sleep?: { forced: boolean; summaryChars: number };
+	/** Last auto-compaction outcome in this run (#167). Absent when none happened. */
+	compaction?: CompactionRecord;
 }
 
 /**
@@ -291,6 +332,8 @@ export interface RuntimeStateFile {
 	emptyWakes?: number;
 	/** `background` for a detached CLI instance, `foreground` for an attached one. */
 	mode?: "background" | "foreground";
+	/** Last auto-compaction outcome (#167), so operators see why context is growing. */
+	lastCompaction?: CompactionRecord;
 	error?: string;
 }
 

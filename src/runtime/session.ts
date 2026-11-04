@@ -16,6 +16,8 @@ import { DEFAULT_CONTRACT, type LoadedConfig } from "../config.js";
 import { defaultModelSpec } from "../config.js";
 import type { Logger } from "../log.js";
 import { ensureDir } from "../util.js";
+import { maskSecrets } from "../secrets.js";
+import { installCompactionGuard } from "./compaction.js";
 import { buildSystemPrompt } from "./prompt.js";
 import { ALIVE_TOOL_NAMES, createAliveTools, type ToolDeps } from "./tools.js";
 import { SandboxManager } from "../sandbox/manager.js";
@@ -182,6 +184,21 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 		resourceLoader,
 		sessionManager,
 		settingsManager,
+	});
+
+	// Auto-compaction is pi's own loop, but the summary is a provider response
+	// like any other. Guard it so an HTML/error page can never become the new
+	// context (#167); failures keep the old transcript and back off across turns.
+	installCompactionGuard(session, {
+		log,
+		mask: (text) => maskSecrets(text, config.config.secrets),
+		contextTokens: () => {
+			try {
+				return session.getContextUsage()?.tokens ?? 0;
+			} catch {
+				return 0;
+			}
+		},
 	});
 
 	// Extensions may register tools, but only names selected below become active.
