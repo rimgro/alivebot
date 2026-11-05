@@ -77,13 +77,16 @@ interface Calls {
 	stateDirs: string[];
 	/** Initiator the CLI passed to the service control (#168). */
 	initiators: string[];
+	/** Whether `--force`/`--kill` reached the service control (#181). */
+	forces: boolean[];
 }
 function fakeService(calls: Calls, stopResult: Partial<StopResult> = {}): ServiceControl {
 	return {
-		stop: async (config, _flags, initiator) => {
+		stop: async (config, flags, initiator) => {
 			calls.names.push("stop");
 			calls.stateDirs.push(config.paths.stateDir);
 			calls.initiators.push(initiator ?? "(default)");
+			calls.forces.push(flags.force === true || flags.kill === true);
 			return { stopped: true, alreadyStopped: false, forceKilled: false, wasSuspended: false, pid: 4242, ...stopResult };
 		},
 		start: async () => {
@@ -101,7 +104,7 @@ interface CliResult {
 }
 /** Run the real CLI entry with a fake service control and a fake environment. */
 async function cli(argv: string[], env: NodeJS.ProcessEnv, stopResult: Partial<StopResult> = {}): Promise<CliResult> {
-	const calls: Calls = { names: [], stateDirs: [], initiators: [] };
+	const calls: Calls = { names: [], stateDirs: [], initiators: [], forces: [] };
 	const out: string[] = [];
 	const err: string[] = [];
 	const stdoutWrite = process.stdout.write;
@@ -170,6 +173,11 @@ try {
 
 		const stopHelp = await cli(["stop", "--help"], INSIDE_UNIT);
 		check("stop --help documents --timeout", stopHelp.out.includes("--timeout"), stopHelp.out);
+		check(
+			"stop --help describes force as not waiting for the drain (#181)",
+			stopHelp.out.includes("do not wait for the graceful drain"),
+			stopHelp.out,
+		);
 		const statusHelp = await cli(["status", "--help"], INSIDE_UNIT);
 		check("status --help documents --json", statusHelp.out.includes("--json"), statusHelp.out);
 		check("status --help does not read or print state", !statusHelp.out.includes("inbox"), statusHelp.out);
@@ -261,6 +269,13 @@ try {
 
 		check("alive stop tells the runtime it is a stop (#168)", stop.calls.initiators.join(",") === "stop", stop.calls.initiators);
 		check("alive stop inside the harness is still a stop", inside.calls.initiators.join(",") === "stop", inside.calls.initiators);
+
+		const forced = await cli(["stop", "--force"], OUTSIDE);
+		check("--force is forwarded to the service control (#181)", forced.calls.forces.join(",") === "true", forced.calls);
+		const killed = await cli(["stop", "--kill"], OUTSIDE);
+		check("--kill is the force alias", killed.calls.forces.join(",") === "true", killed.calls);
+		const plainStop = await cli(["stop"], OUTSIDE);
+		check("a plain stop is not forced", plainStop.calls.forces.join(",") === "false", plainStop.calls);
 
 		const failure = await cli(["stop"], OUTSIDE, { stopped: false, error: "still alive" });
 		check("a failed stop exits 1", failure.code === 1, failure.code);

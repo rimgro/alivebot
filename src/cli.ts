@@ -130,7 +130,7 @@ const SERVICE_USAGE: Record<"stop" | "restart" | "status", string> = {
 		"usage: alive stop [--timeout DURATION] [--force] [--config CONFIG]\n" +
 		"\n" +
 		"  --timeout DURATION  graceful SIGTERM window before SIGKILL (default loop.shutdownGraceMs + 5s)\n" +
-		"  --force, --kill     skip SIGTERM and kill immediately\n" +
+		"  --force, --kill     do not wait for the graceful drain; close the run now\n" +
 		"  --config CONFIG     config file (default ./alive.config.json)\n" +
 		"\n" +
 		"Stops the background runtime of the current project. One warning line always\n" +
@@ -141,7 +141,7 @@ const SERVICE_USAGE: Record<"stop" | "restart" | "status", string> = {
 		"\n" +
 		"  --yes, -y           restart even from inside the harness (ends this run)\n" +
 		"  --timeout DURATION  graceful SIGTERM window before SIGKILL (default loop.shutdownGraceMs + 5s)\n" +
-		"  --force, --kill     skip SIGTERM and kill the old runtime immediately\n" +
+		"  --force, --kill     do not wait for the graceful drain; close the old run now\n" +
 		"  --config CONFIG     config file (default ./alive.config.json)\n" +
 		"  --model MODEL       model for the restarted runtime\n" +
 		"  --verbose           verbose logging for the restarted runtime\n" +
@@ -1687,7 +1687,7 @@ usage:
   alive workers diff <id> [--full]            review worker changes
   alive workers models                        show the worker model/permission allowlist
   alive stop [--force] [--timeout 30s]        stop the running instance
-                                              (--force: SIGKILL immediately)
+                                              (--force: do not wait for the drain, close the run now)
   alive abort-tool <agent>                    abort only the tool running right now
                                               (run/context/stoppedBy are untouched)
   alive restart [--yes] [--verbose]           stop, then start in the background again

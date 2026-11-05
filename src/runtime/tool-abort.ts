@@ -257,6 +257,20 @@ export class ToolAbortGate {
 		this.notifyStateChange();
 	}
 
+	/**
+	 * Forget the active tool without turning it into an operator abort (#181).
+	 *
+	 * A force stop closes the whole run instead of going through the tool-abort
+	 * gate, so no "aborted by operator" error is delivered to the agent. This
+	 * makes sure `runtime.json` does not keep advertising a tool after the run
+	 * settled, even if the underlying call never reached its own `end()`.
+	 */
+	clearActive(): void {
+		if (!this.active) return;
+		this.active = undefined;
+		this.notifyStateChange();
+	}
+
 	/** Never let a state-file write failure break the tool call itself. */
 	private notifyStateChange(): void {
 		try {

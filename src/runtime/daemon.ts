@@ -38,6 +38,19 @@ export interface StopIntent {
 	at: number;
 	/** Pid the marker was written for, so another instance's stop is not claimed. */
 	pid?: number;
+	/**
+	 * `alive stop|restart --force` (#181): close the active run at once instead
+	 * of waiting for the graceful drain. Older markers have no such field and
+	 * therefore read as a normal graceful stop.
+	 */
+	force?: boolean;
+}
+
+/** What the runtime needs from `<stateDir>/stop-intent.json`. */
+export interface StopIntentReading {
+	initiator: StopInitiator;
+	/** True only when the CLI explicitly asked for a force stop (#181). */
+	force: boolean;
 }
 
 export function stopIntentPath(stateDir: string): string {
@@ -52,9 +65,16 @@ function isStopInitiator(value: unknown): value is StopInitiator {
  * Record why the runtime is about to receive SIGTERM. Best effort: a missing
  * state dir or a read-only FS must never block an operator's stop.
  */
-export function writeStopIntent(stateDir: string, initiator: StopInitiator, options: { at?: number; pid?: number } = {}): void {
+export function writeStopIntent(
+	stateDir: string,
+	initiator: StopInitiator,
+	options: { at?: number; pid?: number; force?: boolean } = {},
+): void {
 	const intent: StopIntent = { initiator, at: options.at ?? Date.now() };
 	if (options.pid !== undefined) intent.pid = options.pid;
+	// Additive: a graceful marker keeps its historical shape, and old readers
+	// that do not know `force` simply see a normal stop.
+	if (options.force) intent.force = true;
 	try {
 		ensureDir(stateDir);
 		writeJsonAtomic(stopIntentPath(stateDir), intent);
@@ -84,7 +104,7 @@ export function clearStopIntent(stateDir: string): void {
 export function readStopIntent(
 	stateDir: string,
 	options: { now?: number; pid?: number } = {},
-): StopInitiator | undefined {
+): StopIntentReading | undefined {
 	const file = stopIntentPath(stateDir);
 	if (!fs.existsSync(file)) return undefined;
 	const now = options.now ?? Date.now();
@@ -96,7 +116,8 @@ export function readStopIntent(
 	if (typeof intent.at !== "number" || !Number.isFinite(intent.at)) return undefined;
 	if (now - intent.at >= STOP_INTENT_TTL_MS) return undefined;
 	if (intent.pid !== undefined && intent.pid !== pid) return undefined;
-	return intent.initiator;
+	// Missing or non-boolean `force` (legacy markers) means graceful.
+	return { initiator: intent.initiator, force: intent.force === true };
 }
 
 export function stdoutLogPath(paths: Paths): string {
@@ -208,12 +229,21 @@ export async function waitForRuntime(
 	return null;
 }
 
+/** How long a force stop gives the runtime to exit on SIGTERM before SIGKILL. */
+export const DEFAULT_FORCE_STOP_TIMEOUT_MS = 2_000;
+
 export interface StopOptions {
 	/** Graceful window before escalating to SIGKILL. */
 	timeoutMs?: number;
 	pollMs?: number;
-	/** Skip SIGTERM and kill immediately. */
+	/**
+	 * Stop without waiting for the graceful drain. The runtime still receives
+	 * the marker and SIGTERM, so it can write its run record; SIGKILL is only
+	 * the escalation when it does not exit inside `forceTimeoutMs` (#181).
+	 */
 	force?: boolean;
+	/** Short SIGTERM window used by `force`; ignored on the graceful path. */
+	forceTimeoutMs?: number;
 	/** Who asked for the stop: `alive stop` vs `alive restart` (#168). */
 	initiator?: StopInitiator;
 }
@@ -240,6 +270,7 @@ export interface StopResult {
 export async function stopRuntime(stateDir: string, options: StopOptions = {}): Promise<StopResult> {
 	const timeoutMs = options.timeoutMs ?? 15_000;
 	const pollMs = options.pollMs ?? 150;
+	const forceTimeoutMs = options.forceTimeoutMs ?? DEFAULT_FORCE_STOP_TIMEOUT_MS;
 	const initiator = options.initiator ?? "restart";
 	const snapshot = snapshotRuntime(stateDir);
 	if (!snapshot || !snapshot.alive) {
@@ -250,30 +281,33 @@ export async function stopRuntime(stateDir: string, options: StopOptions = {}): 
 
 	const { pid } = snapshot;
 	const wasSuspended = snapshot.suspended;
-	if (!options.force) {
-		// The runtime writes the run record from inside its SIGTERM handler; the
-		// marker is the only way it can know whether this was a stop or a restart.
-		writeStopIntent(stateDir, initiator, { pid });
-		if (wasSuspended) {
-			try {
-				process.kill(pid, "SIGCONT");
-			} catch {
-				// already gone
-			}
-		}
+	// A force stop is not "do not tell the process": the runtime writes the run
+	// record from inside its SIGTERM handler, and the marker is the only way it
+	// can know whether this was a stop or a restart and whether it may wait for
+	// the drain (#168, #181). SIGKILL is only the escalation below.
+	writeStopIntent(stateDir, initiator, { pid, ...(options.force ? { force: true } : {}) });
+	if (wasSuspended) {
 		try {
-			process.kill(pid, "SIGTERM");
-		} catch (err) {
-			if ((err as NodeJS.ErrnoException).code === "ESRCH") {
-				clearStopIntent(stateDir);
-				return { pid, stopped: true, alreadyStopped: true, forceKilled: false, wasSuspended };
-			}
-			throw err;
+			process.kill(pid, "SIGCONT");
+		} catch {
+			// already gone
 		}
-		if (await waitForExit(pid, timeoutMs, pollMs)) {
-			finishStop(stateDir, pid);
-			return { pid, stopped: true, alreadyStopped: false, forceKilled: false, wasSuspended };
+	}
+	try {
+		process.kill(pid, "SIGTERM");
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ESRCH") {
+			clearStopIntent(stateDir);
+			return { pid, stopped: true, alreadyStopped: true, forceKilled: false, wasSuspended };
 		}
+		throw err;
+	}
+	// Force gets a short window to settle through the normal shutdown path; a
+	// graceful stop keeps its full drain budget.
+	const graceMs = options.force ? forceTimeoutMs : timeoutMs;
+	if (await waitForExit(pid, graceMs, pollMs)) {
+		finishStop(stateDir, pid);
+		return { pid, stopped: true, alreadyStopped: false, forceKilled: false, wasSuspended };
 	}
 
 	let killed = false;
@@ -314,5 +348,8 @@ async function waitForExit(pid: number, timeoutMs: number, pollMs: number): Prom
 function finishStop(stateDir: string, pid: number): void {
 	const state = readRuntimeState(stateDir);
 	if (!state || state.pid !== pid) return;
-	writeRuntimeState(stateDir, { ...state, status: "stopped", idling: false, lastTickAt: Date.now() });
+	// A stopped runtime cannot have a tool in flight. Clearing the field also
+	// covers a force stop whose SIGKILL landed before the runtime could write
+	// its final state (#181), so `runtime.json` never advertises a dead tool.
+	writeRuntimeState(stateDir, { ...state, status: "stopped", idling: false, activeTool: undefined, lastTickAt: Date.now() });
 }

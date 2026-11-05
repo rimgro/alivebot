@@ -57,6 +57,8 @@ export interface AliveRuntimeOptions {
  */
 export interface StopOptions {
 	initiator?: StopInitiator;
+	/** `--force`: close the run immediately instead of waiting for the drain (#181). */
+	force?: boolean;
 }
 
 /**
@@ -464,25 +466,41 @@ export class AliveRuntime {
 		// default (a service manager restart) — never from the signal alone (#168).
 		// The marker is always consumed, so a stale one cannot label a later stop.
 		const marker = readStopIntent(this.config.paths.stateDir);
-		const initiator: StopInitiator = options.initiator ?? marker ?? "restart";
+		const initiator: StopInitiator = options.initiator ?? marker?.initiator ?? "restart";
+		const force = options.force ?? marker?.force ?? false;
 		this.runner?.setStopInitiator(initiator);
-		this.log.info("stopping", { reason, initiator });
+		this.log.info("stopping", { reason, initiator, force });
 		// Wake the loop from `WakeScheduler`/backoff without touching an in-flight
-		// tool. The session is only aborted if the drain budget expires.
+		// tool. On the graceful path the session is only aborted if the drain
+		// budget expires.
 		this.abortController.abort();
 		if (this.schedulerTimer) {
 			clearInterval(this.schedulerTimer);
 			this.schedulerTimer = undefined;
 		}
-		const graceMs = this.config.config.loop.shutdownGraceMs;
-		const drained = await this.runner.drain(graceMs);
-		if (drained.outcome === "drained") {
-			this.log.info("graceful shutdown drained the active run", { durationMs: drained.durationMs, graceMs });
-		} else if (drained.outcome === "aborted") {
-			this.log.warn("graceful shutdown did not finish within the budget; run aborted", {
-				durationMs: drained.durationMs,
-				graceMs,
+		if (force) {
+			// `--force` means "do not wait for the drain", not "skip the shutdown":
+			// the run is closed through the normal settle path, keeping its
+			// `stoppedBy` and a `usageUnsettled` record (#181). It must not go
+			// through the operator tool-abort gate, so the agent never sees an
+			// "aborted by operator" tool error.
+			const aborted = await this.runner.abortNow();
+			this.toolAbort?.clearActive();
+			this.log.info("force shutdown closed the active run without waiting for the drain", {
+				durationMs: aborted.durationMs,
+				activeRun: aborted.active,
 			});
+		} else {
+			const graceMs = this.config.config.loop.shutdownGraceMs;
+			const drained = await this.runner.drain(graceMs);
+			if (drained.outcome === "drained") {
+				this.log.info("graceful shutdown drained the active run", { durationMs: drained.durationMs, graceMs });
+			} else if (drained.outcome === "aborted") {
+				this.log.warn("graceful shutdown did not finish within the budget; run aborted", {
+					durationMs: drained.durationMs,
+					graceMs,
+				});
+			}
 		}
 		await this.loopPromise?.catch(() => undefined);
 		const session = this.runner?.currentSession;
@@ -492,8 +510,11 @@ export class AliveRuntime {
 		session?.dispose();
 		await this.sandbox?.close().catch((error) => this.log.warn("sandbox detach failed; VM retained", { error: String(error) }));
 		this.statusKind = "stopped";
+		// Force already cleared the gate; this is also a no-op on the graceful
+		// path, where the settled `execute` removed its own tool.
+		if (force) this.toolAbort?.clearActive();
 		this.writeState(true);
-		this.log.info("stopped", { reason });
+		this.log.info("stopped", { reason, initiator, force });
 	}
 
 	// ---------------------------------------------------------------------
