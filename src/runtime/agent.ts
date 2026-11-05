@@ -8,7 +8,7 @@ import { term, stamp } from "../term.js";
 import type { AliveEvent } from "../store/events.js";
 import type { EventStore } from "../store/events.js";
 import type { PolicyStore } from "../store/policy.js";
-import { runTurnCount, type ContextResetReason, type RunLog, type RunRecord, type RunStoppedBy, type RunStopReason } from "../store/runs.js";
+import { runTurnCount, type ContextResetReason, type RunLog, type RunProviderError, type RunRecord, type RunStoppedBy, type RunStopReason } from "../store/runs.js";
 import type { ThreadStore } from "../store/threads.js";
 import { renderAwakePrompt, renderInterruptPrompt, renderLongRunWarning, renderNudgePrompt } from "./prompt.js";
 import { TurnTraceRecorder, hasUsage, residualUsage } from "./run-trace.js";
@@ -18,6 +18,13 @@ import { classifyNetworkError, withRetries } from "../retry.js";
 import { maskSecrets } from "../secrets.js";
 import { privateMemoryScope } from "./memory-access.js";
 import { compactionMonitorFor } from "./compaction.js";
+import {
+	ProviderDiagnostics,
+	hasImageAttachments,
+	isRequestFormatError,
+	providerErrorRecord,
+	type ProviderDiagnosticsSnapshot,
+} from "./provider-diag.js";
 import type { RunHandle, ToolDeps } from "./tools.js";
 import type { ToolAbortGate } from "./tool-abort.js";
 
@@ -227,9 +234,15 @@ export class AgentRunner {
 	private forceClosing = false;
 	/** Resolves when the active `execute` has written its record. */
 	private executionSettled: { promise: Promise<void>; resolve: () => void } | undefined;
+	/** Provider request/response evidence of the current run (#176). */
+	private readonly providerDiagnostics: ProviderDiagnostics;
 
 	constructor(deps: AgentRunnerDeps) {
 		this.deps = deps;
+		this.providerDiagnostics = new ProviderDiagnostics({
+			log: deps.log,
+			secrets: deps.config.config.secrets,
+		});
 	}
 
 	async init(): Promise<void> {
@@ -340,6 +353,8 @@ export class AgentRunner {
 		this.unsubscribe?.();
 		this.unsubscribe = this.session.subscribe((event) => this.handleSessionEvent(event));
 		this.installTurnGuard();
+		// A rebuilt session has a new agent; `attach` is idempotent per agent object.
+		this.providerDiagnostics.attach(this.session.agent);
 	}
 
 	/**
@@ -560,6 +575,9 @@ export class AgentRunner {
 			const startedAt = Date.now();
 			this.turnTrace.reset({ turns: previous?.turns, count: previous ? runTurnCount(previous) : 0 });
 			this.toolCallsThisRun = 0;
+			// Fresh evidence per run: a previous run's request must never be attached
+			// to an error that happened before this run reached the provider.
+			this.providerDiagnostics.reset();
 			const run: RunHandle = {
 				id: previous?.id ?? `run_${startedAt.toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
 				index: previous?.index ?? runs.nextIndex(),
@@ -619,6 +637,10 @@ export class AgentRunner {
 			/** Which side raised `stopReason = "error"`: the provider/session or the model (#168). */
 			let errorSource: "provider" | "model" | undefined;
 			let error: string | undefined;
+			/** Provider evidence persisted when the run closes with a provider error (#176). */
+			let providerError: RunProviderError | undefined;
+			/** One attachment-free retry per run: a format rejection must not loop. */
+			let formatRetried = false;
 			let first = true;
 
 			while (true) {
@@ -627,11 +649,13 @@ export class AgentRunner {
 					break;
 				}
 				if (!first) this.trackEvents(run, this.claimDeliverable());
+				let activePrompt: string | undefined;
 				try {
 					const awake = first
 						? await this.renderAwake(run, options.redeliveryRange)
 						: await this.renderNudge(run, options.redeliveryRange);
 					const prompt = first && previous ? resumePrompt(previous, awake) : awake;
+					activePrompt = prompt;
 					first = false;
 					run.promptChars += prompt.length;
 					const tokensBeforePrompt = sessionTokenTotal(this.session);
@@ -662,7 +686,7 @@ export class AgentRunner {
 								classifyNetworkError(caught).transient,
 						},
 					);
-				} catch (err) {
+				} catch (caught) {
 					if (this.aborting || this.draining || this.deps.isStopping()) {
 						// The fallback abort after the grace budget, or an abort raced by a
 						// stop: this is a deliberate stop, not a model failure.
@@ -670,13 +694,52 @@ export class AgentRunner {
 						log.info(`run #${run.index} session stopped during shutdown`, { stopReason });
 						break;
 					}
-					error = maskSecrets(err instanceof Error ? err.message : String(err), this.deps.config.config.secrets);
-					log.error(`run #${run.index} session error`, { error });
-					stopReason = "error";
-					// Thrown out of `session.prompt`: the provider, the network or the
-					// session failed, not the model's answer (#168).
-					errorSource = "provider";
-					break;
+					const snapshot = this.providerDiagnostics.take();
+					const reported = this.logProviderError(run, caught, snapshot);
+					error = reported.error;
+					// #176: a format rejection of a request that carried images gets exactly one
+					// retry with the image blocks stripped from the OUTGOING payload. The
+					// session history keeps its attachments; `dropAttachmentsOnce` changes
+					// only what is sent next. Never retried during shutdown or a second time
+					// in the same run.
+					const retryPrompt = activePrompt;
+					const canRetryWithoutAttachments =
+						!formatRetried &&
+						hasImageAttachments(snapshot?.request) &&
+						isRequestFormatError({ status: reported.record.status, body: reported.record.body }) &&
+						!this.aborting &&
+						!this.draining &&
+						!this.deps.isStopping();
+					if (!canRetryWithoutAttachments || retryPrompt === undefined) {
+						providerError = reported.record;
+						stopReason = "error";
+						// Thrown out of `session.prompt`: the provider, the network or the
+						// session failed, not the model's answer (#168).
+						errorSource = "provider";
+						break;
+					}
+					formatRetried = true;
+					this.providerDiagnostics.dropAttachmentsOnce();
+					log.warn(`run #${run.index} provider format retry without attachments`, {
+						status: reported.record.status,
+						requestId: reported.record.requestId,
+						model: snapshot?.request?.model,
+						images: snapshot?.request?.blocks.image,
+						imageBytes: snapshot?.request?.imageBytes,
+					});
+					try {
+						await this.session.prompt(retryPrompt, { expandPromptTemplates: false, source: "extension" });
+					} catch (retryCaught) {
+						// The retry itself failed: close the run with its own evidence.
+						const retrySnapshot = this.providerDiagnostics.take();
+						const retryReport = this.logProviderError(run, retryCaught, retrySnapshot);
+						error = retryReport.error;
+						providerError = retryReport.record;
+						stopReason = "error";
+						errorSource = "provider";
+						break;
+					}
+					// Retry succeeded: fall through to the ordinary post-prompt checks.
 				}
 
 				if (run.sleepRequested) {
@@ -794,6 +857,7 @@ export class AgentRunner {
 				stopReason: finalStopReason,
 				stoppedBy,
 				error,
+				providerError: finalStopReason === "error" && errorSource === "provider" ? providerError : undefined,
 				sessionFile: this.session.sessionFile,
 				summary,
 				events,
@@ -848,10 +912,38 @@ export class AgentRunner {
 			this.aborting = false;
 			this.draining = false;
 			this.forceClosing = false;
+			this.providerDiagnostics.reset();
 			this.deps.setRun(undefined);
 			if (this.executionSettled?.promise === settled) this.executionSettled = undefined;
 			settle();
 		}
+	}
+
+	/**
+	 * Log one provider failure with its #176 evidence and build the record block.
+	 *
+	 * The existing `error` field stays exactly what it was (the masked error
+	 * message); status/request id/body/request summary are added beside it.
+	 */
+	private logProviderError(
+		run: RunHandle,
+		caught: unknown,
+		snapshot: ProviderDiagnosticsSnapshot | undefined,
+	): { error: string; record: RunProviderError } {
+		const description = this.providerDiagnostics.describeError(caught);
+		const record = providerErrorRecord(Date.now(), description, snapshot);
+		const error = maskSecrets(caught instanceof Error ? caught.message : String(caught), this.deps.config.config.secrets);
+		this.deps.log.error(`run #${run.index} session error`, {
+			error,
+			...(record.status !== undefined ? { status: record.status } : {}),
+			...(record.requestId !== undefined ? { requestId: record.requestId } : {}),
+			...(record.code !== undefined ? { code: record.code } : {}),
+			...(record.body !== undefined ? { body: record.body } : {}),
+			...(record.model !== undefined ? { model: record.model } : {}),
+			...(record.request !== undefined ? { request: record.request } : {}),
+			...(record.attachmentsDropped === true ? { attachmentsDropped: true } : {}),
+		});
+		return { error, record };
 	}
 
 	private get isFreshContext(): boolean {
