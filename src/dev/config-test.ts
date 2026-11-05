@@ -11,6 +11,8 @@ import * as path from "node:path";
 import {
 	DEFAULT_CONFIG,
 	DEFAULT_EMPTY_WAKE_BACKOFF,
+	DEFAULT_HEALTH_CONFIG,
+	DEFAULT_HEALTH_SILENT_MS,
 	DEFAULT_LOOP_CONTEXT_HARD_TOKENS,
 	DEFAULT_LOOP_CONTEXT_SLEEP_GRACE_TURNS,
 	DEFAULT_LOOP_CONTEXT_SLEEP_TOKENS,
@@ -30,6 +32,7 @@ import {
 	loadConfig,
 	redactSecretFields,
 	resolveContextPolicy,
+	validateHealthConfig,
 	validateLoopConfig,
 	validateProfileContextConfig,
 	type LoopConfig,
@@ -294,6 +297,52 @@ section("process environment with a different value never overwrites the config 
 	fs.rmSync(configPath, { force: true });
 }
 
+
+// ---------------------------------------------------------------------------
+section("health.silentMs: dead-agent default and validation (#175)");
+{
+	check(
+		"the schema default is 2 hours and 0 means disabled",
+		DEFAULT_HEALTH_CONFIG.silentMs === 7_200_000 && DEFAULT_HEALTH_SILENT_MS === 7_200_000 && DEFAULT_CONFIG.health.silentMs === 7_200_000,
+		{ config: DEFAULT_CONFIG.health, constant: DEFAULT_HEALTH_SILENT_MS },
+	);
+	const root = tempRoot("health");
+	const loaded = loadConfig({ cwd: root, secretLog: () => undefined, secretWarn: () => undefined });
+	check("a config without a health block inherits the 2 h default", loaded.config.health.silentMs === 7_200_000, loaded.config.health);
+
+	writeConfig(root, { health: { silentMs: 300_000 } });
+	const overridden = loadConfig({ cwd: root, secretLog: () => undefined, secretWarn: () => undefined });
+	check("an explicit health.silentMs wins", overridden.config.health.silentMs === 300_000, overridden.config.health);
+
+	writeConfig(root, { health: { silentMs: 0 } });
+	const disabled = loadConfig({ cwd: root, secretLog: () => undefined, secretWarn: () => undefined });
+	check("health.silentMs = 0 disables the dead rule", disabled.config.health.silentMs === 0, disabled.config.health);
+
+	const filled = validateHealthConfig(undefined);
+	const nulled = validateHealthConfig(null);
+	check(
+		"a missing or null block falls back to the default",
+		filled.silentMs === 7_200_000 && nulled.silentMs === 7_200_000,
+		{ filled, nulled },
+	);
+	for (const value of [-1, 1.5, Number.POSITIVE_INFINITY, Number.NaN, "300000"]) {
+		let message = "";
+		try {
+			validateHealthConfig({ silentMs: value });
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		check(`health.silentMs=${String(value)} is rejected`, message.startsWith("health.silentMs"), message || "accepted");
+	}
+	let objectMessage = "";
+	try {
+		validateHealthConfig("nope");
+	} catch (error) {
+		objectMessage = error instanceof Error ? error.message : String(error);
+	}
+	check("a non-object health block is rejected", objectMessage.startsWith("health must be an object"), objectMessage || "accepted");
+	fs.rmSync(root, { recursive: true, force: true });
+}
 
 // ---------------------------------------------------------------------------
 section("loop.emptyWakeBackoff: defaults, validation and safe fallbacks (#116)");

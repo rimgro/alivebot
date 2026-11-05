@@ -15,12 +15,15 @@ import * as path from "node:path";
 import { main } from "../cli.js";
 import {
 	HEARTBEAT_FILE,
+	detectUnitStatus,
 	heartbeatPath,
 	readHeartbeat,
 	harnessIdentity,
 	readHeartbeatStatus,
 	recordHeartbeat,
 	refreshHeartbeat,
+	resetUnitStatusCache,
+	systemdUnitName,
 	writeHeartbeat,
 } from "../heartbeat.js";
 
@@ -72,6 +75,7 @@ try {
 	{
 		const stateDir = path.join(root, "shape", ".alive");
 		const startedAt = Date.UTC(2026, 0, 2, 3, 4, 5);
+		const writtenAt = startedAt + 20_000;
 		const written = recordHeartbeat({
 			stateDir,
 			pid: 4242,
@@ -80,6 +84,9 @@ try {
 			buildId: "test-build-1",
 			tag: "v9.9.9",
 			ref: "feature/heartbeat",
+			lastTickAt: startedAt,
+			unitStatus: "active",
+			now: writtenAt,
 		});
 		check("recordHeartbeat returns what it wrote", written?.pid === 4242 && written.version === "9.9.9", written);
 
@@ -88,10 +95,15 @@ try {
 
 		const raw = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
 		check(
-			"the JSON shape is exactly pid, startedAt, version, buildId, tag, ref",
-			JSON.stringify(Object.keys(raw).sort()) === JSON.stringify(["buildId", "pid", "ref", "startedAt", "tag", "version"]),
+			"the JSON shape keeps the old fields and adds the #175 observability fields",
+			JSON.stringify(Object.keys(raw).sort()) ===
+				JSON.stringify(["buildId", "lastTickAt", "pid", "ref", "staleSeconds", "startedAt", "tag", "unitStatus", "updatedAt", "version"]),
 			raw,
 		);
+		check("updatedAt records the last update", raw.updatedAt === new Date(writtenAt).toISOString(), raw.updatedAt);
+		check("lastTickAt is recorded as ISO", raw.lastTickAt === new Date(startedAt).toISOString(), raw.lastTickAt);
+		check("staleSeconds is the whole number of seconds since the tick", raw.staleSeconds === 20, raw.staleSeconds);
+		check("unitStatus is recorded", raw.unitStatus === "active", raw.unitStatus);
 		check("pid is a number", raw.pid === 4242);
 		check("startedAt is an ISO timestamp", raw.startedAt === new Date(startedAt).toISOString(), raw.startedAt);
 		check("version is recorded", raw.version === "9.9.9");
@@ -209,6 +221,135 @@ try {
 		const missing = readHeartbeatStatus(stateDir, 300_000);
 		check("a missing file is missing", missing.state === "missing" && missing.fresh === false, missing);
 		check("a missing file has no age and no contents", missing.ageMs === undefined && missing.heartbeat === undefined);
+	}
+
+	// -------------------------------------------------------------------------
+	section("new observability fields: old files, growth and identity preservation (#175)");
+	{
+		const legacyDir = path.join(root, "legacy", ".alive");
+		fs.mkdirSync(legacyDir, { recursive: true });
+		const legacyStart = new Date(Date.now() - 120_000).toISOString();
+		fs.writeFileSync(
+			heartbeatPath(legacyDir),
+			`${JSON.stringify({ pid: 55, startedAt: legacyStart, version: "0.0.1", buildId: "legacy-build" })}\n`,
+			"utf8",
+		);
+		const legacy = readHeartbeat(legacyDir);
+		check(
+			"an old heartbeat without the new fields still reads",
+			legacy !== undefined && legacy.pid === 55 && legacy.startedAt === legacyStart && legacy.buildId === "legacy-build",
+			legacy,
+		);
+		check(
+			"the new fields stay undefined on an old file",
+			legacy !== undefined &&
+				legacy.updatedAt === undefined &&
+				legacy.lastTickAt === undefined &&
+				legacy.staleSeconds === undefined &&
+				legacy.unitStatus === undefined,
+			legacy,
+		);
+		const legacyStatus = readHeartbeatStatus(legacyDir, 300_000);
+		check(
+			"readHeartbeatStatus does not invent staleSeconds/unitStatus for an old file",
+			legacyStatus.staleSeconds === undefined && legacyStatus.unitStatus === undefined,
+			legacyStatus,
+		);
+
+		const growthDir = path.join(root, "growth", ".alive");
+		const tick = Date.now() - 7_000;
+		const firstWrite = Date.now();
+		recordHeartbeat({
+			stateDir: growthDir,
+			pid: 6161,
+			startedAt: tick - 30_000,
+			version: "2.0.0",
+			buildId: "growth-build",
+			tag: "v2.0.0",
+			ref: "feature/growth",
+			lastTickAt: tick,
+			now: firstWrite,
+		});
+		const first = readHeartbeat(growthDir)!;
+		check("staleSeconds is non-zero after the tick", (first.staleSeconds ?? 0) >= 7, first);
+		check("the first update carries updatedAt", typeof first.updatedAt === "string" && first.updatedAt.length > 0, first.updatedAt);
+
+		const nextWrite = firstWrite + 5_000;
+		check(
+			"refreshHeartbeat rewrites the record",
+			refreshHeartbeat(growthDir, undefined, nextWrite, { lastTickAt: tick, unitStatus: "inactive" }) === true,
+		);
+		const second = readHeartbeat(growthDir)!;
+		check("staleSeconds grows with the next update", (second.staleSeconds ?? 0) >= (first.staleSeconds ?? 0) + 5, {
+			first: first.staleSeconds,
+			second: second.staleSeconds,
+		});
+		check("updatedAt moves with the next update", second.updatedAt === new Date(nextWrite).toISOString(), second.updatedAt);
+		check(
+			"the refresh preserves pid/startedAt/version/buildId/tag/ref",
+			second.pid === 6161 &&
+				second.startedAt === first.startedAt &&
+				second.version === "2.0.0" &&
+				second.buildId === "growth-build" &&
+				second.tag === "v2.0.0" &&
+				second.ref === "feature/growth",
+			second,
+		);
+		check("the refresh records unitStatus", second.unitStatus === "inactive", second.unitStatus);
+		const growthStatus = readHeartbeatStatus(growthDir, 300_000);
+		check(
+			"readHeartbeatStatus exposes the new fields when they exist",
+			growthStatus.staleSeconds === second.staleSeconds && growthStatus.unitStatus === "inactive" && growthStatus.state === "fresh",
+			growthStatus,
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	section("systemd unit status: best effort, cached and bounded (#175)");
+	{
+		check("the unit name follows the managed profile id", systemdUnitName("developer") === "alive-agent@developer");
+		check(
+			"no systemctl on PATH reads as none",
+			detectUnitStatus("no-systemctl", { now: 1, envPath: path.join(root, "definitely-empty-bin") }) === "none",
+		);
+
+		const binDir = path.join(root, "fake-systemctl-bin");
+		fs.mkdirSync(binDir, { recursive: true });
+		const fake = path.join(binDir, "systemctl");
+		fs.writeFileSync(
+			fake,
+			[
+				"#!/bin/sh",
+				'if [ "$1" = "is-active" ]; then',
+				'  printf "%s\\n" "${FAKE_UNIT_STATUS:-active}"',
+				'  exit "${FAKE_UNIT_EXIT:-0}"',
+				"fi",
+				"exit 1",
+				"",
+			].join("\n"),
+		);
+		fs.chmodSync(fake, 0o755);
+		const originalPath = process.env.PATH;
+		process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ""}`;
+		try {
+			resetUnitStatusCache();
+			process.env.FAKE_UNIT_STATUS = "inactive";
+			check("the fake systemctl answer is read", detectUnitStatus("cache-test", { now: 1_000 }) === "inactive");
+			process.env.FAKE_UNIT_STATUS = "active";
+			check("a second query inside 30 s uses the cache", detectUnitStatus("cache-test", { now: 20_000 }) === "inactive");
+			check("after 30 s the answer is refreshed", detectUnitStatus("cache-test", { now: 31_001 }) === "active");
+			process.env.FAKE_UNIT_STATUS = "banana";
+			check("an unknown answer is reported as unknown", detectUnitStatus("odd-answer", { now: 1 }) === "unknown");
+			process.env.FAKE_UNIT_STATUS = "failed";
+			process.env.FAKE_UNIT_EXIT = "3";
+			check("a failing systemctl still reports its printed state", detectUnitStatus("failed-unit", { now: 1 }) === "failed");
+		} finally {
+			delete process.env.FAKE_UNIT_STATUS;
+			delete process.env.FAKE_UNIT_EXIT;
+			process.env.PATH = originalPath;
+			resetUnitStatusCache();
+			fs.rmSync(binDir, { recursive: true, force: true });
+		}
 	}
 
 	// -------------------------------------------------------------------------

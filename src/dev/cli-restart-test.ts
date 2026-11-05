@@ -23,6 +23,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { main, type ServiceControl } from "../cli.js";
 import { loadConfig } from "../config.js";
+import { writeHeartbeat } from "../heartbeat.js";
 import { Logger } from "../log.js";
 import { AliveRuntime } from "../runtime/loop.js";
 import { readRuntimeState, writeRuntimeState } from "../store/runs.js";
@@ -304,6 +305,89 @@ try {
 			check(`${label}: exactly one warning line`, occurrences === 1, result.err);
 		}
 	}
+	// -------------------------------------------------------------------------
+	section("alive status reports dead and running health (#175)");
+	{
+		const healthProject = fs.mkdtempSync(path.join(os.tmpdir(), "alive-cli-health-"));
+		const healthConfig = path.join(healthProject, "alive.config.json");
+		fs.writeFileSync(healthConfig, JSON.stringify({ name: "Health", health: { silentMs: 600_000 } }), "utf8");
+		const healthStateDir = path.join(healthProject, ".alive");
+		const statusJson = async (): Promise<{ code: number; payload: Record<string, unknown> }> => {
+			const out: string[] = [];
+			const stdoutWrite = process.stdout.write;
+			const stderrWrite = process.stderr.write;
+			process.stdout.write = ((chunk: unknown) => { out.push(String(chunk)); return true; }) as typeof process.stdout.write;
+			process.stderr.write = (() => true) as typeof process.stderr.write;
+			let code = -1;
+			try {
+				code = await main(["status", "--json", "--config", healthConfig]);
+			} finally {
+				process.stdout.write = stdoutWrite;
+				process.stderr.write = stderrWrite;
+			}
+			return { code, payload: JSON.parse(out.join("")) as Record<string, unknown> };
+		};
+
+		const now = Date.now();
+		writeRuntimeState(healthStateDir, {
+			pid: 999_999_999,
+			startedAt: now - 60_000,
+			lastTickAt: now - 30_000,
+			status: "working",
+			runIndex: 1,
+			pending: 0,
+			openThreads: 0,
+			sleeps: 0,
+		});
+		writeHeartbeat({
+			stateDir: healthStateDir,
+			pid: 999_999_999,
+			startedAt: now - 60_000,
+			lastTickAt: now - 30_000,
+			unitStatus: "inactive",
+		});
+		const dead = await statusJson();
+		const deadHealth = dead.payload.health as Record<string, unknown> | undefined;
+		check("a dead pid is reported as health.state=dead", dead.code === 0 && deadHealth?.state === "dead", deadHealth);
+		check(
+			"the dead reason names the process, heartbeat and unit",
+			typeof deadHealth?.reason === "string" &&
+				deadHealth.reason.includes("process is not running") &&
+				deadHealth.reason.includes("heartbeat") &&
+				deadHealth.reason.includes("unit inactive"),
+			deadHealth?.reason,
+		);
+		check(
+			"the health block carries heartbeat age, silentMs and unitStatus",
+			typeof deadHealth?.heartbeatAgeMs === "number" &&
+				deadHealth.silentMs === 600_000 &&
+				deadHealth.unitStatus === "inactive",
+			deadHealth,
+		);
+		check(
+			"the existing runtime/staleRuntime fields are unchanged",
+			dead.payload.runtime === null && (dead.payload.staleRuntime as { pid?: number } | null)?.pid === 999_999_999,
+			{ runtime: dead.payload.runtime, staleRuntime: dead.payload.staleRuntime },
+		);
+
+		writeRuntimeState(healthStateDir, {
+			pid: process.pid,
+			startedAt: now - 60_000,
+			lastTickAt: now,
+			status: "idle",
+			runIndex: 1,
+			pending: 0,
+			openThreads: 0,
+			sleeps: 0,
+		});
+		writeHeartbeat({ stateDir: healthStateDir, pid: process.pid, startedAt: now - 60_000, lastTickAt: now });
+		const running = await statusJson();
+		const runningHealth = running.payload.health as Record<string, unknown> | undefined;
+		check("a live pid with a fresh heartbeat is health.state=running", runningHealth?.state === "running", runningHealth);
+		check("a running health block has no dead reason", runningHealth?.reason === undefined, runningHealth);
+		fs.rmSync(healthProject, { recursive: true, force: true });
+	}
+
 	// -------------------------------------------------------------------------
 	section("a failed runtime boot is loud and exits non-zero (#173)");
 	{
