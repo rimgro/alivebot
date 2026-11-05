@@ -450,6 +450,12 @@ export function isInsideUpdateWindow(window: string, now: Date): boolean {
  * the agent is idle. Returns a human-readable reason, or undefined when idle.
  */
 export function autoBusyReason(probe: AutoUpdateContext): string | undefined {
+	// A stalled run outlives its heartbeat (#173): the heartbeat is refreshed by
+	// the same loop that stopped ticking, so the age check below would call a
+	// frozen run idle. The stall is decided before it, on runtime.json alone.
+	if (probe.runtimeStatus === "stalled") {
+		return `runtime reports a stalled run; refusing to update while run ${probe.runtimeRunId ?? "(unknown)"} is open`;
+	}
 	const age = probe.heartbeatAgeMs;
 	if (age === undefined || age > AUTO_BUSY_HEARTBEAT_MS) return undefined;
 	const rounded = `${Math.max(0, Math.round(age / 1000))}s`;
