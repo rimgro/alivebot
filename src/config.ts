@@ -735,6 +735,87 @@ export interface ToolsConfig {
 	bash: boolean;
 	/** Unified allowlist for built-in, Alive, module, and custom tools. */
 	allowlist: string[];
+	/**
+	 * Compact tool catalog (#69). When true, only `compactKeep` (plus the two
+	 * dispatchers) is active and full schemas/calls go through find_tool/use_tool.
+	 * Off by default: the prompt and the active tool set are unchanged.
+	 */
+	compactCatalog?: boolean;
+	/** Tools that stay active in compact mode. Undefined = DEFAULT_COMPACT_KEEP_TOOLS. */
+	compactKeep?: string[];
+}
+
+/**
+ * Tools that stay directly callable when the compact catalog is on.
+ *
+ * The list is a starting point, not a promise: `compactActiveTools` filters it
+ * through the effective allowlist, so a name the profile cannot use is simply
+ * dropped. `file`/`sandbox_control` matter only for isolated profiles; `worker`
+ * stays hidden on purpose (its schema is large) and is reachable via use_tool.
+ */
+export const DEFAULT_COMPACT_KEEP_TOOLS: readonly string[] = [
+	"read",
+	"write",
+	"edit",
+	"bash",
+	"grep",
+	"find",
+	"ls",
+	"send_message",
+	"idle",
+	"sleep",
+	"note",
+	"memory",
+	"retain",
+	"journal",
+	"find_tool",
+	"use_tool",
+	"sandbox_control",
+	"file",
+];
+
+/** The two dispatchers of the compact catalog. */
+export const COMPACT_DISPATCHER_TOOLS: readonly string[] = ["find_tool", "use_tool"];
+
+/**
+ * Normalize the optional compact-catalog fields.
+ *
+ * Configs written before #69 have neither field; `deepMerge` with
+ * DEFAULT_CONFIG supplies the defaults, so absence is never an error. A field
+ * that is present but malformed is rejected the same way other typed config
+ * blocks are, instead of silently changing the tool surface.
+ */
+export function validateToolsConfig(value: unknown): ToolsConfig {
+	if (value === undefined || value === null) throw new Error("tools must be an object");
+	if (typeof value !== "object" || Array.isArray(value)) throw new Error("tools must be an object");
+	const raw = value as Partial<ToolsConfig>;
+	const compactCatalog = raw.compactCatalog === undefined || raw.compactCatalog === null ? false : raw.compactCatalog;
+	if (typeof compactCatalog !== "boolean") {
+		throw new Error(`tools.compactCatalog must be a boolean, got "${String(compactCatalog)}"`);
+	}
+	const normalized: ToolsConfig = {
+		builtin: Array.isArray(raw.builtin) ? raw.builtin : [...DEFAULT_CONFIG.tools.builtin],
+		bash: typeof raw.bash === "boolean" ? raw.bash : DEFAULT_CONFIG.tools.bash,
+		allowlist: Array.isArray(raw.allowlist) ? raw.allowlist : [...DEFAULT_CONFIG.tools.allowlist],
+		compactCatalog,
+	};
+	if (raw.compactKeep !== undefined && raw.compactKeep !== null) {
+		if (!Array.isArray(raw.compactKeep)) throw new Error("tools.compactKeep must be an array of tool names");
+		const keep: string[] = [];
+		for (const entry of raw.compactKeep) {
+			if (typeof entry !== "string" || !entry.trim()) throw new Error("tools.compactKeep must contain non-empty tool names");
+			const name = entry.trim();
+			if (!keep.includes(name)) keep.push(name);
+		}
+		normalized.compactKeep = keep;
+	}
+	return normalized;
+}
+
+/** Make sure the compact dispatchers are allowed when the mode is on. */
+export function ensureCompactCatalogTools(allowlist: string[], compactCatalog: boolean): string[] {
+	if (!compactCatalog) return allowlist;
+	return [...new Set([...allowlist, ...COMPACT_DISPATCHER_TOOLS])];
 }
 
 /** Per-action authority to manage other persistent agents. Targets are explicit ids; '*' grants all current and future ids. */
@@ -910,6 +991,10 @@ export const DEFAULT_CONFIG: AliveConfig = {
 			"send_message", "message_agent", "idle", "sleep", "notifications", "remind", "list_reminders", "cancel_reminder",
 			"note", "retain", "memory", "journal", "history", "close_thread", "status", "dashboard",
 		],
+		// Compact catalog is opt-in (#69): the default prompt and active tool set
+		// stay exactly as they were before the feature existed.
+		compactCatalog: false,
+		compactKeep: [...DEFAULT_COMPACT_KEEP_TOOLS],
 	},
 	memory: {
 		enabled: true,
@@ -1192,12 +1277,18 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	// A custom/local allowlist can replace the inherited one wholesale. The
 	// context-reset path needs sleep+retain+journal, so put them back and warn once.
 	const tools = ensureContextTools(merged.tools?.allowlist);
-	merged.tools = { ...merged.tools, allowlist: tools.allowlist };
+	merged.tools = validateToolsConfig({ ...merged.tools, allowlist: tools.allowlist });
 	if (tools.added.length > 0) {
 		options.configWarn?.(
 			`warning: tools.allowlist is missing ${tools.added.join(", ")}; added back because the runtime needs them to reset context and preserve memory (#170)`,
 		);
 	}
+	// The compact catalog is unusable without its two dispatchers, so enabling
+	// the mode also grants them. The mode itself stays opt-in.
+	merged.tools = {
+		...merged.tools,
+		allowlist: ensureCompactCatalogTools(merged.tools.allowlist, merged.tools.compactCatalog === true),
+	};
 	merged.sandbox = validateSandboxConfig(merged.sandbox);
 	merged.workers = validateWorkersConfig(merged.workers);
 	merged.updates = validateUpdatesConfig(merged.updates);
