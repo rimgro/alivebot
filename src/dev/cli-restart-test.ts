@@ -386,6 +386,65 @@ try {
 		check("a live pid with a fresh heartbeat is health.state=running", runningHealth?.state === "running", runningHealth);
 		check("a running health block has no dead reason", runningHealth?.reason === undefined, runningHealth);
 		fs.rmSync(healthProject, { recursive: true, force: true });
+
+		// #190: a profile that never started is sleeping, not dead. Nothing was
+		// written into its state dir, so there is no trace of a launch.
+		const freshProject = fs.mkdtempSync(path.join(os.tmpdir(), "alive-cli-never-started-"));
+		const freshConfig = path.join(freshProject, "alive.config.json");
+		fs.writeFileSync(freshConfig, JSON.stringify({ name: "Fresh", health: { silentMs: 600_000 } }), "utf8");
+		const statusText = async (): Promise<string> => {
+			const out: string[] = [];
+			const stdoutWrite = process.stdout.write;
+			const stderrWrite = process.stderr.write;
+			process.stdout.write = ((chunk: unknown) => { out.push(String(chunk)); return true; }) as typeof process.stdout.write;
+			process.stderr.write = (() => true) as typeof process.stderr.write;
+			try {
+				await main(["status", "--config", freshConfig]);
+			} finally {
+				process.stdout.write = stdoutWrite;
+				process.stderr.write = stderrWrite;
+			}
+			return out.join("");
+		};
+		const freshJson = async (): Promise<Record<string, unknown> | undefined> => {
+			const out: string[] = [];
+			const stdoutWrite = process.stdout.write;
+			const stderrWrite = process.stderr.write;
+			process.stdout.write = ((chunk: unknown) => { out.push(String(chunk)); return true; }) as typeof process.stdout.write;
+			process.stderr.write = (() => true) as typeof process.stderr.write;
+			try {
+				await main(["status", "--json", "--config", freshConfig]);
+			} finally {
+				process.stdout.write = stdoutWrite;
+				process.stderr.write = stderrWrite;
+			}
+			return JSON.parse(out.join("")).health as Record<string, unknown> | undefined;
+		};
+		const neverStartedText = await statusText();
+		check(
+			"`alive status` prints sleeping (never started) for an untouched profile (#190)",
+			neverStartedText.includes("sleeping (never started)") && !neverStartedText.includes("not running") && !neverStartedText.includes("dead"),
+			neverStartedText,
+		);
+		const neverStartedHealth = await freshJson();
+		check(
+			"the JSON health block says stopped + neverStarted (#190)",
+			neverStartedHealth?.state === "stopped" &&
+				neverStartedHealth.neverStarted === true &&
+				neverStartedHealth.reason === undefined,
+			neverStartedHealth,
+		);
+		// One trace of a launch brings the no-runtime dead rule back.
+		fs.mkdirSync(path.join(freshProject, ".alive"), { recursive: true });
+		fs.writeFileSync(path.join(freshProject, ".alive", "usage.json"), JSON.stringify({ days: {} }), "utf8");
+		const startedText = await statusText();
+		const startedHealth = await freshJson();
+		check(
+			"`alive status` reports dead again once the profile has launched before (#190)",
+			startedText.includes("dead") && startedHealth?.state === "dead" && startedHealth.neverStarted === undefined,
+			{ text: startedText, health: startedHealth },
+		);
+		fs.rmSync(freshProject, { recursive: true, force: true });
 	}
 
 	// -------------------------------------------------------------------------
