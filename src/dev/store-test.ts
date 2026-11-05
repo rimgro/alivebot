@@ -368,6 +368,26 @@ section("run log: who stopped the run (#168)");
 			log.list(10).find((record) => record.id === "run_legacy_shape")?.usageUnsettled === undefined,
 		log.list(10).map((record) => [record.id, record.usageUnsettled]),
 	);
+	log.record({
+		...base,
+		id: "run_context_reset",
+		index: 4,
+		stopReason: "slept",
+		contextReset: { reason: "hard", tokens: 260_000, limitTokens: 250_000 },
+	});
+	const storedReset = log.list(10).find((record) => record.id === "run_context_reset");
+	check(
+		"contextReset round-trips additively through runs.jsonl (#170)",
+		storedReset?.contextReset?.reason === "hard" &&
+			storedReset.contextReset.tokens === 260_000 &&
+			storedReset.contextReset.limitTokens === 250_000,
+		storedReset?.contextReset,
+	);
+	check(
+		"old records without contextReset stay readable",
+		log.list(10).find((record) => record.id === "run_legacy_shape")?.contextReset === undefined,
+		log.list(10).find((record) => record.id === "run_legacy_shape"),
+	);
 	fs.rmSync(stoppedByRoot, { recursive: true, force: true });
 }
 

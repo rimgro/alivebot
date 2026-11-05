@@ -648,6 +648,7 @@ export class AliveRuntime {
 			sleeps: this.sleepCount,
 			emptyWakes: this.wake?.consecutiveEmptyWakes ?? 0,
 			lastCompaction: this.lastCompactionRecord(),
+			contextTokens: this.currentContextTokens(),
 			mode: process.env.ALIVE_DAEMON === "1" ? "background" : "foreground",
 		};
 		writeRuntimeState(this.config.paths.stateDir, state);
@@ -656,6 +657,16 @@ export class AliveRuntime {
 	private sessionModel(): string | undefined {
 		const model = this.runner?.currentSession?.model;
 		return model ? `${model.provider}/${model.id}` : undefined;
+	}
+
+	/** Current context (prompt) size, the same estimate the context guards use (#170). */
+	private currentContextTokens(): number | undefined {
+		try {
+			const tokens = this.runner?.currentSession?.getSessionStats().contextUsage?.tokens;
+			return typeof tokens === "number" && Number.isFinite(tokens) && tokens > 0 ? Math.round(tokens) : undefined;
+		} catch {
+			return undefined;
+		}
 	}
 
 	/** Latest compaction outcome: live monitor first, otherwise the last run record. */
@@ -718,6 +729,10 @@ export class AliveRuntime {
 			tokensToday: { input: usage.input, output: usage.output },
 			lastRun: lastRun ? { ...lastRun, summary: describeRunRecord(lastRun) } : undefined,
 			lastCompaction: this.lastCompactionRecord(),
+			contextTokens: this.currentContextTokens(),
+			cacheReadPerTurn: lastRun && runTurnCount(lastRun) > 0
+				? (lastRun.usage?.cacheRead ?? 0) / runTurnCount(lastRun)
+				: undefined,
 			model: this.sessionModel(),
 			sessionFile: this.runner?.currentSession?.sessionFile ?? this.pendingResume?.sessionFile ?? this.resumeSessionFile,
 			history: this.history.stats(),

@@ -106,6 +106,28 @@ export interface LoopConfig {
 	 * Default 50 000 tokens.
 	 */
 	contextWarnStepTokens: number;
+	/**
+	 * Context-size soft sleep threshold (#170). When the estimated context crosses
+	 * this many tokens the agent gets a directive, not a hint: finish the current
+	 * step and go to `sleep` now; sleep keeps memory through summary.md/journal.
+	 * If the agent does not sleep within `contextSleepGraceTurns`, the runtime
+	 * forces a sleep at the next step boundary. 0 = disabled. Default 150 000
+	 * (the same default as `contextWarnTokens`).
+	 */
+	contextSleepTokens: number;
+	/**
+	 * How many completed turns after the first crossing of `contextSleepTokens` are
+	 * allowed before the runtime forces a sleep (0 = force on that same step
+	 * boundary). The grace lets the agent finish the step and retain facts.
+	 * Default 3.
+	 */
+	contextSleepGraceTurns: number;
+	/**
+	 * Hard context ceiling (#170). Crossing it forces a sleep at the step boundary
+	 * immediately, with no grace. The run ends as `slept` and the next run starts
+	 * with a fresh empty context. 0 = disabled. Default 250 000.
+	 */
+	contextHardTokens: number;
 	/** Max events returned by one `idle` call. The rest are delivered on the next idle. */
 	maxEventsPerIdle: number;
 	/** How many times an unanswered user message is carried over before we stop nudging. */
@@ -132,6 +154,28 @@ export interface LoopConfig {
 	resumeWindowMs: number;
 	/** Stretch the idle-wake interval while nothing happens (see `EmptyWakeBackoffConfig`). */
 	emptyWakeBackoff: EmptyWakeBackoffConfig;
+}
+
+/**
+ * Per-profile context policy (#170). Every field is optional: an omitted field
+ * falls back to the corresponding `loop.context*` value, so a profile can move
+ * only the threshold it cares about. `hardTokens` must not be below the
+ * effective soft threshold.
+ */
+export interface ProfileContextConfig {
+	/** Soft sleep threshold in context tokens; 0 disables the soft path. */
+	sleepTokens?: number;
+	/** Turns allowed after the first soft crossing before sleep is forced; 0 = immediately. */
+	sleepGraceTurns?: number;
+	/** Hard context ceiling; crossing it forces a sleep at the next step boundary. */
+	hardTokens?: number;
+}
+
+/** The effective context-sleep policy after applying the profile override. */
+export interface EffectiveContextPolicy {
+	sleepTokens: number;
+	sleepGraceTurns: number;
+	hardTokens: number;
 }
 
 /**
@@ -183,6 +227,22 @@ export const DEFAULT_LOOP_RUN_VERY_LONG_MS = 3 * 60 * 60_000;
 export const DEFAULT_LOOP_CONTEXT_WARN_TOKENS = 150_000;
 export const DEFAULT_LOOP_CONTEXT_WARN_STEP_TOKENS = 50_000;
 
+/**
+ * Context-sleep defaults (#170): the soft threshold mirrors the historical warn
+ * default (150k), the hard ceiling is 250k, and 3 turns of grace let the agent
+ * finish its step and write a summary/journal before the forced reset.
+ */
+export const DEFAULT_LOOP_CONTEXT_SLEEP_TOKENS = DEFAULT_LOOP_CONTEXT_WARN_TOKENS;
+export const DEFAULT_LOOP_CONTEXT_SLEEP_GRACE_TURNS = 3;
+export const DEFAULT_LOOP_CONTEXT_HARD_TOKENS = 250_000;
+
+/**
+ * Tools that every profile must be able to call for context management (#170).
+ * A local `tools.allowlist` replaces the inherited list wholesale, so a profile
+ * that lost `sleep`/`retain`/`journal` could grow its context forever.
+ */
+export const CONTEXT_REQUIRED_TOOLS = ["sleep", "retain", "journal"] as const;
+
 /** Graceful-shutdown and resume defaults (#124). */
 export const DEFAULT_LOOP_SHUTDOWN_GRACE_MS = 30_000;
 export const DEFAULT_LOOP_RESUME_WINDOW_MS = 10 * 60_000;
@@ -233,6 +293,23 @@ export function validateLoopConfig(value: LoopConfig): LoopConfig {
 			"loop.contextWarnStepTokens must be > 0 when loop.contextWarnTokens is enabled (set contextWarnTokens = 0 to disable the hint)",
 		);
 	}
+	const contextSleepTokens = runHealthMs(
+		value.contextSleepTokens,
+		"contextSleepTokens",
+		DEFAULT_LOOP_CONTEXT_SLEEP_TOKENS,
+	);
+	const contextSleepGraceTurns = runHealthMs(
+		value.contextSleepGraceTurns,
+		"contextSleepGraceTurns",
+		DEFAULT_LOOP_CONTEXT_SLEEP_GRACE_TURNS,
+	);
+	const contextHardTokens = runHealthMs(value.contextHardTokens, "contextHardTokens", DEFAULT_LOOP_CONTEXT_HARD_TOKENS);
+	if (contextSleepTokens > 0 && contextHardTokens > 0 && contextHardTokens < contextSleepTokens) {
+		throw new Error(
+			"loop.contextHardTokens must be >= loop.contextSleepTokens when both are enabled " +
+				"(set either to 0 to disable that threshold)",
+		);
+	}
 	return {
 		...value,
 		runTimeoutMs: runHealthMs(value.runTimeoutMs, "runTimeoutMs", DEFAULT_LOOP_RUN_TIMEOUT_MS),
@@ -241,6 +318,9 @@ export function validateLoopConfig(value: LoopConfig): LoopConfig {
 		runVeryLongMs: runHealthMs(value.runVeryLongMs, "runVeryLongMs", DEFAULT_LOOP_RUN_VERY_LONG_MS),
 		contextWarnTokens,
 		contextWarnStepTokens,
+		contextSleepTokens,
+		contextSleepGraceTurns,
+		contextHardTokens,
 		shutdownGraceMs: runHealthMs(value.shutdownGraceMs, "shutdownGraceMs", DEFAULT_LOOP_SHUTDOWN_GRACE_MS),
 		resumeWindowMs: runHealthMs(value.resumeWindowMs, "resumeWindowMs", DEFAULT_LOOP_RESUME_WINDOW_MS),
 		emptyWakeBackoff: {
@@ -262,6 +342,69 @@ function runHealthMs(value: unknown, key: string, fallback: number): number {
 		throw new Error(`loop.${key} must be a whole number >= 0 (0 disables it), got "${String(value)}"`);
 	}
 	return value;
+}
+
+/** Validate one optional context-policy scalar: a whole number >= 0, or omitted. */
+function contextScalar(value: unknown, key: string): number | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+		throw new Error(`context.${key} must be a whole number >= 0 (0 disables it), got "${String(value)}"`);
+	}
+	return value;
+}
+
+/**
+ * Validate the optional per-profile `context` block (#170).
+ *
+ * The same rules as the loop keys apply (whole number >= 0, 0 = disabled).
+ * Cross-field validation uses the *effective* values, so overriding only
+ * `hardTokens` below the inherited soft threshold is rejected instead of
+ * producing a policy that can never reach its hard ceiling.
+ */
+export function validateProfileContextConfig(value: unknown, loop: LoopConfig): ProfileContextConfig | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (typeof value !== "object" || Array.isArray(value)) throw new Error("context must be an object");
+	const raw = value as Record<string, unknown>;
+	const sleepTokens = contextScalar(raw.sleepTokens, "sleepTokens");
+	const sleepGraceTurns = contextScalar(raw.sleepGraceTurns, "sleepGraceTurns");
+	const hardTokens = contextScalar(raw.hardTokens, "hardTokens");
+	const effectiveSleep = sleepTokens ?? loop.contextSleepTokens;
+	const effectiveHard = hardTokens ?? loop.contextHardTokens;
+	if (effectiveSleep > 0 && effectiveHard > 0 && effectiveHard < effectiveSleep) {
+		throw new Error(
+			"context.hardTokens must be >= the effective soft threshold (context.sleepTokens or loop.contextSleepTokens) " +
+				"when both are enabled",
+		);
+	}
+	return {
+		...(sleepTokens !== undefined ? { sleepTokens } : {}),
+		...(sleepGraceTurns !== undefined ? { sleepGraceTurns } : {}),
+		...(hardTokens !== undefined ? { hardTokens } : {}),
+	};
+}
+
+/** Effective context-sleep policy: profile `context` block over `loop.context*`. */
+export function resolveContextPolicy(config: AliveConfig): EffectiveContextPolicy {
+	return {
+		sleepTokens: config.context?.sleepTokens ?? config.loop.contextSleepTokens,
+		sleepGraceTurns: config.context?.sleepGraceTurns ?? config.loop.contextSleepGraceTurns,
+		hardTokens: config.context?.hardTokens ?? config.loop.contextHardTokens,
+	};
+}
+
+/**
+ * Make sure the effective tool allowlist can manage context (#170).
+ *
+ * `sleep` resets the context, `retain` preserves facts across the reset, and
+ * `journal` is how the runtime records why a reset was forced. A custom
+ * allowlist (especially a local override) replaces the inherited one wholesale,
+ * so silently dropping these tools would leave the agent unable to sleep.
+ * Returns a new list; the caller decides whether/where to warn.
+ */
+export function ensureContextTools(allowlist: unknown): { allowlist: string[]; added: string[] } {
+	const list = Array.isArray(allowlist) ? [...(allowlist as string[])] : [];
+	const added = CONTEXT_REQUIRED_TOOLS.filter((tool) => !list.includes(tool));
+	return { allowlist: added.length > 0 ? [...list, ...added] : list, added };
 }
 
 export interface BudgetConfig {
@@ -633,6 +776,8 @@ export interface AliveConfig {
 	sandbox: SandboxConfig;
 	memory: MemoryConfig;
 	loop: LoopConfig;
+	/** Optional per-profile override of the loop's context-sleep thresholds (#170). */
+	context?: ProfileContextConfig;
 	budget: BudgetConfig;
 	/** Harness updates: off by default, including the restart watchdog. */
 	updates: UpdatesConfig;
@@ -735,6 +880,9 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		runVeryLongMs: DEFAULT_LOOP_RUN_VERY_LONG_MS,
 		contextWarnTokens: DEFAULT_LOOP_CONTEXT_WARN_TOKENS,
 		contextWarnStepTokens: DEFAULT_LOOP_CONTEXT_WARN_STEP_TOKENS,
+		contextSleepTokens: DEFAULT_LOOP_CONTEXT_SLEEP_TOKENS,
+		contextSleepGraceTurns: DEFAULT_LOOP_CONTEXT_SLEEP_GRACE_TURNS,
+		contextHardTokens: DEFAULT_LOOP_CONTEXT_HARD_TOKENS,
 		shutdownGraceMs: DEFAULT_LOOP_SHUTDOWN_GRACE_MS,
 		resumeWindowMs: DEFAULT_LOOP_RESUME_WINDOW_MS,
 		maxEventsPerIdle: 8,
@@ -886,6 +1034,11 @@ export interface LoadConfigOptions {
 	secretLog?: (line: string) => void;
 	/** Warning sink for automatic migration. Defaults to stderr. */
 	secretWarn?: (line: string) => void;
+	/**
+	 * Warning sink for non-secret config normalization (for example required tools
+	 * added back to a custom allowlist, #170). Omit to stay silent.
+	 */
+	configWarn?: (line: string) => void;
 }
 
 export interface ProfileSecretDefaults {
@@ -978,6 +1131,16 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	applySecretEnv(merged, collectSecretEnv(envPath, process.env));
 	migrateLoopConfig(merged.loop as unknown as Record<string, unknown>);
 	merged.loop = validateLoopConfig(merged.loop);
+	merged.context = validateProfileContextConfig(merged.context, merged.loop);
+	// A custom/local allowlist can replace the inherited one wholesale. The
+	// context-reset path needs sleep+retain+journal, so put them back and warn once.
+	const tools = ensureContextTools(merged.tools?.allowlist);
+	merged.tools = { ...merged.tools, allowlist: tools.allowlist };
+	if (tools.added.length > 0) {
+		options.configWarn?.(
+			`warning: tools.allowlist is missing ${tools.added.join(", ")}; added back because the runtime needs them to reset context and preserve memory (#170)`,
+		);
+	}
 	merged.sandbox = validateSandboxConfig(merged.sandbox);
 	merged.workers = validateWorkersConfig(merged.workers);
 	merged.updates = validateUpdatesConfig(merged.updates);

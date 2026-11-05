@@ -36,7 +36,7 @@ import {
 	restartRefusalText,
 } from "./runtime/harness-guard.js";
 import { LOG_SOURCES, followFile, readLogTail, renderLogLine, resolveLogSource } from "./logs.js";
-import { findProfile, loadDashboard, loadRootConfig } from "./dashboard/state.js";
+import { findProfile, loadDashboard, loadRootConfig, cacheReadPerTurn, contextMetricsText } from "./dashboard/state.js";
 import { DEFAULT_USAGE_DAYS, buildUsageReport, renderUsageReport } from "./usage/report.js";
 import { WorkerStore, validateWorkerId, workerLabel } from "./workers/store.js";
 import { gitDiff, gitState, isGitRepository } from "./workers/worktree.js";
@@ -385,6 +385,7 @@ function loadForCli(
 		configPath: flagString(flags, "config"),
 		overrides,
 		migrateSecrets: options.migrateSecrets,
+		configWarn: (line) => process.stderr.write(`${line}\n`),
 	});
 }
 
@@ -902,6 +903,11 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 					...(telegramConflict ? { pollerConflict: { ...telegramConflict, state: "duplicate-poller" } } : {}),
 				}
 			: undefined;
+	const last = runs.last();
+	const cachePerTurn = last ? cacheReadPerTurn(last.usage ?? { cacheRead: 0 }, runTurnCount(last)) : null;
+	// Current context is written by the runtime into runtime.json (#170); the
+	// cacheRead/turn metric is derived from the last recorded run, never invented.
+	const contextMetric = contextMetricsText({ contextTokens: runtime?.contextTokens, cacheReadPerTurn: cachePerTurn });
 
 	if (flagBool(flags, "json")) {
 		process.stdout.write(
@@ -919,7 +925,8 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 					...(telegramReport ? { telegram: telegramReport } : {}),
 					workers: config.config.workers.enabled ? new WorkerStore(config.paths).list() : undefined,
 					usageToday: usage,
-					lastRun: runs.last(),
+					lastRun: last,
+					context: { tokens: runtime?.contextTokens, cacheReadPerTurn: cachePerTurn },
 				},
 				null,
 				2,
@@ -966,8 +973,8 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 		);
 	}
 	line("budget", `$${usage.cost.toFixed(4)} today, ${usage.runs} runs, ${usage.turns} turns`);
-	const last = runs.last();
-	line("last run", last ? `#${last.index} ${formatDuration(last.durationMs)} ${last.stopReason}` : "never");
+	line("context", contextMetric);
+	line("last run", last ? `#${last.index} ${formatDuration(last.durationMs)} ${last.stopReason}${last.contextReset ? ` (context reset: ${last.contextReset.reason})` : ""}` : "never");
 	line("workspace", config.paths.workspaceDir);
 	line("journal", config.paths.journalDir);
 	if (config.config.workers.enabled) {

@@ -38,6 +38,9 @@ import { formatDuration, localDay } from "../util.js";
 import {
 	buildCostTrend,
 	buildTimeline,
+	cacheReadPerTurn,
+	contextMetricsText,
+	formatCompactTokens,
 	COST_TREND_DAYS,
 	deriveAgentStatus,
 	estimatePromptTokens,
@@ -180,6 +183,7 @@ const runB = {
 	promptChars: 2_345,
 	usage: { input: 20, output: 4, cacheRead: 40, cacheWrite: 6, total: 70, cost: 0.02 },
 	sleep: { forced: false, summaryChars: 42 },
+	contextReset: { reason: "soft" as const, tokens: 160_000, limitTokens: 150_000 },
 };
 const runC = {
 	id: "run_c",
@@ -220,6 +224,7 @@ writeJson(path.join(stateDir, "runtime.json"), {
 	pending: 0,
 	openThreads: 0,
 	sleeps: 1,
+	contextTokens: 82_000,
 	mode: "background",
 });
 writeJson(path.join(stateDir, "reminders.json"), [
@@ -942,6 +947,40 @@ async function main(): Promise<void> {
 	check("active run is reported as current run", mainSummary.currentRun === "run #3 in progress", mainSummary.currentRun);
 	check("spend today comes from usage.json", Math.abs(mainSummary.spendTodayUsd - 0.06) < 1e-9, mainSummary.spendTodayUsd);
 	check("runs today comes from usage.json", mainSummary.runsToday === 3, mainSummary.runsToday);
+	check("the current context size comes from runtime.json (#170)", mainSummary.contextTokens === 82_000, mainSummary.contextTokens);
+	check(
+		"cacheRead per turn is derived from the active run, not invented",
+		mainSummary.cacheReadPerTurn === 50,
+		mainSummary.cacheReadPerTurn,
+	);
+	check(
+		"the status/dashboard metric line reads context 82k · cacheRead/turn 50",
+		contextMetricsText({ contextTokens: mainSummary.contextTokens, cacheReadPerTurn: mainSummary.cacheReadPerTurn }) ===
+			"context 82k · cacheRead/turn 50",
+		contextMetricsText({ contextTokens: mainSummary.contextTokens, cacheReadPerTurn: mainSummary.cacheReadPerTurn }),
+	);
+	check(
+		"compact token formatting covers plain, one-decimal and kilo values",
+		formatCompactTokens(940) === "940" && formatCompactTokens(1_500) === "1.5k" && formatCompactTokens(82_000) === "82k" && formatCompactTokens(undefined) === "—",
+		[formatCompactTokens(940), formatCompactTokens(1_500), formatCompactTokens(82_000), formatCompactTokens(undefined)],
+	);
+	check(
+		"cacheRead/turn is null without turns (no garbage)",
+		cacheReadPerTurn({ cacheRead: 74_000 }, 0) === null && Math.abs((cacheReadPerTurn({ cacheRead: 222_000 }, 3) ?? 0) - 74_000) < 1e-9,
+		[cacheReadPerTurn({ cacheRead: 74_000 }, 0), cacheReadPerTurn({ cacheRead: 222_000 }, 3)],
+	);
+	check(
+		"a forced contextReset is exposed on the run view, old records have none",
+		toRunView(runB as unknown as RunRecord).contextReset?.reason === "soft" &&
+			toRunView(runB as unknown as RunRecord).contextReset?.tokens === 160_000 &&
+			toRunView(runA as unknown as RunRecord).contextReset === undefined,
+		{ reset: toRunView(runB as unknown as RunRecord).contextReset, legacy: toRunView(runA as unknown as RunRecord).contextReset },
+	);
+	check(
+		"describeRun marks a run that ended in a context reset",
+		describeRun(runB as unknown as RunRecord).includes("context reset (soft)"),
+		describeRun(runB as unknown as RunRecord),
+	);
 	const writerSummary = readAgentSummary(writer, { now });
 	check("dead runtime -> status sleeping", writerSummary.status === "sleeping", writerSummary.status);
 	check("spend falls back to today's run records when usage.json is absent", Math.abs(writerSummary.spendTodayUsd - 0.005) < 1e-9, writerSummary.spendTodayUsd);
@@ -1235,6 +1274,17 @@ async function main(): Promise<void> {
 	const indexHtml = renderIndexPage([mainSummary, writerSummary], renderContext);
 	const agentHtml = renderAgentPage(detail, renderContext);
 	const runHtml = renderRunPage(runDetail, renderContext);
+	check(
+		"the dashboard renders the context/cacheRead metric line (#170)",
+		indexHtml.includes("context 82k · cacheRead/turn 50") && agentHtml.includes("context 82k · cacheRead/turn 50"),
+		indexHtml.match(/context[^<]*/)?.[0],
+	);
+	const resetRunHtml = renderRunPage(loadRunDetail(main, "run_b")!, renderContext);
+	check(
+		"a run with a forced contextReset is marked on its page",
+		resetRunHtml.includes("context reset</th>") && resetRunHtml.includes("soft at 160,000 tokens (limit 150,000)"),
+		resetRunHtml.match(/context reset<\/th>[^<]*/)?.[0],
+	);
 	check("agents page never renders the agent token", !indexHtml.includes(GITHUB_TOKEN));
 	check("agent page masks the fake token in an event/trigger title", !agentHtml.includes(GITHUB_TOKEN) && /\[github#\d+\]/.test(agentHtml), { hasMask: /\[github#\d+\]/.test(agentHtml), hasToken: agentHtml.includes(GITHUB_TOKEN) });
 	check("run page masks the token in the model error", !runHtml.includes(TELEGRAM_TOKEN), runHtml.includes(TELEGRAM_TOKEN));
@@ -1712,7 +1762,7 @@ async function main(): Promise<void> {
 	check("settings page shows the configured model", editorView.model === "openai/gpt-test", editorView.model);
 	check(
 		"settings page shows the tool allowlist",
-		editorView.allowlist.join(",") === "read,write,edit,bash,idle",
+		editorView.allowlist.join(",") === "read,write,edit,bash,idle,sleep,retain,journal",
 		editorView.allowlist,
 	);
 	check(

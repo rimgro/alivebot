@@ -30,7 +30,7 @@ try {
 	fs.writeFileSync(local, JSON.stringify({ modules: { telegram: { allowedChatIds: ["777"] } }, tools: { bash: false }, name: "Preserved" }));
 	setupBrowser(loadConfig({ cwd: root }), { "public-url": "https://phone.test", headless: true });
 	let loaded = loadConfig({ cwd: root });
-	assert.deepEqual(loaded.config.tools.allowlist, ["read", "status", "browser", "browser_share"]);
+	assert.deepEqual(loaded.config.tools.allowlist, ["read", "status", "sleep", "retain", "journal", "browser", "browser_share"]);
 	assert.equal(loaded.config.tools.bash, false);
 	assert.equal(loaded.config.name, "Preserved");
 	assert.equal(loaded.config.modules.browser!.headless, true);

@@ -21,6 +21,9 @@ import {
 } from "./memory.js";
 import {
 	TIMELINE_KINDS,
+	cacheReadPerTurn,
+	contextMetricsText,
+	formatCompactTokens,
 	formatCost,
 	formatRate,
 	formatTimestamp,
@@ -358,6 +361,14 @@ function renderStatus(summary: AgentSummary, masker: Masker): string {
 		(summary.statusNote ? ` <span class="sub">${masker.text(summary.statusNote)}</span>` : "");
 }
 
+/** The `context 82k · cacheRead/turn 74k` line (#170). */
+function renderContextMetric(summary: AgentSummary, masker: Masker): string {
+	return masker.text(contextMetricsText({
+		contextTokens: summary.contextTokens,
+		cacheReadPerTurn: summary.cacheReadPerTurn,
+	}));
+}
+
 /** `stopped by stop`, with `(inferred)` when the record predates #168. */
 function stoppedByLabel(run: RunView): string {
 	return `${run.stoppedBy}${run.stoppedByInferred ? " (inferred)" : ""}`;
@@ -372,10 +383,15 @@ function renderRunFacts(run: RunView, masker: Masker): string {
 	const unsettled = run.usageUnsettled
 		? ` <span class="sub">· usage unsettled</span>`
 		: "";
+	const reset = run.contextReset
+		? ` <span class="sub">· context reset (${masker.text(run.contextReset.reason)}) at ${masker.num(run.contextReset.tokens)} tokens (limit ${masker.num(run.contextReset.limitTokens)})</span>`
+		: "";
+	const cachePerTurn = cacheReadPerTurn(run.usage, run.turns);
+	const cachePart = cachePerTurn === null ? "" : ` · cacheRead/turn ${masker.text(formatCompactTokens(cachePerTurn))}`;
 	return `<table class="mini">
 <tr><th>duration</th><td class="mono">${masker.text(formatDuration(run.durationMs))}</td><th>active</th><td class="mono">${masker.text(formatDuration(run.activeMs))}</td><th>idle</th><td class="mono">${masker.text(formatDuration(run.idleMs))}</td></tr>
-<tr><th>tokens</th><td colspan="5" class="mono">in ${masker.num(run.usage.input)} · out ${masker.num(run.usage.output)} · cacheRead ${masker.num(run.usage.cacheRead)} · cacheWrite ${masker.num(run.usage.cacheWrite)}</td></tr>
-<tr><th>cost</th><td class="mono">${masker.text(formatCost(run.usage.cost))}</td><th>turns</th><td class="mono">${masker.num(run.turns)}</td><th>result</th><td class="outcome ${run.outcome.key}">${masker.text(run.outcome.label)}${initiator}${unsettled}</td></tr>
+<tr><th>tokens</th><td colspan="5" class="mono">in ${masker.num(run.usage.input)} · out ${masker.num(run.usage.output)} · cacheRead ${masker.num(run.usage.cacheRead)} · cacheWrite ${masker.num(run.usage.cacheWrite)}${cachePart}</td></tr>
+<tr><th>cost</th><td class="mono">${masker.text(formatCost(run.usage.cost))}</td><th>turns</th><td class="mono">${masker.num(run.turns)}</td><th>result</th><td class="outcome ${run.outcome.key}">${masker.text(run.outcome.label)}${initiator}${unsettled}${reset}</td></tr>
 </table>`;
 }
 
@@ -643,7 +659,7 @@ export function renderIndexPage(agents: AgentSummary[], context: RenderContext):
 <td><a href="${agentHref(agent.id, masker)}">${masker.text(agent.name)}</a><div class="sub mono">${masker.text(agent.id)}</div></td>
 <td>${renderStatus(agent, masker)}</td>
 <td class="mono">${masker.text(agent.model)}</td>
-<td>${masker.text(agent.currentRun)}</td>
+<td>${masker.text(agent.currentRun)}<div class="sub mono">${renderContextMetric(agent, masker)}</div></td>
 <td class="num">${masker.text(formatCost(agent.spendTodayUsd))}<div class="sub">${masker.num(agent.runsToday)} runs</div></td>
 </tr>`);
 	const body = `<h1>agents</h1>
@@ -674,6 +690,7 @@ export function renderAgentPage(detail: AgentDetail, context: RenderContext): st
 <table class="kv">
 <tr><th>status</th><td>${renderStatus(summary, masker)}</td><th>model</th><td class="mono">${masker.text(summary.model)}</td></tr>
 <tr><th>current run</th><td>${masker.text(summary.currentRun)}</td><th>spend today</th><td class="mono">${masker.text(formatCost(summary.spendTodayUsd))}</td></tr>
+<tr><th>context</th><td colspan="3" class="mono">${renderContextMetric(summary, masker)}</td></tr>
 <tr><th>runs recorded</th><td class="mono">${masker.num(detail.totals.runs)}</td><th>lifetime cost</th><td class="mono">${masker.text(formatCost(detail.totals.cost))}</td></tr>
 <tr><th>pid</th><td class="mono">${summary.pid === undefined ? "—" : masker.num(summary.pid)}</td><th>config</th><td class="mono">${masker.text(summary.configPath)}</td></tr>
 </table>
@@ -903,6 +920,7 @@ run ${masker.text(run.id)} · ${masker.text(formatTimestamp(run.startedAt))} →
 <tr><th>outbound</th><td class="mono">${masker.num(run.outboundCount)}</td><th>reminders created</th><td class="mono">${masker.num(run.remindersCreated.length)}</td><th>journal entries</th><td class="mono">${masker.num(run.journalEntries)}</td></tr>
 ${run.sleep ? `<tr><th>sleep</th><td class="mono" colspan="5">${masker.text(run.sleep.forced ? "forced by the runtime" : "requested by the agent")} · summary ${masker.num(run.sleep.summaryChars)} chars</td></tr>` : ""}
 ${run.compaction ? `<tr><th>compaction</th><td class="mono" colspan="5">${masker.text(compactionLabel(run.compaction))}</td></tr>` : ""}
+${run.contextReset ? `<tr><th>context reset</th><td class="mono" colspan="5">${masker.text(run.contextReset.reason)} at ${masker.num(run.contextReset.tokens)} tokens (limit ${masker.num(run.contextReset.limitTokens)})</td></tr>` : ""}
 </table>
 
 <h2>steps (per-turn usage)</h2>

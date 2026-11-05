@@ -52,7 +52,7 @@ try {
 		toolAllowlist: tools,
 	});
 	const childConfig = loadConfig({ cwd: root, configPath: child.configPath });
-	assert.deepEqual(childConfig.config.tools.allowlist, tools);
+	assert.deepEqual(childConfig.config.tools.allowlist, [...tools, "sleep", "retain", "journal"]);
 	assert.match(fs.readFileSync(path.join(child.directory, "CONTRACT.md"), "utf8"), /Role: Research analyst/);
 	assert.match(fs.readFileSync(path.join(child.directory, "CONTRACT.md"), "utf8"), /Own literature reviews/);
 	assert.equal(canCreateAgents(childConfig), false, "a create_agent tool name without the matching capability grants no authority");
