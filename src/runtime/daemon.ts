@@ -15,10 +15,89 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Paths } from "../config.js";
 import { readRuntimeState, writeRuntimeState, type RuntimeStateFile } from "../store/runs.js";
-import { ensureDir, isProcessAlive, isProcessSuspended, sleep } from "../util.js";
+import { ensureDir, isProcessAlive, isProcessSuspended, readJson, sleep, writeJsonAtomic } from "../util.js";
 
 /** File the detached runtime writes its stdout/stderr to. */
 export const STDOUT_LOG_NAME = "stdout.log";
+
+/**
+ * Who asked for the stop. Both `alive stop` and `alive restart` send SIGTERM,
+ * so the signal itself cannot tell the runtime which one it was (#168).
+ */
+export type StopInitiator = "stop" | "restart";
+
+/** `<stateDir>/stop-intent.json`: written by the CLI just before SIGTERM. */
+export const STOP_INTENT_FILE = "stop-intent.json";
+
+/** A marker older than this is a leftover, not an explanation for this stop. */
+export const STOP_INTENT_TTL_MS = 5 * 60_000;
+
+export interface StopIntent {
+	initiator: StopInitiator;
+	/** Wall clock the marker was written. */
+	at: number;
+	/** Pid the marker was written for, so another instance's stop is not claimed. */
+	pid?: number;
+}
+
+export function stopIntentPath(stateDir: string): string {
+	return path.join(stateDir, STOP_INTENT_FILE);
+}
+
+function isStopInitiator(value: unknown): value is StopInitiator {
+	return value === "stop" || value === "restart";
+}
+
+/**
+ * Record why the runtime is about to receive SIGTERM. Best effort: a missing
+ * state dir or a read-only FS must never block an operator's stop.
+ */
+export function writeStopIntent(stateDir: string, initiator: StopInitiator, options: { at?: number; pid?: number } = {}): void {
+	const intent: StopIntent = { initiator, at: options.at ?? Date.now() };
+	if (options.pid !== undefined) intent.pid = options.pid;
+	try {
+		ensureDir(stateDir);
+		writeJsonAtomic(stopIntentPath(stateDir), intent);
+	} catch {
+		// Diagnostics only: the stop itself proceeds.
+	}
+}
+
+/** Delete the marker (idempotent). */
+export function clearStopIntent(stateDir: string): void {
+	try {
+		fs.rmSync(stopIntentPath(stateDir), { force: true });
+	} catch {
+		// Already gone or not ours to delete.
+	}
+}
+
+/**
+ * Read the initiator of the stop in progress, then consume the marker.
+ *
+ * The marker is only trusted when it is fresh (`STOP_INTENT_TTL_MS`) and, if it
+ * names a pid, when that pid is this process: a stale marker from a failed stop
+ * must not relabel today's run. Stale and corrupt markers are deleted so they
+ * cannot confuse the next shutdown. `now`/`pid` are clock and identity seams for
+ * tests; they default to the wall clock and `process.pid`.
+ */
+export function readStopIntent(
+	stateDir: string,
+	options: { now?: number; pid?: number } = {},
+): StopInitiator | undefined {
+	const file = stopIntentPath(stateDir);
+	if (!fs.existsSync(file)) return undefined;
+	const now = options.now ?? Date.now();
+	const pid = options.pid ?? process.pid;
+	const intent = readJson<Partial<StopIntent> | null>(file, null);
+	clearStopIntent(stateDir);
+	if (!intent || typeof intent !== "object") return undefined;
+	if (!isStopInitiator(intent.initiator)) return undefined;
+	if (typeof intent.at !== "number" || !Number.isFinite(intent.at)) return undefined;
+	if (now - intent.at >= STOP_INTENT_TTL_MS) return undefined;
+	if (intent.pid !== undefined && intent.pid !== pid) return undefined;
+	return intent.initiator;
+}
 
 export function stdoutLogPath(paths: Paths): string {
 	return path.join(paths.logsDir, STDOUT_LOG_NAME);
@@ -135,6 +214,8 @@ export interface StopOptions {
 	pollMs?: number;
 	/** Skip SIGTERM and kill immediately. */
 	force?: boolean;
+	/** Who asked for the stop: `alive stop` vs `alive restart` (#168). */
+	initiator?: StopInitiator;
 }
 
 export interface StopResult {
@@ -159,14 +240,20 @@ export interface StopResult {
 export async function stopRuntime(stateDir: string, options: StopOptions = {}): Promise<StopResult> {
 	const timeoutMs = options.timeoutMs ?? 15_000;
 	const pollMs = options.pollMs ?? 150;
+	const initiator = options.initiator ?? "restart";
 	const snapshot = snapshotRuntime(stateDir);
 	if (!snapshot || !snapshot.alive) {
+		// Nothing to tell: a marker left behind would relabel the next stop.
+		clearStopIntent(stateDir);
 		return { pid: snapshot?.pid, stopped: true, alreadyStopped: true, forceKilled: false, wasSuspended: false };
 	}
 
 	const { pid } = snapshot;
 	const wasSuspended = snapshot.suspended;
 	if (!options.force) {
+		// The runtime writes the run record from inside its SIGTERM handler; the
+		// marker is the only way it can know whether this was a stop or a restart.
+		writeStopIntent(stateDir, initiator, { pid });
 		if (wasSuspended) {
 			try {
 				process.kill(pid, "SIGCONT");
@@ -178,6 +265,7 @@ export async function stopRuntime(stateDir: string, options: StopOptions = {}): 
 			process.kill(pid, "SIGTERM");
 		} catch (err) {
 			if ((err as NodeJS.ErrnoException).code === "ESRCH") {
+				clearStopIntent(stateDir);
 				return { pid, stopped: true, alreadyStopped: true, forceKilled: false, wasSuspended };
 			}
 			throw err;
@@ -195,6 +283,8 @@ export async function stopRuntime(stateDir: string, options: StopOptions = {}): 
 	} catch (err) {
 		if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
 	}
+	// SIGKILL never reaches a handler, so the marker describes nothing now.
+	clearStopIntent(stateDir);
 	const gone = await waitForExit(pid, 5_000, pollMs);
 	if (gone) finishStop(stateDir, pid);
 	return {

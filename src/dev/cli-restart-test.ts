@@ -75,12 +75,15 @@ const OUTSIDE: NodeJS.ProcessEnv = { PATH: "/usr/local/bin:/usr/bin:/bin" };
 interface Calls {
 	names: string[];
 	stateDirs: string[];
+	/** Initiator the CLI passed to the service control (#168). */
+	initiators: string[];
 }
 function fakeService(calls: Calls, stopResult: Partial<StopResult> = {}): ServiceControl {
 	return {
-		stop: async (config) => {
+		stop: async (config, _flags, initiator) => {
 			calls.names.push("stop");
 			calls.stateDirs.push(config.paths.stateDir);
+			calls.initiators.push(initiator ?? "(default)");
 			return { stopped: true, alreadyStopped: false, forceKilled: false, wasSuspended: false, pid: 4242, ...stopResult };
 		},
 		start: async () => {
@@ -98,7 +101,7 @@ interface CliResult {
 }
 /** Run the real CLI entry with a fake service control and a fake environment. */
 async function cli(argv: string[], env: NodeJS.ProcessEnv, stopResult: Partial<StopResult> = {}): Promise<CliResult> {
-	const calls: Calls = { names: [], stateDirs: [] };
+	const calls: Calls = { names: [], stateDirs: [], initiators: [] };
 	const out: string[] = [];
 	const err: string[] = [];
 	const stdoutWrite = process.stdout.write;
@@ -213,6 +216,7 @@ try {
 		const forced = await cli(["restart", "--yes"], INSIDE_UNIT);
 		check("exits 0", forced.code === 0, [forced.code, forced.err]);
 		check("stops, then starts", forced.calls.names.join(",") === "stop,start", forced.calls.names);
+		check("alive restart tells the runtime it is a restart (#168)", forced.calls.initiators.join(",") === "restart", forced.calls.initiators);
 		check("targets the configured state dir", forced.calls.stateDirs[0] === stateDir, forced.calls.stateDirs);
 		check("says --yes was used", forced.err.includes("--yes given"), forced.err);
 		check("prints the interruption warning line", forced.err.includes(interruptWarningLine("restart")), forced.err);
@@ -227,6 +231,7 @@ try {
 		const plain = await cli(["restart"], OUTSIDE);
 		check("exits 0", plain.code === 0, [plain.code, plain.err]);
 		check("stops, then starts", plain.calls.names.join(",") === "stop,start", plain.calls.names);
+		check("a plain restart is a restart initiator", plain.calls.initiators.join(",") === "restart", plain.calls.initiators);
 		check("reports the stop like before", plain.out.includes("stopped pid 4242"), plain.out);
 		check("prints no refusal", !plain.err.includes("refused"), plain.err);
 		check("prints the interruption warning line", plain.err.includes(interruptWarningLine("restart")), plain.err);
@@ -253,6 +258,9 @@ try {
 		const inside = await cli(["stop"], INSIDE_UNIT);
 		check("stop is not refused inside the harness", inside.code === 0 && inside.calls.names.join(",") === "stop", [inside.code, inside.err]);
 		check("stop inside the harness still warns", inside.err.includes(interruptWarningLine("stop")), inside.err);
+
+		check("alive stop tells the runtime it is a stop (#168)", stop.calls.initiators.join(",") === "stop", stop.calls.initiators);
+		check("alive stop inside the harness is still a stop", inside.calls.initiators.join(",") === "stop", inside.calls.initiators);
 
 		const failure = await cli(["stop"], OUTSIDE, { stopped: false, error: "still alive" });
 		check("a failed stop exits 1", failure.code === 1, failure.code);

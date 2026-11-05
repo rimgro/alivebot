@@ -28,7 +28,7 @@ import { browserCommand } from "./modules/browser/cli.js";
 import { TelegramAllowlistStore, TelegramStateStore, telegramIdentityView } from "./modules/telegram/state.js";
 import { AliveRuntime } from "./runtime/loop.js";
 import { readHeartbeatStatus } from "./heartbeat.js";
-import { snapshotRuntime, spawnBackground, stdoutLogPath, stopRuntime, waitForRuntime, type StopResult } from "./runtime/daemon.js";
+import { snapshotRuntime, spawnBackground, stdoutLogPath, stopRuntime, waitForRuntime, type StopInitiator, type StopResult } from "./runtime/daemon.js";
 import {
 	HARNESS_ENV_MARKER,
 	detectHarnessEnvironment,
@@ -67,7 +67,11 @@ interface ParsedArgs {
  * the command with a fake service control instead of real processes.
  */
 export interface ServiceControl {
-	stop(config: LoadedConfig, flags: Record<string, string | boolean>): Promise<StopResult>;
+	/**
+	 * `initiator` says whether this is a stop or a restart: both send SIGTERM, so
+	 * it travels to the runtime through the stop-intent marker (#168).
+	 */
+	stop(config: LoadedConfig, flags: Record<string, string | boolean>, initiator?: StopInitiator): Promise<StopResult>;
 	/** Returns the exit code of the start (0 = the runtime came up). */
 	start(config: LoadedConfig, flags: Record<string, string | boolean>): Promise<number>;
 }
@@ -168,7 +172,7 @@ function printServiceHelp(command: "stop" | "restart" | "status", flags: Record<
 
 export function createServiceControl(): ServiceControl {
 	return {
-		stop: (config, flags) => {
+		stop: (config, flags, initiator = "restart") => {
 			const timeoutFlag = flagString(flags, "timeout");
 			// Give the runtime's graceful drain (`loop.shutdownGraceMs`) room to
 			// finish before this command escalates to SIGKILL. An explicit --timeout
@@ -177,6 +181,7 @@ export function createServiceControl(): ServiceControl {
 			return stopRuntime(config.paths.stateDir, {
 				timeoutMs: timeoutFlag ? parseDurationMs(timeoutFlag) : drainTimeoutMs,
 				force: flagBool(flags, "force") || flagBool(flags, "kill"),
+				initiator,
 			});
 		},
 		start: (config, flags) => startBackground(config, flags),
@@ -443,16 +448,20 @@ async function runCommand(cwd: string, flags: Record<string, string | boolean>):
 	const runtime = await AliveRuntime.create({ config, log, force: flagBool(flags, "force") });
 
 	let stopping = false;
-	const onSignal = () => {
+	const onSignal = (initiator?: StopInitiator) => {
 		if (stopping) return;
 		stopping = true;
-		void runtime.stop("signal");
+		// SIGINT is an operator at the terminal (`stop`); SIGTERM/SIGHUP are a
+		// service manager or a closed terminal (`restart`). The intent marker
+		// written by `alive stop|restart` outranks neither: an explicit initiator
+		// wins, so Ctrl+C on a foreground run is never mislabelled a restart.
+		void runtime.stop("signal", initiator ? { initiator } : {});
 	};
-	process.on("SIGINT", onSignal);
-	process.on("SIGTERM", onSignal);
+	process.on("SIGINT", () => onSignal("stop"));
+	process.on("SIGTERM", () => onSignal());
 	// Closing the terminal (SIGHUP) should shut down gracefully, not leave the inbox
 	// marked mid-run and force an "interrupted run" recovery on the next start.
-	process.on("SIGHUP", onSignal);
+	process.on("SIGHUP", () => onSignal());
 
 	if (once) {
 		await runtime.init();
@@ -530,16 +539,17 @@ async function startBackground(config: LoadedConfig, flags: Record<string, strin
 }
 
 async function stopCommand(cwd: string, flags: Record<string, string | boolean>, options: CliOptions = {}): Promise<number> {
-	return await stopWithConfig(loadForCli(flags), flags, options);
+	return await stopWithConfig(loadForCli(flags), flags, options, "stop");
 }
 
 async function stopWithConfig(
 	config: LoadedConfig,
 	flags: Record<string, string | boolean>,
 	options: CliOptions = {},
+	initiator: StopInitiator = "restart",
 ): Promise<number> {
 	const service = options.service ?? createServiceControl();
-	const result = await service.stop(config, flags);
+	const result = await service.stop(config, flags, initiator);
 
 	if (result.alreadyStopped) {
 		process.stdout.write(`not running${result.pid ? term.gray(` (last pid ${result.pid})`) : ""}\n`);
@@ -575,7 +585,7 @@ async function restartCommand(cwd: string, flags: Record<string, string | boolea
 	}
 
 	const service = options.service ?? createServiceControl();
-	const stopped = await stopWithConfig(config, flags, options);
+	const stopped = await stopWithConfig(config, flags, options, "restart");
 	if (stopped !== 0) return stopped;
 	return service.start(config, flags);
 }

@@ -27,13 +27,13 @@ import { FakeMemoryStore } from "./fake-memory.js";
 import { Outbox } from "../store/outbox.js";
 import { PolicyStore } from "../store/policy.js";
 import { ReminderStore } from "../store/reminders.js";
-import { interruptedResumeDecision, RUN_TURN_TRACE_LIMIT, RunLog, type RunRecord } from "../store/runs.js";
+import { interruptedResumeDecision, RUN_TURN_TRACE_LIMIT, RunLog, runTurnCount, type RunRecord } from "../store/runs.js";
 import { ThreadStore } from "../store/threads.js";
 import { HistoryStore } from "../store/history.js";
 import { RunEventLog } from "../store/run-events.js";
 import { AgentRunner, CONTEXT_WARN_MESSAGE, runActiveMs } from "../runtime/agent.js";
 import { isOutboundRecorded } from "../runtime/tools.js";
-import { TurnTraceRecorder } from "../runtime/run-trace.js";
+import { TurnTraceRecorder, residualUsage, zeroUsage } from "../runtime/run-trace.js";
 import { hasWakeWorthyPending, WakeScheduler, wakeIntervalMs } from "../runtime/wake.js";
 import { createAliveTools, type RunHandle, type ToolDeps } from "../runtime/tools.js";
 import { installCompactionGuard } from "../runtime/compaction.js";
@@ -739,6 +739,196 @@ section("the turn recorder is bounded and tolerates malformed events (#121)");
 	check("snapshot() returns a copy", recorder.snapshot() !== snapshot && recorder.snapshot()[0] !== snapshot[0]);
 }
 
+section("the residual is a consistency check, never a negative number (#168)");
+{
+	const usage = (input: number, output: number, cost: number) => ({
+		input,
+		output,
+		cacheRead: 0,
+		cacheWrite: 0,
+		total: input + output,
+		cost,
+	});
+	const trace = (value: ReturnType<typeof usage>) => ({ index: 1, startedAt: 0, durationMs: 0, usage: value, tools: [] });
+	const residual = residualUsage(usage(100, 10, 0.01), [trace(usage(60, 6, 0.006))]);
+	check(
+		"the residual is the spend no confirmed turn accounts for",
+		residual.input === 40 && residual.output === 4 && residual.total === 44 && Math.abs(residual.cost - 0.004) < 1e-12,
+		residual,
+	);
+	check(
+		"a fully explained segment leaves no residual",
+		JSON.stringify(residualUsage(usage(60, 6, 0.006), [trace(usage(60, 6, 0.006))])) === JSON.stringify(zeroUsage()),
+		residualUsage(usage(60, 6, 0.006), [trace(usage(60, 6, 0.006))]),
+	);
+	check(
+		"every residual field is clamped at zero, never negative",
+		JSON.stringify(residualUsage(usage(10, 1, 0.001), [trace(usage(50, 50, 0.5))])) === JSON.stringify(zeroUsage()) &&
+			Object.values(residualUsage(usage(10, 1, 0.001), [trace(usage(50, 50, 0.5))])).every((value) => value >= 0),
+		residualUsage(usage(10, 1, 0.001), [trace(usage(50, 50, 0.5))]),
+	);
+	check(
+		"float noise from summing costs is not spend",
+		JSON.stringify(residualUsage(usage(0, 0, 0.010000000000000009), [trace(usage(0, 0, 0.01))])) ===
+			JSON.stringify(zeroUsage()),
+		residualUsage(usage(0, 0, 0.010000000000000009), [trace(usage(0, 0, 0.01))]),
+	);
+	check(
+		"with no confirmed turn the whole segment is residual",
+		JSON.stringify(residualUsage(usage(7, 3, 0.002), [])) === JSON.stringify(usage(7, 3, 0.002)),
+		residualUsage(usage(7, 3, 0.002), []),
+	);
+
+	const recorder = new TurnTraceRecorder(() => 1_000);
+	recorder.reset();
+	recorder.endTurn({ message: { role: "assistant", usage: { input: 30, output: 3, totalTokens: 33, cost: { total: 0.003 } } } });
+	check(
+		"usageSinceReset() reports the confirmed turns of this segment",
+		recorder.usageSinceReset().input === 30 &&
+			recorder.usageSinceReset().total === 33 &&
+			Math.abs(recorder.usageSinceReset().cost - 0.003) < 1e-12,
+		recorder.usageSinceReset(),
+	);
+	recorder.reset({ turns: recorder.snapshot(), count: 1 });
+	check(
+		"a resumed segment starts from zero attributed usage, so its delta is its own",
+		JSON.stringify(recorder.usageSinceReset()) === JSON.stringify(zeroUsage()),
+		recorder.usageSinceReset(),
+	);
+	check("the seeded trace is still there for the record", recorder.snapshot().length === 1, recorder.snapshot());
+}
+
+
+// ---------------------------------------------------------------------------
+// who stopped the run (#168)
+// ---------------------------------------------------------------------------
+
+section("the run record names its initiator (#168)");
+{
+	policy.reset();
+	resetRunHealth();
+	handler = async () => {
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "stoppedBy: slept", summary_md: "# slept\n" });
+	};
+	const record = await runner.execute();
+	check(
+		"a run the agent ended by sleeping is stopped by sleep",
+		record?.stopReason === "slept" && record?.stoppedBy === "sleep",
+		{ stopReason: record?.stopReason, stoppedBy: record?.stoppedBy },
+	);
+}
+{
+	policy.reset();
+	setRunHealth({ runTimeoutMs: 60_000, runWarnMs: 0, runNoOutboundTurns: 0, runVeryLongMs: 0 });
+	handler = async () => {
+		const run = currentRun!;
+		runner.checkRunGuards(run.startedAt + 61_000);
+	};
+	const record = await runner.execute();
+	resetRunHealth();
+	check(
+		"the configured active-time limit is a limit stop",
+		record?.stopReason === "timeout" && record?.stoppedBy === "limit",
+		{ stopReason: record?.stopReason, stoppedBy: record?.stoppedBy },
+	);
+}
+{
+	policy.reset();
+	// Non-retryable provider failure: one attempt, no backoff to wait out.
+	handler = async () => {
+		throw new Error("invalid request: unsupported tool schema");
+	};
+	const record = await runner.execute();
+	check(
+		"a failure thrown out of session.prompt is the provider",
+		record?.stopReason === "error" && record?.stoppedBy === "provider",
+		{ stopReason: record?.stopReason, stoppedBy: record?.stoppedBy, error: record?.error },
+	);
+	check("the provider stop is persisted on the record", runs.list(1)[0]?.stoppedBy === "provider", runs.list(1)[0]?.stoppedBy);
+}
+{
+	policy.reset();
+	handler = async (session) => {
+		session.emit({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "I cannot do that" }],
+				stopReason: "error",
+				errorMessage: "model refused",
+			},
+		});
+	};
+	const record = await runner.execute();
+	check(
+		"an error reported by the assistant message is the model",
+		record?.stopReason === "error" && record?.stoppedBy === "model" && record?.error === "model refused",
+		{ stopReason: record?.stopReason, stoppedBy: record?.stoppedBy, error: record?.error },
+	);
+}
+
+section("spend that no turn_end accounts for is flagged, not invented (#168)");
+{
+	policy.reset();
+	handler = async (session) => {
+		// The provider billed a turn, but the run is stopped before any turn_end.
+		session.addUsage(120, 12, 0.02);
+		session.emit({ type: "turn_start" });
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "unsettled", summary_md: "# unsettled\n" });
+	};
+	const record = await runner.execute();
+	check(
+		"the spend is still on the record",
+		record?.stopReason === "slept" && Math.abs((record?.usage.cost ?? 0) - 0.02) < 1e-9,
+		{ cost: record?.usage?.cost, stopReason: record?.stopReason },
+	);
+	check("a run with no confirmed turn_end is flagged usageUnsettled", record?.usageUnsettled === true, record?.usageUnsettled);
+	check("no step is invented for the unsettled spend", (record?.turns ?? []).length === 0, record?.turns);
+	check("turnCount stays the number of model turns", runTurnCount(record ?? {}) === 0, runTurnCount(record ?? {}));
+	check("the flag is persisted on the record", runs.list(1)[0]?.usageUnsettled === true, runs.list(1)[0]?.usageUnsettled);
+}
+{
+	policy.reset();
+	handler = async (session) => {
+		// Billed AND confirmed: nothing is left over, so nothing is flagged.
+		session.addUsage(120, 12, 0.02);
+		session.emit({ type: "turn_start" });
+		emitAssistantTurn(session, { input: 120, output: 12, cost: 0.02 }, "confirmed work");
+		await session.turn();
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "settled", summary_md: "# settled\n" });
+	};
+	const record = await runner.execute();
+	check(
+		"a fully explained run is not flagged",
+		record?.stopReason === "slept" && record?.usageUnsettled === undefined && (record?.turns ?? []).length === 1,
+		{ stopReason: record?.stopReason, usageUnsettled: record?.usageUnsettled, steps: record?.turns?.length },
+	);
+}
+{
+	// The delta basis is the snapshot taken at run start, never session start:
+	// spend the session made before this run began must not look unsettled.
+	policy.reset();
+	const session = runner.currentSession as unknown as FakeSession;
+	session.addUsage(500, 50, 0.5);
+	handler = async (current) => {
+		current.addUsage(100, 10, 0.01);
+		current.emit({ type: "turn_start" });
+		emitAssistantTurn(current, { input: 100, output: 10, cost: 0.01 }, "work after the snapshot");
+		await current.turn();
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "run-start snapshot", summary_md: "# snapshot\n" });
+	};
+	const record = await runner.execute();
+	check(
+		"session spend from before the run is not counted as residual",
+		record?.usageUnsettled === undefined && Math.abs((record?.usage.cost ?? 0) - 0.01) < 1e-9,
+		{ usageUnsettled: record?.usageUnsettled, usage: record?.usage },
+	);
+}
+
 
 // ---------------------------------------------------------------------------
 // empty wakes (#116)
@@ -1080,6 +1270,7 @@ section("graceful shutdown drains the in-flight tool, writes a summary and recor
 	interruptedRecord = record ?? undefined;
 	check("the drain finished inside the grace ceiling", drain.outcome === "drained" && Date.now() - drainStartedAt < 500, { drain, elapsed: Date.now() - drainStartedAt });
 	check("the run is recorded as interrupted, not aborted", record?.stopReason === "interrupted", record?.stopReason);
+	check("a SIGTERM restart is recorded as stopped by restart (#168)", record?.stoppedBy === "restart", record?.stoppedBy);
 	check("the in-flight tool result was awaited", duplicateResult.includes("Delivered") && record?.outbound.length === 1, { duplicateResult, outbound: record?.outbound });
 	check("the outbound record keeps the delivery key", Boolean(record?.outbound[0]?.deliveryKey), record?.outbound[0]);
 	check("no second model step was started", steps === 1 && session.prompts.length === 1, { steps, prompts: session.prompts.length });
@@ -1115,6 +1306,74 @@ section("grace expiry falls back to aborting the run (#124)");
 	check("the drain reports the abort fallback", drain.outcome === "aborted" && Date.now() - drainStartedAt >= 39, { drain, elapsed: Date.now() - drainStartedAt });
 	check("the session was aborted after the budget", session.aborted === true);
 	check("the run is recorded as aborted, not interrupted", record?.stopReason === "aborted", record?.stopReason);
+	check("a grace-expiry abort is recorded as cancel (#168)", record?.stoppedBy === "cancel", record?.stoppedBy);
+}
+
+section("a graceful stop records the initiator and the residual (#168)");
+{
+	const world = makeShutdownWorld("stop-initiator", { shutdownGraceMs: 2_000 });
+	await world.runner.init();
+	world.store.append({ kind: "user_message", source: "test", priority: "normal", title: "before stop", text: "work before stop", thread: "alice", expectsReply: true });
+	let startedResolve!: () => void;
+	const started = new Promise<void>((resolve) => {
+		startedResolve = resolve;
+	});
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	world.handler = async (current) => {
+		// The provider billed this turn, but the run ends before any turn_end.
+		current.addUsage(200, 20, 0.04);
+		startedResolve();
+		await gate;
+		await current.turn();
+	};
+	const execution = world.runner.execute();
+	await started;
+	world.runner.setStopInitiator("stop");
+	const drainPromise = world.runner.drain(2_000);
+	setTimeout(release, 25);
+	const drain = await drainPromise;
+	const record = await execution;
+	check(
+		"a graceful drain records the initiator the runtime set",
+		drain.outcome === "drained" && record?.stopReason === "interrupted" && record?.stoppedBy === "stop",
+		{ drain, stopReason: record?.stopReason, stoppedBy: record?.stoppedBy },
+	);
+	check(
+		"an interrupted run still flags the spend no turn_end accounts for",
+		record?.usageUnsettled === true && Math.abs((record?.usage.cost ?? 0) - 0.04) < 1e-9 && (record?.turns ?? []).length === 0,
+		{ usageUnsettled: record?.usageUnsettled, usage: record?.usage, steps: record?.turns?.length },
+	);
+}
+
+section("a forced abort is a cancel and keeps the residual flag (#168)");
+{
+	const world = makeShutdownWorld("abort-residual", { shutdownGraceMs: 40 });
+	await world.runner.init();
+	let startedResolve!: () => void;
+	const started = new Promise<void>((resolve) => {
+		startedResolve = resolve;
+	});
+	world.handler = async (current) => {
+		current.addUsage(80, 8, 0.015);
+		startedResolve();
+		await new Promise<void>((resolve) => {
+			current.onAbort = resolve;
+		});
+		throw new Error("session aborted");
+	};
+	const execution = world.runner.execute();
+	await started;
+	const drain = await world.runner.drain(40);
+	const record = await execution;
+	check("a forced abort after the grace budget is a cancel", drain.outcome === "aborted" && record?.stoppedBy === "cancel", { drain: drain.outcome, stoppedBy: record?.stoppedBy });
+	check(
+		"the aborted run keeps the residual flag",
+		record?.usageUnsettled === true && Math.abs((record?.usage.cost ?? 0) - 0.015) < 1e-9,
+		{ usageUnsettled: record?.usageUnsettled, usage: record?.usage },
+	);
 }
 
 section("startup decision: a recent interrupted run resumes, an old one expires (#124)");

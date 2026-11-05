@@ -230,6 +230,7 @@ function buildMainFixture(): MainFixture {
 			cost: 0.01,
 			turns: 1,
 			stopReason: "aborted",
+			extra: { stoppedBy: "stop" },
 			events: [{ seq: 4, kind: "user_message", thread: "console", title: "stop requested" }],
 		}),
 		runRecord({
@@ -464,6 +465,16 @@ check(
 	report.failures.items.map((run) => run.id),
 );
 check("stalled runs are not counted as failures", !report.failures.items.some((run) => run.id === "run_5"));
+check(
+	"each failure names who stopped it (#168)",
+	report.failures.items.map((run) => `${run.id}:${run.stoppedBy}`).join(",") === "run_2:provider,run_4:stop",
+	report.failures.items.map((run) => [run.id, run.stoppedBy]),
+);
+check(
+	"a derived initiator is reported as inferred",
+	report.failures.items.map((run) => `${run.id}:${run.stoppedByInferred}`).join(",") === "run_2:true,run_4:false",
+	report.failures.items.map((run) => [run.id, run.stoppedByInferred]),
+);
 check(
 	"failure spend is visible in the table",
 	tableText.includes("failed / aborted runs") && tableText.includes("2 run(s)"),

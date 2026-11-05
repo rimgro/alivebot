@@ -16,7 +16,18 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "../config.js";
 import { followFile, readLogTail, renderLogLine, resolveLogSource } from "../logs.js";
-import { snapshotRuntime, spawnBackground, stdoutLogPath, stopRuntime, waitForRuntime } from "../runtime/daemon.js";
+import {
+	clearStopIntent,
+	readStopIntent,
+	snapshotRuntime,
+	spawnBackground,
+	STOP_INTENT_TTL_MS,
+	stopIntentPath,
+	stdoutLogPath,
+	stopRuntime,
+	waitForRuntime,
+	writeStopIntent,
+} from "../runtime/daemon.js";
 import { writeRuntimeState, readRuntimeState } from "../store/runs.js";
 import { isProcessAlive, isProcessSuspended, processState, sleep } from "../util.js";
 
@@ -191,6 +202,99 @@ section("stopRuntime");
 	writeRuntimeState(stateDir, { ...readRuntimeState(stateDir)!, pid: graceful.pid!, status: "idle" });
 	const clean = await stopRuntime(stateDir, { timeoutMs: 5_000, pollMs: 50 });
 	check("a cooperative runtime stops gracefully", clean.stopped && !clean.forceKilled, clean);
+}
+
+section("stop-intent marker: `alive stop` vs `alive restart` (#168)");
+{
+	const intentDir = path.join(root, "intent-state");
+	check("no marker means no initiator", readStopIntent(intentDir) === undefined);
+
+	writeStopIntent(intentDir, "stop", { pid: process.pid });
+	check("a fresh marker for this pid is accepted", readStopIntent(intentDir) === "stop");
+	check("reading a marker consumes it", !fs.existsSync(stopIntentPath(intentDir)));
+
+	writeStopIntent(intentDir, "restart", { pid: process.pid + 1 });
+	check("a marker for another pid is ignored", readStopIntent(intentDir) === undefined);
+	check("a pid-mismatched marker is deleted", !fs.existsSync(stopIntentPath(intentDir)));
+
+	const now = Date.now();
+	writeStopIntent(intentDir, "stop", { at: now - STOP_INTENT_TTL_MS - 1, pid: process.pid });
+	check("a stale marker is ignored", readStopIntent(intentDir, { now, pid: process.pid }) === undefined);
+	check("a stale marker is deleted", !fs.existsSync(stopIntentPath(intentDir)));
+	writeStopIntent(intentDir, "stop", { at: now - STOP_INTENT_TTL_MS + 1, pid: process.pid });
+	check("a marker inside the window is still accepted", readStopIntent(intentDir, { now, pid: process.pid }) === "stop");
+
+	fs.mkdirSync(intentDir, { recursive: true });
+	fs.writeFileSync(stopIntentPath(intentDir), "{not json", "utf8");
+	check("a corrupt marker is ignored", readStopIntent(intentDir) === undefined);
+	check("a corrupt marker is deleted", !fs.existsSync(stopIntentPath(intentDir)));
+	fs.writeFileSync(stopIntentPath(intentDir), JSON.stringify({ initiator: "slept", at: Date.now() }), "utf8");
+	check("an unknown initiator is ignored", readStopIntent(intentDir) === undefined);
+
+	writeStopIntent(intentDir, "stop", { pid: process.pid });
+	clearStopIntent(intentDir);
+	check("clearStopIntent removes the marker", !fs.existsSync(stopIntentPath(intentDir)));
+	clearStopIntent(intentDir);
+	check("clearStopIntent is idempotent", !fs.existsSync(stopIntentPath(intentDir)));
+}
+
+section("stopRuntime writes the marker before SIGTERM (#168)");
+{
+	const intentDir = path.join(root, "intent-runtime");
+	fs.mkdirSync(intentDir, { recursive: true });
+	const seenFile = path.join(intentDir, "seen-on-sigterm.json");
+	const readyFile = path.join(intentDir, "ready");
+	// The stub copies the marker while handling SIGTERM: seeing it there proves
+	// the file is written before the signal, not after the process is gone.
+	const child = spawnStub(
+		`const fs = require("node:fs");` +
+			`process.on("SIGTERM", () => {` +
+			` let seen = "missing";` +
+			` try { seen = fs.readFileSync(${JSON.stringify(stopIntentPath(intentDir))}, "utf8"); } catch {}` +
+			` fs.writeFileSync(${JSON.stringify(seenFile)}, seen);` +
+			` process.exit(0);` +
+			`});` +
+			`fs.writeFileSync(${JSON.stringify(readyFile)}, "ready");` +
+			`setInterval(() => {}, 1000);`,
+	);
+	if (!(await waitForFile(readyFile))) throw new Error("stop-intent stub never became ready");
+	writeRuntimeState(intentDir, {
+		pid: child.pid!,
+		startedAt: Date.now() - 1_000,
+		lastTickAt: Date.now(),
+		status: "idle",
+		runIndex: 1,
+		pending: 0,
+		openThreads: 0,
+		sleeps: 0,
+	});
+	const stopped = await stopRuntime(intentDir, { timeoutMs: 5_000, pollMs: 25, initiator: "stop" });
+	check("the runtime was stopped gracefully", stopped.stopped && !stopped.forceKilled, stopped);
+	let seen: { initiator?: unknown; pid?: unknown } | undefined;
+	try {
+		seen = JSON.parse(fs.readFileSync(seenFile, "utf8"));
+	} catch {
+		seen = undefined;
+	}
+	check("the marker is already on disk when SIGTERM arrives", seen?.initiator === "stop", seen);
+	check("the marker names the pid that was signalled", seen?.pid === child.pid, { seen, pid: child.pid });
+	// The stub is not a runtime: it copies the marker but never consumes it, so
+	// the real shutdown path is exercised by reading it here (as
+	// `AliveRuntime.stop()` does) after the process is gone.
+	check(
+		"the marker left for the runtime is valid for the signalled pid and is consumed once",
+		readStopIntent(intentDir, { pid: child.pid }) === "stop" && !fs.existsSync(stopIntentPath(intentDir)),
+		{ exists: fs.existsSync(stopIntentPath(intentDir)) },
+	);
+	check(
+		"the consumed marker is not accepted twice",
+		readStopIntent(intentDir, { pid: child.pid }) === undefined && !fs.existsSync(stopIntentPath(intentDir)),
+	);
+
+	// A marker left over from an earlier attempt must not label the next stop.
+	writeStopIntent(intentDir, "stop", { pid: process.pid });
+	const nothing = await stopRuntime(intentDir);
+	check("stopping nothing clears a leftover marker", nothing.alreadyStopped && !fs.existsSync(stopIntentPath(intentDir)), nothing);
 }
 
 section("log rendering and following");

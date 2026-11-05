@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { DEFAULT_CONFIG, DEFAULT_CONTRACT, loadConfig, resolveMemoryDatabasePath, type AgentManagementPermissions, type LoadedConfig } from "./config.js";
 import { defaultTelegramTokenEnv, MASTER_TELEGRAM_TOKEN_ENV, migrateConfigSecrets, profileEnvSegment, readEnvFileValues } from "./config-secrets.js";
-import { snapshotRuntime, spawnBackground, stopRuntime, waitForRuntime } from "./runtime/daemon.js";
+import { snapshotRuntime, spawnBackground, stopRuntime, waitForRuntime, type StopInitiator } from "./runtime/daemon.js";
 import { sleep } from "./util.js";
 import { mergeSandboxConfig, type SandboxConfig } from "./sandbox/config.js";
 import { DEFAULT_WORKERS_CONFIG } from "./workers/config.js";
@@ -222,7 +222,7 @@ export async function updateManagedAgentProfile(
 		const wasRunning = snapshotRuntime(config.paths.stateDir)?.alive ?? false;
 		updateAgentProfile(base, agent.id, updates);
 		if (wasRunning) {
-			await stopManagedAgentUnlocked(base, agent);
+			await stopManagedAgentUnlocked(base, agent, "restart");
 			if (getAgentEnabled(agent)) await startManagedAgentUnlocked(base, agent);
 		}
 		return agent;
@@ -319,22 +319,29 @@ async function startManagedAgentUnlocked(
 
 export async function stopManagedAgent(base: LoadedConfig, idInput: string): Promise<void> {
 	const agent = findManagedAgent(base, idInput);
-	await withAgentLifecycleLock(base, agent.id, () => stopManagedAgentUnlocked(base, agent));
+	await withAgentLifecycleLock(base, agent.id, () => stopManagedAgentUnlocked(base, agent, "stop"));
 }
 
 export async function restartManagedAgent(base: LoadedConfig, idInput: string): Promise<{ pid: number; logFile: string }> {
 	const agent = findManagedAgent(base, idInput);
 	return withAgentLifecycleLock(base, agent.id, async () => {
 		if (!getAgentEnabled(agent)) throw new Error(`agent ${agent.id} is disabled and cannot be restarted`);
-		await stopManagedAgentUnlocked(base, agent);
+		await stopManagedAgentUnlocked(base, agent, "restart");
 		return startManagedAgentUnlocked(base, agent);
 	});
 }
 
-async function stopManagedAgentUnlocked(base: LoadedConfig, agent: ManagedAgent): Promise<void> {
+async function stopManagedAgentUnlocked(
+	base: LoadedConfig,
+	agent: ManagedAgent,
+	initiator: StopInitiator = "stop",
+): Promise<void> {
 	const config = loadAgentConfig(base, agent);
 	const result = await stopRuntime(config.paths.stateDir, {
 		timeoutMs: config.config.loop.shutdownGraceMs + 5_000,
+		// A managed agent stop is an operator stop; a restart says so, so the
+		// agent's run record knows who ended it (#168).
+		initiator,
 	});
 	if (!result.stopped) throw new Error(result.error ?? `agent ${agent.id} could not be stopped`);
 }
@@ -347,7 +354,7 @@ export async function disableManagedAgent(
 	const agent = findManagedAgent(base, idInput);
 	await withAgentLifecycleLock(base, agent.id, async () => {
 		writeAgentEnabled(agent, false);
-		await stopManagedAgentUnlocked(base, agent);
+		await stopManagedAgentUnlocked(base, agent, "stop");
 		const config = loadAgentConfig(base, agent);
 		if (snapshotRuntime(config.paths.stateDir)?.alive) throw new Error(`agent ${agent.id} remains running; it is disabled but must be stopped manually`);
 	}, options);

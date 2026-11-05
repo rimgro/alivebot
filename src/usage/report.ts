@@ -33,7 +33,7 @@ import {
 	type RunView,
 	type SessionTurn,
 } from "../dashboard/state.js";
-import { runTurnCount, type RunRecord, type RunStopReason } from "../store/runs.js";
+import { runTurnCount, type RunRecord, type RunStoppedBy, type RunStopReason } from "../store/runs.js";
 import { formatDuration, localDay, oneLine, readJson } from "../util.js";
 import { readWorkerUsage, workerUsagePath } from "../workers/store.js";
 
@@ -130,6 +130,10 @@ export interface UsageFailureRun {
 	finishedAt: number;
 	day: string;
 	stopReason: RunStopReason;
+	/** Who stopped the run (#168): `provider`, `model`, `restart`, `stop`, `cancel` or `limit`. */
+	stoppedBy: RunStoppedBy;
+	/** True when `stoppedBy` was derived from `stopReason` (a record written before #168). */
+	stoppedByInferred: boolean;
 	outcome: RunOutcomeClass;
 	cost: number;
 	turns: number;
@@ -428,6 +432,8 @@ function toFailureRun(view: RunView): UsageFailureRun {
 		finishedAt: view.finishedAt,
 		day: localDay(view.finishedAt),
 		stopReason: view.stopReason,
+		stoppedBy: view.stoppedBy,
+		stoppedByInferred: view.stoppedByInferred,
 		outcome: runOutcome(view.stopReason).key,
 		cost: view.usage.cost,
 		turns: view.turns,

@@ -13,7 +13,17 @@ import { ReminderStore } from "../store/reminders.js";
 import { ThreadStore } from "../store/threads.js";
 import { NoteStore } from "../store/notes.js";
 import { Journal } from "../store/journal.js";
-import { interruptedResumeDecision, RunLog, runTurnCount, type RunRecord } from "../store/runs.js";
+import {
+	interruptedResumeDecision,
+	isRunStoppedBy,
+	RUN_STOPPED_BY_VALUES,
+	RunLog,
+	runStoppedBy,
+	runStoppedByInferred,
+	runTurnCount,
+	type RunRecord,
+	type RunStopReason,
+} from "../store/runs.js";
 import { DEFAULT_POLICY, PolicyStore } from "../store/policy.js";
 import { DEFAULT_CONFIG, validateLoopConfig } from "../config.js";
 import { runOutcome } from "../dashboard/state.js";
@@ -268,6 +278,97 @@ section("run log: a resumed record replaces its line and accumulates usage (#124
 	check("resume decision: 0 disables", interruptedResumeDecision(runs.last(), finishedAt + 1, 0) === "expire");
 	check("runTurnCount reads the current shape", runTurnCount(runs.last()!) === 2, runs.last());
 	fs.rmSync(resumeRoot, { recursive: true, force: true });
+}
+
+section("run log: who stopped the run (#168)");
+{
+	const legacy = (stopReason: RunStopReason) => runStoppedBy({ stopReason });
+	check("a slept run was stopped by the agent's own sleep", legacy("slept") === "sleep", legacy("slept"));
+	check(
+		"stalled/timeout/budget derive to a limit stop",
+		legacy("stalled") === "limit" && legacy("timeout") === "limit" && legacy("budget") === "limit",
+		[legacy("stalled"), legacy("timeout"), legacy("budget")],
+	);
+	check("a bare error is attributed to the provider", legacy("error") === "provider", legacy("error"));
+	check(
+		"legacy interrupted/aborted runs derive to a restart",
+		legacy("interrupted") === "restart" && legacy("aborted") === "restart",
+		[legacy("interrupted"), legacy("aborted")],
+	);
+	check(
+		"an explicit field wins over the derived value",
+		runStoppedBy({ stoppedBy: "stop", stopReason: "interrupted" }) === "stop" &&
+			runStoppedBy({ stoppedBy: "model", stopReason: "error" }) === "model" &&
+			runStoppedBy({ stoppedBy: "cancel", stopReason: "aborted" }) === "cancel",
+		[runStoppedBy({ stoppedBy: "stop", stopReason: "interrupted" })],
+	);
+	check(
+		"garbage values are ignored and the stop reason still answers",
+		runStoppedBy({ stoppedBy: "banana", stopReason: "slept" }) === "sleep" &&
+			runStoppedBy({ stoppedBy: 42, stopReason: "error" }) === "provider" &&
+			runStoppedBy({ stoppedBy: null }) === "restart" &&
+			runStoppedBy({ stoppedBy: "", stopReason: "timeout" }) === "limit",
+		[runStoppedBy({ stoppedBy: "banana", stopReason: "slept" }), runStoppedBy({ stoppedBy: 42, stopReason: "error" })],
+	);
+	check(
+		"every allowed literal is accepted as-is",
+		RUN_STOPPED_BY_VALUES.every((value) => isRunStoppedBy(value) && runStoppedBy({ stoppedBy: value, stopReason: "slept" }) === value),
+		RUN_STOPPED_BY_VALUES.filter((value) => runStoppedBy({ stoppedBy: value, stopReason: "slept" }) !== value),
+	);
+	check("non-literals are rejected", !isRunStoppedBy("slept") && !isRunStoppedBy(undefined) && !isRunStoppedBy("STOP"));
+
+	// Both shapes must survive a real write/read cycle.
+	const stoppedByRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-run-stopped-by-test-"));
+	const log = new RunLog(stoppedByRoot);
+	const now = Date.now();
+	const base: RunRecord = {
+		id: "run_legacy_shape",
+		index: 1,
+		startedAt: now - 1_000,
+		finishedAt: now,
+		durationMs: 1_000,
+		activeMs: 1_000,
+		idleMs: 0,
+		stopReason: "interrupted",
+		events: [],
+		outbound: [],
+		remindersCreated: [],
+		notesTouched: [],
+		journalEntries: 0,
+		idleReturns: 0,
+		interruptDeliveries: 0,
+		nudges: 0,
+		turnCount: 0,
+		promptChars: 0,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 },
+	};
+	log.record(base);
+	log.record({ ...base, id: "run_explicit", index: 2, stopReason: "interrupted", stoppedBy: "stop" });
+	const stored = log.list(10);
+	check(
+		"a legacy line without the field still reads and derives its initiator",
+		stored[0]?.stoppedBy === undefined && runStoppedBy(stored[0]!) === "restart",
+		stored[0],
+	);
+	check("the new field round-trips through runs.jsonl", stored[1]?.stoppedBy === "stop" && runStoppedBy(stored[1]!) === "stop", stored[1]);
+	check(
+		"a derived initiator is marked inferred, a recorded one is not",
+		runStoppedByInferred(stored[0]!) && !runStoppedByInferred(stored[1]!),
+		{ legacy: runStoppedByInferred(stored[0]!), recorded: runStoppedByInferred(stored[1]!) },
+	);
+	check(
+		"garbage in the stored field counts as inferred",
+		runStoppedByInferred({ stoppedBy: "banana", stopReason: "slept" }) && runStoppedByInferred({ stoppedBy: 7 }),
+		runStoppedByInferred({ stoppedBy: "banana", stopReason: "slept" }),
+	);
+	log.record({ ...base, id: "run_unsettled", index: 3, usageUnsettled: true });
+	check(
+		"the usage-unsettled flag round-trips and absent means settled",
+		log.list(10).find((record) => record.id === "run_unsettled")?.usageUnsettled === true &&
+			log.list(10).find((record) => record.id === "run_legacy_shape")?.usageUnsettled === undefined,
+		log.list(10).map((record) => [record.id, record.usageUnsettled]),
+	);
+	fs.rmSync(stoppedByRoot, { recursive: true, force: true });
 }
 
 section("loop shutdown/resume config is validated and interrupted is not an error (#124)");
