@@ -8,10 +8,10 @@ import { term, stamp } from "../term.js";
 import type { AliveEvent } from "../store/events.js";
 import type { EventStore } from "../store/events.js";
 import type { PolicyStore } from "../store/policy.js";
-import { runTurnCount, type RunLog, type RunRecord, type RunStopReason } from "../store/runs.js";
+import { runTurnCount, type RunLog, type RunRecord, type RunStoppedBy, type RunStopReason } from "../store/runs.js";
 import type { ThreadStore } from "../store/threads.js";
 import { renderAwakePrompt, renderInterruptPrompt, renderLongRunWarning, renderNudgePrompt } from "./prompt.js";
-import { TurnTraceRecorder } from "./run-trace.js";
+import { TurnTraceRecorder, hasUsage, residualUsage } from "./run-trace.js";
 import type { RunAnomalyEvent, RunEventSink } from "../store/run-events.js";
 import { hasWakeWorthyPending } from "./wake.js";
 import { classifyNetworkError, withRetries } from "../retry.js";
@@ -44,6 +44,9 @@ export interface DrainResult {
 	outcome: "idle" | "drained" | "aborted";
 	durationMs: number;
 }
+
+/** Who asked for a deliberate shutdown (#168): `alive restart` or `alive stop`. */
+export type StopInitiator = "restart" | "stop";
 
 export interface AgentRunnerDeps {
 	config: LoadedConfig;
@@ -80,6 +83,35 @@ export function runActiveMs(run: RunHandle, now = Date.now()): number {
 
 /** How many identical tool calls in a row count as `run_repeat_tool`. */
 export const RUN_REPEAT_TOOL_THRESHOLD = 3;
+
+/**
+ * Who ended a run, from how it ended (#168).
+ *
+ * - `slept` — the agent chose to sleep;
+ * - `timeout`/`budget`/`stalled` — a safety limit (or a model that refused to idle);
+ * - `error` — the provider/session that raised it (`errorSource: "provider"`) or
+ *   the assistant message that reported it (`"model"`);
+ * - `interrupted`/`aborted` — a deliberate shutdown: `cancel` once the grace
+ *   budget expired and the session was aborted, otherwise the initiator the
+ *   runtime recorded (`restart` by default, `stop` for `alive stop`).
+ */
+export function runStoppedByFor(
+	stopReason: RunStopReason,
+	input: { errorSource?: "provider" | "model"; forcedAbort: boolean; initiator: StopInitiator },
+): RunStoppedBy {
+	switch (stopReason) {
+		case "slept":
+			return "sleep";
+		case "stalled":
+		case "timeout":
+		case "budget":
+			return "limit";
+		case "error":
+			return input.errorSource === "provider" ? "provider" : "model";
+		default:
+			return input.forcedAbort ? "cancel" : input.initiator;
+	}
+}
 
 /**
  * The one built-in context-size hint (#123).
@@ -149,6 +181,12 @@ export class AgentRunner {
 	 * starting another model step.
 	 */
 	private draining = false;
+	/**
+	 * Who is shutting the runner down (#168), set by `AliveRuntime.stop()` before
+	 * draining. It only labels the run record: `stop` vs `restart` decide nothing
+	 * else. Defaults to `restart`, the historical meaning of a SIGTERM.
+	 */
+	private stopInitiator: StopInitiator = "restart";
 	/** Resolves when the active `execute` has written its record. */
 	private executionSettled: { promise: Promise<void>; resolve: () => void } | undefined;
 
@@ -169,6 +207,15 @@ export class AgentRunner {
 	markAborting(): void {
 		this.aborting = true;
 		this.abortRetryDelay();
+	}
+
+	/**
+	 * Record who is stopping the runner (#168). Called before `drain()` so the run
+	 * that the deliberate shutdown ends carries `stoppedBy: "stop"` or
+	 * `"restart"` instead of a guess.
+	 */
+	setStopInitiator(initiator: StopInitiator): void {
+		this.stopInitiator = initiator;
 	}
 
 	/** Interrupt a scheduled backoff, but leave an in-flight prompt to session.abort(). */
@@ -457,6 +504,8 @@ export class AgentRunner {
 			});
 
 			let stopReason: RunStopReason | undefined;
+			/** Which side raised `stopReason = "error"`: the provider/session or the model (#168). */
+			let errorSource: "provider" | "model" | undefined;
 			let error: string | undefined;
 			let first = true;
 
@@ -509,6 +558,9 @@ export class AgentRunner {
 					error = maskSecrets(err instanceof Error ? err.message : String(err), this.deps.config.config.secrets);
 					log.error(`run #${run.index} session error`, { error });
 					stopReason = "error";
+					// Thrown out of `session.prompt`: the provider, the network or the
+					// session failed, not the model's answer (#168).
+					errorSource = "provider";
 					break;
 				}
 
@@ -531,6 +583,8 @@ export class AgentRunner {
 				if (run.lastStopReason === "error" || run.lastError) {
 					error = run.lastError ?? "model error";
 					stopReason = "error";
+					// The assistant message itself reported the failure (#168).
+					errorSource = "model";
 					break;
 				}
 
@@ -549,7 +603,23 @@ export class AgentRunner {
 			const statsAfter = this.session.getSessionStats();
 			const segmentUsage = this.diffUsage(statsBefore, statsAfter);
 			const usage = previous ? addUsage(previous.usage, segmentUsage) : segmentUsage;
+			// Consistency check only (#168): the session-stats delta is measured from
+			// the snapshot taken at *run* start (`statsBefore`), so spend the session
+			// made before this run began is never counted here. Spend that no
+			// confirmed `turn_end` of this segment accounts for is flagged on the
+			// record and logged; the usage numbers themselves are never rewritten
+			// and no step is invented.
+			const residual = residualUsage(segmentUsage, [{ usage: this.turnTrace.usageSinceReset() }]);
+			const usageUnsettled = hasUsage(residual);
 			if (!run.idling) run.activeMs += Math.max(0, finishedAt - (run.activeSince ?? finishedAt));
+			// Who ended the run (#168): derived once from the outcome and, for a
+			// deliberate shutdown, from the initiator the CLI recorded.
+			const finalStopReason: RunStopReason = stopReason ?? "stalled";
+			const stoppedBy = runStoppedByFor(finalStopReason, {
+				errorSource,
+				forcedAbort: this.aborting,
+				initiator: this.stopInitiator,
+			});
 
 			const reachedModel = run.lastStopReason !== undefined || run.turns > 0 || run.idleReturns > 0;
 			const redeliver = stopReason === "error" || stopReason === "timeout" || stopReason === "aborted";
@@ -603,7 +673,8 @@ export class AgentRunner {
 				durationMs: finishedAt - run.startedAt,
 				activeMs: run.activeMs,
 				idleMs: run.idleMs,
-				stopReason: stopReason ?? "stalled",
+				stopReason: finalStopReason,
+				stoppedBy,
 				error,
 				sessionFile: this.session.sessionFile,
 				summary,
@@ -620,6 +691,7 @@ export class AgentRunner {
 				turns: this.turnTrace.snapshot(),
 				promptChars: run.promptChars,
 				usage,
+				usageUnsettled: usageUnsettled ? true : undefined,
 				sleep: run.sleepRequested ? { forced: run.sleepForced, summaryChars: run.sleepSummary?.length ?? 0 } : undefined,
 				compaction: compactionMonitorFor(this.session)?.record(),
 			};
@@ -632,6 +704,7 @@ export class AgentRunner {
 
 			log.info(`run #${run.index} end`, {
 				stopReason: record.stopReason,
+				stoppedBy: record.stoppedBy,
 				durationMs: record.durationMs,
 				activeMs: record.activeMs,
 				idleMs: record.idleMs,
@@ -640,6 +713,15 @@ export class AgentRunner {
 				usage: usage.cost,
 				resumed: Boolean(previous),
 			});
+			if (usageUnsettled) {
+				log.warn(`run #${run.index} spent tokens that no turn_end accounts for`, {
+					residualInput: residual.input,
+					residualOutput: residual.output,
+					residualTotal: residual.total,
+					residualCost: residual.cost,
+					turns: run.turns,
+				});
+			}
 
 			if (stopReason === "slept") await this.rebuildSession();
 			return record;

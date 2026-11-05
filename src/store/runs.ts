@@ -20,6 +20,71 @@ export type RunStopReason =
 	| "aborted";
 
 /**
+ * Who initiated the stop of a run (#168).
+ *
+ * `RunStopReason` says *how* the run ended; this says *who* ended it, which is
+ * what an operator asks after seeing a run that spent money and never slept:
+ * the agent itself (`sleep`), a harness restart, `alive stop`, a stopped grace
+ * period (`cancel`), a safety limit, or the provider/model.
+ */
+export type RunStoppedBy = "sleep" | "restart" | "stop" | "cancel" | "limit" | "provider" | "model";
+
+/** Runtime list of the allowed `RunStoppedBy` values, used to sanitize records read from disk. */
+export const RUN_STOPPED_BY_VALUES: readonly RunStoppedBy[] = [
+	"sleep",
+	"restart",
+	"stop",
+	"cancel",
+	"limit",
+	"provider",
+	"model",
+];
+
+/** True when `value` is one of the allowed `RunStoppedBy` literals. */
+export function isRunStoppedBy(value: unknown): value is RunStoppedBy {
+	return typeof value === "string" && (RUN_STOPPED_BY_VALUES as readonly string[]).includes(value);
+}
+
+/**
+ * Who stopped a run, for both shapes on disk.
+ *
+ * New records carry `stoppedBy`; records written before #168 only have
+ * `stopReason`, so the initiator is derived from it. Readers (dashboard, usage
+ * report) must use this helper instead of touching the raw field, which also
+ * makes garbage values harmless.
+ */
+export function runStoppedBy(record: { stoppedBy?: unknown; stopReason?: RunStopReason }): RunStoppedBy {
+	if (isRunStoppedBy(record.stoppedBy)) return record.stoppedBy;
+	switch (record.stopReason) {
+		case "slept":
+			return "sleep";
+		case "stalled":
+		case "timeout":
+		case "budget":
+			return "limit";
+		case "error":
+			return "provider";
+		case "interrupted":
+		case "aborted":
+			return "restart";
+		default:
+			// No usable stop reason at all: a deliberate stop is the neutral answer.
+			return "restart";
+	}
+}
+
+/**
+ * True when `runStoppedBy` had to derive the initiator instead of reading it.
+ *
+ * Records written before #168 (and records with a corrupted field) only have
+ * `stopReason`, so the answer is a guess. Readers must label it as such instead
+ * of presenting it as a recorded fact.
+ */
+export function runStoppedByInferred(record: { stoppedBy?: unknown; stopReason?: RunStopReason }): boolean {
+	return !isRunStoppedBy(record.stoppedBy);
+}
+
+/**
  * One message the run delivered.
  *
  * `deliveryKey` is the outbox idempotency key (`OutgoingMessage.deliveryKey`)
@@ -112,6 +177,8 @@ export interface RunRecord {
 	/** Wall clock spent blocked inside `idle`. */
 	idleMs: number;
 	stopReason: RunStopReason;
+	/** Who initiated the stop (#168). Absent on records written before it existed. */
+	stoppedBy?: RunStoppedBy;
 	error?: string;
 	/** Pi session file backing this run, so a resume can reopen the exact session. */
 	sessionFile?: string;
@@ -132,6 +199,13 @@ export interface RunRecord {
 	turnCount: number;
 	promptChars: number;
 	usage: RunUsage;
+	/**
+	 * True when the session-stats delta of this run contains spend that none of
+	 * its per-turn traces account for — the provider billed a step that never
+	 * reported `turn_end` (#168). A consistency flag only: the usage numbers are
+	 * the runtime's own and are never rewritten.
+	 */
+	usageUnsettled?: boolean;
 	/**
 	 * Per-turn usage captured while the run happened (bounded to the last
 	 * `RUN_TURN_TRACE_LIMIT` turns). Absent on records written before #121.

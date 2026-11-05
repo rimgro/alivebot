@@ -51,6 +51,7 @@ import {
 	paginateTimeline,
 	parseTimelineQuery,
 	readAgentSummary,
+	describeRun,
 	readSessionTurns,
 	runOutcome,
 	sumRuns,
@@ -604,6 +605,30 @@ const runTruncated = {
 	promptChars: 10,
 	usage: { input: 5_000, output: 500, cacheRead: 4_000, cacheWrite: 50, total: 9_550, cost: 0.05 },
 };
+/** A run stopped by an operator whose spend no turn_end accounts for (#168). */
+const runStoppedByOperator = {
+	id: "run_t7",
+	index: 7,
+	startedAt: tracedBase + 360_000,
+	finishedAt: tracedBase + 370_000,
+	durationMs: 10_000,
+	activeMs: 10_000,
+	idleMs: 0,
+	stopReason: "aborted" as const,
+	stoppedBy: "stop" as const,
+	events: [],
+	outbound: [],
+	remindersCreated: [],
+	notesTouched: [],
+	journalEntries: 0,
+	idleReturns: 0,
+	interruptDeliveries: 0,
+	nudges: 0,
+	turnCount: 0,
+	promptChars: 10,
+	usage: { input: 20, output: 2, cacheRead: 0, cacheWrite: 0, total: 22, cost: 0.002 },
+	usageUnsettled: true,
+};
 appendJsonl(path.join(tracedStateDir, "runs", "runs.jsonl"), [
 	runTraced,
 	runMismatch,
@@ -611,6 +636,7 @@ appendJsonl(path.join(tracedStateDir, "runs", "runs.jsonl"), [
 	runMalformed,
 	runMixed,
 	runTruncated,
+	runStoppedByOperator,
 ]);
 
 // ---------------------------------------------------------------------------
@@ -1363,6 +1389,65 @@ async function main(): Promise<void> {
 		"the page explains that the sums cover only the stored window",
 		truncatedHtml.includes("partial — the stored trace covers turns 199–200") && !truncatedHtml.includes("MISMATCH"),
 		truncatedHtml.match(/partial[^<]*/)?.[0],
+	);
+
+	section("run initiator and unsettled usage (#168)");
+	const stoppedByOperator = loadRunDetail(tracedProfile, "run_t7")!;
+	check(
+		"toRunView exposes the initiator stored on the record",
+		stoppedByOperator.run.stoppedBy === "stop" && stoppedByOperator.run.stoppedByInferred === false,
+		{ stoppedBy: stoppedByOperator.run.stoppedBy, inferred: stoppedByOperator.run.stoppedByInferred },
+	);
+	check(
+		"a legacy record's derived initiator is marked inferred",
+		legacy.run.stoppedBy === "provider" && legacy.run.stoppedByInferred === true,
+		{ stoppedBy: legacy.run.stoppedBy, inferred: legacy.run.stoppedByInferred },
+	);
+	check(
+		"a recorded initiator is not marked inferred",
+		stoppedByOperator.run.stoppedByInferred === false && traced.run.stoppedByInferred === true,
+		{ recorded: stoppedByOperator.run.stoppedByInferred, legacy: traced.run.stoppedByInferred },
+	);
+	check(
+		"the run view carries the usage-unsettled flag",
+		stoppedByOperator.run.usageUnsettled === true && traced.run.usageUnsettled === false,
+		{ operator: stoppedByOperator.run.usageUnsettled, traced: traced.run.usageUnsettled },
+	);
+	const stoppedHtml = renderRunPage(stoppedByOperator, renderContext);
+	check(
+		"the run page names the initiator and the unsettled usage",
+		stoppedHtml.includes("stopped by stop") && stoppedHtml.includes("usage unsettled"),
+		stoppedHtml.match(/stopped by[^<]*/)?.[0],
+	);
+	check(
+		"an inferred initiator is never presented as fact",
+		renderRunPage(legacy, renderContext).includes("stopped by provider (inferred)"),
+		renderRunPage(legacy, renderContext).match(/stopped by[^<]*/)?.[0],
+	);
+	check(
+		"a settled run page carries neither note",
+		!renderRunPage(traced, renderContext).includes("usage unsettled") && !renderRunPage(traced, renderContext).includes("inferred"),
+	);
+	check(
+		"describeRun adds the initiator only when it is not the outcome keyword",
+		describeRun(runTraced as unknown as RunRecord).includes("· sleep ·") && !describeRun(runTraced as unknown as RunRecord).includes("stopped by"),
+		describeRun(runTraced as unknown as RunRecord),
+	);
+	check(
+		"describeRun names a recorded operator stop without 'inferred'",
+		describeRun(runStoppedByOperator as unknown as RunRecord).includes("· stopped by stop ·") &&
+			describeRun(runStoppedByOperator as unknown as RunRecord).includes("usage unsettled"),
+		describeRun(runStoppedByOperator as unknown as RunRecord),
+	);
+	check(
+		"describeRun labels a derived initiator as inferred",
+		describeRun(runLegacy as unknown as RunRecord).includes("· stopped by provider (inferred)"),
+		describeRun(runLegacy as unknown as RunRecord),
+	);
+	check(
+		"an unsettled run invents no step",
+		stoppedByOperator.run.turns === 0 && stoppedByOperator.run.steps === undefined && !stoppedByOperator.steps.recorded,
+		{ turns: stoppedByOperator.run.turns, steps: stoppedByOperator.run.steps },
 	);
 
 	section("prompt composition (#121)");

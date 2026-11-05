@@ -358,11 +358,24 @@ function renderStatus(summary: AgentSummary, masker: Masker): string {
 		(summary.statusNote ? ` <span class="sub">${masker.text(summary.statusNote)}</span>` : "");
 }
 
+/** `stopped by stop`, with `(inferred)` when the record predates #168. */
+function stoppedByLabel(run: RunView): string {
+	return `${run.stoppedBy}${run.stoppedByInferred ? " (inferred)" : ""}`;
+}
+
 function renderRunFacts(run: RunView, masker: Masker): string {
+	// Only the non-obvious initiators are shown: `sleep` repeats the outcome, so
+	// a run record keeps the `· stopped by stop` note for real operator stops (#168).
+	const initiator = run.stoppedBy === run.outcome.key
+		? ""
+		: ` <span class="sub">· stopped by ${masker.text(stoppedByLabel(run))}</span>`;
+	const unsettled = run.usageUnsettled
+		? ` <span class="sub">· usage unsettled</span>`
+		: "";
 	return `<table class="mini">
 <tr><th>duration</th><td class="mono">${masker.text(formatDuration(run.durationMs))}</td><th>active</th><td class="mono">${masker.text(formatDuration(run.activeMs))}</td><th>idle</th><td class="mono">${masker.text(formatDuration(run.idleMs))}</td></tr>
 <tr><th>tokens</th><td colspan="5" class="mono">in ${masker.num(run.usage.input)} · out ${masker.num(run.usage.output)} · cacheRead ${masker.num(run.usage.cacheRead)} · cacheWrite ${masker.num(run.usage.cacheWrite)}</td></tr>
-<tr><th>cost</th><td class="mono">${masker.text(formatCost(run.usage.cost))}</td><th>turns</th><td class="mono">${masker.num(run.turns)}</td><th>result</th><td class="outcome ${run.outcome.key}">${masker.text(run.outcome.label)}</td></tr>
+<tr><th>cost</th><td class="mono">${masker.text(formatCost(run.usage.cost))}</td><th>turns</th><td class="mono">${masker.num(run.turns)}</td><th>result</th><td class="outcome ${run.outcome.key}">${masker.text(run.outcome.label)}${initiator}${unsettled}</td></tr>
 </table>`;
 }
 
@@ -879,7 +892,7 @@ ${detail.transcript.map((turn) => renderTurn(turn, masker)).join("\n")}
 	const body = `<h1>run #${masker.num(run.index)}</h1>
 <p class="sub"><a href="${agentHref(detail.agent.id, masker)}">${masker.text(detail.agent.name)}</a> ·
 run ${masker.text(run.id)} · ${masker.text(formatTimestamp(run.startedAt))} → ${masker.text(formatTimestamp(run.finishedAt))} ·
-<span class="outcome ${run.outcome.key}">${masker.text(run.outcome.label)}</span></p>
+<span class="outcome ${run.outcome.key}">${masker.text(run.outcome.label)}</span>${run.stoppedBy === run.outcome.key ? "" : ` · stopped by ${masker.text(stoppedByLabel(run))}`}${run.usageUnsettled ? " · usage unsettled" : ""}</p>
 
 <h2>totals</h2>
 <table class="kv">

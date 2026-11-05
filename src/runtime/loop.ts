@@ -24,6 +24,7 @@ import {
 } from "../store/runs.js";
 import { RunEventLog } from "../store/run-events.js";
 import { ThreadStore } from "../store/threads.js";
+import { readStopIntent, type StopInitiator } from "./daemon.js";
 import { buildAgent, readSoul } from "./session.js";
 import { hasWakeWorthyPending, WakeScheduler } from "./wake.js";
 import { SandboxManager } from "../sandbox/manager.js";
@@ -44,6 +45,17 @@ export interface AliveRuntimeOptions {
 	config: LoadedConfig;
 	log: Logger;
 	force?: boolean;
+}
+
+/**
+ * Extra, optional knobs for `stop()`.
+ *
+ * `reason` stays free-form and backward compatible ("signal", "once",
+ * "smoke", "requested"); `initiator` is who stopped the run, which is what the
+ * run record needs (#168).
+ */
+export interface StopOptions {
+	initiator?: StopInitiator;
 }
 
 /**
@@ -426,10 +438,17 @@ export class AliveRuntime {
 		return record;
 	}
 
-	async stop(reason = "requested"): Promise<void> {
+	async stop(reason = "requested", options: StopOptions = {}): Promise<void> {
 		if (this.stopping) return;
 		this.stopping = true;
-		this.log.info("stopping", { reason });
+		// Both `alive stop` and `alive restart` arrive as SIGTERM, so the initiator
+		// comes from the explicit argument, the stop-intent marker or the SIGTERM
+		// default (a service manager restart) — never from the signal alone (#168).
+		// The marker is always consumed, so a stale one cannot label a later stop.
+		const marker = readStopIntent(this.config.paths.stateDir);
+		const initiator: StopInitiator = options.initiator ?? marker ?? "restart";
+		this.runner?.setStopInitiator(initiator);
+		this.log.info("stopping", { reason, initiator });
 		// Wake the loop from `WakeScheduler`/backoff without touching an in-flight
 		// tool. The session is only aborted if the drain budget expires.
 		this.abortController.abort();

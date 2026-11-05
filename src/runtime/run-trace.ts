@@ -17,6 +17,61 @@ function numberOrZero(value: unknown): number {
 	return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
+/** A zeroed usage object (`RunUsage` is always fully populated). */
+export function zeroUsage(): RunUsage {
+	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 };
+}
+
+/** True when a usage object reports any token or any cost. */
+export function hasUsage(usage: RunUsage): boolean {
+	return (
+		usage.input !== 0 ||
+		usage.output !== 0 ||
+		usage.cacheRead !== 0 ||
+		usage.cacheWrite !== 0 ||
+		usage.total !== 0 ||
+		usage.cost !== 0
+	);
+}
+
+/** Per-field slack below which a residual is floating-point noise, not spend. */
+export const RESIDUAL_USAGE_EPSILON = 1e-9;
+
+/**
+ * The spend of a run segment that none of its per-turn traces accounts for.
+ *
+ * `total` is the session-stats delta of the segment (measured from the snapshot
+ * taken at run start, never from session start); `traces` are the confirmed
+ * `turn_end` steps recorded during that same segment. A provider that bills a
+ * step without ever sending `turn_end` leaves a positive residual, which the
+ * run record surfaces as `usageUnsettled` (#168). Every field is clamped at 0:
+ * an over-reported trace (a resumed session, a provider that settles twice)
+ * must never produce negative numbers, and sub-epsilon float noise is not spend.
+ */
+export function residualUsage(total: RunUsage, traces: ReadonlyArray<{ usage: RunUsage }>): RunUsage {
+	const attributed = zeroUsage();
+	for (const trace of traces) {
+		attributed.input += numberOrZero(trace.usage?.input);
+		attributed.output += numberOrZero(trace.usage?.output);
+		attributed.cacheRead += numberOrZero(trace.usage?.cacheRead);
+		attributed.cacheWrite += numberOrZero(trace.usage?.cacheWrite);
+		attributed.total += numberOrZero(trace.usage?.total);
+		attributed.cost += numberOrZero(trace.usage?.cost);
+	}
+	const delta = (difference: number): number => {
+		// Sub-epsilon differences are float noise (0.01 + 0.01 is not 0.02), not spend.
+		return difference > RESIDUAL_USAGE_EPSILON ? difference : 0;
+	};
+	return {
+		input: delta(total.input - attributed.input),
+		output: delta(total.output - attributed.output),
+		cacheRead: delta(total.cacheRead - attributed.cacheRead),
+		cacheWrite: delta(total.cacheWrite - attributed.cacheWrite),
+		total: delta(total.total - attributed.total),
+		cost: delta(total.cost - attributed.cost),
+	};
+}
+
 /**
  * Read the usage of one assistant message.
  *
@@ -87,12 +142,16 @@ export class TurnTraceRecorder {
 	private buffer: RunTurnTrace[] = [];
 	private startedAt: number | undefined;
 	private count = 0;
+	/** Spend already attributed to confirmed turns since the last `reset()`. */
+	private attributed = zeroUsage();
 
 	constructor(private readonly now: () => number = Date.now) {}
 
 	/**
 	 * Called when a run starts. A resumed run seeds the recorder with its prior
 	 * traces and turn count so new steps continue at the next absolute index.
+	 * The attributed-usage counter is per segment: the caller subtracts it from
+	 * the session-stats delta of the same segment.
 	 */
 	reset(previous: { turns?: RunTurnTrace[]; count?: number } = {}): void {
 		this.buffer = (previous.turns ?? []).map((trace) => ({
@@ -101,8 +160,14 @@ export class TurnTraceRecorder {
 			tools: [...trace.tools],
 		}));
 		this.startedAt = undefined;
+		this.attributed = zeroUsage();
 		const lastIndex = this.buffer[this.buffer.length - 1]?.index ?? 0;
 		this.count = Math.max(previous.count ?? 0, lastIndex, this.buffer.length);
+	}
+
+	/** Usage of every confirmed turn recorded since the last `reset()`. */
+	usageSinceReset(): RunUsage {
+		return { ...this.attributed };
 	}
 
 	/** `turn_start`: remember when the turn began. */
@@ -124,11 +189,18 @@ export class TurnTraceRecorder {
 		// A turn without an assistant message would be a zero-cost fiction.
 		if (fields.role !== undefined && fields.role !== "assistant") return undefined;
 		this.count += 1;
+		const usage = usageFromMessage(fields);
+		this.attributed.input += usage.input;
+		this.attributed.output += usage.output;
+		this.attributed.cacheRead += usage.cacheRead;
+		this.attributed.cacheWrite += usage.cacheWrite;
+		this.attributed.total += usage.total;
+		this.attributed.cost += usage.cost;
 		const trace: RunTurnTrace = {
 			index: this.count,
 			startedAt,
 			durationMs: Math.max(0, at - startedAt),
-			usage: usageFromMessage(fields),
+			usage,
 			tools: toolNames(fields, input.toolResults),
 		};
 		this.buffer.push(trace);

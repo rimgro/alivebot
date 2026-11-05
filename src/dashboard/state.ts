@@ -18,9 +18,12 @@ import type { AliveEvent } from "../store/events.js";
 import type { Reminder } from "../store/reminders.js";
 import {
 	RUN_TURN_TRACE_LIMIT,
+	runStoppedBy,
+	runStoppedByInferred,
 	runTurnCount,
 	type CompactionRecord,
 	type RunRecord,
+	type RunStoppedBy,
 	type RunStopReason,
 	type RunUsage,
 	type RuntimeStateFile,
@@ -234,6 +237,10 @@ export interface RunView {
 	activeMs: number;
 	idleMs: number;
 	stopReason: RunStopReason;
+	/** Who stopped the run (#168); derived from the stop reason for older records. */
+	stoppedBy: RunStoppedBy;
+	/** True when `stoppedBy` was derived from `stopReason` instead of recorded. */
+	stoppedByInferred: boolean;
 	outcome: RunOutcome;
 	error?: string;
 	turns: number;
@@ -252,6 +259,8 @@ export interface RunView {
 	sleep?: { forced: boolean; summaryChars: number };
 	/** Last auto-compaction outcome in this run (#167). */
 	compaction?: CompactionRecord;
+	/** True when the run spent tokens that no per-turn trace accounts for (#168). */
+	usageUnsettled: boolean;
 }
 
 export function toRunView(record: RunRecord): RunView {
@@ -265,6 +274,8 @@ export function toRunView(record: RunRecord): RunView {
 		activeMs: record.activeMs,
 		idleMs: record.idleMs,
 		stopReason: record.stopReason,
+		stoppedBy: runStoppedBy(record),
+		stoppedByInferred: runStoppedByInferred(record),
 		outcome: runOutcome(record.stopReason),
 		error: record.error,
 		turns: runTurnCount(record),
@@ -294,6 +305,7 @@ export function toRunView(record: RunRecord): RunView {
 		journalEntries: record.journalEntries ?? 0,
 		sleep: record.sleep,
 		compaction: record.compaction,
+		usageUnsettled: record.usageUnsettled === true,
 	};
 }
 
@@ -714,7 +726,14 @@ export function describeRun(record: RunRecord): string {
 	const compaction = record.compaction && !record.compaction.ok
 		? ` · compaction failed: ${record.compaction.reasonClass ?? "provider_error"}`
 		: "";
-	return `#${record.index} ${formatDuration(record.durationMs)} · ${outcome.key} · ${runTurnCount(record)} turns · ${record.events?.length ?? 0} events${compaction}`;
+	// The initiator is only worth a word when it is not already the outcome
+	// keyword (`sleep` says nothing that `slept` did not). A derived initiator is
+	// labelled `(inferred)` so a guess is never read as a recorded fact (#168).
+	const stoppedBy = runStoppedBy(record);
+	const inferred = runStoppedByInferred(record) ? " (inferred)" : "";
+	const initiator = stoppedBy === outcome.key ? "" : ` · stopped by ${stoppedBy}${inferred}`;
+	const unsettled = record.usageUnsettled === true ? " · usage unsettled" : "";
+	return `#${record.index} ${formatDuration(record.durationMs)} · ${outcome.key}${initiator} · ${runTurnCount(record)} turns · ${record.events?.length ?? 0} events${compaction}${unsettled}`;
 }
 
 export function readAgentSummary(
