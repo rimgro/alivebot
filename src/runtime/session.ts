@@ -12,14 +12,13 @@ import {
 	SettingsManager,
 	type AgentSession,
 } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_CONTRACT, type LoadedConfig } from "../config.js";
-import { defaultModelSpec } from "../config.js";
+import { DEFAULT_COMPACT_KEEP_TOOLS, DEFAULT_CONTRACT, defaultModelSpec, ensureCompactCatalogTools, type LoadedConfig } from "../config.js";
 import type { Logger } from "../log.js";
 import { ensureDir } from "../util.js";
 import { maskSecrets } from "../secrets.js";
 import { installCompactionGuard } from "./compaction.js";
 import { buildSystemPrompt } from "./prompt.js";
-import { ALIVE_TOOL_NAMES, createAliveTools, type ToolDeps } from "./tools.js";
+import { ALIVE_TOOL_NAMES, createAliveTools, type CompactToolBridge, type CompactToolDefinition, type ToolDeps } from "./tools.js";
 import { SandboxManager } from "../sandbox/manager.js";
 import { createSandboxTools } from "../sandbox/tools.js";
 import type { ToolAbortGate } from "./tool-abort.js";
@@ -56,6 +55,60 @@ export interface BuildAgentOptions {
 }
 
 /**
+ * Pick the directly active tools when the compact catalog is on (#69).
+ *
+ * The keep list is a preference: only names that survived the allowlist /
+ * isolation / registration filter in `allowed` can stay active. The two
+ * dispatchers are appended last and filtered the same way, so the compact set
+ * is always a subset of the full set and never invents a permitted tool.
+ */
+export function compactActiveTools(input: {
+	allowed: string[];
+	keep?: string[];
+	required?: string[];
+}): string[] {
+	const allowed = new Set(input.allowed);
+	const names: string[] = [];
+	const add = (name: string) => {
+		if (allowed.has(name) && !names.includes(name)) names.push(name);
+	};
+	for (const name of input.keep ?? DEFAULT_COMPACT_KEEP_TOOLS) add(name);
+	for (const name of input.required ?? ["find_tool", "use_tool"]) add(name);
+	return names;
+}
+
+/** One-line fallbacks for pi built-ins, used only by the compact prompt table. */
+const BUILTIN_TOOL_DESCRIPTIONS: Record<string, string> = {
+	read: "Read a file from the workspace.",
+	write: "Write a file in the workspace.",
+	edit: "Replace exact text in a workspace file.",
+	bash: "Run a shell command in the workspace.",
+	grep: "Search file contents for a pattern.",
+	find: "Find files by glob pattern.",
+	ls: "List a workspace directory.",
+};
+
+/** Name + one line for the hidden tools; schemas come from find_tool instead. */
+function compactPromptEntries(input: {
+	allowed: string[];
+	active: string[];
+	definitions: Array<{ name: string; description: string }>;
+}): Array<{ name: string; description: string }> {
+	const active = new Set(input.active);
+	const descriptions = new Map(input.definitions.map((definition) => [definition.name, definition.description]));
+	return input.allowed
+		.filter((name) => !active.has(name) && name !== "find_tool" && name !== "use_tool")
+		.map((name) => ({
+			name,
+			description:
+				descriptions.get(name) ??
+				BUILTIN_TOOL_DESCRIPTIONS[name] ??
+				"custom or extension tool registered in this session",
+		}))
+		.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+/**
  * Build the pi coding-agent session that backs this runtime.
  *
  * We use the SDK in-process (not RPC/TUI). Everything is explicit:
@@ -81,6 +134,10 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 	const blockedHostTools = new Set(["web_search", ...(!sharedBrowser ? ["browser"] : [])]);
 	const reserved = new Set([...sandboxTools.map((tool) => tool.name), ...blockedHostTools, "tool_registry"]);
 	if (isolated && toolDeps.moduleTools.some((tool) => reserved.has(tool.name))) throw new Error("Module tools cannot override isolated filesystem/shell tools");
+	const compactCatalog = cfg.tools.compactCatalog === true;
+	// Keep the dispatchers allowed even when a caller built LoadedConfig by hand
+	// instead of going through loadConfig's normalization.
+	const toolAllowlist = compactCatalog ? ensureCompactCatalogTools(cfg.tools.allowlist, true) : cfg.tools.allowlist;
 
 	ensureDir(paths.agentDir);
 	ensureDir(paths.sessionsDir);
@@ -105,7 +162,46 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 		}
 	}
 
-	const systemPrompt = buildSystemPrompt({
+	const settingsManager = SettingsManager.inMemory({
+		compaction: { enabled: true },
+		retry: { enabled: true, maxRetries: 3 },
+	});
+
+	const toolboxExtensionPath = path.join(
+		path.dirname(fileURLToPath(import.meta.url)),
+		`toolbox-extension${fileURLToPath(import.meta.url).endsWith(".ts") ? ".ts" : ".js"}`,
+	);
+	process.env.ALIVE_TOOLS_DIR = path.join(paths.stateDir, "tools");
+	process.env.ALIVE_TOOL_ALLOWLIST = JSON.stringify(toolAllowlist);
+
+	const sandboxBuiltins = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
+	const builtinTools = cfg.tools.builtin.filter((tool) => (!isolated || sandboxBuiltins.has(tool)) && (tool !== "bash" || cfg.tools.bash));
+	const persistedTools = isolated ? [] : readPersistedToolNames(path.join(paths.stateDir, "tools", "registry.json"));
+	// Workers use the same execution boundary as this session: the agent's VM
+	// when sandboxed, the profile workspace otherwise. Enable the tool from the
+	// operator-owned workers switch, not from a delegated grant.
+	const workerTools = cfg.workers.enabled ? ["worker"] : [];
+	const allowedTools = selectAllowedTools({
+		allowlist: [...toolAllowlist, ...workerTools],
+		builtins: builtinTools,
+		alive: isolated ? [...ALIVE_TOOL_NAMES.filter((name) => !blockedHostTools.has(name)), "file", "sandbox_control"] : [...ALIVE_TOOL_NAMES],
+		modules: toolDeps.moduleTools.map((tool) => tool.name),
+		sandbox: sandboxTools.map((tool) => tool.name),
+		custom: persistedTools,
+		toolRegistryAvailable: !isolated,
+	});
+
+	// Compact catalog (#69): the whole allowlisted set stays registered so
+	// use_tool can reach it; only a short subset is active. The mode is opt-in,
+	// so the default path below keeps the exact previous prompt and tool list.
+	const compactBridge: CompactToolBridge | undefined = compactCatalog ? {} : undefined;
+	const aliveTools = createAliveTools(compactBridge ? { ...toolDeps, compactBridge } : toolDeps);
+	const registeredAliveTools = isolated ? aliveTools.filter((tool) => !blockedHostTools.has(tool.name)) : aliveTools;
+	const activeTools = compactCatalog
+		? compactActiveTools({ allowed: allowedTools, keep: cfg.tools.compactKeep })
+		: allowedTools;
+
+	const promptBase = {
 		name: cfg.name,
 		soul,
 		contract: readContract(paths.contractPath),
@@ -123,19 +219,21 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 				sandboxed: isolated,
 			}
 			: undefined,
-	});
+	};
+	// `fullSystemPrompt` is the pre-#69 prompt, kept only as the "before" side
+	// of the start-up metric when compact mode is on.
+	const fullSystemPrompt = buildSystemPrompt(promptBase);
+	const hiddenPromptEntries = compactCatalog
+		? compactPromptEntries({
+			allowed: allowedTools,
+			active: activeTools,
+			definitions: [...registeredAliveTools, ...sandboxTools],
+		})
+		: undefined;
+	const systemPrompt = hiddenPromptEntries
+		? buildSystemPrompt({ ...promptBase, compactCatalog: hiddenPromptEntries })
+		: fullSystemPrompt;
 
-	const settingsManager = SettingsManager.inMemory({
-		compaction: { enabled: true },
-		retry: { enabled: true, maxRetries: 3 },
-	});
-
-	const toolboxExtensionPath = path.join(
-		path.dirname(fileURLToPath(import.meta.url)),
-		`toolbox-extension${fileURLToPath(import.meta.url).endsWith(".ts") ? ".ts" : ".js"}`,
-	);
-	process.env.ALIVE_TOOLS_DIR = path.join(paths.stateDir, "tools");
-	process.env.ALIVE_TOOL_ALLOWLIST = JSON.stringify(cfg.tools.allowlist);
 	const resourceLoader = new DefaultResourceLoader({
 		cwd: paths.workspaceDir,
 		agentDir: paths.agentDir,
@@ -152,23 +250,6 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 	for (const error of resourceLoader.getExtensions().errors) {
 		log.warn("extension failed to load", { path: error.path, error: error.error });
 	}
-
-	const sandboxBuiltins = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
-	const builtinTools = cfg.tools.builtin.filter((tool) => (!isolated || sandboxBuiltins.has(tool)) && (tool !== "bash" || cfg.tools.bash));
-	const persistedTools = isolated ? [] : readPersistedToolNames(path.join(paths.stateDir, "tools", "registry.json"));
-	// Workers use the same execution boundary as this session: the agent's VM
-	// when sandboxed, the profile workspace otherwise. Enable the tool from the
-	// operator-owned workers switch, not from a delegated grant.
-	const workerTools = cfg.workers.enabled ? ["worker"] : [];
-	const allowedTools = selectAllowedTools({
-		allowlist: [...cfg.tools.allowlist, ...workerTools],
-		builtins: builtinTools,
-		alive: isolated ? [...ALIVE_TOOL_NAMES.filter((name) => !blockedHostTools.has(name)), "file", "sandbox_control"] : [...ALIVE_TOOL_NAMES],
-		modules: toolDeps.moduleTools.map((tool) => tool.name),
-		sandbox: sandboxTools.map((tool) => tool.name),
-		custom: persistedTools,
-		toolRegistryAvailable: !isolated,
-	});
 
 	const { sessionManager, resumeFailure } = openSessionManager({
 		config,
@@ -187,9 +268,7 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 		// SDK-level name ceiling, so future host builtins cannot become active.
 		noTools: isolated ? "builtin" : undefined,
 		tools: isolated ? allowedTools : undefined,
-		customTools: isolated
-			? [...createAliveTools(toolDeps).filter((tool) => !blockedHostTools.has(tool.name)), ...sandboxTools]
-			: createAliveTools(toolDeps),
+		customTools: isolated ? [...registeredAliveTools, ...sandboxTools] : registeredAliveTools,
 		resourceLoader,
 		sessionManager,
 		settingsManager,
@@ -213,11 +292,60 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 	// Extensions may register tools, but only names selected below become active.
 	// The same configured allowlist is enforced by the toolbox extension for tools
 	// created or loaded after this initial activation.
-	session.setActiveToolsByName(allowedTools);
+	session.setActiveToolsByName(activeTools);
+
+	// Fill the compact bridge only after the registry and activation exist: it
+	// must resolve hidden tools through pi, not through a private copy.
+	if (compactCatalog && compactBridge) {
+		const hiddenAllowed = new Set(allowedTools);
+		const hiddenActive = new Set(activeTools);
+		compactBridge.hidden = () =>
+			session
+				.getAllTools()
+				.filter(
+					(info) =>
+						hiddenAllowed.has(info.name) &&
+						!hiddenActive.has(info.name) &&
+						info.name !== "find_tool" &&
+						info.name !== "use_tool",
+				)
+				.map((info) => {
+					const definition = session.getToolDefinition(info.name);
+					if (!definition) return undefined;
+					return {
+						name: definition.name,
+						description: definition.description,
+						parameters: definition.parameters,
+						execute: definition.execute,
+					} as CompactToolDefinition;
+				})
+				.filter((definition): definition is CompactToolDefinition => definition !== undefined);
+		let callSeq = 0;
+		compactBridge.execute = async (name, params, signal) => {
+			const definition = session.getToolDefinition(name);
+			if (!definition) throw new Error(`tool "${name}" is not registered in this session`);
+			callSeq += 1;
+			// Same pi execution path as a direct call: the definition owns its
+			// implementation, limits and error text. Only the extension context has
+			// to be synthesized here (the SDK does the same for agent-loop calls).
+			const context = session.extensionRunner.createContext();
+			return definition.execute(`compact_${callSeq}_${name}`, params, signal, undefined, context);
+		};
+	}
 	// Wrap every active tool (built-ins, alive tools and sandbox tools) so the
 	// operator can abort exactly the call that is running (#164). The runtime
 	// re-wraps before each model step for tools activated later.
 	options.toolAbortGate?.wrapAgent(session.agent);
+
+	if (compactCatalog) {
+		log.info("compact tool catalog active", {
+			activeTools: session.getActiveToolNames().length,
+			hiddenTools: compactBridge?.hidden?.().length ?? 0,
+			promptCharsBefore: fullSystemPrompt.length,
+			promptCharsAfter: systemPrompt.length,
+			promptCharsSession: session.systemPrompt.length,
+		});
+	}
 
 	if (modelFallbackMessage) log.warn("model fallback", { message: modelFallbackMessage });
 	log.info("agent session ready", {

@@ -108,11 +108,128 @@ export interface ToolDeps {
 	workers?: WorkerManager;
 	/** Host-side dashboard tool; undefined in tests and embedders that do not need it. */
 	dashboard?: DashboardTool;
+	/**
+	 * Compact-catalog bridge (#69). Filled by the session after the pi registry
+	 * exists, so find_tool/use_tool call the same registered tools instead of a
+	 * private copy of their implementations.
+	 */
+	compactBridge?: CompactToolBridge;
 	deliver: (message: OutgoingMessage) => Promise<void>;
 	getRun: () => RunHandle | undefined;
 	runtimeStatus: () => Record<string, unknown>;
 	isStopping: () => boolean;
 	log: Logger;
+}
+
+/** A tool that is registered in the session but deliberately not active. */
+export interface CompactToolDefinition {
+	name: string;
+	description: string;
+	parameters: unknown;
+	execute: ToolDefinition["execute"];
+}
+
+/**
+ * Mutable bridge between the compact dispatchers and the pi session registry.
+ *
+ * `session.ts` creates the holder before `createAliveTools` (the tools need it)
+ * and fills both fields right after `createAgentSession`/`setActiveToolsByName`.
+ * Tests inject their own holder, which keeps find_tool/use_tool independent of
+ * a real model, network or VM.
+ */
+export interface CompactToolBridge {
+	/** Registered-but-inactive tools, with full parameter schemas. */
+	hidden?: () => CompactToolDefinition[];
+	/** Execute a hidden tool through the session's own definition. */
+	execute?: (name: string, params: Record<string, unknown>, signal?: AbortSignal) => Promise<AgentToolResult<unknown>>;
+}
+
+/** Parsed `use_tool.arguments`: an object, or a JSON object encoded as a string. */
+export function parseToolArguments(value: unknown): Record<string, unknown> {
+	if (value === undefined || value === null) return {};
+	if (typeof value === "string") {
+		const text = value.trim();
+		if (!text) return {};
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(text);
+		} catch (error) {
+			throw new Error(`arguments is not valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+			throw new Error("arguments must be a JSON object, not a primitive or an array");
+		}
+		return parsed as Record<string, unknown>;
+	}
+	if (typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
+	throw new Error("arguments must be an object or a JSON object string");
+}
+
+function schemaText(schema: unknown): string {
+	try {
+		return JSON.stringify(schema) ?? "";
+	} catch {
+		return "";
+	}
+}
+
+/** Occurrences of `needle`, with an extra point when the hit starts a word. */
+function substringScore(needle: string, haystack: string): number {
+	if (!needle) return 0;
+	const text = haystack.toLowerCase();
+	let score = 0;
+	let from = 0;
+	while (from <= text.length) {
+		const at = text.indexOf(needle, from);
+		if (at < 0) break;
+		score += 1;
+		if (at === 0 || !/[a-z0-9]/i.test(text.charAt(at - 1))) score += 1;
+		from = at + Math.max(1, needle.length);
+		if (score >= 20) break;
+	}
+	return score;
+}
+
+/**
+ * Score a query against one text: the whole phrase first, then individual
+ * words when the phrase is not contiguous ("browser share"). Deterministic.
+ */
+function matchScore(needle: string, haystack: string): number {
+	const whole = substringScore(needle, haystack);
+	if (whole > 0) return whole;
+	const parts = needle.split(/\s+/).filter((part) => part.length >= 2);
+	if (parts.length < 2) return 0;
+	let score = 0;
+	for (const part of parts) score += substringScore(part, haystack);
+	return score;
+}
+
+/**
+ * Deterministic search over the hidden catalogue (#69).
+ *
+ * Name matches weigh most, then one-line description, then the schema text;
+ * a hit at a word boundary adds one point. Ties break on the name, so the same
+ * query always yields the same top-3.
+ */
+export function rankHiddenTools(
+	query: string,
+	tools: CompactToolDefinition[],
+	limit = 3,
+): CompactToolDefinition[] {
+	const needle = query.trim().toLowerCase();
+	if (!needle) return [];
+	return tools
+		.map((tool) => ({
+			tool,
+			score:
+				matchScore(needle, tool.name) * 4 +
+				matchScore(needle, tool.description) * 2 +
+				matchScore(needle, schemaText(tool.parameters)),
+		}))
+		.filter((entry) => entry.score > 0)
+		.sort((a, b) => b.score - a.score || (a.tool.name < b.tool.name ? -1 : a.tool.name > b.tool.name ? 1 : 0))
+		.slice(0, Math.max(1, limit))
+		.map((entry) => entry.tool);
 }
 
 export const ALIVE_TOOL_NAMES = [
@@ -137,6 +254,8 @@ export const ALIVE_TOOL_NAMES = [
 	"manage_agents",
 	"message_agent",
 	"worker",
+	"find_tool",
+	"use_tool",
 ] as const;
 
 type ToolResult = AgentToolResult<Record<string, unknown>>;
@@ -1337,6 +1456,90 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		},
 	});
 
+	const compactEnabled = deps.config.config.tools.compactCatalog === true;
+	const compactBridge = deps.compactBridge;
+	const hiddenCatalogue = (): CompactToolDefinition[] => {
+		const hidden = compactBridge?.hidden?.();
+		if (!hidden) throw new Error("the compact tool catalog is not initialized in this session");
+		return hidden;
+	};
+	const dispatcherNames = new Set(["find_tool", "use_tool"]);
+
+	const findTool = defineTool({
+		name: "find_tool",
+		label: "Find tool",
+		description:
+			"Search the hidden part of the tool catalogue by name, description or parameter schema. " +
+			"Returns up to three tools with their full parameter schemas. Call use_tool afterwards.",
+		parameters: Type.Object({
+			query: Type.String({ description: "Words to search for in a tool name, description or schema." }),
+		}),
+		execute: async (_toolCallId, params): Promise<ToolResult> => {
+			const query = params.query.trim();
+			if (!query) {
+				return ok("no match — pass a non-empty query (a word from the tool name or description).", { matches: [] });
+			}
+			const matches = rankHiddenTools(query, hiddenCatalogue());
+			if (matches.length === 0) {
+				return ok(
+					`no match for "${query}". Try a broader word from the tool name or description ` +
+						`(for example "browser", "reminder", "agent", "worker").`,
+					{ matches: [] },
+				);
+			}
+			const body = matches
+				.map((tool, index) => {
+					const schema = JSON.stringify(tool.parameters, null, 2);
+					return `${index + 1}. ${tool.name}\n${tool.description}\nparameters:\n${schema}`;
+				})
+				.join("\n\n");
+			return ok(
+				`${matches.length} match(es) for "${query}":\n\n${body}\n\nCall one with use_tool({ name, arguments }).`,
+				{ matches: matches.map((tool) => tool.name) },
+			);
+		},
+	});
+
+	const useTool = defineTool({
+		name: "use_tool",
+		label: "Use hidden tool",
+		description:
+			"Call a tool that is not in your active list. Pass the name and its arguments as an object or a JSON object string. " +
+			"Run find_tool first when you do not know the schema.",
+		parameters: Type.Object({
+			name: Type.String({ description: "Exact hidden tool name, e.g. from find_tool." }),
+			arguments: Type.Optional(
+				Type.Unknown({ description: "Tool arguments as an object, or the same object encoded as a JSON string." }),
+			),
+		}),
+		execute: async (_toolCallId, params, signal): Promise<AgentToolResult<unknown>> => {
+			const name = params.name.trim();
+			if (!name) throw new Error("name is required");
+			if (dispatcherNames.has(name)) {
+				throw new Error(`${name} cannot be called through use_tool; call it directly (no recursion through the dispatchers)`);
+			}
+			const allowed = new Set(deps.config.config.tools.allowlist);
+			if (deps.config.config.workers?.enabled) allowed.add("worker");
+			if (!allowed.has(name)) {
+				throw new Error(
+					`tool "${name}" is not in tools.allowlist for this profile; the allowlist is an operator decision`,
+				);
+			}
+			if (!compactBridge?.execute) throw new Error("the compact tool catalog is not initialized in this session");
+			// Only registered-but-hidden tools are valid targets. This rejects typos
+			// and already-active tools before their implementation is reached.
+			if (compactBridge.hidden) {
+				const hidden = compactBridge.hidden();
+				if (!hidden.some((tool) => tool.name === name)) {
+					throw new Error(`tool "${name}" is not a hidden tool in this session; check find_tool or call it directly if it is active`);
+				}
+			}
+			const args = parseToolArguments(params.arguments);
+			// Nothing is logged here on purpose: hidden arguments may carry secrets.
+			return compactBridge.execute(name, args, signal);
+		},
+	});
+
 	return [
 		webSearch,
 		...(deps.moduleTools.some(tool => tool.name === "browser") ? [] : [browser]),
@@ -1359,6 +1562,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		history,
 		closeThread,
 		status,
+		...(compactEnabled ? [findTool, useTool] : []),
 		...deps.moduleTools,
 	].filter(tool => deps.config.config.memory.enabled !== false || tool.name !== "memory") as ToolDefinition[];
 }

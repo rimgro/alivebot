@@ -25,6 +25,33 @@ export interface SystemPromptInput {
 		pullRequest: boolean;
 		sandboxed: boolean;
 	};
+	/**
+	 * Present only in compact-catalog mode (#69): the tools hidden behind
+	 * find_tool/use_tool. The full schemas are deliberately omitted — that is
+	 * the whole point of the mode — and only a name plus one line is listed.
+	 */
+	compactCatalog?: Array<{ name: string; description: string }>;
+}
+
+/**
+ * A short table of contents for the tools that are not active (#69).
+ *
+ * It must stay cheap: one line per hidden tool, no JSON schemas. The model gets
+ * those from `find_tool` only when it actually needs the tool.
+ */
+export function renderCompactCatalogSection(tools: Array<{ name: string; description: string }>): string {
+	const lines = [...tools]
+		.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+		.map((tool) => `- ${tool.name} — ${truncate(oneLine(tool.description), 160) || "(no description)"}`);
+	return `# Оглавление инструментов
+
+Only the tools in your active tool definitions can be called directly. For any
+other tool: call \`find_tool({ query })\` first to get its full parameter schema,
+then call \`use_tool({ name, arguments })\` with arguments that match that schema.
+Do not guess arguments for a hidden tool.
+
+Hidden tools (${lines.length}):
+${lines.length > 0 ? lines.join("\n") : "- (none)"}`;
 }
 
 /**
@@ -234,7 +261,9 @@ step limit. Do the important thing first and schedule the rest.${warnLine}
 
 - State and memory live in ${input.stateDir} (journal/, notes, reminders, logs).
 - Current time is always given in the message that woke you. Trust it over your
-  sense of time.`;
+  sense of time.${input.compactCatalog ? `
+
+${renderCompactCatalogSection(input.compactCatalog)}` : ""}`;
 }
 
 export interface AwakePromptInput {
