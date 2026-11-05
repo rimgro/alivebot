@@ -55,6 +55,12 @@ sandboxes without a user systemd manager.
   - node: `%h/.local/share/node24/bin/node`
   - repo: `%h/Projects/alive`
 
+The installer checks both before it touches anything and aborts with a clear
+message if either is missing, instead of enabling a unit that cannot start (it
+would fail on ExecStart and then sit in `start request repeated too quickly`).
+`ALIVE_SYSTEMD_NODE_BIN` and `ALIVE_SYSTEMD_ENTRY` override the two paths it
+verifies, for a host that keeps the checkout elsewhere.
+
 If the checkout lives somewhere else, change the templates in this directory and
 reinstall. Do not patch the host copies: the next install overwrites them.
 
@@ -77,7 +83,9 @@ Host divergence, for now: on the current host the base unit still points at
 pi-node v22, and node24 plus the browser token are provided by a single local
 `browser-deployment.conf` drop-in. After Rima's migration window the host moves
 to the templates in this repository, where node24 and `browser-token.conf` are the
-base state.
+base state. The installer deletes a leftover `browser-deployment.conf` from both
+drop-in directories (`removed legacy drop-in ...`) so it does not stay behind as
+stale configuration next to the files this directory owns.
 
 ## Update after editing a template
 
