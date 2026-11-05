@@ -37,6 +37,9 @@
     "maxNudgesPerRun": 5,
     "interrupt": true
   },
+  "health": {
+    "silentMs": 300000
+  },
   "budget": {
     "maxDailyCostUsd": 0,
     "maxWakesPerHour": 0

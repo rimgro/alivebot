@@ -766,6 +766,34 @@ export interface MemoryConfig {
 	revisionThreshold: number;
 }
 
+/**
+ * Dead-agent observability (#175).
+ *
+ * `silentMs` is how long a profile may go without a heartbeat while its pid is
+ * still alive (or while there is no runtime state at all) before the dashboard
+ * and `alive status` call it dead instead of sleeping. 0 disables the check.
+ * The schema default is 2 hours for managed profiles; the root profile of this
+ * repository overrides it to 5 minutes in `alive.config.json`.
+ */
+export interface HealthConfig {
+	silentMs: number;
+}
+
+export const DEFAULT_HEALTH_SILENT_MS = 2 * 60 * 60_000;
+export const DEFAULT_HEALTH_CONFIG: HealthConfig = { silentMs: DEFAULT_HEALTH_SILENT_MS };
+
+/** Validate the optional `health` block: a whole number >= 0, 0 = disabled. */
+export function validateHealthConfig(value: unknown): HealthConfig {
+	if (value === undefined || value === null) return { ...DEFAULT_HEALTH_CONFIG };
+	if (typeof value !== "object" || Array.isArray(value)) throw new Error("health must be an object");
+	const raw = value as Partial<HealthConfig>;
+	const silentMs = raw.silentMs === undefined || raw.silentMs === null ? DEFAULT_HEALTH_SILENT_MS : raw.silentMs;
+	if (typeof silentMs !== "number" || !Number.isSafeInteger(silentMs) || silentMs < 0) {
+		throw new Error(`health.silentMs must be a whole number >= 0 (0 disables it), got "${String(silentMs)}"`);
+	}
+	return { silentMs };
+}
+
 export interface AliveConfig {
 	name: string;
 	/** Model spec, e.g. "anthropic/claude-sonnet-4-5:high". Empty = use the default from ~/.pi/agent/settings.json. */
@@ -799,6 +827,8 @@ export interface AliveConfig {
 	sandbox: SandboxConfig;
 	memory: MemoryConfig;
 	loop: LoopConfig;
+	/** Dead-agent observability thresholds (#175). */
+	health: HealthConfig;
 	/** Optional per-profile override of the loop's context-sleep thresholds (#170). */
 	context?: ProfileContextConfig;
 	budget: BudgetConfig;
@@ -916,6 +946,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		interrupt: true,
 		emptyWakeBackoff: DEFAULT_EMPTY_WAKE_BACKOFF,
 	},
+	health: DEFAULT_HEALTH_CONFIG,
 	budget: {
 		maxDailyCostUsd: 0,
 		maxWakesPerHour: 0,
@@ -1156,6 +1187,7 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	applySecretEnv(merged, collectSecretEnv(envPath, process.env));
 	migrateLoopConfig(merged.loop as unknown as Record<string, unknown>);
 	merged.loop = validateLoopConfig(merged.loop);
+	merged.health = validateHealthConfig(merged.health);
 	merged.context = validateProfileContextConfig(merged.context, merged.loop);
 	// A custom/local allowlist can replace the inherited one wholesale. The
 	// context-reset path needs sleep+retain+journal, so put them back and warn once.

@@ -37,7 +37,7 @@ import {
 	restartRefusalText,
 } from "./runtime/harness-guard.js";
 import { LOG_SOURCES, followFile, readLogTail, renderLogLine, resolveLogSource } from "./logs.js";
-import { findProfile, loadDashboard, loadRootConfig, cacheReadPerTurn, contextMetricsText } from "./dashboard/state.js";
+import { findProfile, loadDashboard, loadRootConfig, cacheReadPerTurn, contextMetricsText, deriveAgentHealth } from "./dashboard/state.js";
 import { DEFAULT_USAGE_DAYS, buildUsageReport, renderUsageReport } from "./usage/report.js";
 import { WorkerStore, validateWorkerId, workerLabel } from "./workers/store.js";
 import { gitDiff, gitState, isGitRepository } from "./workers/worktree.js";
@@ -992,6 +992,17 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 	const usage = runs.usageToday();
 	const storeStatus = store.status();
 	const running = runtime ? isProcessAlive(runtime.pid) : false;
+	const heartbeat = readHeartbeatStatus(config.paths.stateDir, config.config.updates.heartbeatStaleMs);
+	// Process-level health (#175): a dead pid without a clean stop, a live pid whose
+	// heartbeat went silent, or no runtime and no heartbeat at all. The existing
+	// working/waiting/sleeping state remains separate (`alive status` shows the
+	// runtime status while the process is alive).
+	const health = deriveAgentHealth(runtime, {
+		pidAlive: () => running,
+		heartbeatAgeMs: heartbeat.ageMs,
+		silentMs: config.config.health.silentMs,
+		unitStatus: heartbeat.heartbeat?.unitStatus,
+	});
 	// An open run whose `lastTickAt` is older than `loop.runStallMs` is stalled
 	// (#173). Derived at read time, so a frozen process is visible even though it
 	// can no longer write runtime.json itself.
@@ -1031,6 +1042,7 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 					paths: config.paths,
 					runtime: runtime && running ? runtime : null,
 					staleRuntime: runtime && !running ? runtime : null,
+					health,
 					inbox: storeStatus,
 					reminders: reminders.list(),
 					threads: threads.all(),
@@ -1053,7 +1065,11 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 	const line = (label: string, value: string) => process.stdout.write(`${label.padEnd(12)} ${value}\n`);
 	const snapshot = snapshotRuntime(config.paths.stateDir);
 	line("agent", config.config.name);
-	line("status", running && runtime ? `${stall ? term.red("stalled") : runtime.status} (pid ${runtime.pid})` : "not running");
+	if (health.state === "dead") {
+		line("status", `${term.red("dead")} — ${health.reason ?? "no signs of life"}`);
+	} else {
+		line("status", running && runtime ? `${stall ? term.red("stalled") : runtime.status} (pid ${runtime.pid})` : "not running");
+	}
 	if (stall && runtime) {
 		line(
 			"stalled",

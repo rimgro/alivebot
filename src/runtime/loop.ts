@@ -1,7 +1,8 @@
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import { resolveMemoryDatabasePath, type LoadedConfig } from "../config.js";
-import { recordHeartbeat, refreshHeartbeat } from "../heartbeat.js";
+import { detectUnitStatus, recordHeartbeat, refreshHeartbeat } from "../heartbeat.js";
 import type { Logger } from "../log.js";
 import { EventStore } from "../store/events.js";
 import { HistoryStore } from "../store/history.js";
@@ -984,28 +985,46 @@ export class AliveRuntime {
 	// ---------------------------------------------------------------------
 
 	private writeHeartbeat(): void {
+		const now = Date.now();
+		const profileId = this.managedProfileId();
 		const record = recordHeartbeat({
 			stateDir: this.config.paths.stateDir,
 			startedAt: this.startedAt,
+			lastTickAt: this.lastStateWriteAt || this.startedAt,
+			unitStatus: profileId ? detectUnitStatus(profileId, { now }) : undefined,
 			log: this.log,
 		});
-		if (record) this.lastHeartbeatAt = Date.now();
+		if (record) this.lastHeartbeatAt = now;
+	}
+
+	/** Managed profile id (directory name), or undefined for the root profile. */
+	private managedProfileId(): string | undefined {
+		if (!this.config.config.rootConfigPath.trim()) return undefined;
+		return path.basename(this.config.paths.rootDir) || undefined;
 	}
 
 	/**
-	 * The record is written once at start; only its mtime moves afterwards, so a
-	 * long-lived process never looks dead to a watchdog while the pid, start time
-	 * and version it reports stay those of the real process start.
+	 * The record is written once at start; afterwards it is atomically rewritten
+	 * on the configured interval so `updatedAt`, `lastTickAt`, `staleSeconds` and
+	 * the best-effort systemd unit state stay true (#175). The mtime still moves
+	 * with each rewrite, so outside watchdogs keep reading freshness from it.
+	 *
+	 * The interval is never shorter than one second nor than
+	 * `updates.heartbeatStaleMs / 3`, matching the old touch cadence.
 	 */
 	private keepHeartbeatFresh(): void {
 		const intervalMs = Math.max(1_000, Math.floor(this.config.config.updates.heartbeatStaleMs / 3));
 		const now = Date.now();
 		if (now - this.lastHeartbeatAt < intervalMs) return;
-		if (refreshHeartbeat(this.config.paths.stateDir, this.log, now)) {
+		const profileId = this.managedProfileId();
+		// Diagnostics only, cached for 30 s and bounded by a 2 s timeout inside.
+		const unitStatus = profileId ? detectUnitStatus(profileId, { now }) : undefined;
+		const lastTickAt = this.lastStateWriteAt || this.startedAt;
+		if (refreshHeartbeat(this.config.paths.stateDir, this.log, now, { lastTickAt, unitStatus })) {
 			this.lastHeartbeatAt = now;
 			return;
 		}
-		// The file disappeared or cannot be touched: rewrite the full record.
+		// The file disappeared or cannot be rewritten: write the full record.
 		this.writeHeartbeat();
 	}
 

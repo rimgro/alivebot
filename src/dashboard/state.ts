@@ -13,6 +13,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { DEFAULT_CONTRACT, loadConfig, type LoadedConfig } from "../config.js";
+import { readHeartbeatStatus, type UnitStatus } from "../heartbeat.js";
 import { buildSystemPrompt } from "../runtime/prompt.js";
 import type { AliveEvent } from "../store/events.js";
 import type { Reminder } from "../store/reminders.js";
@@ -715,7 +716,7 @@ export function readInboxEvents(stateDir: string): AliveEvent[] {
 // agents list
 // ---------------------------------------------------------------------------
 
-export type AgentStatus = "working" | "waiting" | "sleeping";
+export type AgentStatus = "working" | "waiting" | "sleeping" | "dead";
 
 export interface AgentStatusView {
 	status: AgentStatus;
@@ -730,35 +731,74 @@ export interface DeriveStatusOptions {
 	pidAlive?: (pid: number) => boolean;
 	/** `loop.runStallMs`; 0 disables the stalled-run marker (#173). */
 	runStallMs?: number;
+	/** Age of the heartbeat file's mtime; undefined when there is no heartbeat (#175). */
+	heartbeatAgeMs?: number;
+	/** `health.silentMs`; 0 disables the dead-agent rules (#175). */
+	silentMs?: number;
+	/** Best-effort systemd unit state recorded in the heartbeat (#175). */
+	unitStatus?: UnitStatus;
+}
+
+/** Why a profile is considered dead, or undefined when no dead rule fires. */
+function deadAgentView(
+	runtime: RuntimeStateFile | null,
+	alive: boolean,
+	options: DeriveStatusOptions,
+	now: number,
+): AgentStatusView | undefined {
+	const silentMs = Math.max(0, Math.trunc(options.silentMs ?? 0));
+	const ageMs = options.heartbeatAgeMs;
+	const silent = ageMs === undefined || ageMs > silentMs;
+	const heartbeatText = ageMs === undefined
+		? "no heartbeat"
+		: `heartbeat ${formatDuration(ageMs)} ago`;
+	if (!runtime) {
+		if (silentMs <= 0 || !silent) return undefined;
+		return { status: "dead", note: `no runtime state; ${heartbeatText}` };
+	}
+	if (!alive && runtime.status !== "stopped") {
+		const parts = ["process is not running", heartbeatText];
+		if (options.unitStatus && options.unitStatus !== "active" && options.unitStatus !== "none") {
+			parts.push(`unit ${options.unitStatus}`);
+		}
+		if (runtime.error) parts.push(`runtime failed to start: ${oneLine(runtime.error, 160)}`);
+		return { status: "dead", note: parts.join("; ") };
+	}
+	if (alive && silentMs > 0 && ageMs !== undefined && ageMs > silentMs) {
+		return { status: "dead", note: `no heartbeat for ${formatDuration(ageMs)}` };
+	}
+	return undefined;
 }
 
 /**
- * Map `runtime.json` onto the three states the issue asks for.
+ * Map `runtime.json` (and the heartbeat) onto the states the dashboard shows.
  *
  * working = a run is in progress; waiting = blocked in `idle` (or paused by the
- * budget); sleeping = no live runtime, i.e. the agent is between lives and its
- * context is gone.
+ * budget); sleeping = no live runtime, i.e. the agent is between lives; dead =
+ * the process is gone without a clean stop, or a live pid stopped sending
+ * heartbeats (#175). A stalled open run keeps its own branch and wins over the
+ * heartbeat-based dead rule (#173).
  */
 export function deriveAgentStatus(
 	runtime: RuntimeStateFile | null,
 	options: DeriveStatusOptions = {},
 ): AgentStatusView {
-	if (!runtime) return { status: "sleeping", note: "no runtime state" };
-	const alive = (options.pidAlive ?? isProcessAlive)(runtime.pid);
+	const now = options.now ?? Date.now();
+	const alive = runtime ? (options.pidAlive ?? isProcessAlive)(runtime.pid) : false;
+	if (!runtime) {
+		return deadAgentView(null, false, options, now) ?? { status: "sleeping", note: "no runtime state" };
+	}
 	if (!alive) {
-		const note = runtime.status === "stopped"
-			? "runtime stopped"
-			: runtime.status === "error"
-				? `runtime failed to start: ${oneLine(runtime.error ?? "unknown error", 160)}`
-				: "process is not running";
-		return { status: "sleeping", note };
+		// A clean stop is a sleep, not a failure. Anything else with a dead pid is
+		// visible as dead instead of looking like a normal sleep (#175).
+		return deadAgentView(runtime, false, options, now) ?? { status: "sleeping", note: "runtime stopped" };
 	}
 	// An open run that stopped ticking is not "working": it is a visible failure
 	// (#173). Derived from `lastTickAt` so a frozen process is caught too.
 	const stall = detectRunStall({
 		runId: runtime.runId,
 		lastTickAt: runtime.lastTickAt,
-		now: options.now ?? Date.now(),
+		now,
 		thresholdMs: options.runStallMs ?? 0,
 	}) ?? (runtime.status === "stalled" ? runtime.runStalled : undefined);
 	if (stall) {
@@ -769,15 +809,49 @@ export function deriveAgentStatus(
 		};
 	}
 	if (runtime.status === "error") return { status: "sleeping", note: `runtime failed to start: ${oneLine(runtime.error ?? "unknown error", 160)}` };
+	const dead = deadAgentView(runtime, true, options, now);
+	if (dead) return dead;
 	if (runtime.status === "paused-budget") return { status: "waiting", note: "paused: budget" };
 	if (runtime.idling || runtime.status === "idle") {
-		const now = options.now ?? Date.now();
 		const since = runtime.idleSince ? ` since ${new Date(runtime.idleSince).toISOString()}` : "";
 		const waited = runtime.idleSince ? `, ${formatDuration(now - runtime.idleSince)}` : "";
 		return { status: "waiting", note: `idle${since}${waited}` };
 	}
 	if (runtime.status === "starting") return { status: "working", note: "starting" };
 	return { status: "working", note: `run #${runtime.runIndex}` };
+}
+
+export type AgentHealthState = "dead" | "running" | "stopped";
+
+/** The additive `health` block `alive status --json` exposes (#175). */
+export interface AgentHealthView {
+	state: AgentHealthState;
+	reason?: string;
+	heartbeatAgeMs?: number;
+	silentMs: number;
+	unitStatus?: UnitStatus;
+}
+
+/**
+ * Process-level health, separate from the working/waiting/sleeping UI state.
+ * Shares the dead rules with `deriveAgentStatus`; a stalled run still counts as
+ * a running process here (its own badge is the anomaly).
+ */
+export function deriveAgentHealth(
+	runtime: RuntimeStateFile | null,
+	options: DeriveStatusOptions = {},
+): AgentHealthView {
+	const now = options.now ?? Date.now();
+	const alive = runtime ? (options.pidAlive ?? isProcessAlive)(runtime.pid) : false;
+	const silentMs = Math.max(0, Math.trunc(options.silentMs ?? 0));
+	const dead = deadAgentView(runtime, alive, options, now);
+	return {
+		state: dead ? "dead" : alive ? "running" : "stopped",
+		...(dead ? { reason: dead.note } : {}),
+		...(options.heartbeatAgeMs !== undefined ? { heartbeatAgeMs: options.heartbeatAgeMs } : {}),
+		silentMs,
+		...(options.unitStatus !== undefined ? { unitStatus: options.unitStatus } : {}),
+	};
 }
 
 export interface AgentSummary {
@@ -830,8 +904,16 @@ export function readAgentSummary(
 ): AgentSummary {
 	const now = options.now ?? Date.now();
 	const runtime = readRuntimeStateFile(profile.stateDir);
+	const heartbeat = readHeartbeatStatus(
+		profile.stateDir,
+		profile.config.config.updates.heartbeatStaleMs,
+		now,
+	);
 	const status = deriveAgentStatus(runtime, {
 		...options,
+		heartbeatAgeMs: options.heartbeatAgeMs ?? heartbeat.ageMs,
+		silentMs: options.silentMs ?? profile.config.config.health.silentMs,
+		unitStatus: options.unitStatus ?? heartbeat.heartbeat?.unitStatus,
 		runStallMs: options.runStallMs ?? profile.config.config.loop.runStallMs,
 	});
 	const lastCompaction = runtime?.lastCompaction;

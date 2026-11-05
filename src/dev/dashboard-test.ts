@@ -1036,9 +1036,67 @@ async function main(): Promise<void> {
 		{ now, pidAlive: () => false },
 	);
 	check(
-		"a dead process with status error explains the failed boot (#173)",
-		bootError.status === "sleeping" && bootError.note.includes("runtime failed to start") && bootError.note.includes("not a valid pi session"),
+		"a dead process with status error is dead and explains the failed boot (#173/#175)",
+		bootError.status === "dead" &&
+			bootError.note.includes("process is not running") &&
+			bootError.note.includes("runtime failed to start") &&
+			bootError.note.includes("not a valid pi session"),
 		bootError,
+	);
+
+	// #175: a dead pid without a clean stop is visibly dead, not asleep.
+	const deadPid = deriveAgentStatus(
+		{ pid: 42, startedAt: base, lastTickAt: base, status: "working", runIndex: 3, pending: 0, openThreads: 0, sleeps: 0 },
+		{ now, pidAlive: () => false, heartbeatAgeMs: 90_000, silentMs: 600_000, unitStatus: "inactive" },
+	);
+	check(
+		"dead pid without a clean stop -> dead with the reason",
+		deadPid.status === "dead" &&
+			deadPid.note.includes("process is not running") &&
+			deadPid.note.includes("heartbeat") &&
+			deadPid.note.includes("unit inactive"),
+		deadPid,
+	);
+	// A live pid whose heartbeat went silent also reads dead (reused pid case).
+	const silent = deriveAgentStatus(
+		{ pid: 42, startedAt: base, lastTickAt: now - 1_000, status: "idle", runIndex: 3, pending: 0, openThreads: 0, sleeps: 0, idling: true, idleSince: now - 1_000 },
+		{ now, pidAlive: () => true, heartbeatAgeMs: 11 * 60_000, silentMs: 10 * 60_000 },
+	);
+	check(
+		"a live pid with a silent heartbeat -> dead",
+		silent.status === "dead" && silent.note.includes(`no heartbeat for ${formatDuration(11 * 60_000)}`),
+		silent,
+	);
+	const silentButStalled = deriveAgentStatus(stalledRuntime, {
+		now,
+		pidAlive: () => true,
+		runStallMs: 10 * 60_000,
+		heartbeatAgeMs: 30 * 60_000,
+		silentMs: 10 * 60_000,
+	});
+	check(
+		"the stalled branch keeps priority over the dead heartbeat rule",
+		silentButStalled.stalled === true && silentButStalled.status === "working" && silentButStalled.note.includes("stalled"),
+		silentButStalled,
+	);
+	const noSigns = deriveAgentStatus(null, { now, heartbeatAgeMs: undefined, silentMs: 10 * 60_000 });
+	check(
+		"no runtime and no heartbeat -> dead when health.silentMs is enabled",
+		noSigns.status === "dead" && noSigns.note.includes("no heartbeat"),
+		noSigns,
+	);
+	const noSignsDisabled = deriveAgentStatus(null, { now, heartbeatAgeMs: undefined, silentMs: 0 });
+	check("health.silentMs = 0 disables the no-runtime dead rule", noSignsDisabled.status === "sleeping", noSignsDisabled);
+	const freshNoRuntime = deriveAgentStatus(null, { now, heartbeatAgeMs: 1_000, silentMs: 10 * 60_000 });
+	check("a fresh heartbeat without runtime stays sleeping", freshNoRuntime.status === "sleeping", freshNoRuntime);
+	const deadHtml = renderIndexPage(
+		[{ ...mainSummary, status: "dead", statusNote: "process is not running; heartbeat 2m ago" }],
+		{ secrets: DEFAULT_SECRETS_CONFIG, env: {}, now },
+	);
+	check(
+		"the dashboard renders the dead status with its red class",
+		deadHtml.includes('class="st dead"') && deadHtml.includes("dead") && deadHtml.includes("process is not running"),
+		deadHtml.match(/class="st dead"[^<]*/)?.[0],
 	);
 	const stalledHtml = renderIndexPage(
 		[{ ...mainSummary, runStalled: { since: now - 15 * 60_000, ageMs: 15 * 60_000, thresholdMs: 10 * 60_000, runId: "run_c" } }],

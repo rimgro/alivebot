@@ -24,6 +24,7 @@
  * The file deliberately holds only facts about the *process*: pid, start time
  * and the harness build. Agent state (inbox, runs, memory) lives elsewhere.
  */
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,7 +33,111 @@ import { readJson, writeJsonAtomic } from "./util.js";
 
 export const HEARTBEAT_FILE = "heartbeat.json";
 
-/** What is on disk: exactly this shape, nothing else. */
+/**
+ * Best-effort systemd unit state for a managed profile.
+ *
+ * `none` means there is no usable `systemctl` (or no unit to ask), `unknown`
+ * means the command failed or answered something this build does not know.
+ */
+export type UnitStatus = "active" | "inactive" | "failed" | "activating" | "deactivating" | "unknown" | "none";
+
+const UNIT_STATUS_VALUES: readonly UnitStatus[] = [
+	"active",
+	"inactive",
+	"failed",
+	"activating",
+	"deactivating",
+	"unknown",
+	"none",
+];
+
+export function isUnitStatus(value: unknown): value is UnitStatus {
+	return typeof value === "string" && (UNIT_STATUS_VALUES as readonly string[]).includes(value);
+}
+
+/** How long one answered `systemctl is-active` is trusted. */
+export const UNIT_STATUS_CACHE_MS = 30_000;
+/** A hung service manager must never hold the scheduler for longer than this. */
+export const UNIT_STATUS_TIMEOUT_MS = 2_000;
+
+const unitStatusCache = new Map<string, { status: UnitStatus; checkedAt: number }>();
+
+/** The systemd template instance a managed profile is expected to run as. */
+export function systemdUnitName(profileId: string): string {
+	return `alive-agent@${profileId}`;
+}
+
+/** Test seam: forget every cached unit answer. */
+export function resetUnitStatusCache(): void {
+	unitStatusCache.clear();
+}
+
+/**
+ * Ask `systemctl is-active` for one managed profile's unit, cached for 30 s.
+ *
+ * This is diagnostics only. It never throws: a missing `systemctl` reads as
+ * `none`, a timeout/failure/unknown answer as `unknown`. The call is bounded by
+ * `UNIT_STATUS_TIMEOUT_MS`, so a wedged service manager cannot hang the caller.
+ */
+export function detectUnitStatus(
+	profileId: string,
+	options: { now?: number; cacheTtlMs?: number; envPath?: string } = {},
+): UnitStatus {
+	const unit = systemdUnitName(profileId);
+	const now = options.now ?? Date.now();
+	const cached = unitStatusCache.get(unit);
+	const ttl = options.cacheTtlMs ?? UNIT_STATUS_CACHE_MS;
+	if (cached && now - cached.checkedAt < ttl) return cached.status;
+	const status = queryUnitStatus(unit, options.envPath);
+	unitStatusCache.set(unit, { status, checkedAt: now });
+	return status;
+}
+
+function queryUnitStatus(unit: string, envPath = process.env.PATH ?? ""): UnitStatus {
+	const executable = findExecutable("systemctl", envPath);
+	if (!executable) return "none";
+	try {
+		const result = spawnSync(executable, ["is-active", unit], {
+			encoding: "utf8",
+			timeout: UNIT_STATUS_TIMEOUT_MS,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		if (result.error) return (result.error as NodeJS.ErrnoException).code === "ENOENT" ? "none" : "unknown";
+		const answer = String(result.stdout ?? "").trim().toLowerCase().split(/\s+/)[0] ?? "";
+		return isUnitStatus(answer) ? answer : "unknown";
+	} catch {
+		return "unknown";
+	}
+}
+
+/** Find an executable on PATH without spawning a shell. */
+function findExecutable(name: string, envPath: string): string | undefined {
+	const extensions = process.platform === "win32"
+		? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean)
+		: [""];
+	for (const directory of envPath.split(path.delimiter)) {
+		if (!directory) continue;
+		for (const extension of extensions) {
+			const candidate = path.join(directory, name + extension);
+			try {
+				if (!fs.statSync(candidate).isFile()) continue;
+				fs.accessSync(candidate, fs.constants.X_OK);
+				return candidate;
+			} catch {
+				// Not here or not executable.
+			}
+		}
+	}
+	return undefined;
+}
+
+/**
+ * What is on disk.
+ *
+ * The first six fields are the historical record. The rest were added for the
+ * dashboard's dead-agent detection (#175) and are optional so files written by
+ * older builds, and old readers that ignore unknown keys, keep working.
+ */
 export interface HeartbeatRecord {
 	pid: number;
 	/** ISO timestamp of the process start. */
@@ -45,6 +150,14 @@ export interface HeartbeatRecord {
 	tag?: string;
 	/** Git branch or short commit the harness runs from, when known. */
 	ref?: string;
+	/** ISO timestamp of the last heartbeat update (#175). */
+	updatedAt?: string;
+	/** ISO timestamp of the runtime's last tick, when known (#175). */
+	lastTickAt?: string;
+	/** Whole seconds between `lastTickAt` and `updatedAt`; 0 when no tick was recorded (#175). */
+	staleSeconds?: number;
+	/** Best-effort `systemctl is-active alive-agent@<profile>` answer (#175). */
+	unitStatus?: UnitStatus;
 }
 
 /** The subset of `Logger` the heartbeat needs; a stub is enough in tests. */
@@ -61,6 +174,12 @@ export interface HeartbeatWriteOptions {
 	buildId?: string;
 	tag?: string;
 	ref?: string;
+	/** Runtime tick this update reflects (#175); omitted at process start. */
+	lastTickAt?: number | Date;
+	/** Best-effort unit state (#175); omitted when unknown or not managed. */
+	unitStatus?: UnitStatus;
+	/** Clock seam for tests; defaults to now. */
+	now?: number | Date;
 }
 
 export function heartbeatPath(stateDir: string): string {
@@ -77,16 +196,26 @@ export function writeHeartbeat(options: HeartbeatWriteOptions): HeartbeatRecord 
 		options.startedAt instanceof Date
 			? options.startedAt
 			: new Date(options.startedAt ?? Date.now());
+	const writtenAt = options.now instanceof Date ? options.now : new Date(options.now ?? Date.now());
+	const lastTickAt = options.lastTickAt instanceof Date
+		? options.lastTickAt
+		: options.lastTickAt === undefined
+			? undefined
+			: new Date(options.lastTickAt);
 	const record: HeartbeatRecord = {
 		pid: options.pid ?? process.pid,
 		startedAt: startedAt.toISOString(),
 		version: options.version ?? identity.version,
 		buildId: options.buildId ?? identity.buildId,
+		updatedAt: writtenAt.toISOString(),
+		staleSeconds: lastTickAt ? Math.max(0, Math.trunc((writtenAt.getTime() - lastTickAt.getTime()) / 1_000)) : 0,
 	};
 	const tag = options.tag ?? identity.tag;
 	if (tag) record.tag = tag;
 	const ref = options.ref ?? identity.ref;
 	if (ref) record.ref = ref;
+	if (lastTickAt) record.lastTickAt = lastTickAt.toISOString();
+	if (options.unitStatus) record.unitStatus = options.unitStatus;
 	writeJsonAtomic(heartbeatPath(options.stateDir), record);
 	return record;
 }
@@ -109,15 +238,54 @@ export function recordHeartbeat(
 	}
 }
 
+export interface HeartbeatRefreshOptions {
+	/** Runtime tick this refresh reflects (#175). */
+	lastTickAt?: number | Date;
+	/** Best-effort unit state (#175); omitted keeps the previous value. */
+	unitStatus?: UnitStatus;
+}
+
 /**
- * Refresh liveness without rewriting the record: only the mtime moves, so
- * `startedAt` keeps pointing at the real process start. Never throws.
+ * Refresh the record in place (#175).
+ *
+ * The historical refresh only moved the mtime. The file now also carries
+ * `updatedAt`, `lastTickAt`, `staleSeconds` and `unitStatus`, so a real rewrite
+ * is needed; it is still atomic and preserves `pid`, `startedAt`, `version`,
+ * `buildId`, `tag` and `ref` verbatim. The rename also moves the mtime, which
+ * remains the freshness signal. Never throws; returns false when the caller
+ * should write a full record instead.
  */
-export function refreshHeartbeat(stateDir: string, log?: HeartbeatLog, now = Date.now()): boolean {
+export function refreshHeartbeat(
+	stateDir: string,
+	log?: HeartbeatLog,
+	now = Date.now(),
+	options: HeartbeatRefreshOptions = {},
+): boolean {
 	const file = heartbeatPath(stateDir);
 	try {
-		const date = new Date(now);
-		fs.utimesSync(file, date, date);
+		const existing = readHeartbeat(stateDir);
+		if (!existing) {
+			if (fs.existsSync(file)) return false;
+			// Historical contract: refreshing a missing file is an error (and the
+			// caller then writes the full record). utimes throws ENOENT for us.
+			const date = new Date(now);
+			fs.utimesSync(file, date, date);
+			return true;
+		}
+		const previousTick = existing.lastTickAt ? Date.parse(existing.lastTickAt) : undefined;
+		const optionTick = options.lastTickAt instanceof Date
+			? options.lastTickAt.getTime()
+			: options.lastTickAt;
+		const lastTickAt = optionTick ?? (Number.isFinite(previousTick) ? previousTick : undefined);
+		const record: HeartbeatRecord = {
+			...existing,
+			updatedAt: new Date(now).toISOString(),
+			staleSeconds: lastTickAt === undefined ? 0 : Math.max(0, Math.trunc((now - lastTickAt) / 1_000)),
+		};
+		if (lastTickAt !== undefined) record.lastTickAt = new Date(lastTickAt).toISOString();
+		const unitStatus = options.unitStatus ?? existing.unitStatus;
+		if (unitStatus) record.unitStatus = unitStatus;
+		writeJsonAtomic(file, record);
 		return true;
 	} catch (error) {
 		log?.warn("heartbeat refresh failed", { path: file, error: errorMessage(error) });
@@ -142,6 +310,12 @@ export function readHeartbeat(stateDir: string): HeartbeatRecord | undefined {
 	};
 	if (typeof raw.tag === "string" && raw.tag) record.tag = raw.tag;
 	if (typeof raw.ref === "string" && raw.ref) record.ref = raw.ref;
+	if (typeof raw.updatedAt === "string" && raw.updatedAt) record.updatedAt = raw.updatedAt;
+	if (typeof raw.lastTickAt === "string" && raw.lastTickAt) record.lastTickAt = raw.lastTickAt;
+	if (typeof raw.staleSeconds === "number" && Number.isFinite(raw.staleSeconds) && raw.staleSeconds >= 0) {
+		record.staleSeconds = Math.trunc(raw.staleSeconds);
+	}
+	if (isUnitStatus(raw.unitStatus)) record.unitStatus = raw.unitStatus;
 	return record;
 }
 
@@ -156,6 +330,10 @@ export interface HeartbeatStatus {
 	ageMs?: number;
 	/** How long the recorded process has been running; undefined without `startedAt`. */
 	uptimeMs?: number;
+	/** `staleSeconds` from the record, when an updated build wrote it (#175). */
+	staleSeconds?: number;
+	/** `unitStatus` from the record, when an updated build wrote it (#175). */
+	unitStatus?: UnitStatus;
 	heartbeat?: HeartbeatRecord;
 }
 
@@ -185,6 +363,8 @@ export function readHeartbeatStatus(stateDir: string, staleAfterMs: number, now 
 	};
 	const startedAtMs = Date.parse(heartbeat.startedAt);
 	if (Number.isFinite(startedAtMs)) status.uptimeMs = Math.max(0, now - startedAtMs);
+	if (heartbeat.staleSeconds !== undefined) status.staleSeconds = heartbeat.staleSeconds;
+	if (heartbeat.unitStatus !== undefined) status.unitStatus = heartbeat.unitStatus;
 	return status;
 }
 

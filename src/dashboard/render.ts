@@ -125,6 +125,7 @@ const CSS = `
   --working: #d3a552;
   --waiting: #9b988f;
   --sleeping: #6e6b64;
+  --dead: #d9534f;
   --error: #d08080;
   --sleep: #a8a08a;
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -177,6 +178,7 @@ table.mini th { color: var(--muted); font-weight: 500; white-space: nowrap; }
 .st.working { color: var(--working); }
 .st.waiting { color: var(--waiting); }
 .st.sleeping { color: var(--sleeping); }
+.st.dead { color: var(--dead); border-color: var(--dead); }
 .st.long { color: var(--error); border-color: var(--error); }
 form.abort { margin: 10px 0 0; }
 form.abort button { background: transparent; color: var(--text); border: 1px solid var(--line); padding: 5px 10px; font: inherit; cursor: pointer; }
