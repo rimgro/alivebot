@@ -139,6 +139,30 @@ export const RUN_TURN_TRACE_LIMIT = 200;
 export type CompactionFailureClass = "provider_html" | "provider_json_invalid" | "provider_error";
 
 /**
+ * Why the runtime forced a context reset (#170):
+ *
+ * - `soft` — the context stayed above `contextSleepTokens` past
+ *   `contextSleepGraceTurns`;
+ * - `hard` — the context crossed `contextHardTokens`;
+ * - `compaction` — auto-compaction kept failing, so growing the context was
+ *   worse than resetting it (compaction remains the first fallback).
+ */
+export type ContextResetReason = "soft" | "hard" | "compaction";
+
+/**
+ * One forced context reset, persisted on the run record only when the runtime
+ * (not the agent) ended the run with `sleepForced`. Additive field: older
+ * records simply do not carry it.
+ */
+export interface RunContextReset {
+	reason: ContextResetReason;
+	/** Context size (pi's prompt estimate) at the moment of the reset. */
+	tokens: number;
+	/** Threshold that fired (`sleepTokens`, `hardTokens`, or the fallback limit). */
+	limitTokens: number;
+}
+
+/**
  * The last compaction attempt, persisted on the run record and runtime status so
  * the dashboard can explain why the context keeps growing after a failed
  * compaction. Counters/reason classes only: the provider body itself is logged
@@ -214,6 +238,11 @@ export interface RunRecord {
 	sleep?: { forced: boolean; summaryChars: number };
 	/** Last auto-compaction outcome in this run (#167). Absent when none happened. */
 	compaction?: CompactionRecord;
+	/**
+	 * Forced context reset that ended this run (#170). Absent when the agent
+	 * slept itself, or when no threshold fired.
+	 */
+	contextReset?: RunContextReset;
 }
 
 /**
@@ -408,6 +437,8 @@ export interface RuntimeStateFile {
 	mode?: "background" | "foreground";
 	/** Last auto-compaction outcome (#167), so operators see why context is growing. */
 	lastCompaction?: CompactionRecord;
+	/** Current context (pi's prompt estimate) in tokens (#170); absent while unknown. */
+	contextTokens?: number;
 	error?: string;
 }
 

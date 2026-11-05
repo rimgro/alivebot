@@ -31,7 +31,7 @@ import { interruptedResumeDecision, RUN_TURN_TRACE_LIMIT, RunLog, runTurnCount, 
 import { ThreadStore } from "../store/threads.js";
 import { HistoryStore } from "../store/history.js";
 import { RunEventLog } from "../store/run-events.js";
-import { AgentRunner, CONTEXT_WARN_MESSAGE, runActiveMs } from "../runtime/agent.js";
+import { AgentRunner, CONTEXT_SLEEP_MESSAGE, CONTEXT_WARN_MESSAGE, runActiveMs } from "../runtime/agent.js";
 import { isOutboundRecorded } from "../runtime/tools.js";
 import { TurnTraceRecorder, residualUsage, zeroUsage } from "../runtime/run-trace.js";
 import { hasWakeWorthyPending, WakeScheduler, wakeIntervalMs } from "../runtime/wake.js";
@@ -64,6 +64,9 @@ const config = loadConfig({
 			runVeryLongMs: 3 * 60 * 60_000,
 			contextWarnTokens: 150_000,
 			contextWarnStepTokens: 50_000,
+			contextSleepTokens: 150_000,
+			contextSleepGraceTurns: 3,
+			contextHardTokens: 250_000,
 			shutdownGraceMs: 30_000,
 			resumeWindowMs: 10 * 60_000,
 			maxEventsPerIdle: 8,
@@ -307,11 +310,23 @@ function resetRunHealth(): void {
 		runVeryLongMs: 3 * 60 * 60_000,
 	});
 }
-function setContextWarn(patch: { contextWarnTokens?: number; contextWarnStepTokens?: number }): void {
+function setContextWarn(patch: {
+	contextWarnTokens?: number;
+	contextWarnStepTokens?: number;
+	contextSleepTokens?: number;
+	contextSleepGraceTurns?: number;
+	contextHardTokens?: number;
+}): void {
 	Object.assign(config.config.loop, patch);
 }
 function resetContextWarn(): void {
-	setContextWarn({ contextWarnTokens: 150_000, contextWarnStepTokens: 50_000 });
+	setContextWarn({
+		contextWarnTokens: 150_000,
+		contextWarnStepTokens: 50_000,
+		contextSleepTokens: 150_000,
+		contextSleepGraceTurns: 3,
+		contextHardTokens: 250_000,
+	});
 }
 
 section("a 20-minute active run is warned, never killed, with runTimeoutMs = 0 (#127)");
@@ -503,6 +518,8 @@ section("context threshold: one hint at 150k, re-armed only on +50k growth (#123
 	policy.reset();
 	resetRunHealth();
 	resetContextWarn();
+	// Isolate the old advisory hint: the soft sleep directive has its own section.
+	setContextWarn({ contextSleepTokens: 0, contextHardTokens: 0 });
 	handler = async (session) => {
 		const run = currentRun!;
 		// Cumulative billing is huge, the actual context is tiny: the hint must
@@ -601,7 +618,7 @@ section("context threshold: one hint at 150k, re-armed only on +50k growth (#123
 section("contextWarnTokens = 0 disables both the hint and context_high (#123)");
 {
 	policy.reset();
-	setContextWarn({ contextWarnTokens: 0, contextWarnStepTokens: 50_000 });
+	setContextWarn({ contextWarnTokens: 0, contextWarnStepTokens: 50_000, contextSleepTokens: 0, contextHardTokens: 0 });
 	handler = async (session) => {
 		const run = currentRun!;
 		session.setContextTokens(1_000_000);
@@ -617,6 +634,217 @@ section("contextWarnTokens = 0 disables both the hint and context_high (#123)");
 	};
 	const record = await runner.execute();
 	check("the disabled hint did not affect the run", record?.stopReason === "slept", record?.stopReason);
+	resetContextWarn();
+}
+
+// ---------------------------------------------------------------------------
+// context sleep (#170): soft directive, grace and a hard ceiling
+// ---------------------------------------------------------------------------
+
+section("context sleep: directive at soft, forced reset after grace (#170)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	setContextWarn({ contextSleepTokens: 150_000, contextSleepGraceTurns: 2, contextHardTokens: 250_000, contextWarnTokens: 150_000, contextWarnStepTokens: 50_000 });
+	const sessionsBefore = created.length;
+	handler = async (session) => {
+		const run = currentRun!;
+		session.setContextTokens(149_999);
+		await session.turn();
+		check(
+			"below the soft threshold: no directive and no reset",
+			session.steered.length === 0 && run.sleepRequested === false,
+			{ steered: session.steered, sleepRequested: run.sleepRequested },
+		);
+
+		session.setContextTokens(150_000);
+		await session.turn();
+		check(
+			"crossing the soft threshold steers the sleep directive once",
+			session.steered.length === 1 && session.steered[0] === CONTEXT_SLEEP_MESSAGE,
+			session.steered,
+		);
+		check("crossing alone does not force the reset", run.sleepRequested === false, run.sleepRequested);
+
+		session.setContextTokens(160_000);
+		const firstGraceTurn = await session.turn();
+		check(
+			"one turn of grace is still allowed",
+			firstGraceTurn === false && run.sleepRequested === false && session.aborted === false,
+			{ firstGraceTurn, sleepRequested: run.sleepRequested },
+		);
+		check("the directive is not repeated turn by turn", session.steered.length === 1, session.steered.length);
+
+		session.setContextTokens(170_000);
+		const stopped = await session.turn();
+		check(
+			"after the grace the step boundary forces the sleep (no tool call)",
+			stopped === true && run.sleepRequested === true && run.sleepForced === true,
+			{ stopped, sleepRequested: run.sleepRequested, sleepForced: run.sleepForced },
+		);
+	};
+	const record = await runner.execute();
+	check("the forced sleep ends the run as slept", record?.stopReason === "slept", record?.stopReason);
+	check("the run record says the sleep was forced", record?.sleep?.forced === true, record?.sleep);
+	check(
+		"contextReset names the soft reason, the size and the threshold",
+		record?.contextReset?.reason === "soft" &&
+			record?.contextReset?.tokens === 170_000 &&
+			record?.contextReset?.limitTokens === 150_000,
+		record?.contextReset,
+	);
+	check(
+		"the journal records why the context was reset",
+		journal.tail(30).some((line) => line.includes("[context-reset]") && line.includes("soft") && line.includes("170000")),
+		journal.tail(5),
+	);
+	const resetAnomalies = anomaliesOf(record?.id ?? "", "context_reset");
+	check(
+		"one context_reset anomaly carries the reason and size",
+		resetAnomalies.length === 1 &&
+			resetAnomalies[0]?.resetReason === "soft" &&
+			resetAnomalies[0]?.contextTokens === 170_000 &&
+			resetAnomalies[0]?.limitTokens === 150_000,
+		resetAnomalies,
+	);
+	check(
+		"the next run starts on a fresh session with an empty context",
+		created.length === sessionsBefore + 1 && created.at(-1)?.disposed === false && created.at(-2)?.disposed === true,
+		{ sessions: created.length, sessionsBefore },
+	);
+	resetContextWarn();
+}
+
+section("contextHardTokens forces the reset immediately, without grace (#170)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	setContextWarn({ contextSleepTokens: 100_000, contextSleepGraceTurns: 10, contextHardTokens: 200_000 });
+	handler = async (session) => {
+		const run = currentRun!;
+		session.setContextTokens(200_000);
+		const stopped = await session.turn();
+		check(
+			"the hard ceiling forces on the first boundary, ignoring grace",
+			stopped === true && run.sleepRequested === true && run.sleepForced === true,
+			{ stopped, sleepRequested: run.sleepRequested, sleepForced: run.sleepForced },
+		);
+	};
+	const record = await runner.execute();
+	check("the run is recorded as a hard context reset", record?.stopReason === "slept" && record?.contextReset?.reason === "hard", record?.contextReset);
+	check(
+		"the hard contextReset carries the ceiling",
+		record?.contextReset?.tokens === 200_000 && record?.contextReset?.limitTokens === 200_000,
+		record?.contextReset,
+	);
+	resetContextWarn();
+}
+
+section("context thresholds = 0 never force; the agent's own sleep still works (#170)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	setContextWarn({
+		contextWarnTokens: 0,
+		contextWarnStepTokens: 50_000,
+		contextSleepTokens: 0,
+		contextSleepGraceTurns: 0,
+		contextHardTokens: 0,
+	});
+	handler = async (session) => {
+		const run = currentRun!;
+		session.setContextTokens(9_000_000);
+		let forced = false;
+		for (let turn = 0; turn < 5; turn += 1) {
+			if ((await session.turn()) || run.sleepRequested) forced = true;
+		}
+		check("a huge context never forces or steers when disabled", forced === false && session.steered.length === 0, {
+			forced,
+			steered: session.steered,
+		});
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "disabled thresholds", summary_md: "# disabled thresholds\n" });
+	};
+	const record = await runner.execute();
+	check(
+		"the agent still sleeps normally, with no contextReset",
+		record?.stopReason === "slept" && record?.sleep?.forced === false && record?.contextReset === undefined,
+		{ stopReason: record?.stopReason, sleep: record?.sleep, contextReset: record?.contextReset },
+	);
+	resetContextWarn();
+}
+
+section("the profile context block overrides the loop thresholds (#170)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	config.config.context = { sleepTokens: 80_000, sleepGraceTurns: 0, hardTokens: 90_000 };
+	handler = async (session) => {
+		const run = currentRun!;
+		session.setContextTokens(80_000);
+		const stopped = await session.turn();
+		check(
+			"the profile soft threshold applies immediately with grace 0",
+			stopped === true && run.sleepRequested === true && run.sleepForced === true,
+			{ stopped, sleepRequested: run.sleepRequested },
+		);
+	};
+	const record = await runner.execute();
+	check(
+		"contextReset uses the profile limit, not the loop default",
+		record?.contextReset?.reason === "soft" && record?.contextReset?.limitTokens === 80_000,
+		record?.contextReset,
+	);
+	config.config.context = undefined;
+	resetContextWarn();
+}
+
+section("a repeated compaction failure within grace forces reason=compaction (#170)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	setContextWarn({ contextSleepTokens: 150_000, contextSleepGraceTurns: 3, contextHardTokens: 250_000 });
+	handler = async (session) => {
+		const run = currentRun!;
+		session.setContextTokens(180_000);
+		const failedCompaction = () =>
+			session.emit({
+				type: "compaction_end",
+				reason: "threshold",
+				result: undefined,
+				aborted: false,
+				willRetry: false,
+				errorMessage: "Auto-compaction failed: provider_html",
+			});
+		failedCompaction();
+		await session.turn();
+		check("one failed compaction is left to compaction's own backoff", run.sleepRequested === false, run.sleepRequested);
+		failedCompaction();
+		const stopped = await session.turn();
+		check(
+			"a repeat inside the grace window forces the reset",
+			stopped === true && run.sleepRequested === true && run.sleepForced === true,
+			{ stopped, sleepRequested: run.sleepRequested },
+		);
+	};
+	const record = await runner.execute();
+	check(
+		"the record names the compaction reason and the size",
+		record?.contextReset?.reason === "compaction" && record?.contextReset?.tokens === 180_000 && record?.contextReset?.limitTokens === 250_000,
+		record?.contextReset,
+	);
+	check(
+		"compaction_failed is still recorded for each failure",
+		anomaliesOf(record?.id ?? "", "compaction_failed").length === 2,
+		anomaliesOf(record?.id ?? "", "compaction_failed"),
+	);
+	const resetAnomalies = anomaliesOf(record?.id ?? "", "context_reset");
+	check("context_reset names the compaction reason", resetAnomalies.length === 1 && resetAnomalies[0]?.resetReason === "compaction", resetAnomalies);
 	resetContextWarn();
 }
 

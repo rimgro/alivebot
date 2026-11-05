@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { DEFAULT_CONFIG, DEFAULT_CONTRACT, loadConfig, resolveMemoryDatabasePath, type AgentManagementPermissions, type LoadedConfig } from "./config.js";
+import { DEFAULT_CONFIG, DEFAULT_CONTRACT, loadConfig, resolveMemoryDatabasePath, validateProfileContextConfig, type AgentManagementPermissions, type LoadedConfig, type ProfileContextConfig } from "./config.js";
 import { defaultTelegramTokenEnv, MASTER_TELEGRAM_TOKEN_ENV, migrateConfigSecrets, profileEnvSegment, readEnvFileValues } from "./config-secrets.js";
 import { snapshotRuntime, spawnBackground, stopRuntime, waitForRuntime, type StopInitiator } from "./runtime/daemon.js";
 import { sleep } from "./util.js";
@@ -43,6 +43,8 @@ export interface CreateAgentOptions {
 	management?: AgentManagementPermissions;
 	/** Operator-owned setting; agent tools deliberately cannot grant host access. */
 	sandbox?: Partial<SandboxConfig>;
+	/** Optional per-profile context-sleep policy (#170); omitted = the loop values. */
+	context?: ProfileContextConfig;
 }
 
 export const NO_AGENT_MANAGEMENT: AgentManagementPermissions = {
@@ -87,6 +89,7 @@ export function createAgent(base: LoadedConfig, idInput: string, name?: string, 
 	config.workers = structuredClone(DEFAULT_WORKERS_CONFIG);
 	config.workspace = path.join(directory, "workspace");
 	config.sandbox = sandboxConfig;
+	config.context = options.context ? validateProfileContextConfig(options.context, config.loop) : undefined;
 	config.soulFile = soulPath;
 	// Managed agents may share the database, but memory tools enforce private scope by default.
 	config.memory.databasePath = resolveMemoryDatabasePath(base);
@@ -179,7 +182,7 @@ export function assertCanDelegate(
 export function updateAgentProfile(
 	base: LoadedConfig,
 	idInput: string,
-	updates: { name?: string; role?: string; contract?: string; toolAllowlist?: string[]; management?: AgentManagementPermissions; sandbox?: Partial<SandboxConfig> },
+	updates: { name?: string; role?: string; contract?: string; toolAllowlist?: string[]; management?: AgentManagementPermissions; sandbox?: Partial<SandboxConfig>; context?: ProfileContextConfig },
 ): ManagedAgent {
 	const agent = findManagedAgent(base, idInput);
 	const raw = readAgentConfig(agent);
@@ -194,6 +197,9 @@ export function updateAgentProfile(
 	if (updates.management !== undefined) raw.agentManagement = validateAgentManagementPermissions(updates.management);
 	if (updates.sandbox !== undefined) {
 		raw.sandbox = mergeSandboxConfig(loadAgentConfig(base, agent).config.sandbox, updates.sandbox);
+	}
+	if (updates.context !== undefined) {
+		raw.context = validateProfileContextConfig(updates.context, loadAgentConfig(base, agent).config.loop);
 	}
 	if (updates.role !== undefined || updates.contract !== undefined) {
 		const contractPath = path.join(agent.directory, "CONTRACT.md");
@@ -214,7 +220,7 @@ export function getAgentEnabled(agent: ManagedAgent): boolean {
 export async function updateManagedAgentProfile(
 	base: LoadedConfig,
 	idInput: string,
-	updates: { name?: string; role?: string; contract?: string; toolAllowlist?: string[]; management?: AgentManagementPermissions; sandbox?: Partial<SandboxConfig> },
+	updates: { name?: string; role?: string; contract?: string; toolAllowlist?: string[]; management?: AgentManagementPermissions; sandbox?: Partial<SandboxConfig>; context?: ProfileContextConfig },
 ): Promise<ManagedAgent> {
 	const agent = findManagedAgent(base, idInput);
 	return withAgentLifecycleLock(base, agent.id, async () => {

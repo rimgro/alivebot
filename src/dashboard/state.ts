@@ -22,6 +22,8 @@ import {
 	runStoppedByInferred,
 	runTurnCount,
 	type CompactionRecord,
+	type ContextResetReason,
+	type RunContextReset,
 	type RunRecord,
 	type RunStoppedBy,
 	type RunStopReason,
@@ -259,6 +261,8 @@ export interface RunView {
 	sleep?: { forced: boolean; summaryChars: number };
 	/** Last auto-compaction outcome in this run (#167). */
 	compaction?: CompactionRecord;
+	/** Forced context reset that ended this run (#170); absent otherwise. */
+	contextReset?: RunContextReset;
 	/** True when the run spent tokens that no per-turn trace accounts for (#168). */
 	usageUnsettled: boolean;
 }
@@ -305,8 +309,55 @@ export function toRunView(record: RunRecord): RunView {
 		journalEntries: record.journalEntries ?? 0,
 		sleep: record.sleep,
 		compaction: record.compaction,
+		contextReset: toRunContextReset(record.contextReset),
 		usageUnsettled: record.usageUnsettled === true,
 	};
+}
+
+/**
+ * Read the additive `contextReset` field shape-safely (#170).
+ *
+ * Old records do not have it; a malformed value must not break the dashboard.
+ * Only the three known reasons count as a recorded reset.
+ */
+export function toRunContextReset(value: unknown): RunContextReset | undefined {
+	if (!value || typeof value !== "object") return undefined;
+	const raw = value as Record<string, unknown>;
+	const reason = raw.reason;
+	if (reason !== "soft" && reason !== "hard" && reason !== "compaction") return undefined;
+	const tokens = finiteNumber(raw.tokens);
+	const limitTokens = finiteNumber(raw.limitTokens);
+	if (tokens === undefined || limitTokens === undefined) return undefined;
+	return { reason: reason as ContextResetReason, tokens: Math.max(0, tokens), limitTokens: Math.max(0, limitTokens) };
+}
+
+/** `cacheRead / turns`, or null when the run had no turns (never invent a number). */
+export function cacheReadPerTurn(usage: { cacheRead: number }, turns: number): number | null {
+	if (!Number.isFinite(turns) || turns <= 0) return null;
+	return usage.cacheRead / turns;
+}
+
+/** Compact token count for status/dashboard lines, e.g. `82k`, `6.5k`, `940`. */
+export function formatCompactTokens(tokens: number | null | undefined): string {
+	if (tokens === null || tokens === undefined || !Number.isFinite(tokens) || tokens < 0) return "—";
+	if (tokens < 1_000) return String(Math.round(tokens));
+	if (tokens < 10_000) return `${(tokens / 1_000).toFixed(1)}k`;
+	return `${Math.round(tokens / 1_000)}k`;
+}
+
+/** `context 82k · cacheRead/turn 74k`; the cache part is omitted when unavailable. */
+export function contextMetricsText(input: {
+	contextTokens?: number | null;
+	cacheReadPerTurn?: number | null;
+}): string {
+	const context = input.contextTokens === null || input.contextTokens === undefined
+		? "—"
+		: formatCompactTokens(input.contextTokens);
+	const parts = [`context ${context}`];
+	if (input.cacheReadPerTurn !== null && input.cacheReadPerTurn !== undefined && Number.isFinite(input.cacheReadPerTurn)) {
+		parts.push(`cacheRead/turn ${formatCompactTokens(input.cacheReadPerTurn)}`);
+	}
+	return parts.join(" · ");
 }
 
 export interface RunTotals {
@@ -710,6 +761,10 @@ export interface AgentSummary {
 	spendTodayUsd: number;
 	runsToday: number;
 	lastFinishedAt?: number;
+	/** Current context (pi's prompt estimate) in tokens (#170); undefined when unknown. */
+	contextTokens?: number;
+	/** cacheRead per completed turn of the current/last run (#170); null when there were no turns. */
+	cacheReadPerTurn?: number | null;
 	pid?: number;
 	profileDir: string;
 	configPath: string;
@@ -726,6 +781,8 @@ export function describeRun(record: RunRecord): string {
 	const compaction = record.compaction && !record.compaction.ok
 		? ` · compaction failed: ${record.compaction.reasonClass ?? "provider_error"}`
 		: "";
+	// A forced reset is the explanation for why this run ended: mark it explicitly.
+	const contextReset = record.contextReset ? ` · context reset (${record.contextReset.reason})` : "";
 	// The initiator is only worth a word when it is not already the outcome
 	// keyword (`sleep` says nothing that `slept` did not). A derived initiator is
 	// labelled `(inferred)` so a guess is never read as a recorded fact (#168).
@@ -733,7 +790,7 @@ export function describeRun(record: RunRecord): string {
 	const inferred = runStoppedByInferred(record) ? " (inferred)" : "";
 	const initiator = stoppedBy === outcome.key ? "" : ` · stopped by ${stoppedBy}${inferred}`;
 	const unsettled = record.usageUnsettled === true ? " · usage unsettled" : "";
-	return `#${record.index} ${formatDuration(record.durationMs)} · ${outcome.key}${initiator} · ${runTurnCount(record)} turns · ${record.events?.length ?? 0} events${compaction}${unsettled}`;
+	return `#${record.index} ${formatDuration(record.durationMs)} · ${outcome.key}${initiator} · ${runTurnCount(record)} turns · ${record.events?.length ?? 0} events${compaction}${contextReset}${unsettled}`;
 }
 
 export function readAgentSummary(
@@ -760,6 +817,7 @@ export function readAgentSummary(
 				? describeRun(last)
 				: "no runs yet";
 	const model = profile.config.config.model.trim() || runtime?.model || options.runtimeModel || "default";
+	const metricRun = activeRun ?? last;
 	return {
 		id: profile.id,
 		name: profile.name,
@@ -770,6 +828,10 @@ export function readAgentSummary(
 		spendTodayUsd: usage.cost,
 		runsToday: usage.runs,
 		lastFinishedAt: last?.finishedAt,
+		contextTokens: runtime?.contextTokens,
+		cacheReadPerTurn: metricRun
+			? cacheReadPerTurn(metricRun.usage ?? { cacheRead: 0 }, runTurnCount(metricRun))
+			: null,
 		pid: runtime?.pid,
 		profileDir: profile.profileDir,
 		configPath: profile.configPath,

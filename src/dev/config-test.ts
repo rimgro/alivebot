@@ -11,6 +11,9 @@ import * as path from "node:path";
 import {
 	DEFAULT_CONFIG,
 	DEFAULT_EMPTY_WAKE_BACKOFF,
+	DEFAULT_LOOP_CONTEXT_HARD_TOKENS,
+	DEFAULT_LOOP_CONTEXT_SLEEP_GRACE_TURNS,
+	DEFAULT_LOOP_CONTEXT_SLEEP_TOKENS,
 	DEFAULT_LOOP_CONTEXT_WARN_STEP_TOKENS,
 	DEFAULT_LOOP_CONTEXT_WARN_TOKENS,
 	DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS,
@@ -21,9 +24,12 @@ import {
 	DEFAULT_LOOP_SHUTDOWN_GRACE_MS,
 	EMPTY_WAKE_MAX_INTERVAL_MAX_MS,
 	EMPTY_WAKE_MAX_INTERVAL_MIN_MS,
+	ensureContextTools,
 	loadConfig,
 	redactSecretFields,
+	resolveContextPolicy,
 	validateLoopConfig,
+	validateProfileContextConfig,
 	type LoopConfig,
 } from "../config.js";
 import { findSecretFields, migrateConfigSecrets } from "../config-secrets.js";
@@ -559,6 +565,177 @@ section("loop shutdown/resume keys are validated (#124)");
 		partial.shutdownGraceMs === 30_000 && partial.resumeWindowMs === 10 * 60_000,
 		partial,
 	);
+}
+
+// ---------------------------------------------------------------------------
+section("loop context-sleep thresholds and profile overrides are validated (#170)");
+{
+	check(
+		"the defaults are soft 150k, grace 3 turns and a hard 250k ceiling",
+		DEFAULT_CONFIG.loop.contextSleepTokens === 150_000 &&
+			DEFAULT_CONFIG.loop.contextSleepGraceTurns === 3 &&
+			DEFAULT_CONFIG.loop.contextHardTokens === 250_000 &&
+			DEFAULT_LOOP_CONTEXT_SLEEP_TOKENS === 150_000 &&
+			DEFAULT_LOOP_CONTEXT_SLEEP_GRACE_TURNS === 3 &&
+			DEFAULT_LOOP_CONTEXT_HARD_TOKENS === 250_000,
+		DEFAULT_CONFIG.loop,
+	);
+	const root = tempRoot("contextsleep");
+	const loaded = loadConfig({ cwd: root, secretLog: () => undefined, secretWarn: () => undefined });
+	check(
+		"a config file without the keys gets the defaults",
+		loaded.config.loop.contextSleepTokens === 150_000 &&
+			loaded.config.loop.contextSleepGraceTurns === 3 &&
+			loaded.config.loop.contextHardTokens === 250_000,
+		loaded.config.loop,
+	);
+
+	const overridden = validateLoopConfig({
+		...DEFAULT_CONFIG.loop,
+		contextSleepTokens: 100_000,
+		contextSleepGraceTurns: 0,
+		contextHardTokens: 120_000,
+	});
+	check(
+		"explicit values win",
+		overridden.contextSleepTokens === 100_000 &&
+			overridden.contextSleepGraceTurns === 0 &&
+			overridden.contextHardTokens === 120_000,
+		overridden,
+	);
+	const disabled = validateLoopConfig({
+		...DEFAULT_CONFIG.loop,
+		contextSleepTokens: 0,
+		contextSleepGraceTurns: 0,
+		contextHardTokens: 0,
+	});
+	check(
+		"0 disables every context-sleep threshold",
+		disabled.contextSleepTokens === 0 && disabled.contextSleepGraceTurns === 0 && disabled.contextHardTokens === 0,
+		disabled,
+	);
+
+	const rejects: Array<[string, LoopConfig, string]> = [
+		["a negative contextSleepTokens", { ...DEFAULT_CONFIG.loop, contextSleepTokens: -1 }, "loop.contextSleepTokens"],
+		["a fractional contextSleepTokens", { ...DEFAULT_CONFIG.loop, contextSleepTokens: 1.5 }, "loop.contextSleepTokens"],
+		["a string contextSleepTokens", { ...DEFAULT_CONFIG.loop, contextSleepTokens: "150000" as unknown as number }, "loop.contextSleepTokens"],
+		["a negative contextSleepGraceTurns", { ...DEFAULT_CONFIG.loop, contextSleepGraceTurns: -1 }, "loop.contextSleepGraceTurns"],
+		["a fractional contextSleepGraceTurns", { ...DEFAULT_CONFIG.loop, contextSleepGraceTurns: 1.5 }, "loop.contextSleepGraceTurns"],
+		["a negative contextHardTokens", { ...DEFAULT_CONFIG.loop, contextHardTokens: -1 }, "loop.contextHardTokens"],
+		["a fractional contextHardTokens", { ...DEFAULT_CONFIG.loop, contextHardTokens: 1.5 }, "loop.contextHardTokens"],
+		[
+			"a hard ceiling below the soft threshold",
+			{ ...DEFAULT_CONFIG.loop, contextSleepTokens: 200_000, contextHardTokens: 150_000 },
+			"loop.contextHardTokens must be >= loop.contextSleepTokens",
+		],
+	];
+	for (const [label, value, expected] of rejects) {
+		let message = "";
+		try {
+			validateLoopConfig(value);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		check(`${label} is rejected`, message.startsWith(expected), message || "accepted");
+	}
+
+	const zeroSoftWithHard = validateLoopConfig({ ...DEFAULT_CONFIG.loop, contextSleepTokens: 0, contextHardTokens: 250_000 });
+	check(
+		"a disabled soft threshold does not require a hard ceiling above it",
+		zeroSoftWithHard.contextSleepTokens === 0 && zeroSoftWithHard.contextHardTokens === 250_000,
+		zeroSoftWithHard,
+	);
+	const partial = validateLoopConfig({
+		...DEFAULT_CONFIG.loop,
+		contextSleepTokens: undefined,
+		contextSleepGraceTurns: null,
+		contextHardTokens: undefined,
+	} as unknown as LoopConfig);
+	check(
+		"missing or null context-sleep keys fall back to the defaults",
+		partial.contextSleepTokens === 150_000 && partial.contextSleepGraceTurns === 3 && partial.contextHardTokens === 250_000,
+		partial,
+	);
+
+	const profile = validateProfileContextConfig({ sleepTokens: 90_000, sleepGraceTurns: 0 }, DEFAULT_CONFIG.loop);
+	check(
+		"a profile context block keeps only the fields it sets",
+		profile?.sleepTokens === 90_000 && profile?.sleepGraceTurns === 0 && profile?.hardTokens === undefined,
+		profile,
+	);
+	check("an absent profile block stays undefined", validateProfileContextConfig(undefined, DEFAULT_CONFIG.loop) === undefined);
+	check(
+		"the effective policy merges profile over loop",
+		resolveContextPolicy({ ...DEFAULT_CONFIG, context: { sleepTokens: 90_000 } }).sleepTokens === 90_000 &&
+			resolveContextPolicy({ ...DEFAULT_CONFIG, context: { sleepTokens: 90_000 } }).hardTokens === 250_000,
+		resolveContextPolicy({ ...DEFAULT_CONFIG, context: { sleepTokens: 90_000 } }),
+	);
+	let profileMessage = "";
+	try {
+		validateProfileContextConfig({ hardTokens: 100_000 }, DEFAULT_CONFIG.loop);
+	} catch (error) {
+		profileMessage = error instanceof Error ? error.message : String(error);
+	}
+	check(
+		"a profile hard ceiling below the inherited soft threshold is rejected",
+		profileMessage.startsWith("context.hardTokens must be >="),
+		profileMessage || "accepted",
+	);
+	for (const value of [-1, 1.5, Number.POSITIVE_INFINITY, "100000"]) {
+		let message = "";
+		try {
+			validateProfileContextConfig({ sleepTokens: value }, DEFAULT_CONFIG.loop);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		check(`context.sleepTokens=${String(value)} is rejected`, message.startsWith("context.sleepTokens"), message || "accepted");
+	}
+
+	const required = ensureContextTools(["read", "bash"]);
+	check(
+		"sleep, retain and journal are added back to a custom allowlist",
+		required.added.join(",") === "sleep,retain,journal" &&
+			required.allowlist.includes("read") &&
+			required.allowlist.includes("sleep") &&
+			required.allowlist.includes("retain") &&
+			required.allowlist.includes("journal"),
+		required,
+	);
+	const already = ensureContextTools(["read", "sleep", "retain", "journal"]);
+	check("an allowlist that already has them is unchanged and silent", already.added.length === 0 && already.allowlist.join(",") === "read,sleep,retain,journal", already);
+
+	writeConfig(root, { tools: { allowlist: ["read", "bash"] } });
+	const warnings: string[] = [];
+	const normalized = loadConfig({
+		cwd: root,
+		secretLog: () => undefined,
+		secretWarn: () => undefined,
+		configWarn: (line) => warnings.push(line),
+	});
+	check(
+		"loadConfig normalizes a local/custom allowlist and warns once",
+		["sleep", "retain", "journal"].every((tool) => normalized.config.tools.allowlist.includes(tool)) && warnings.length === 1,
+		{ allowlist: normalized.config.tools.allowlist, warnings },
+	);
+	check(
+		"the warning names the added tools",
+		warnings[0]?.includes("sleep") && warnings[0]?.includes("retain") && warnings[0]?.includes("journal"),
+		warnings[0],
+	);
+
+	const profileLoaded = loadConfig({
+		cwd: root,
+		secretLog: () => undefined,
+		secretWarn: () => undefined,
+		overrides: { context: { sleepTokens: 90_000, sleepGraceTurns: 1, hardTokens: 200_000 } },
+	});
+	check(
+		"a profile context block survives loadConfig and resolves over the loop",
+		profileLoaded.config.context?.sleepTokens === 90_000 &&
+			resolveContextPolicy(profileLoaded.config).sleepGraceTurns === 1,
+		profileLoaded.config.context,
+	);
+	fs.rmSync(root, { recursive: true, force: true });
 }
 
 process.stdout.write(`\n${failures === 0 ? "all config tests passed" : `${failures} config test(s) failed`}\n`);

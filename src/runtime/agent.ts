@@ -1,14 +1,14 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import type { LoadedConfig } from "../config.js";
+import { resolveContextPolicy, type LoadedConfig } from "../config.js";
 import type { Logger } from "../log.js";
 import { appendJsonl, formatDuration, oneLine, sleep, truncate } from "../util.js";
 import { term, stamp } from "../term.js";
 import type { AliveEvent } from "../store/events.js";
 import type { EventStore } from "../store/events.js";
 import type { PolicyStore } from "../store/policy.js";
-import { runTurnCount, type RunLog, type RunRecord, type RunStoppedBy, type RunStopReason } from "../store/runs.js";
+import { runTurnCount, type ContextResetReason, type RunLog, type RunRecord, type RunStoppedBy, type RunStopReason } from "../store/runs.js";
 import type { ThreadStore } from "../store/threads.js";
 import { renderAwakePrompt, renderInterruptPrompt, renderLongRunWarning, renderNudgePrompt } from "./prompt.js";
 import { TurnTraceRecorder, hasUsage, residualUsage } from "./run-trace.js";
@@ -127,6 +127,19 @@ export const CONTEXT_WARN_MESSAGE =
 	"уйди в `sleep`: сон сохраняет память через summary. Не уходи в сон посреди связной задачи.";
 
 /**
+ * The soft context-sleep directive (#170).
+ *
+ * Unlike {@link CONTEXT_WARN_MESSAGE} this is an instruction, not a hint: at
+ * `contextSleepTokens` the agent must finish the current step and sleep. The
+ * runtime enforces it at the step boundary after `contextSleepGraceTurns`, so
+ * the agent cannot grow the context past the ceiling just by ignoring it.
+ */
+export const CONTEXT_SLEEP_MESSAGE =
+	"Контекст выше порога: заверши текущий шаг и уйди в `sleep` сейчас. " +
+	"Сон сохраняет память через summary — перед сном вызови retain и передай полный summary_md. " +
+	"Не начинай новую задачу в этом контексте.";
+
+/**
  * Per-run guard state. Nothing here knows about prompts or messages: it is
  * counters and a tool-argument fingerprint only, so an anomaly event can never
  * leak conversation content.
@@ -144,6 +157,14 @@ interface RunWatch {
 	repeatFlagged: boolean;
 	/** Context size (tokens) at the last `context_high` hint; undefined until the first. */
 	contextWarnedAt?: number;
+	/** First turn at/above the soft threshold; undefined while below it. */
+	contextSoftSince?: number;
+	/** True once the soft sleep directive has been steered for this crossing. */
+	contextSleepSteered: boolean;
+	/** Forced reset that ended this run; persisted on the record. */
+	contextReset?: { reason: ContextResetReason; tokens: number; limitTokens: number };
+	/** Turn of the previous failed compaction, for the repeated-failure window. */
+	lastCompactionFailureTurn?: number;
 }
 
 /**
@@ -385,6 +406,7 @@ export class AgentRunner {
 			limitTurns?: number;
 			contextTokens?: number;
 			limitTokens?: number;
+			resetReason?: RunAnomalyEvent["resetReason"];
 			tool?: string;
 			repeats?: number;
 			reasonClass?: RunAnomalyEvent["reasonClass"];
@@ -411,6 +433,7 @@ export class AgentRunner {
 			limitTurns: input.limitTurns,
 			contextTokens: input.contextTokens,
 			limitTokens: input.limitTokens,
+			resetReason: input.resetReason,
 			tool: input.tool,
 			repeats: input.repeats,
 			reasonClass: input.reasonClass,
@@ -488,6 +511,10 @@ export class AgentRunner {
 				repeatCount: 0,
 				repeatFlagged: false,
 				contextWarnedAt: undefined,
+				contextSoftSince: undefined,
+				contextSleepSteered: false,
+				contextReset: undefined,
+				lastCompactionFailureTurn: undefined,
 			};
 			store.beginRun(run.id);
 
@@ -694,6 +721,7 @@ export class AgentRunner {
 				usageUnsettled: usageUnsettled ? true : undefined,
 				sleep: run.sleepRequested ? { forced: run.sleepForced, summaryChars: run.sleepSummary?.length ?? 0 } : undefined,
 				compaction: compactionMonitorFor(this.session)?.record(),
+				contextReset: this.watch?.contextReset,
 			};
 
 			this.deps.runs.record(record);
@@ -847,6 +875,10 @@ export class AgentRunner {
 			// Only hint while the run is actually continuing: no steering into a
 			// run that is already being stopped or drained.
 			this.noteContextSize(run);
+			// Context pressure is enforced here, at the step boundary, in runtime
+			// code (#170). It must not depend on the agent calling a tool.
+			this.maybeForceContextReset(run);
+			if (run.sleepRequested) return true;
 			return false;
 		};
 	}
@@ -951,6 +983,9 @@ export class AgentRunner {
 						reason: outcome?.reason ?? event.errorMessage,
 						excerpt: outcome?.excerpt,
 					});
+					// A stable compaction failure is the last fallback: if it repeats within
+					// the grace window, sleep resets the context instead of growing it (#170).
+					this.noteCompactionFailure(run, tokens ?? 0);
 				} else {
 					this.deps.log.warn("compaction failed", {
 						reason: event.reason,
@@ -1002,28 +1037,46 @@ export class AgentRunner {
 	}
 
 	/**
-	 * Context-size hint (#123), checked once per turn.
+	 * Context-size steering, checked once per turn boundary (#123, #170).
 	 *
 	 * The size is pi's own estimate of the current prompt/context
 	 * (`contextUsage.tokens`), not the cumulative billed token counter: what
-	 * matters is how much the model must carry, not how much it has spent. When
-	 * it crosses `loop.contextWarnTokens`, the agent gets one service message
-	 * suggesting sleep **if** the task is finished or it is switching to
-	 * unrelated work. The hint is re-armed only after the context grows another
-	 * `loop.contextWarnStepTokens`; a flat context never repeats it. Dropping
-	 * back below the threshold (e.g. after a compaction) re-arms it for the next
-	 * crossing.
+	 * matters is how much the model must carry, not how much it has spent.
 	 *
-	 * Nothing here sleeps the agent or compacts the context: this is a hint, and
-	 * `sleep` stays the agent's own decision.
+	 * - At `contextSleepTokens` the agent gets one **directive**: finish the step
+	 *   and sleep now. This is the soft path; the runtime still gives it
+	 *   `contextSleepGraceTurns` before forcing the reset.
+	 * - At `contextWarnTokens` (the older hint) it gets the advisory
+	 *   {@link CONTEXT_WARN_MESSAGE}, re-armed only after another
+	 *   `contextWarnStepTokens` of growth. When the soft directive fires at the
+	 *   same threshold the hint is skipped so the two do not stack.
+	 *
+	 * Dropping back below a threshold re-arms it for the next crossing.
 	 */
 	private noteContextSize(run: RunHandle): void {
 		const loop = this.deps.config.config.loop;
-		if (loop.contextWarnTokens <= 0) return;
+		const policy = resolveContextPolicy(this.deps.config.config);
 		const watch = this.watch?.runId === run.id ? this.watch : undefined;
 		if (!watch) return;
 		const contextTokens = sessionContextTokens(this.session);
 		if (contextTokens <= 0) return;
+
+		if (policy.sleepTokens > 0 && contextTokens >= policy.sleepTokens) {
+			// First turn of this crossing: remember when it happened and steer one
+			// directive. The hint below is skipped for the same crossing.
+			if (watch.contextSoftSince === undefined) watch.contextSoftSince = run.turns;
+			if (!watch.contextSleepSteered) {
+				watch.contextSleepSteered = true;
+				void this.steerContextSleep(run, contextTokens, policy.sleepTokens);
+			}
+			return;
+		}
+		// Fell back below the soft threshold: a later crossing deserves a fresh
+		// directive and a fresh grace window (e.g. after a successful compaction).
+		watch.contextSoftSince = undefined;
+		watch.contextSleepSteered = false;
+
+		if (loop.contextWarnTokens <= 0) return;
 		if (contextTokens < loop.contextWarnTokens) {
 			// Fell back below the threshold: a later crossing deserves a fresh hint.
 			watch.contextWarnedAt = undefined;
@@ -1044,6 +1097,86 @@ export class AgentRunner {
 	}
 
 	/**
+	 * Enforce the context-sleep policy at a step boundary (#170).
+	 *
+	 * The hard ceiling wins over grace: crossing `contextHardTokens` forces the
+	 * sleep immediately. Otherwise the soft threshold forces it once
+	 * `contextSleepGraceTurns` turns have completed since the first crossing.
+	 * The sleep is runtime state (`sleepRequested`/`sleepForced`), not a tool
+	 * call, so a profile without `sleep` in its allowlist still resets.
+	 */
+	private maybeForceContextReset(run: RunHandle): void {
+		if (run.sleepRequested) return;
+		const watch = this.watch?.runId === run.id ? this.watch : undefined;
+		if (!watch) return;
+		const policy = resolveContextPolicy(this.deps.config.config);
+		const contextTokens = sessionContextTokens(this.session);
+		if (contextTokens <= 0) return;
+		if (policy.hardTokens > 0 && contextTokens >= policy.hardTokens) {
+			this.forceContextReset(run, { reason: "hard", tokens: contextTokens, limitTokens: policy.hardTokens });
+			return;
+		}
+		if (
+			policy.sleepTokens > 0 &&
+			contextTokens >= policy.sleepTokens &&
+			watch.contextSoftSince !== undefined &&
+			run.turns - watch.contextSoftSince >= policy.sleepGraceTurns
+		) {
+			this.forceContextReset(run, { reason: "soft", tokens: contextTokens, limitTokens: policy.sleepTokens });
+		}
+	}
+
+	/**
+	 * End the run with a forced sleep and record why. The existing run path sees
+	 * `sleepRequested`, records `stopReason = "slept"` and rebuilds the session,
+	 * so the next run starts with a genuinely empty context.
+	 */
+	private forceContextReset(
+		run: RunHandle,
+		reset: { reason: ContextResetReason; tokens: number; limitTokens: number },
+	): void {
+		if (run.sleepRequested) return;
+		run.sleepRequested = true;
+		run.sleepForced = true;
+		const watch = this.watch?.runId === run.id ? this.watch : undefined;
+		if (watch) watch.contextReset = { ...reset };
+		this.deps.toolDeps.journal.append(
+			`[context-reset] forced sleep (${reset.reason}): context ${reset.tokens} tokens reached ${reset.limitTokens}; ` +
+				"memory survives through summary.md and journal; the next run starts with an empty context",
+		);
+		run.journalEntries += 1;
+		const now = Date.now();
+		this.emitAnomaly(run, {
+			type: "context_reset",
+			now,
+			activeMs: runActiveMs(run, now),
+			contextTokens: reset.tokens,
+			limitTokens: reset.limitTokens,
+			resetReason: reset.reason,
+		});
+	}
+
+	/**
+	 * Track a failed auto-compaction (#167) and force a reset when it keeps
+	 * failing (#170). A single failure is still left to compaction's own backoff;
+	 * a repeat within the grace window means the context would only keep growing.
+	 * `contextSleepGraceTurns = 0` means "no grace": the first failure resets.
+	 */
+	private noteCompactionFailure(run: RunHandle, tokens: number): void {
+		if (run.sleepRequested) return;
+		const watch = this.watch?.runId === run.id ? this.watch : undefined;
+		if (!watch) return;
+		const policy = resolveContextPolicy(this.deps.config.config);
+		const turn = run.turns;
+		const previous = watch.lastCompactionFailureTurn;
+		const repeatedWithinGrace = previous !== undefined && turn - previous <= policy.sleepGraceTurns;
+		watch.lastCompactionFailureTurn = turn;
+		if (policy.sleepGraceTurns > 0 && !repeatedWithinGrace) return;
+		const limitTokens = policy.hardTokens > 0 ? policy.hardTokens : policy.sleepTokens;
+		this.forceContextReset(run, { reason: "compaction", tokens, limitTokens });
+	}
+
+	/**
 	 * Steer the built-in context-size hint into the working agent (#123).
 	 * `sleep` remains voluntary: the run continues if the agent decides not to.
 	 */
@@ -1056,6 +1189,18 @@ export class AgentRunner {
 			});
 		} catch (err) {
 			this.deps.log.warn("context-size hint failed", {
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	}
+
+	/** Steer the directive that tells the agent to finish the step and sleep (#170). */
+	private async steerContextSleep(run: RunHandle, contextTokens: number, threshold: number): Promise<void> {
+		try {
+			await this.session.steer(CONTEXT_SLEEP_MESSAGE);
+			this.deps.log.info(`run #${run.index} context-sleep directive steered`, { contextTokens, threshold });
+		} catch (err) {
+			this.deps.log.warn("context-sleep directive failed", {
 				error: err instanceof Error ? err.message : String(err),
 			});
 		}

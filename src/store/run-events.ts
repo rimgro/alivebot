@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import { appendJsonl, ensureDir, readJsonl } from "../util.js";
-import type { CompactionFailureClass } from "./runs.js";
+import type { CompactionFailureClass, ContextResetReason } from "./runs.js";
 
 /**
  * Run-anomaly events the runtime records about its own runs (#127, #123).
@@ -17,6 +17,11 @@ import type { CompactionFailureClass } from "./runs.js";
  * to sleep only if the task is finished or it is switching to unrelated work.
  * It is recorded once per crossing, not per turn.
  *
+ * `context_reset` (#170) records that the runtime forced a sleep at a step
+ * boundary because the context crossed the soft or hard ceiling (or compaction
+ * kept failing). Unlike `context_high`, the run does not continue: its next run
+ * starts with an empty context.
+ *
  * One file per profile: `<stateDir>/runs/events.jsonl`, next to `runs.jsonl`.
  */
 export type RunAnomalyType =
@@ -25,6 +30,7 @@ export type RunAnomalyType =
 	| "run_repeat_tool"
 	| "run_very_long"
 	| "context_high"
+	| "context_reset"
 	| "compaction_failed";
 
 export interface RunAnomalyEvent {
@@ -55,8 +61,10 @@ export interface RunAnomalyEvent {
 	 * estimate (`contextUsage.tokens`), never cumulative billing.
 	 */
 	contextTokens?: number;
-	/** `context_high`: the configured `loop.contextWarnTokens` threshold. */
+	/** `context_high`/`context_reset`: the configured threshold that fired. */
 	limitTokens?: number;
+	/** `context_reset`: why `sleepForced` happened — soft grace, the hard ceiling, or repeated compaction failures. */
+	resetReason?: ContextResetReason;
 	/** `run_repeat_tool`: the tool name. Arguments are deliberately not recorded. */
 	tool?: string;
 	/** `run_repeat_tool`: how many times in a row the same call was repeated. */
