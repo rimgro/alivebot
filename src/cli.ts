@@ -1002,6 +1002,7 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 		heartbeatAgeMs: heartbeat.ageMs,
 		silentMs: config.config.health.silentMs,
 		unitStatus: heartbeat.heartbeat?.unitStatus,
+		startLoop: heartbeat.startLoop ?? heartbeat.heartbeat?.startLoop,
 		// A profile that never ran has no runtime for a normal reason: the mark of a
 		// launch lives in usage.json / runs.jsonl / logs / heartbeat.json (#190).
 		launchHistory: hasLaunchHistory(config.paths.stateDir),
@@ -1089,6 +1090,12 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 		// A halted boot stays alive on purpose (#178); say why instead of only
 		// showing the status word.
 		line("error", term.red(oneLine(runtime.error ?? "unknown error", 300)));
+	}
+	const startLoop = heartbeat.startLoop ?? heartbeat.heartbeat?.startLoop;
+	if (startLoop?.warn) {
+		// Repeated starts are a process-level signal, visible even when the current
+		// boot is otherwise healthy (#178).
+		line("restart loop:", `${startLoop.starts} starts in 10m`);
 	}
 	if (running && runtime) {
 		line("mode", `${runtime.mode ?? "foreground"}${snapshot?.suspended ? term.red(" — SUSPENDED (SIGSTOP/Ctrl+Z), serves nothing") : ""}`);

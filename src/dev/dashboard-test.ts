@@ -1010,6 +1010,24 @@ async function main(): Promise<void> {
 	const writerSummary = readAgentSummary(writer, { now });
 	check("dead runtime -> status sleeping", writerSummary.status === "sleeping", writerSummary.status);
 	check("spend falls back to today's run records when usage.json is absent", Math.abs(writerSummary.spendTodayUsd - 0.005) < 1e-9, writerSummary.spendTodayUsd);
+	const loopSummary = readAgentSummary(main, {
+		now,
+		startLoop: { starts: 6, windowSeconds: 600, threshold: 5, warn: true },
+	});
+	check(
+		"a restart loop is appended to the agent card note (#178)",
+		loopSummary.statusNote.includes("restart loop: 6 starts/10m"),
+		loopSummary.statusNote,
+	);
+	const quietLoopSummary = readAgentSummary(main, {
+		now,
+		startLoop: { starts: 2, windowSeconds: 600, threshold: 5, warn: false },
+	});
+	check(
+		"a counter below the threshold adds no restart-loop note",
+		!quietLoopSummary.statusNote.includes("restart loop"),
+		quietLoopSummary.statusNote,
+	);
 
 	section("status derivation");
 	const waiting = deriveAgentStatus(
@@ -1180,6 +1198,16 @@ async function main(): Promise<void> {
 		"health: an unknown launch history stays stopped and carries no neverStarted (#190)",
 		stoppedHealth.state === "stopped" && stoppedHealth.neverStarted === undefined && stoppedHealth.reason === undefined,
 		stoppedHealth,
+	);
+	const loopHealth = deriveAgentHealth(null, {
+		now,
+		silentMs: 0,
+		startLoop: { starts: 6, windowSeconds: 600, threshold: 5, warn: true },
+	});
+	check(
+		"health: the restart-loop counter is exposed when recorded (#178)",
+		loopHealth.startLoop?.starts === 6 && loopHealth.startLoop.warn === true && loopHealth.startLoop.threshold === 5,
+		loopHealth,
 	);
 
 	// The dashboard answers "did this profile ever start?" from the state dir

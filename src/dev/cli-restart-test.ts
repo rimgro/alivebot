@@ -327,6 +327,21 @@ try {
 			}
 			return { code, payload: JSON.parse(out.join("")) as Record<string, unknown> };
 		};
+		const statusHuman = async (): Promise<{ code: number; out: string }> => {
+			const out: string[] = [];
+			const stdoutWrite = process.stdout.write;
+			const stderrWrite = process.stderr.write;
+			process.stdout.write = ((chunk: unknown) => { out.push(String(chunk)); return true; }) as typeof process.stdout.write;
+			process.stderr.write = (() => true) as typeof process.stderr.write;
+			let code = -1;
+			try {
+				code = await main(["status", "--config", healthConfig]);
+			} finally {
+				process.stdout.write = stdoutWrite;
+				process.stderr.write = stderrWrite;
+			}
+			return { code, out: out.join("") };
+		};
 
 		const now = Date.now();
 		writeRuntimeState(healthStateDir, {
@@ -345,6 +360,7 @@ try {
 			startedAt: now - 60_000,
 			lastTickAt: now - 30_000,
 			unitStatus: "inactive",
+			startLoop: { starts: 6, windowSeconds: 600, threshold: 5, warn: true },
 		});
 		const dead = await statusJson();
 		const deadHealth = dead.payload.health as Record<string, unknown> | undefined;
@@ -363,6 +379,18 @@ try {
 				deadHealth.silentMs === 600_000 &&
 				deadHealth.unitStatus === "inactive",
 			deadHealth,
+		);
+		check(
+			"the health block carries the restart-loop counter (#178)",
+			(deadHealth?.startLoop as { starts?: number } | undefined)?.starts === 6 &&
+				(deadHealth?.startLoop as { warn?: boolean } | undefined)?.warn === true,
+			deadHealth?.startLoop,
+		);
+		const deadText = await statusHuman();
+		check(
+			"the human status prints the restart loop when it warns (#178)",
+			deadText.code === 0 && deadText.out.includes("restart loop: 6 starts in 10m"),
+			deadText.out,
 		);
 		check(
 			"the existing runtime/staleRuntime fields are unchanged",

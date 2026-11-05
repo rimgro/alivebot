@@ -26,6 +26,12 @@ import {
 	systemdUnitName,
 	writeHeartbeat,
 } from "../heartbeat.js";
+import {
+	readStartLoop,
+	recordProcessStart,
+	START_LOOP_THRESHOLD,
+	START_LOOP_WINDOW_MS,
+} from "../store/start-loop.js";
 
 let failures = 0;
 function check(name: string, condition: boolean, detail?: unknown): void {
@@ -301,6 +307,136 @@ try {
 			"readHeartbeatStatus exposes the new fields when they exist",
 			growthStatus.staleSeconds === second.staleSeconds && growthStatus.unitStatus === "inactive" && growthStatus.state === "fresh",
 			growthStatus,
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	section("start-loop status travels with the heartbeat (#178)");
+	{
+		const stateDir = path.join(root, "start-loop", ".alive");
+		const writtenAt = Date.UTC(2026, 0, 2, 3, 4, 5);
+		const startLoop = { starts: 6, windowSeconds: 600, threshold: 5, warn: true };
+		recordHeartbeat({
+			stateDir,
+			pid: 8181,
+			startedAt: writtenAt - 60_000,
+			version: "3.0.0",
+			buildId: "start-loop-build",
+			startLoop,
+			now: writtenAt,
+		});
+		const raw = JSON.parse(fs.readFileSync(heartbeatPath(stateDir), "utf8")) as Record<string, unknown>;
+		check(
+			"the heartbeat writes the structured startLoop block",
+			JSON.stringify(raw.startLoop) === JSON.stringify(startLoop),
+			raw.startLoop,
+		);
+		const fromFile = readHeartbeat(stateDir);
+		check(
+			"readHeartbeat round-trips startLoop",
+			fromFile?.startLoop?.starts === 6 && fromFile.startLoop.warn === true && fromFile.startLoop.windowSeconds === 600,
+			fromFile?.startLoop,
+		);
+		const status = readHeartbeatStatus(stateDir, 300_000, writtenAt);
+		check(
+			"readHeartbeatStatus exposes startLoop",
+			status.startLoop?.starts === 6 && status.startLoop.threshold === 5 && status.startLoop.warn === true,
+			status.startLoop,
+		);
+
+		const refreshedAt = writtenAt + 5_000;
+		check("refreshHeartbeat accepts a record with startLoop", refreshHeartbeat(stateDir, undefined, refreshedAt) === true);
+		const preserved = readHeartbeat(stateDir);
+		check(
+			"a refresh without startLoop preserves the previous value",
+			preserved?.startLoop?.starts === 6 && preserved.startLoop.warn === true,
+			preserved?.startLoop,
+		);
+
+		const nextStartLoop = { starts: 2, windowSeconds: 600, threshold: 5, warn: false };
+		check(
+			"refreshHeartbeat overwrites startLoop when given a new value",
+			refreshHeartbeat(stateDir, undefined, refreshedAt + 5_000, { startLoop: nextStartLoop }) === true,
+		);
+		const overwritten = readHeartbeat(stateDir);
+		check(
+			"the refreshed startLoop is what the reader sees",
+			overwritten?.startLoop?.starts === 2 && overwritten.startLoop.warn === false,
+			overwritten?.startLoop,
+		);
+
+		const corruptDir = path.join(root, "start-loop-corrupt", ".alive");
+		fs.mkdirSync(corruptDir, { recursive: true });
+		fs.writeFileSync(
+			heartbeatPath(corruptDir),
+			JSON.stringify({
+				pid: 1,
+				startedAt: new Date(writtenAt).toISOString(),
+				version: "1.0.0",
+				buildId: "corrupt",
+				startLoop: { starts: -1, windowSeconds: 600, threshold: 5, warn: true },
+			}),
+			"utf8",
+		);
+		check("a malformed startLoop block is not invented", readHeartbeat(corruptDir)?.startLoop === undefined, readHeartbeat(corruptDir));
+		check(
+			"readHeartbeatStatus does not invent startLoop either",
+			readHeartbeatStatus(corruptDir, 300_000, writtenAt).startLoop === undefined,
+			readHeartbeatStatus(corruptDir, 300_000, writtenAt),
+		);
+
+		const badWarnDir = path.join(root, "start-loop-bad-warn", ".alive");
+		fs.mkdirSync(badWarnDir, { recursive: true });
+		fs.writeFileSync(
+			heartbeatPath(badWarnDir),
+			JSON.stringify({
+				pid: 2,
+				startedAt: new Date(writtenAt).toISOString(),
+				version: "1.0.0",
+				buildId: "bad-warn",
+				startLoop: { starts: 6, windowSeconds: 600, threshold: 5, warn: "yes" },
+			}),
+			"utf8",
+		);
+		check("a non-boolean warn drops the block", readHeartbeat(badWarnDir)?.startLoop === undefined, readHeartbeat(badWarnDir));
+	}
+
+	// -------------------------------------------------------------------------
+	section("start-loop status decays with the window (#178 review)");
+	{
+		const stateDir = path.join(root, "start-loop-decay", ".alive");
+		const base = Date.UTC(2026, 0, 2, 3, 4, 5);
+		for (let index = 0; index < START_LOOP_THRESHOLD; index += 1) {
+			recordProcessStart(stateDir, base + index * 1_000);
+		}
+		const atBoot = readStartLoop(stateDir, base + START_LOOP_THRESHOLD * 1_000);
+		check("five starts inside the window warn", atBoot.starts === START_LOOP_THRESHOLD && atBoot.warn === true, atBoot);
+
+		const bootHeartbeatAt = base + (START_LOOP_THRESHOLD + 1) * 1_000;
+		recordHeartbeat({
+			stateDir,
+			pid: 9191,
+			startedAt: base,
+			version: "3.1.0",
+			buildId: "start-loop-decay",
+			startLoop: atBoot,
+			now: bootHeartbeatAt,
+		});
+		const bootStatus = readHeartbeatStatus(stateDir, 300_000, bootHeartbeatAt);
+		check("the heartbeat carries the warn state while the window is full", bootStatus.startLoop?.warn === true, bootStatus.startLoop);
+
+		// After the whole window the five old starts are gone; the next boot is the
+		// only one left, so the next heartbeat rewrite must not keep the alert.
+		const later = base + START_LOOP_WINDOW_MS + 60_000;
+		check("all old starts fall out of the window", readStartLoop(stateDir, later).starts === 0, readStartLoop(stateDir, later));
+		const nextStart = recordProcessStart(stateDir, later);
+		check("the next start counts 1 and does not warn", nextStart.starts === 1 && nextStart.warn === false, nextStart);
+		check("the heartbeat is rewritten with the decayed status", refreshHeartbeat(stateDir, undefined, later, { startLoop: nextStart }) === true);
+		const decayed = readHeartbeatStatus(stateDir, 300_000, later);
+		check(
+			"the rewritten heartbeat reports 1 start and no warn",
+			decayed.startLoop?.starts === 1 && decayed.startLoop.warn === false,
+			decayed.startLoop,
 		);
 	}
 
