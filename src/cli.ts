@@ -486,6 +486,12 @@ async function runCommand(cwd: string, flags: Record<string, string | boolean>):
 	try {
 		if (once) {
 			await runtime.init();
+			if (runtime.haltedByInitFailures) {
+				// A one-shot command has nothing to stay alive for: only the
+				// long-lived runtime waits in status=error to break a restart loop.
+				const recorded = readRuntimeState(config.paths.stateDir)?.error;
+				return failBoot(log, new Error(recorded ?? "init failed repeatedly; see runtime.json"));
+			}
 			const record = await runtime.runOnce();
 			await runtime.stop("once");
 			return record ? 0 : 0;
@@ -569,6 +575,18 @@ async function startBackground(config: LoadedConfig, flags: Record<string, strin
 	if (!snapshot) {
 		process.stderr.write(`${term.red("failed to start:")} pid ${handle.pid} did not come up\n`);
 		printLogTail(handle.logFile, 15);
+		return 1;
+	}
+	if (snapshot.state.status === "error") {
+		// Repeated init failures (#178): the process is alive on purpose so the
+		// service manager cannot restart it in a loop, but the agent did not start.
+		process.stderr.write(
+			`${term.red("failed to start:")} ${config.config.name} is alive in status=error ` +
+				`(repeated init failures, restart loop stopped)\n` +
+				`  ${oneLine(snapshot.state.error ?? "no error recorded", 300)}\n` +
+				`  ${term.dim(`pid ${handle.pid} stays up until stopped; see alive status and ${path.relative(config.paths.rootDir, handle.logFile)}`)}` +
+				"\n",
+		);
 		return 1;
 	}
 
@@ -1044,6 +1062,11 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 					` (threshold ${formatDuration(stall.thresholdMs)}); the run is still open`,
 			),
 		);
+	}
+	if (running && runtime && runtime.status === "error") {
+		// A halted boot stays alive on purpose (#178); say why instead of only
+		// showing the status word.
+		line("error", term.red(oneLine(runtime.error ?? "unknown error", 300)));
 	}
 	if (running && runtime) {
 		line("mode", `${runtime.mode ?? "foreground"}${snapshot?.suspended ? term.red(" — SUSPENDED (SIGSTOP/Ctrl+Z), serves nothing") : ""}`);

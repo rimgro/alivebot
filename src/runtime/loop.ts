@@ -25,6 +25,16 @@ import {
 	type RuntimeStateFile,
 	type RuntimeStatusKind,
 } from "../store/runs.js";
+import {
+	INIT_FAILURE_STAY_THRESHOLD,
+	INIT_FAILURE_WINDOW_MS,
+	initFailureDecision,
+	readInitFailures,
+	resetInitFailures,
+	writeInitFailures,
+	type InitFailureDecision,
+	type InitFailureRecord,
+} from "../store/init-failures.js";
 import { RunEventLog } from "../store/run-events.js";
 import { ThreadStore } from "../store/threads.js";
 import { maskSecrets } from "../secrets.js";
@@ -122,6 +132,10 @@ export class AliveRuntime {
 	private lastBudgetNotice = "";
 	/** Run id whose `run_stalled` anomaly was already written (#173). */
 	private stalledRunId: string | undefined;
+	/** True when repeated init failures left this process alive in `status: "error"` (#178). */
+	private initHalted = false;
+	/** Resolves the pending `run()` when `stop()` ends a halted (status=error) process. */
+	private stopResolve: (() => void) | undefined;
 	/** Last run record to reopen on startup (#124), consumed by `loop()`. */
 	private pendingResume: RunRecord | undefined;
 	/** Session file to continue across a graceful restart; set before `runner.init()`. */
@@ -387,10 +401,30 @@ export class AliveRuntime {
 		} catch (error) {
 			// A boot that dies here used to leave a live pid with `status: "starting"`
 			// and no ticks, so systemd never restarted it (#173). Make the failure
-			// loud on disk and let the caller exit non-zero.
-			this.recordBootFailure(error);
+			// loud on disk and let the caller exit non-zero — unless the same boot
+			// has failed `INIT_FAILURE_STAY_THRESHOLD` times in a row: then exiting
+			// only feeds a restart loop (#178) and the process stays alive in
+			// `status: "error"` instead.
+			const decision = this.recordBootFailure(error);
+			if (decision.action === "stay") {
+				this.initHalted = true;
+				this.log.warn("init keeps failing; staying alive in status=error instead of restarting in a loop", {
+					consecutive: decision.consecutive,
+					threshold: INIT_FAILURE_STAY_THRESHOLD,
+					windowMs: INIT_FAILURE_WINDOW_MS,
+				});
+				return;
+			}
 			throw error;
 		}
+		// A working boot clears the streak, so the next unrelated failure gets its
+		// two retries again.
+		resetInitFailures(this.config.paths.stateDir);
+	}
+
+	/** True when repeated init failures left the process alive in `status: "error"` (#178). */
+	get haltedByInitFailures(): boolean {
+		return this.initHalted;
 	}
 
 	private async initRuntime(): Promise<void> {
@@ -488,7 +522,7 @@ export class AliveRuntime {
 	 * runs after the restart. Both writes are best effort — the caller still exits
 	 * non-zero, which is what makes the service manager retry.
 	 */
-	private recordBootFailure(error: unknown): void {
+	private recordBootFailure(error: unknown): InitFailureDecision {
 		// The message lands in runtime.json and in the agent's inbox, so it is
 		// masked like every other text that leaves the process.
 		const message = maskSecrets(
@@ -497,6 +531,7 @@ export class AliveRuntime {
 		);
 		const now = Date.now();
 		this.log.error("runtime failed to start", { error: message });
+		const decision = this.countBootFailure(now, message);
 		try {
 			const previous = readRuntimeState(this.config.paths.stateDir);
 			// Only inherit fields from our own state file: a stale one belongs to the
@@ -543,13 +578,70 @@ export class AliveRuntime {
 				error: appendError instanceof Error ? appendError.message : String(appendError),
 			});
 		}
+		return decision;
+	}
+
+	/**
+	 * Update the consecutive-failure counter before the process decides whether to
+	 * exit (#178). A previous failure older than `INIT_FAILURE_WINDOW_MS` is a new
+	 * incident: the count restarts at 1, so a one-off crash after a long uptime is
+	 * retried normally.
+	 */
+	private countBootFailure(now: number, message: string): InitFailureDecision {
+		let previous: InitFailureRecord | undefined;
+		try {
+			previous = readInitFailures(this.config.paths.stateDir);
+		} catch (readError) {
+			this.log.error("cannot read the init-failure counter; treating this as the first failure", {
+				error: readError instanceof Error ? readError.message : String(readError),
+			});
+		}
+		const decision = initFailureDecision(previous, now);
+		try {
+			writeInitFailures(this.config.paths.stateDir, {
+				consecutive: decision.consecutive,
+				lastFailureAt: now,
+				lastError: message,
+			});
+		} catch (writeError) {
+			// Without the counter the next boot cannot see the streak, so it will
+			// exit again: the old behaviour, never a silent endless loop.
+			this.log.error("cannot persist the init-failure counter", {
+				error: writeError instanceof Error ? writeError.message : String(writeError),
+			});
+		}
+		return decision;
 	}
 
 	/** Blocking loop. Resolves when stop() is called. */
 	async run(): Promise<void> {
 		await this.init();
+		if (this.initHalted) {
+			// The process must stay alive (systemd would restart a non-zero exit
+			// forever, #178) but does nothing: no run, no ticks, no init retries.
+			await this.waitForStop();
+			return;
+		}
 		this.loopPromise = this.loop();
 		await this.loopPromise;
+	}
+
+	/**
+	 * Wait for `stop()`, which is the only way out of a halted boot.
+	 *
+	 * A pending promise alone does not keep Node alive, so the wait holds one
+	 * no-op timer: without a live handle the process would exit (code 0) and a
+	 * `Restart=always` unit would start it again — exactly the loop #178 is about.
+	 * The timer never touches runtime state, so there are still no ticks.
+	 */
+	private waitForStop(): Promise<void> {
+		return new Promise<void>((resolve) => {
+			const keepAlive = setInterval(() => undefined, INIT_HALT_KEEPALIVE_MS);
+			this.stopResolve = () => {
+				clearInterval(keepAlive);
+				resolve();
+			};
+		});
 	}
 
 	/**
@@ -559,6 +651,9 @@ export class AliveRuntime {
 	 */
 	async runOnce(): Promise<RunRecord | null> {
 		await this.init();
+		// A halted boot has nothing to run; the caller decides what a one-shot
+		// command does with `status: "error"` (it exits instead of waiting).
+		if (this.initHalted) return null;
 		this.fireDueReminders();
 		if (this.pendingResume) {
 			const resume = this.pendingResume;
@@ -577,6 +672,9 @@ export class AliveRuntime {
 	async stop(reason = "requested", options: StopOptions = {}): Promise<void> {
 		if (this.stopping) return;
 		this.stopping = true;
+		// A halted boot (status=error) waits here: SIGTERM/SIGINT must still end it.
+		this.stopResolve?.();
+		this.stopResolve = undefined;
 		// Operator tool-abort polling belongs to a live runtime; a stop/restart is
 		// the separate graceful path and must not race it (#164, #181).
 		this.toolAbort?.stopPolling();
@@ -995,6 +1093,9 @@ export class AliveRuntime {
 		this.log.warn("stale runtime state file found", { pid: state.pid, status: state.status });
 	}
 }
+
+/** How often the halted (status=error) process proves it is still alive: once an hour. */
+const INIT_HALT_KEEPALIVE_MS = 60 * 60_000;
 
 /**
  * Size of a resume target in bytes, or `undefined` when it cannot be read
