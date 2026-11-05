@@ -148,6 +148,105 @@ export function runInterruptions(record: { interruptedBy?: unknown }): RunInterr
 }
 
 /**
+ * Aggregate description of one outgoing provider request (#176).
+ *
+ * Counts and sizes only: message text, tool arguments and base64 image data
+ * never appear here, so the summary is safe to log and to persist.
+ */
+export interface ProviderRequestSummary {
+	model?: string;
+	stream?: boolean;
+	messages: number;
+	blocks: {
+		text: number;
+		image: number;
+		tool_use: number;
+		tool_result: number;
+		other: number;
+	};
+	/** Estimated decoded size of the base64 image parts. */
+	imageBytes: number;
+	/** Length of the JSON payload as sent. */
+	bytes: number;
+	/** Number of tools offered to the model, when the payload has a tool list. */
+	tools?: number;
+}
+
+/**
+ * Why a run closed with a provider error (#176), persisted on the run record.
+ *
+ * `requestId` is the key an operator needs to ask the gateway owner what was
+ * rejected; `request` is the aggregate request shape at that moment; `body` is
+ * the provider's response body, already masked and bounded by the runtime.
+ */
+export interface RunProviderError {
+	/** ISO timestamp of the rejected provider call. */
+	at: string;
+	status?: number;
+	requestId?: string;
+	code?: string;
+	body?: string;
+	model?: string;
+	request?: ProviderRequestSummary;
+	/** True when the failed request was a retry sent without image attachments. */
+	attachmentsDropped?: boolean;
+}
+
+function providerCount(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.trunc(value)) : 0;
+}
+
+/**
+ * The request summary stored on a run, sanitized. Anything malformed is dropped
+ * instead of throwing so an old or hand-edited `runs.jsonl` still loads.
+ */
+export function providerRequestSummary(value: unknown): ProviderRequestSummary | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const candidate = value as Record<string, unknown>;
+	const blocks = candidate.blocks;
+	const blockRecord = blocks && typeof blocks === "object" && !Array.isArray(blocks)
+		? (blocks as Record<string, unknown>)
+		: {};
+	const summary: ProviderRequestSummary = {
+		messages: providerCount(candidate.messages),
+		blocks: {
+			text: providerCount(blockRecord.text),
+			image: providerCount(blockRecord.image),
+			tool_use: providerCount(blockRecord.tool_use),
+			tool_result: providerCount(blockRecord.tool_result),
+			other: providerCount(blockRecord.other),
+		},
+		imageBytes: providerCount(candidate.imageBytes),
+		bytes: providerCount(candidate.bytes),
+	};
+	if (typeof candidate.model === "string" && candidate.model.length > 0) summary.model = candidate.model;
+	if (typeof candidate.stream === "boolean") summary.stream = candidate.stream;
+	if (typeof candidate.tools === "number" && Number.isFinite(candidate.tools)) summary.tools = providerCount(candidate.tools);
+	return summary;
+}
+
+/**
+ * The provider-error block of a run record, sanitized. Older records have no
+ * field at all; malformed blocks are ignored rather than thrown on.
+ */
+export function runProviderError(record: { providerError?: unknown }): RunProviderError | undefined {
+	const value = record.providerError;
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const candidate = value as Record<string, unknown>;
+	if (typeof candidate.at !== "string" || candidate.at.trim().length === 0) return undefined;
+	const out: RunProviderError = { at: candidate.at };
+	if (typeof candidate.status === "number" && Number.isFinite(candidate.status)) out.status = candidate.status;
+	for (const key of ["requestId", "code", "body", "model"] as const) {
+		const field = candidate[key];
+		if (typeof field === "string" && field.length > 0) out[key] = field;
+	}
+	const request = providerRequestSummary(candidate.request);
+	if (request !== undefined) out.request = request;
+	if (candidate.attachmentsDropped === true) out.attachmentsDropped = true;
+	return out;
+}
+
+/**
  * One message the run delivered.
  *
  * `deliveryKey` is the outbox idempotency key (`OutgoingMessage.deliveryKey`)
@@ -267,6 +366,12 @@ export interface RunRecord {
 	/** Who initiated the stop (#168). Absent on records written before it existed. */
 	stoppedBy?: RunStoppedBy;
 	error?: string;
+	/**
+	 * Provider failure that closed this run (#176): status, request id, masked
+	 * response body and the aggregate request shape. Absent on older records and
+	 * on runs that did not end with a provider error.
+	 */
+	providerError?: RunProviderError;
 	/** Pi session file backing this run, so a resume can reopen the exact session. */
 	sessionFile?: string;
 	/** Human-readable interruption summary, written when a harness restart drains the run. */
