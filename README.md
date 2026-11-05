@@ -463,6 +463,15 @@ alive run --once          # один run в терминале, без демо�
 Stdout фонового процесса пишется в `.alive/logs/stdout.log`, структурированный лог —
 в `.alive/logs/alive.jsonl`.
 
+### systemd-юниты (user-скоуп)
+
+Шаблоны `alive.service`, `alive-agent@.service`, drop-in с защитой от петли стартов
+(#178) и идемпотентный установщик лежат в [`deploy/systemd/`](deploy/systemd/README.md).
+Это единственный источник unit-файлов: правьте шаблоны в репо и переустанавливайте
+(`./deploy/systemd/install.sh [profile…]`), а не хостовые копии в
+`~/.config/systemd/user/`. Все юниты — в user-скоупе; нужен
+`loginctl enable-linger "$USER"`, иначе после ребута они не поднимутся.
+
 ### Heartbeat и внешний watchdog
 
 При старте рантайм один раз на процесс (не на каждый run) атомарно пишет

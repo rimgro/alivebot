@@ -1,0 +1,17 @@
+[Unit]
+Description=Alive primary agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/alive
+ExecStart=%h/.local/share/node24/bin/node %h/Projects/alive/dist/index.js run --foreground
+TimeoutStopSec=45
+Restart=always
+RestartSec=5
+Environment=HOME=%h
+Environment=PATH=%h/.pi/agent/bin:%h/.local/bin:%h/.local/share/node24/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
