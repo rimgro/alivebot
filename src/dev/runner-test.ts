@@ -1700,6 +1700,50 @@ section("a forced abort is a cancel and keeps the residual flag (#168)");
 	);
 }
 
+section("force stop closes the run at once, keeping the initiator and unsettled usage (#181)");
+{
+	const world = makeShutdownWorld("force-stop", { shutdownGraceMs: 60_000 });
+	await world.runner.init();
+	const session = world.sessions[0]!;
+	let startedResolve!: () => void;
+	const started = new Promise<void>((resolve) => {
+		startedResolve = resolve;
+	});
+	world.handler = async (current) => {
+		// The provider billed this step, but the forced close ends the run before
+		// any turn_end can account for it.
+		current.addUsage(80, 8, 0.015);
+		startedResolve();
+		await new Promise<void>((resolve) => {
+			current.onAbort = resolve;
+		});
+		throw new Error("session aborted");
+	};
+	const execution = world.runner.execute();
+	await started;
+	world.runner.setStopInitiator("stop");
+	const startedAt = Date.now();
+	const aborted = await world.runner.abortNow();
+	const record = await execution;
+	check(
+		"force stop does not wait for the shutdown grace budget",
+		aborted.active && Date.now() - startedAt < 1_000,
+		{ aborted, elapsed: Date.now() - startedAt },
+	);
+	check("the session was aborted by the force path", session.aborted === true);
+	check(
+		"the force-closed run keeps the initiator as stoppedBy, not cancel",
+		record?.stopReason === "interrupted" && record?.stoppedBy === "stop",
+		{ stopReason: record?.stopReason, stoppedBy: record?.stoppedBy },
+	);
+	check("the force-closed run is flagged usageUnsettled", record?.usageUnsettled === true, record?.usageUnsettled);
+	check(
+		"the usage numbers stay the provider's, no synthetic spend",
+		Math.abs((record?.usage.cost ?? 0) - 0.015) < 1e-9 && record?.usage.input === 80,
+		record?.usage,
+	);
+}
+
 section("startup decision: a recent interrupted run resumes, an old one expires (#124)");
 {
 	const record = interruptedRecord!;

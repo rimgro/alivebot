@@ -210,7 +210,9 @@ section("stop-intent marker: `alive stop` vs `alive restart` (#168)");
 	check("no marker means no initiator", readStopIntent(intentDir) === undefined);
 
 	writeStopIntent(intentDir, "stop", { pid: process.pid });
-	check("a fresh marker for this pid is accepted", readStopIntent(intentDir) === "stop");
+	const fresh = readStopIntent(intentDir);
+	check("a fresh marker for this pid is accepted", fresh?.initiator === "stop", fresh);
+	check("a marker without force reads as graceful", fresh?.force === false, fresh);
 	check("reading a marker consumes it", !fs.existsSync(stopIntentPath(intentDir)));
 
 	writeStopIntent(intentDir, "restart", { pid: process.pid + 1 });
@@ -222,7 +224,15 @@ section("stop-intent marker: `alive stop` vs `alive restart` (#168)");
 	check("a stale marker is ignored", readStopIntent(intentDir, { now, pid: process.pid }) === undefined);
 	check("a stale marker is deleted", !fs.existsSync(stopIntentPath(intentDir)));
 	writeStopIntent(intentDir, "stop", { at: now - STOP_INTENT_TTL_MS + 1, pid: process.pid });
-	check("a marker inside the window is still accepted", readStopIntent(intentDir, { now, pid: process.pid }) === "stop");
+	check("a marker inside the window is still accepted", readStopIntent(intentDir, { now, pid: process.pid })?.initiator === "stop");
+
+	writeStopIntent(intentDir, "restart", { pid: process.pid, force: true });
+	const forcedMarker = readStopIntent(intentDir);
+	check(
+		"a force marker carries initiator and force (#181)",
+		forcedMarker?.initiator === "restart" && forcedMarker.force === true,
+		forcedMarker,
+	);
 
 	fs.mkdirSync(intentDir, { recursive: true });
 	fs.writeFileSync(stopIntentPath(intentDir), "{not json", "utf8");
@@ -270,7 +280,7 @@ section("stopRuntime writes the marker before SIGTERM (#168)");
 	});
 	const stopped = await stopRuntime(intentDir, { timeoutMs: 5_000, pollMs: 25, initiator: "stop" });
 	check("the runtime was stopped gracefully", stopped.stopped && !stopped.forceKilled, stopped);
-	let seen: { initiator?: unknown; pid?: unknown } | undefined;
+	let seen: { initiator?: unknown; pid?: unknown; force?: unknown } | undefined;
 	try {
 		seen = JSON.parse(fs.readFileSync(seenFile, "utf8"));
 	} catch {
@@ -278,12 +288,13 @@ section("stopRuntime writes the marker before SIGTERM (#168)");
 	}
 	check("the marker is already on disk when SIGTERM arrives", seen?.initiator === "stop", seen);
 	check("the marker names the pid that was signalled", seen?.pid === child.pid, { seen, pid: child.pid });
+	check("a graceful stop writes no force flag", seen?.force === undefined, seen);
 	// The stub is not a runtime: it copies the marker but never consumes it, so
 	// the real shutdown path is exercised by reading it here (as
 	// `AliveRuntime.stop()` does) after the process is gone.
 	check(
 		"the marker left for the runtime is valid for the signalled pid and is consumed once",
-		readStopIntent(intentDir, { pid: child.pid }) === "stop" && !fs.existsSync(stopIntentPath(intentDir)),
+		readStopIntent(intentDir, { pid: child.pid })?.initiator === "stop" && !fs.existsSync(stopIntentPath(intentDir)),
 		{ exists: fs.existsSync(stopIntentPath(intentDir)) },
 	);
 	check(
@@ -295,6 +306,95 @@ section("stopRuntime writes the marker before SIGTERM (#168)");
 	writeStopIntent(intentDir, "stop", { pid: process.pid });
 	const nothing = await stopRuntime(intentDir);
 	check("stopping nothing clears a leftover marker", nothing.alreadyStopped && !fs.existsSync(stopIntentPath(intentDir)), nothing);
+}
+
+section("force stop: marker + SIGTERM, SIGKILL only as escalation (#181)");
+{
+	const forceDir = path.join(root, "force-runtime");
+	fs.mkdirSync(forceDir, { recursive: true });
+	const seenFile = path.join(forceDir, "seen-on-sigterm.json");
+	const readyFile = path.join(forceDir, "ready");
+	// Cooperative runtime: it records the marker it saw and exits inside the
+	// short force window, so no SIGKILL is needed.
+	const child = spawnStub(
+		`const fs = require("node:fs");` +
+			`process.on("SIGTERM", () => {` +
+			` let seen = "missing";` +
+			` try { seen = fs.readFileSync(${JSON.stringify(stopIntentPath(forceDir))}, "utf8"); } catch {}` +
+			` fs.writeFileSync(${JSON.stringify(seenFile)}, seen);` +
+			` setTimeout(() => process.exit(0), 50);` +
+			`});` +
+			`fs.writeFileSync(${JSON.stringify(readyFile)}, "ready");` +
+			`setInterval(() => {}, 1000);`,
+	);
+	if (!(await waitForFile(readyFile))) throw new Error("force-stop stub never became ready");
+	writeRuntimeState(forceDir, {
+		pid: child.pid!,
+		startedAt: Date.now() - 1_000,
+		lastTickAt: Date.now(),
+		status: "idle",
+		runIndex: 1,
+		pending: 0,
+		openThreads: 0,
+		sleeps: 0,
+	});
+	const forced = await stopRuntime(forceDir, { force: true, forceTimeoutMs: 5_000, pollMs: 25, initiator: "restart" });
+	check("a cooperative force stop needs no SIGKILL", forced.stopped && !forced.forceKilled, forced);
+	let seen: { initiator?: unknown; pid?: unknown; force?: unknown } | undefined;
+	try {
+		seen = JSON.parse(fs.readFileSync(seenFile, "utf8"));
+	} catch {
+		seen = undefined;
+	}
+	check("a force stop still sends SIGTERM with the marker on disk", seen?.initiator === "restart", seen);
+	check("the marker tells the runtime this is a force stop", seen?.force === true, seen);
+	check("the force marker names the signalled pid", seen?.pid === child.pid, { seen, pid: child.pid });
+	check("the runtime state is rewritten as stopped", readRuntimeState(forceDir)?.status === "stopped");
+	check(
+		"the force marker is left for the runtime to consume",
+		readStopIntent(forceDir, { pid: child.pid })?.force === true && !fs.existsSync(stopIntentPath(forceDir)),
+	);
+
+	// A runtime that ignores SIGTERM past the short force window is the only
+	// case that gets SIGKILL, and the marker is cleared only afterwards.
+	const stubbornDir = path.join(root, "force-stubborn");
+	fs.mkdirSync(stubbornDir, { recursive: true });
+	const stubbornSeen = path.join(stubbornDir, "seen-on-sigterm.json");
+	const stubbornReady = path.join(stubbornDir, "ready");
+	const stubborn = spawnStub(
+		`const fs = require("node:fs");` +
+			`process.on("SIGTERM", () => {` +
+			` let seen = "missing";` +
+			` try { seen = fs.readFileSync(${JSON.stringify(stopIntentPath(stubbornDir))}, "utf8"); } catch {}` +
+			` fs.writeFileSync(${JSON.stringify(stubbornSeen)}, seen);` +
+			`});` +
+			`fs.writeFileSync(${JSON.stringify(stubbornReady)}, "ready");` +
+			`setInterval(() => {}, 1000);`,
+	);
+	if (!(await waitForFile(stubbornReady))) throw new Error("stubborn force-stop stub never became ready");
+	writeRuntimeState(stubbornDir, {
+		pid: stubborn.pid!,
+		startedAt: Date.now() - 1_000,
+		lastTickAt: Date.now(),
+		status: "working",
+		runIndex: 1,
+		pending: 0,
+		openThreads: 0,
+		sleeps: 0,
+		activeTool: { name: "bash", startedAt: Date.now() - 500 },
+	});
+	const escalated = await stopRuntime(stubbornDir, { force: true, forceTimeoutMs: 150, pollMs: 25, initiator: "stop" });
+	check("a runtime that outlives the short force window is SIGKILLed", escalated.stopped && escalated.forceKilled, escalated);
+	let stubbornMarker: { initiator?: unknown; force?: unknown } | undefined;
+	try {
+		stubbornMarker = JSON.parse(fs.readFileSync(stubbornSeen, "utf8"));
+	} catch {
+		stubbornMarker = undefined;
+	}
+	check("even the escalated force stop wrote its marker before SIGTERM", stubbornMarker?.initiator === "stop" && stubbornMarker.force === true, stubbornMarker);
+	check("the marker is cleared once SIGKILL makes it unreadable", !fs.existsSync(stopIntentPath(stubbornDir)));
+	check("a force-killed runtime leaves no active tool in runtime.json", readRuntimeState(stubbornDir)?.activeTool === undefined, readRuntimeState(stubbornDir));
+	check("the escalated runtime is gone", await waitGone(stubborn.pid!));
 }
 
 section("log rendering and following");

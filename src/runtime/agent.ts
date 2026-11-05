@@ -219,6 +219,12 @@ export class AgentRunner {
 	 * else. Defaults to `restart`, the historical meaning of a SIGTERM.
 	 */
 	private stopInitiator: StopInitiator = "restart";
+	/**
+	 * Set by `abortNow()`: a force stop (#181) closes the run mid-flight, so any
+	 * spend without a confirmed `turn_end` must be flagged unsettled on the
+	 * record. It never invents usage numbers.
+	 */
+	private forceClosing = false;
 	/** Resolves when the active `execute` has written its record. */
 	private executionSettled: { promise: Promise<void>; resolve: () => void } | undefined;
 
@@ -253,6 +259,37 @@ export class AgentRunner {
 	/** Interrupt a scheduled backoff, but leave an in-flight prompt to session.abort(). */
 	private abortRetryDelay(): void {
 		if (!this.session.isStreaming) this.promptRetryAbort?.abort();
+	}
+
+	/**
+	 * Close the active run immediately, without waiting for the drain (#181).
+	 *
+	 * This is the `--force` half of a stop/restart: it keeps the `draining` flag
+	 * (not `aborting`) so the run settles through the ordinary path as a
+	 * deliberate `interrupted` record labelled with the initiator (`stop` or
+	 * `restart`) instead of `cancel`, and marks the record `usageUnsettled`
+	 * because the aborted step may have spent tokens without a `turn_end`.
+	 * The session abort is what stops the current tool call; the operator
+	 * tool-abort gate is deliberately not involved (#164, #181).
+	 */
+	async abortNow(): Promise<{ durationMs: number; active: boolean }> {
+		const startedAt = Date.now();
+		this.forceClosing = true;
+		this.draining = true;
+		this.abortRetryDelay();
+		const execution = this.executionSettled?.promise;
+		if (!execution) {
+			this.forceClosing = false;
+			this.draining = false;
+			return { durationMs: Date.now() - startedAt, active: false };
+		}
+		try {
+			await this.session.abort();
+		} catch (err) {
+			this.deps.log.warn("force-stop abort failed", { error: err instanceof Error ? err.message : String(err) });
+		}
+		await execution;
+		return { durationMs: Date.now() - startedAt, active: true };
 	}
 
 	/**
@@ -676,7 +713,10 @@ export class AgentRunner {
 			// record and logged; the usage numbers themselves are never rewritten
 			// and no step is invented.
 			const residual = residualUsage(segmentUsage, [{ usage: this.turnTrace.usageSinceReset() }]);
-			const usageUnsettled = hasUsage(residual);
+			// Force stop (#181): a run closed mid-flight may have no `turn_end` for
+			// its last step, so treat its usage as unsettled even when the numbers
+			// happen to balance. The flag never changes the numbers themselves.
+			const usageUnsettled = hasUsage(residual) || this.forceClosing;
 			if (!run.idling) run.activeMs += Math.max(0, finishedAt - (run.activeSince ?? finishedAt));
 			// Who ended the run (#168): derived once from the outcome and, for a
 			// deliberate shutdown, from the initiator the CLI recorded.
@@ -795,6 +835,7 @@ export class AgentRunner {
 		} finally {
 			this.aborting = false;
 			this.draining = false;
+			this.forceClosing = false;
 			this.deps.setRun(undefined);
 			if (this.executionSettled?.promise === settled) this.executionSettled = undefined;
 			settle();

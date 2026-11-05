@@ -180,9 +180,9 @@ alive telegram whitelist remove 123456789
 | `alive config [show] [--json]` | эффективный конфиг; секреты заменены на `[redacted]` |
 | `alive config migrate-secrets [--dry-run] [--json]` | переносит plaintext-секреты из конфига в `.env` (или показывает, что перенеслось бы) |
 | `alive run [--foreground] [--once] [--force] [--verbose]` | запускает агента **в фоне** (детач, переживает закрытие терминала); `--foreground` — остаться в терминале, `--once` — один run и выход |
-| `alive stop [--force] [--timeout 30s]` | останавливает инстанс: SIGTERM, при игноре — SIGKILL; `--force` — сразу SIGKILL |
+| `alive stop [--force] [--timeout 30s]` | останавливает инстанс: SIGTERM, при игноре — SIGKILL; `--force` — не ждать планового drain, сразу закрыть run |
 | `alive abort-tool <agent>` | обрывает **только текущий tool call**: run, контекст и `stoppedBy` не трогаются; агент получает ошибку `aborted by operator: tool <name>` и продолжает следующим шагом |
-| `alive restart [--verbose]` | `stop` + `run` в фоне |
+| `alive restart [--force] [--verbose]` | `stop` + `run` в фоне; `--force` — не ждать drain, закрыть старый run сразу |
 | `alive update [--check] [--auto] [--rollback] [--status] [--tag vX.Y.Z] [--force]` | обновление харнесса до стабильного тега; `--check` — отчёт, `--auto` — автообновление с проверками и кодом 10 «перезапусти меня», `--rollback` — откат по маркеру, `--status` — состояние |
 | `alive logs [-n 50] [-f] [--file stdout\|alive\|thoughts] [--json]` | хвост логов; `-f` — следить за новыми строками |
 | `alive say <text> [--thread t] [--no-reply]` | кладёт сообщение человека в durable-инбокс |
@@ -450,6 +450,7 @@ alive logs --file alive   # структурный JSONL лога рантайм
 alive logs --file thoughts # приватный монолог агента
 alive restart             # перезапуск (например, после правки конфига)
 alive stop                # SIGTERM, потом SIGKILL
+                          # --force: не ждать drain, закрыть run сразу
 alive run --once          # один run в терминале, без демона
 ```
 
@@ -1126,6 +1127,13 @@ summary в `runs.jsonl` и journal. Если бюджет истёк — пре�
 - слэш-команда **`/abort_tool`** (алиас `/abort-tool`) от владельца в личном
   Telegram-чате;
 - **`alive abort-tool <agent>`** в CLI (`main` — корневой профиль).
+
+`--force` у `alive stop|restart` — это «не ждать drain», а не «не уведомлять
+процесс»: маркер `stop-intent.json` пишется с `force: true`, рантайм получает
+SIGTERM и закрывает активный run через обычный settle-путь (в записи остаются
+`stoppedBy: stop|restart` и `usageUnsettled: true`), не дожидаясь текущего tool
+call. SIGKILL — только эскалация, если процесс не вышел за короткое окно (2 с).
+Без `--force` поведение прежнее: SIGTERM, ожидание `shutdownGraceMs` и drain.
 
 Все три пишут одноразовый флаг `<stateDir>/abort-tool.json` с timestamp,
 источником, инициатором и id run (если известен). Рантайм читает его на каждом
