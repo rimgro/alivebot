@@ -1007,6 +1007,48 @@ async function main(): Promise<void> {
 		{ now, pidAlive: () => false },
 	);
 	check("stopped process -> sleeping", dead.status === "sleeping" && dead.note === "runtime stopped", dead);
+	// #173: an open run whose runtime stopped ticking is an error, not normal work.
+	const stalledRuntime = {
+		pid: 42,
+		startedAt: base,
+		lastTickAt: now - 15 * 60_000,
+		status: "working" as const,
+		runIndex: 3,
+		runId: "run_c",
+		pending: 0,
+		openThreads: 0,
+		sleeps: 0,
+	};
+	const stalled = deriveAgentStatus(stalledRuntime, { now, pidAlive: () => true, runStallMs: 10 * 60_000 });
+	check(
+		"an open run without ticks for longer than runStallMs is stalled",
+		stalled.stalled === true && stalled.status === "working" && stalled.note.includes("stalled") && stalled.note.includes(formatDuration(15 * 60_000)),
+		stalled,
+	);
+	const ticking = deriveAgentStatus({ ...stalledRuntime, lastTickAt: now - 1_000 }, { now, pidAlive: () => true, runStallMs: 10 * 60_000 });
+	check("a ticking open run is not stalled", ticking.stalled === undefined && ticking.status === "working", ticking);
+	const stallDisabled = deriveAgentStatus(stalledRuntime, { now, pidAlive: () => true, runStallMs: 0 });
+	check("runStallMs = 0 disables the stall marker", stallDisabled.stalled === undefined, stallDisabled);
+	const stallNoRun = deriveAgentStatus({ ...stalledRuntime, runId: undefined }, { now, pidAlive: () => true, runStallMs: 10 * 60_000 });
+	check("a runtime without an open run is never stalled", stallNoRun.stalled === undefined, stallNoRun);
+	const bootError = deriveAgentStatus(
+		{ pid: 42, startedAt: base, lastTickAt: base, status: "error", runIndex: 3, pending: 0, openThreads: 0, sleeps: 0, error: "Session file is not a valid pi session" },
+		{ now, pidAlive: () => false },
+	);
+	check(
+		"a dead process with status error explains the failed boot (#173)",
+		bootError.status === "sleeping" && bootError.note.includes("runtime failed to start") && bootError.note.includes("not a valid pi session"),
+		bootError,
+	);
+	const stalledHtml = renderIndexPage(
+		[{ ...mainSummary, runStalled: { since: now - 15 * 60_000, ageMs: 15 * 60_000, thresholdMs: 10 * 60_000, runId: "run_c" } }],
+		{ secrets: DEFAULT_SECRETS_CONFIG, env: {}, now },
+	);
+	check(
+		"the dashboard shows the stall as a red anomaly",
+		stalledHtml.includes("run stalled") && stalledHtml.includes('class="st long"'),
+		stalledHtml.match(/run stalled[^<]*/)?.[0],
+	);
 
 	section("timeline");
 	const detail = loadAgentDetail(main, { now });

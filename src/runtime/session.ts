@@ -29,6 +29,12 @@ export interface AgentBuildResult {
 	model: Model<any> | undefined;
 	modelRuntime: ModelRuntime;
 	modelFallbackMessage?: string;
+	/**
+	 * Set when a resume transcript could not be reopened (#173): the session is a
+	 * fresh one and the caller must close the interrupted run as `aborted`
+	 * instead of pretending it continued.
+	 */
+	resumeFailure?: string;
 }
 
 export interface BuildAgentOptions {
@@ -164,12 +170,12 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 		toolRegistryAvailable: !isolated,
 	});
 
-	const sessionManager =
-		options.sessionFile && !options.forceNewSession
-			? SessionManager.open(options.sessionFile, paths.sessionsDir, paths.workspaceDir)
-			: cfg.session === "continue" && !options.forceNewSession
-				? SessionManager.continueRecent(paths.workspaceDir, paths.sessionsDir)
-				: SessionManager.create(paths.workspaceDir, paths.sessionsDir);
+	const { sessionManager, resumeFailure } = openSessionManager({
+		config,
+		log,
+		sessionFile: options.sessionFile,
+		forceNewSession: options.forceNewSession,
+	});
 
 	const { session, modelFallbackMessage } = await createAgentSession({
 		cwd: paths.workspaceDir,
@@ -222,7 +228,44 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 		tools: session.getActiveToolNames(),
 	});
 
-	return { session, modelRuntime, model: model ?? session.model ?? undefined, modelFallbackMessage };
+	return { session, modelRuntime, model: model ?? session.model ?? undefined, modelFallbackMessage, resumeFailure };
+}
+
+/**
+ * Pick the pi transcript for this session: a resumed run's file, the configured
+ * `continue`/`new` behaviour, or a brand-new transcript (#173).
+ *
+ * Reopening a resume target is the one place where a corrupt file must not take
+ * the whole runtime down: `SessionManager.open` throws on a non-empty file that
+ * is not a pi session, and an unhandled throw during `init()` used to leave the
+ * process alive with `status: "starting"` and no ticks. The failure is reported
+ * to the caller through `resumeFailure` (logged as a warning here), which closes
+ * the interrupted run as `aborted` and starts a new session instead.
+ */
+export function openSessionManager(options: {
+	config: LoadedConfig;
+	log: Logger;
+	sessionFile?: string;
+	forceNewSession?: boolean;
+}): { sessionManager: SessionManager; resumeFailure?: string } {
+	const { log } = options;
+	const { config: cfg, paths } = options.config;
+	// `forceNewSession` (a sleep) ignores the configured `continue` on purpose.
+	const fresh = () =>
+		cfg.session === "continue" && !options.forceNewSession
+			? SessionManager.continueRecent(paths.workspaceDir, paths.sessionsDir)
+			: SessionManager.create(paths.workspaceDir, paths.sessionsDir);
+	if (options.forceNewSession || !options.sessionFile) return { sessionManager: fresh() };
+	try {
+		return { sessionManager: SessionManager.open(options.sessionFile, paths.sessionsDir, paths.workspaceDir) };
+	} catch (error) {
+		const resumeFailure = error instanceof Error ? error.message : String(error);
+		log.warn("cannot reopen the interrupted session file; starting a new session", {
+			sessionFile: options.sessionFile,
+			error: resumeFailure,
+		});
+		return { sessionManager: fresh(), resumeFailure };
+	}
 }
 
 export function selectAllowedTools(input: {

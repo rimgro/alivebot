@@ -36,6 +36,7 @@ const config = loadConfig({
 			runNoOutboundTurns: 60,
 			runVeryLongMs: 3 * 60 * 60_000,
 			toolLongMs: 10 * 60_000,
+			runStallMs: 10 * 60_000,
 			contextWarnTokens: 150_000,
 			contextWarnStepTokens: 50_000,
 			contextSleepTokens: 150_000,

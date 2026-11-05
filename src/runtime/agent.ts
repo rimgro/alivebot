@@ -241,6 +241,15 @@ export class AgentRunner {
 		return this.session;
 	}
 
+	/**
+	 * True once `init()` built a session. A boot that failed before that (for
+	 * example a repeated init failure that leaves the process alive in
+	 * `status: "error"`, #178) still has to survive a stop request.
+	 */
+	get hasSession(): boolean {
+		return Boolean(this.session);
+	}
+
 	/** Set by AliveRuntime.stop() so the run record can distinguish abort from error. */
 	markAborting(): void {
 		this.aborting = true;
@@ -274,6 +283,7 @@ export class AgentRunner {
 	 */
 	async abortNow(): Promise<{ durationMs: number; active: boolean }> {
 		const startedAt = Date.now();
+		if (!this.hasSession) return { durationMs: 0, active: false };
 		this.forceClosing = true;
 		this.draining = true;
 		this.abortRetryDelay();
@@ -302,6 +312,8 @@ export class AgentRunner {
 	 */
 	async drain(graceMs = this.deps.config.config.loop.shutdownGraceMs): Promise<DrainResult> {
 		const startedAt = Date.now();
+		// A stop before the first session exists (a halted boot) has nothing to drain.
+		if (!this.hasSession) return { outcome: "idle", durationMs: 0 };
 		this.draining = true;
 		this.abortRetryDelay();
 		const execution = this.executionSettled?.promise;

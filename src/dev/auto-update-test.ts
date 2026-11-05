@@ -326,6 +326,39 @@ async function typescriptTests(): Promise<void> {
 		check("autoBusyReason agrees", autoBusyReason({ updates: { auto: true, window: "" }, heartbeatAgeMs: 600_000, runtimeStatus: "working", now: new Date() }) === undefined);
 	}
 
+	{
+		// A stalled run (#173) is busy even when its heartbeat already looks stale:
+		// the heartbeat is refreshed by the same loop that stopped ticking, so the
+		// stall must be decided on runtime.json alone.
+		const repo = createFakeRepo({ start: { kind: "tag", name: "v0.2.0" }, tags: TAGS, initialFiles: EXISTING_MARKER });
+		const h = harness(repo, { heartbeatAgeMs: 600_000, runtimeStatus: "stalled", runtimeRunId: "run-9" });
+		const code = await runUpdate({ cwd: ROOT, auto: true }, h.deps);
+		const out = h.out.join("\n");
+		check("a stalled run with a stale heartbeat is busy", code === 0 && out.includes("stalled run") && out.includes("run run-9 is open"), h.out);
+		check("a stalled run does not fetch or apply", repo.calls.length === 0, commandLines(repo));
+		const stalledReason = autoBusyReason({
+			updates: { auto: true, window: "" },
+			heartbeatAgeMs: 600_000,
+			runtimeStatus: "stalled",
+			runtimeRunId: "run-9",
+			now: new Date(),
+		});
+		check("autoBusyReason explains the stalled run", (stalledReason ?? "").includes("run run-9 is open"), stalledReason);
+	}
+	{
+		// `error` (a halted boot, #178) stays idle on purpose: a restart is exactly
+		// what that process needs, so an update may replace it.
+		const repo = createFakeRepo({ start: { kind: "tag", name: "v0.2.0" }, tags: TAGS, initialFiles: EXISTING_MARKER });
+		const h = harness(repo, { heartbeatAgeMs: 600_000, runtimeStatus: "error" });
+		const code = await runUpdate({ cwd: ROOT, auto: true }, h.deps);
+		check("an error runtime with a stale heartbeat is not busy", code === 0 && h.out.join("\n").includes("no newer stable tag"), h.out);
+		check("an error runtime proceeds to the tag check", commandLines(repo).some((line) => line.startsWith("git fetch")), commandLines(repo));
+		check(
+			"autoBusyReason agrees for error",
+			autoBusyReason({ updates: { auto: true, window: "" }, heartbeatAgeMs: 600_000, runtimeStatus: "error", now: new Date() }) === undefined,
+		);
+	}
+
 	section("--auto guard: no newer stable tag");
 	{
 		const repo = createFakeRepo({ start: { kind: "tag", name: "v0.2.0" }, tags: TAGS, initialFiles: EXISTING_MARKER });

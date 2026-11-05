@@ -32,6 +32,7 @@ import { ThreadStore } from "../store/threads.js";
 import { HistoryStore } from "../store/history.js";
 import { RunEventLog } from "../store/run-events.js";
 import { AgentRunner, CONTEXT_SLEEP_MESSAGE, CONTEXT_WARN_MESSAGE, runActiveMs } from "../runtime/agent.js";
+import { openSessionManager } from "../runtime/session.js";
 import { isOutboundRecorded } from "../runtime/tools.js";
 import { TurnTraceRecorder, residualUsage, zeroUsage } from "../runtime/run-trace.js";
 import { hasWakeWorthyPending, WakeScheduler, wakeIntervalMs } from "../runtime/wake.js";
@@ -64,6 +65,7 @@ const config = loadConfig({
 			runNoOutboundTurns: 60,
 			runVeryLongMs: 3 * 60 * 60_000,
 			toolLongMs: 10 * 60_000,
+			runStallMs: 10 * 60_000,
 			contextWarnTokens: 150_000,
 			contextWarnStepTokens: 50_000,
 			contextSleepTokens: 150_000,
@@ -1867,6 +1869,25 @@ section("a failed compaction emits compaction_failed with the reason class (#167
 		record?.compaction?.ok === false && record.compaction.reasonClass === "provider_html",
 		record?.compaction,
 	);
+}
+
+section("a corrupt resume transcript falls back to a new session, never a dead boot (#173)");
+{
+	const resumeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-resume-session-"));
+	const corrupt = path.join(resumeRoot, "archived-session.jsonl");
+	// Non-empty but not a pi session: exactly what `SessionManager.open` rejects
+	// with "Session file is not a valid pi session".
+	fs.writeFileSync(corrupt, "not a pi session\n", "utf8");
+	const opened = openSessionManager({ config, log, sessionFile: corrupt });
+	check("a corrupt resume file is reported, not thrown", typeof opened.resumeFailure === "string" && opened.resumeFailure.length > 0, opened.resumeFailure);
+	check("the failure names the pi session validation", (opened.resumeFailure ?? "").includes("not a valid"), opened.resumeFailure);
+	check("the fallback is a fresh transcript, not the corrupt path", opened.sessionManager.getSessionFile() !== corrupt, opened.sessionManager.getSessionFile());
+	check("the fallback session is usable", typeof opened.sessionManager.getSessionFile() === "string" && opened.sessionManager.getSessionFile()!.length > 0, opened.sessionManager.getSessionFile());
+	const forced = openSessionManager({ config, log, sessionFile: corrupt, forceNewSession: true });
+	check("a sleep (forceNewSession) never opens the resume file", forced.resumeFailure === undefined && forced.sessionManager.getSessionFile() !== corrupt, forced.resumeFailure);
+	const plain = openSessionManager({ config, log });
+	check("a normal start keeps the configured session mode", plain.resumeFailure === undefined && typeof plain.sessionManager.getSessionFile() === "string", plain.sessionManager.getSessionFile());
+	fs.rmSync(resumeRoot, { recursive: true, force: true });
 }
 
 process.stdout.write(

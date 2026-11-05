@@ -15,17 +15,24 @@
  *
  *   npm run test:cli-restart
  */
+import { spawn, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { main, type ServiceControl } from "../cli.js";
-import { writeRuntimeState } from "../store/runs.js";
+import { loadConfig } from "../config.js";
+import { Logger } from "../log.js";
+import { AliveRuntime } from "../runtime/loop.js";
+import { readRuntimeState, writeRuntimeState } from "../store/runs.js";
+import { initFailuresPath, readInitFailures, writeInitFailures } from "../store/init-failures.js";
 import {
 	detectHarnessEnvironment,
 	interruptWarningLine,
 	restartRefusalText,
 } from "../runtime/harness-guard.js";
-import type { StopResult } from "../runtime/daemon.js";
+import { snapshotRuntime, type StopResult } from "../runtime/daemon.js";
 
 let failures = 0;
 function check(name: string, condition: boolean, detail?: unknown): void {
@@ -297,6 +304,213 @@ try {
 			check(`${label}: exactly one warning line`, occurrences === 1, result.err);
 		}
 	}
+	// -------------------------------------------------------------------------
+	section("a failed runtime boot is loud and exits non-zero (#173)");
+	{
+		// A regular file where the pi session directory belongs makes `init()` fail
+		// after runtime.json was already claimed. Nothing here touches the network.
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "alive-cli-dead-start-"));
+		const bootConfig = path.join(project, "alive.config.json");
+		fs.writeFileSync(bootConfig, JSON.stringify({ name: "DeadStart" }), "utf8");
+		const bootStateDir = path.join(project, ".alive");
+		fs.mkdirSync(bootStateDir, { recursive: true });
+		fs.writeFileSync(path.join(bootStateDir, "sessions"), "not a directory", "utf8");
+		const entry = fileURLToPath(new URL("../index.ts", import.meta.url));
+		const child = spawn(process.execPath, [...process.execArgv, entry, "run", "--once", "--config", bootConfig], {
+			cwd: project,
+			env: { ...process.env, ALIVE_DAEMON: "" },
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let childOutput = "";
+		child.stdout!.on("data", (chunk) => { childOutput += String(chunk); });
+		child.stderr!.on("data", (chunk) => { childOutput += String(chunk); });
+		const exitCode = (await once(child, "exit"))[0] as number | null;
+		check("the failed boot exits with a non-zero code", typeof exitCode === "number" && exitCode !== 0, { exitCode, childOutput });
+		const bootState = readRuntimeState(bootStateDir);
+		check("runtime.json says status error", bootState?.status === "error", bootState);
+		check("runtime.json carries the failure message", (bootState?.error ?? "").length > 0, bootState?.error);
+		check("the failed pid is not the test process", bootState?.pid === child.pid, { pid: bootState?.pid, child: child.pid });
+		let inbox = "";
+		try {
+			inbox = fs.readFileSync(path.join(bootStateDir, "inbox", "events.jsonl"), "utf8");
+		} catch {
+			inbox = "";
+		}
+		check("one system event explains the failed boot", inbox.includes("runtime failed to start"), inbox.slice(-400));
+		check("the failure is reported on stderr", /runtime failed to start/.test(childOutput), childOutput.slice(-400));
+		// `alive status` must not report a dead process as alive, and must show the error.
+		const out: string[] = [];
+		const stdoutWrite = process.stdout.write;
+		const stderrWrite = process.stderr.write;
+		process.stdout.write = ((chunk: unknown) => { out.push(String(chunk)); return true; }) as typeof process.stdout.write;
+		process.stderr.write = ((chunk: unknown) => { return true; }) as typeof process.stderr.write;
+		let statusCode = -1;
+		try {
+			statusCode = await main(["status", "--config", bootConfig]);
+		} finally {
+			process.stdout.write = stdoutWrite;
+			process.stderr.write = stderrWrite;
+		}
+		const statusText = out.join("");
+		check("`alive status` exits 0 for a dead runtime", statusCode === 0, statusCode);
+		check("`alive status` does not call the dead runtime alive", statusText.includes("not running") && !statusText.includes(`(pid ${child.pid})`), statusText);
+		check("`alive status` shows the recorded error state", statusText.includes("error"), statusText);
+		const firstFailure = readInitFailures(bootStateDir);
+		check("the failed boot is counted", firstFailure.consecutive === 1, firstFailure);
+		check("the counter records the masked error", (firstFailure.lastError ?? "").length > 0, firstFailure.lastError);
+		fs.rmSync(project, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("repeated init failures keep the process alive instead of a restart loop (#173/#178)");
+	{
+		const entry = fileURLToPath(new URL("../index.ts", import.meta.url));
+		/** A profile whose init always fails after runtime.json was claimed. */
+		const brokenProject = (name: string): { project: string; config: string; stateDir: string } => {
+			const project = fs.mkdtempSync(path.join(os.tmpdir(), name));
+			const config = path.join(project, "alive.config.json");
+			fs.writeFileSync(config, JSON.stringify({ name: "LoopBreaker" }), "utf8");
+			const stateDir = path.join(project, ".alive");
+			fs.mkdirSync(stateDir, { recursive: true });
+			fs.writeFileSync(path.join(stateDir, "sessions"), "not a directory", "utf8");
+			return { project, config, stateDir };
+		};
+		/** Start the runtime as the CLI would and collect its output. */
+		const launch = (cwd: string, args: string[]) => {
+			const child = spawn(process.execPath, [...process.execArgv, entry, ...args], {
+				cwd,
+				env: { ...process.env, ALIVE_DAEMON: "" },
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+			let output = "";
+			child.stdout!.on("data", (chunk) => { output += String(chunk); });
+			child.stderr!.on("data", (chunk) => { output += String(chunk); });
+			return { child, output: () => output };
+		};
+		/** Wait for the child to exit, or "timeout"; the timer never outlives the race. */
+		const exitWithin = (child: ChildProcess, timeoutMs: number): Promise<number | null | "timeout"> => {
+			let timer: NodeJS.Timeout | undefined;
+			const timeout = new Promise<"timeout">((resolve) => {
+				timer = setTimeout(() => resolve("timeout"), timeoutMs);
+			});
+			return Promise.race([once(child, "exit").then(([code]) => code as number | null), timeout]).finally(() => {
+				if (timer) clearTimeout(timer);
+			});
+		};
+		const waitFor = async (predicate: () => boolean, timeoutMs = 30_000): Promise<boolean> => {
+			const deadline = Date.now() + timeoutMs;
+			while (Date.now() < deadline) {
+				if (predicate()) return true;
+				await new Promise((resolve) => setTimeout(resolve, 100));
+			}
+			return predicate();
+		};
+
+		// Third failure inside the window: alive in status=error, no exit.
+		const staying = brokenProject("alive-cli-init-halt-");
+		writeInitFailures(staying.stateDir, { consecutive: 2, lastFailureAt: Date.now() - 60_000, lastError: "earlier failure" });
+		const halted = launch(staying.project, ["run", "--foreground", "--config", staying.config]);
+		try {
+			const reachedError = await waitFor(() => readRuntimeState(staying.stateDir)?.status === "error");
+			check("the third failure lands in status=error", reachedError && readRuntimeState(staying.stateDir)?.status === "error", readRuntimeState(staying.stateDir));
+			const haltedState = readRuntimeState(staying.stateDir);
+			check("the halted runtime keeps the failure message", (haltedState?.error ?? "").length > 0, haltedState?.error);
+			check("the counter records the third failure", readInitFailures(staying.stateDir).consecutive === 3, readInitFailures(staying.stateDir));
+			check("the halted process stays alive instead of exiting", halted.child.exitCode === null && halted.child.signalCode === null, {
+				exitCode: halted.child.exitCode,
+				signal: halted.child.signalCode,
+				output: halted.output(),
+			});
+			check("the failure is logged once as a warning", (halted.output().match(/staying alive in status=error/g) ?? []).length === 1, halted.output());
+			// `alive status` on a halted runtime: alive pid, error status, recorded reason.
+			const out: string[] = [];
+			const stdoutWrite = process.stdout.write;
+			const stderrWrite = process.stderr.write;
+			process.stdout.write = ((chunk: unknown) => { out.push(String(chunk)); return true; }) as typeof process.stdout.write;
+			process.stderr.write = ((chunk: unknown) => { return true; }) as typeof process.stderr.write;
+			try {
+				await main(["status", "--config", staying.config]);
+			} finally {
+				process.stdout.write = stdoutWrite;
+				process.stderr.write = stderrWrite;
+			}
+			const haltedStatus = out.join("");
+			check(
+				"`alive status` reports the halted runtime as error, not alive",
+				haltedStatus.includes(`error (pid ${halted.child.pid})`) && haltedStatus.includes("EEXIST"),
+				haltedStatus,
+			);
+		} finally {
+			halted.child.kill("SIGTERM");
+		}
+		const haltedExit = (await once(halted.child, "exit"))[0] as number | null;
+		check("SIGTERM still ends the halted process cleanly", haltedExit === 0, { exitCode: haltedExit, output: halted.output() });
+		check("the halted process is not left behind", snapshotRuntime(staying.stateDir)?.alive === false, snapshotRuntime(staying.stateDir));
+		check("the shutdown keeps the streak for the next start", readInitFailures(staying.stateDir).consecutive === 3, readInitFailures(staying.stateDir));
+
+		// A stop that lands *before* `run()` reaches its wait (SIGTERM during a slow
+		// init) must still end the process: `stop()` already ran, so its early
+		// return would swallow every later signal and a halted boot would sit on
+		// its keepalive timer forever (#173).
+		{
+			const raced = brokenProject("alive-cli-init-halt-raced-");
+			writeInitFailures(raced.stateDir, { consecutive: 2, lastFailureAt: Date.now() - 60_000 });
+			const racedConfig = loadConfig({ cwd: raced.project, configPath: raced.config });
+			const runtime = await AliveRuntime.create({
+				config: racedConfig,
+				log: new Logger({ file: racedConfig.paths.logFile, console: false, level: "info" }),
+			});
+			// The signal handler completes the whole stop while init() is still running.
+			await runtime.stop("test-before-run");
+			let timer: NodeJS.Timeout | undefined;
+			const timeout = new Promise<"timeout">((resolve) => {
+				timer = setTimeout(() => resolve("timeout"), 10_000);
+			});
+			let settled: "resolved" | "timeout" = "timeout";
+			try {
+				settled = await Promise.race([runtime.run().then(() => "resolved" as const), timeout]);
+			} finally {
+				if (timer) clearTimeout(timer);
+			}
+			check("a stop before run() still ends the halted runtime", settled === "resolved", settled);
+			check("the raced boot really halted in status=error", runtime.haltedByInitFailures, runtime.haltedByInitFailures);
+			if (settled === "timeout") {
+				// A regression here would leave the keepalive handle alive and hang the
+				// whole suite; fail loudly instead of waiting for the CI timeout.
+				process.stderr.write("\nhalted runtime did not finish after an early stop\n");
+				process.exit(1);
+			}
+			fs.rmSync(raced.project, { recursive: true, force: true });
+		}
+
+		// `--once` is a one-shot command: it must not wait in status=error.
+		const onceProject = brokenProject("alive-cli-init-halt-once-");
+		writeInitFailures(onceProject.stateDir, { consecutive: 2, lastFailureAt: Date.now() - 60_000 });
+		const onceChild = launch(onceProject.project, ["run", "--once", "--config", onceProject.config]);
+		const onceExited = await exitWithin(onceChild.child, 30_000);
+		if (onceExited === "timeout") onceChild.child.kill("SIGKILL");
+		check("a one-shot run with a halted boot exits non-zero instead of hanging", typeof onceExited === "number" && onceExited !== 0, {
+			code: onceExited,
+			output: onceChild.output(),
+		});
+		check("the one-shot failure is counted too", readInitFailures(onceProject.stateDir).consecutive === 3, readInitFailures(onceProject.stateDir));
+
+		// A working boot clears the streak, so a later unrelated failure retries.
+		const good = fs.mkdtempSync(path.join(os.tmpdir(), "alive-cli-init-reset-"));
+		const goodConfig = path.join(good, "alive.config.json");
+		fs.writeFileSync(goodConfig, JSON.stringify({ name: "HealthyBoot", memory: { enabled: false } }), "utf8");
+		const goodStateDir = path.join(good, ".alive");
+		writeInitFailures(goodStateDir, { consecutive: 3, lastFailureAt: Date.now() - 60_000, lastError: "previous" });
+		const goodChild = launch(good, ["run", "--once", "--config", goodConfig]);
+		const goodExited = await exitWithin(goodChild.child, 60_000);
+		if (goodExited === "timeout") goodChild.child.kill("SIGKILL");
+		check("a healthy one-shot boot exits 0", goodExited === 0, { code: goodExited, output: goodChild.output().slice(-400) });
+		check("a successful init resets the failure counter", readInitFailures(goodStateDir).consecutive === 0 && !fs.existsSync(initFailuresPath(goodStateDir)), readInitFailures(goodStateDir));
+		fs.rmSync(staying.project, { recursive: true, force: true });
+		fs.rmSync(onceProject.project, { recursive: true, force: true });
+		fs.rmSync(good, { recursive: true, force: true });
+	}
+
 } finally {
 	fs.rmSync(root, { recursive: true, force: true });
 }

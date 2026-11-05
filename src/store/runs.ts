@@ -281,6 +281,45 @@ export function interruptedResumeDecision(
 	return ageMs < windowMs ? "resume" : "expire";
 }
 
+/**
+ * True when a resume target can actually be reopened (#173).
+ *
+ * Pure on purpose: the caller stats the file and passes the size, so the
+ * "missing, empty or unreadable" decision is testable without a filesystem.
+ * An empty file is not a usable transcript: pi would silently start a new
+ * session at that path while the run claims to continue.
+ */
+export function resumeFileUsable(file: string | undefined, sizeBytes: number | undefined): boolean {
+	if (typeof file !== "string" || file.trim().length === 0) return false;
+	return typeof sizeBytes === "number" && Number.isFinite(sizeBytes) && sizeBytes > 0;
+}
+
+/** What startup should do with the last run, transcript included (#173). */
+export type StartupResumeDecision = InterruptedResumeDecision | "unusable";
+
+/**
+ * Startup decision with the transcript check (#173): a resumable run whose
+ * `sessionFile` is gone or unreadable must be closed as `aborted` instead of
+ * being reopened (pi would otherwise open a brand-new session under the old
+ * run and pretend it continued).
+ *
+ * A record without a session file keeps the historical behaviour: the
+ * configured `session: "continue"`/`"new"` mode decides. Pure clock/FS seam:
+ * `fileSizeBytes` is `undefined` for a missing or unreadable file.
+ */
+export function startupResumeDecision(
+	record: RunRecord | undefined,
+	now: number,
+	windowMs: number,
+	sessionFile: string | undefined,
+	fileSizeBytes: number | undefined,
+): StartupResumeDecision {
+	const decision = interruptedResumeDecision(record, now, windowMs);
+	if (decision !== "resume") return decision;
+	if (!sessionFile) return "resume";
+	return resumeFileUsable(sessionFile, fileSizeBytes) ? "resume" : "unusable";
+}
+
 export interface UsageBucket {
 	cost: number;
 	runs: number;
@@ -339,14 +378,16 @@ export class RunLog {
 
 	/**
 	 * Close a run whose stop reason became stale (an `interrupted` run that is
-	 * older than the resume window). Usage and timing stay untouched: only the
-	 * audit outcome changes.
+	 * older than the resume window, or one whose session file is gone). Usage and
+	 * timing stay untouched: only the audit outcome changes. An optional `reason`
+	 * (#173) is persisted in the existing `error` field so the record says why the
+	 * outcome changed instead of only that it did.
 	 */
-	reclassify(id: string, to: RunStopReason, from?: RunStopReason): RunRecord | undefined {
+	reclassify(id: string, to: RunStopReason, from?: RunStopReason, reason?: string): RunRecord | undefined {
 		const all = readJsonl<RunRecord>(this.file);
 		const index = all.findIndex((candidate) => candidate.id === id && (from === undefined || candidate.stopReason === from));
 		if (index === -1) return undefined;
-		const updated = { ...all[index]!, stopReason: to };
+		const updated = { ...all[index]!, stopReason: to, ...(reason ? { error: reason } : {}) };
 		all[index] = updated;
 		writeJsonlAtomic(this.file, all);
 		return updated;
@@ -412,7 +453,7 @@ export class RunLog {
 	}
 }
 
-export type RuntimeStatusKind = "starting" | "working" | "idle" | "paused-budget" | "stopped";
+export type RuntimeStatusKind = "starting" | "working" | "idle" | "paused-budget" | "stopped" | "stalled" | "error";
 
 export interface RuntimeStateFile {
 	pid: number;
@@ -444,7 +485,46 @@ export interface RuntimeStateFile {
 	 * mark a call that has outlived `loop.toolLongMs`. Absent while no tool runs.
 	 */
 	activeTool?: RuntimeActiveTool;
+	/**
+	 * An open run that stopped ticking (#173). Additive and optional: older state
+	 * files do not carry it, and a reader can derive the same view from
+	 * `lastTickAt` with `detectRunStall()`.
+	 */
+	runStalled?: RunStalled;
 	error?: string;
+}
+
+/** One observed stall of an open run (#173). */
+export interface RunStalled {
+	/** The tick that went stale (the last state write before the gap). */
+	since: number;
+	/** Age of that tick when the stall was observed. */
+	ageMs: number;
+	/** Configured `loop.runStallMs` threshold that fired (0 = detection off). */
+	thresholdMs: number;
+	runId?: string;
+}
+
+/**
+ * Detect an open run whose runtime stopped ticking (#173).
+ *
+ * Pure clock seam: `lastTickAt` comes from `runtime.json`, so `alive status` and
+ * the dashboard can flag a frozen run even when the process can no longer write
+ * its own state. A run is open exactly when `runtime.json` carries a `runId`;
+ * without one there is nothing to stall.
+ */
+export function detectRunStall(input: {
+	runId?: string;
+	lastTickAt?: number;
+	now: number;
+	thresholdMs: number;
+}): RunStalled | undefined {
+	if (!(input.thresholdMs > 0)) return undefined;
+	if (!input.runId) return undefined;
+	if (typeof input.lastTickAt !== "number" || !Number.isFinite(input.lastTickAt)) return undefined;
+	const ageMs = Math.max(0, input.now - input.lastTickAt);
+	if (ageMs < input.thresholdMs) return undefined;
+	return { since: input.lastTickAt, ageMs, thresholdMs: input.thresholdMs, runId: input.runId };
 }
 
 export interface RuntimeActiveTool {

@@ -9,18 +9,31 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { EventStore } from "../store/events.js";
+import {
+	INIT_FAILURE_STAY_THRESHOLD,
+	INIT_FAILURE_WINDOW_MS,
+	initFailureDecision,
+	initFailuresPath,
+	readInitFailures,
+	resetInitFailures,
+	writeInitFailures,
+	type InitFailureRecord,
+} from "../store/init-failures.js";
 import { ReminderStore } from "../store/reminders.js";
 import { ThreadStore } from "../store/threads.js";
 import { NoteStore } from "../store/notes.js";
 import { Journal } from "../store/journal.js";
 import {
+	detectRunStall,
 	interruptedResumeDecision,
 	isRunStoppedBy,
+	resumeFileUsable,
 	RUN_STOPPED_BY_VALUES,
 	RunLog,
 	runStoppedBy,
 	runStoppedByInferred,
 	runTurnCount,
+	startupResumeDecision,
 	type RunRecord,
 	type RunStopReason,
 } from "../store/runs.js";
@@ -389,6 +402,145 @@ section("run log: who stopped the run (#168)");
 		log.list(10).find((record) => record.id === "run_legacy_shape"),
 	);
 	fs.rmSync(stoppedByRoot, { recursive: true, force: true });
+}
+
+section("startup resume refuses a missing or empty session file (#173)");
+{
+	const now = Date.now();
+	const interrupted: RunRecord = {
+		id: "run_gone_session",
+		index: 3,
+		startedAt: now - 120_000,
+		finishedAt: now - 60_000,
+		durationMs: 60_000,
+		activeMs: 60_000,
+		idleMs: 0,
+		stopReason: "interrupted",
+		sessionFile: "/tmp/archived-session.jsonl",
+		events: [],
+		outbound: [],
+		remindersCreated: [],
+		notesTouched: [],
+		journalEntries: 0,
+		idleReturns: 0,
+		interruptDeliveries: 0,
+		nudges: 0,
+		turnCount: 1,
+		promptChars: 0,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 },
+	};
+	check("a missing session file is not resumable", startupResumeDecision(interrupted, now, 600_000, interrupted.sessionFile, undefined) === "unusable");
+	check("an empty session file is not resumable", startupResumeDecision(interrupted, now, 600_000, interrupted.sessionFile, 0) === "unusable");
+	check("a readable non-empty session file resumes", startupResumeDecision(interrupted, now, 600_000, interrupted.sessionFile, 4_096) === "resume");
+	check(
+		"a record without a session file keeps the configured session mode",
+		startupResumeDecision({ ...interrupted, sessionFile: undefined }, now, 600_000, undefined, undefined) === "resume",
+	);
+	check(
+		"outside the resume window the file does not matter",
+		startupResumeDecision(interrupted, now + 600_000, 600_000, interrupted.sessionFile, undefined) === "expire",
+	);
+	check(
+		"a non-interrupted run is never resumed",
+		startupResumeDecision({ ...interrupted, stopReason: "slept" }, now, 600_000, interrupted.sessionFile, 4_096) === "none",
+	);
+	check(
+		"resumeFileUsable rejects missing, empty and blank paths",
+		!resumeFileUsable(undefined, 10) && !resumeFileUsable("  ", 10) && !resumeFileUsable("/tmp/x", undefined) && !resumeFileUsable("/tmp/x", 0),
+	);
+	check("resumeFileUsable accepts a non-empty file", resumeFileUsable("/tmp/x", 1));
+
+	// What the runtime does with an "unusable" decision: close the run, do not resume.
+	const resumeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-run-unusable-resume-test-"));
+	const runs = new RunLog(resumeRoot);
+	runs.record(interrupted);
+	const decision = startupResumeDecision(runs.last(), now, 600_000, interrupted.sessionFile, undefined);
+	const closed = decision === "unusable"
+		? runs.reclassify(interrupted.id, "aborted", "interrupted", "resume skipped: session file is missing, empty or unreadable")
+		: undefined;
+	check("an unusable resume target closes the run as aborted", decision === "unusable" && closed?.stopReason === "aborted" && runs.last()?.stopReason === "aborted", { decision, last: runs.last()?.stopReason });
+	check("the reason is persisted in the record's error field", (runs.last()?.error ?? "").includes("resume skipped"), runs.last()?.error);
+	check("the aborted run is no longer resumable", startupResumeDecision(runs.last(), now, 600_000, interrupted.sessionFile, 4_096) === "none");
+	fs.rmSync(resumeRoot, { recursive: true, force: true });
+}
+
+section("an open run without ticks is a stall (#173)");
+{
+	const now = Date.now();
+	check("a fresh open run is not stalled", detectRunStall({ runId: "run_1", lastTickAt: now - 1_000, now, thresholdMs: 600_000 }) === undefined);
+	const stalled = detectRunStall({ runId: "run_1", lastTickAt: now - 600_000, now, thresholdMs: 600_000 });
+	check(
+		"an open run past the threshold reports the age and the threshold",
+		stalled?.ageMs === 600_000 && stalled.thresholdMs === 600_000 && stalled.runId === "run_1" && stalled.since === now - 600_000,
+		stalled,
+	);
+	check("threshold 0 disables the check", detectRunStall({ runId: "run_1", lastTickAt: now - 10 * 600_000, now, thresholdMs: 0 }) === undefined);
+	check("no open run is never a stall", detectRunStall({ lastTickAt: now - 10 * 600_000, now, thresholdMs: 600_000 }) === undefined);
+	check("a missing tick timestamp is not a stall", detectRunStall({ runId: "run_1", now, thresholdMs: 600_000 }) === undefined);
+}
+
+section("consecutive init failures stop a restart loop (#173/#178)");
+{
+	const now = Date.now();
+	const fail = (previous?: InitFailureRecord, at = now) => initFailureDecision(previous, at);
+	const first = fail();
+	check("the first failure counts 1 and exits", first.consecutive === 1 && first.action === "exit" && !first.reset, first);
+	const second = fail({ consecutive: 1, lastFailureAt: now - 60_000 });
+	check("the second failure counts 2 and still exits", second.consecutive === 2 && second.action === "exit", second);
+	const third = fail({ consecutive: 2, lastFailureAt: now - 60_000 });
+	check(
+		"the third failure stays alive in status=error instead of exiting",
+		third.consecutive === INIT_FAILURE_STAY_THRESHOLD && third.action === "stay",
+		third,
+	);
+	check(
+		"the guard is 3 failures inside a 30 minute window",
+		INIT_FAILURE_STAY_THRESHOLD === 3 && INIT_FAILURE_WINDOW_MS === 30 * 60_000,
+		{ threshold: INIT_FAILURE_STAY_THRESHOLD, windowMs: INIT_FAILURE_WINDOW_MS },
+	);
+	const stale = fail({ consecutive: 4, lastFailureAt: now - INIT_FAILURE_WINDOW_MS - 1 });
+	check("a failure after the window starts the count over at 1", stale.consecutive === 1 && stale.action === "exit" && stale.reset, stale);
+	const boundary = fail({ consecutive: 2, lastFailureAt: now - INIT_FAILURE_WINDOW_MS });
+	check("the window boundary is inclusive", boundary.consecutive === 3 && boundary.action === "stay", boundary);
+	// The runtime's own sequence: three fast failures, then one after a long pause.
+	let record: InitFailureRecord | undefined;
+	const actions: string[] = [];
+	for (const at of [now, now + 1_000, now + 2_000]) {
+		const decision = initFailureDecision(record, at);
+		actions.push(`${decision.consecutive}:${decision.action}`);
+		record = { consecutive: decision.consecutive, lastFailureAt: at };
+	}
+	const afterPause = initFailureDecision(record, now + 45 * 60_000);
+	actions.push(`${afterPause.consecutive}:${afterPause.action}`);
+	check("the streak 1,2 exits, 3 stays, and a late failure retries", actions.join(",") === "1:exit,2:exit,3:stay,1:exit", actions);
+
+	// File round-trip: atomic write, documented shape, corrupt file reads as 0.
+	const failuresRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-init-failures-test-"));
+	const failuresDir = path.join(failuresRoot, ".alive");
+	check("a missing counter reads as 0", readInitFailures(failuresDir).consecutive === 0);
+	writeInitFailures(failuresDir, { consecutive: 2, lastFailureAt: now, lastError: "boom" });
+	const stored = JSON.parse(fs.readFileSync(initFailuresPath(failuresDir), "utf8")) as { consecutive: number; lastFailureAt: string; lastError?: string };
+	check(
+		"the counter file is the documented shape",
+		stored.consecutive === 2 && stored.lastFailureAt === new Date(now).toISOString() && stored.lastError === "boom",
+		stored,
+	);
+	const read = readInitFailures(failuresDir);
+	check("the counter round-trips", read.consecutive === 2 && read.lastFailureAt === now && read.lastError === "boom", read);
+	fs.writeFileSync(initFailuresPath(failuresDir), "{not json", "utf8");
+	check("a corrupt counter reads as 0", readInitFailures(failuresDir).consecutive === 0);
+	fs.writeFileSync(initFailuresPath(failuresDir), JSON.stringify({ consecutive: -2, lastFailureAt: "yesterday" }));
+	const garbage = readInitFailures(failuresDir);
+	check("garbage counts read as 0", garbage.consecutive === 0 && garbage.lastFailureAt === 0, garbage);
+	writeInitFailures(failuresDir, { consecutive: 3, lastFailureAt: now });
+	resetInitFailures(failuresDir);
+	check(
+		"a successful boot resets the counter to 0",
+		readInitFailures(failuresDir).consecutive === 0 && !fs.existsSync(initFailuresPath(failuresDir)),
+	);
+	resetInitFailures(failuresDir);
+	check("resetting a missing counter is harmless", readInitFailures(failuresDir).consecutive === 0);
+	fs.rmSync(failuresRoot, { recursive: true, force: true });
 }
 
 section("loop shutdown/resume config is validated and interrupted is not an error (#124)");
