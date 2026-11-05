@@ -87,6 +87,29 @@ else
 fi
 unit_dir=$config_home/systemd/user
 
+# The templates pin node24 and the compiled entry point. Without them systemd
+# accepts the unit, the process dies on the first ExecStart and StartLimitBurst
+# turns that into "start request repeated too quickly", so refuse to install
+# instead of handing the host a unit that cannot start. The defaults mirror
+# ExecStart in alive.service; both can be overridden for a checkout elsewhere.
+check_runtime() {
+	node_bin=${ALIVE_SYSTEMD_NODE_BIN:-$HOME/.local/share/node24/bin/node}
+	entry=${ALIVE_SYSTEMD_ENTRY:-$HOME/Projects/alive/dist/index.js}
+	if [ ! -x "$node_bin" ]; then
+		die "node24 not found or not executable: $node_bin
+The unit templates run %h/.local/share/node24/bin/node. Install node24 there
+(or set ALIVE_SYSTEMD_NODE_BIN) and edit the templates in deploy/systemd/ to
+match before installing."
+	fi
+	if [ ! -f "$entry" ]; then
+		die "compiled entry point not found: $entry
+Run the build (npm run build) in the checkout the units point at, or set
+ALIVE_SYSTEMD_ENTRY, before installing the units."
+	fi
+}
+
+check_runtime
+
 printf 'Installing Alive systemd user units from %s\n' "$repo_dir"
 install -d "$unit_dir/alive.service.d" "$unit_dir/alive-agent@.service.d"
 install -m 0644 "$script_dir/alive.service" "$unit_dir/alive.service"
@@ -95,6 +118,19 @@ install -m 0644 "$script_dir/restart-limit.conf" "$unit_dir/alive.service.d/rest
 install -m 0644 "$script_dir/restart-limit.conf" "$unit_dir/alive-agent@.service.d/restart-limit.conf"
 install -m 0644 "$script_dir/browser-token.conf" "$unit_dir/alive.service.d/browser-token.conf"
 install -m 0644 "$script_dir/browser-token.conf" "$unit_dir/alive-agent@.service.d/browser-token.conf"
+
+# Earlier deployments hand-wrote browser-deployment.conf in the drop-in dirs (it
+# carried node24 and the browser token before the templates did). It is not part
+# of this directory any more, so nothing overwrites it and it would stay behind
+# as stale configuration next to the drop-ins we manage.
+for legacy_dir in "$unit_dir/alive.service.d" "$unit_dir/alive-agent@.service.d"; do
+	legacy=$legacy_dir/browser-deployment.conf
+	if [ -e "$legacy" ]; then
+		rm -f "$legacy"
+		printf 'removed legacy drop-in %s\n' "$legacy"
+	fi
+done
+
 printf 'Installed units in %s\n' "$unit_dir"
 
 # The shared browser host reads its token from this path (see browser-token.conf).
