@@ -449,6 +449,9 @@ try {
 			detectUnitStatus("no-systemctl", { now: 1, envPath: path.join(root, "definitely-empty-bin") }) === "none",
 		);
 
+		// The fake answers `systemctl [--user] show -p FragmentPath -p ActiveState`
+		// the way systemd does: properties on stdout, non-zero exit for a unit that
+		// is not loaded, a bus error on stderr when the manager is unreachable.
 		const binDir = path.join(root, "fake-systemctl-bin");
 		fs.mkdirSync(binDir, { recursive: true });
 		const fake = path.join(binDir, "systemctl");
@@ -456,32 +459,124 @@ try {
 			fake,
 			[
 				"#!/bin/sh",
-				'if [ "$1" = "is-active" ]; then',
-				'  printf "%s\\n" "${FAKE_UNIT_STATUS:-active}"',
-				'  exit "${FAKE_UNIT_EXIT:-0}"',
+				"scope=system",
+				'if [ "$1" = "--user" ]; then',
+				"  scope=user",
+				"  shift",
 				"fi",
-				"exit 1",
+				'if [ "$1" != "show" ]; then',
+				"  exit 1",
+				"fi",
+				'if [ "$scope" = "user" ]; then',
+				'  fragment="${FAKE_USER_FRAGMENT:-}"',
+				'  state="${FAKE_USER_STATE:-inactive}"',
+				'  code="${FAKE_USER_EXIT:-1}"',
+				'  message="${FAKE_USER_STDERR:-}"',
+				"else",
+				'  fragment="${FAKE_SYSTEM_FRAGMENT:-}"',
+				'  state="${FAKE_SYSTEM_STATE:-inactive}"',
+				'  code="${FAKE_SYSTEM_EXIT:-1}"',
+				'  message="${FAKE_SYSTEM_STDERR:-}"',
+				"fi",
+				'if [ -n "$message" ]; then',
+				'  printf "%s\\n" "$message" >&2',
+				"  exit 1",
+				"fi",
+				'printf "FragmentPath=%s\\n" "$fragment"',
+				'printf "ActiveState=%s\\n" "$state"',
+				'exit "$code"',
 				"",
 			].join("\n"),
 		);
 		fs.chmodSync(fake, 0o755);
+
+		const USER_FRAGMENT = "/home/rimgro/.config/systemd/user/alive-agent@.service";
+		const SYSTEM_FRAGMENT = "/etc/systemd/system/alive-agent@.service";
+		/** Answer both scopes for the next query; every knob is reset each time. */
+		const fakeAnswer = (answer: {
+			userFragment?: string;
+			userState?: string;
+			userExit?: number;
+			userStderr?: string;
+			systemFragment?: string;
+			systemState?: string;
+			systemExit?: number;
+		}): void => {
+			const values: Record<string, string> = {
+				FAKE_USER_FRAGMENT: answer.userFragment ?? "",
+				FAKE_USER_STATE: answer.userState ?? "inactive",
+				FAKE_USER_EXIT: String(answer.userExit ?? 1),
+				FAKE_USER_STDERR: answer.userStderr ?? "",
+				FAKE_SYSTEM_FRAGMENT: answer.systemFragment ?? "",
+				FAKE_SYSTEM_STATE: answer.systemState ?? "inactive",
+				FAKE_SYSTEM_EXIT: String(answer.systemExit ?? 1),
+			};
+			for (const [key, value] of Object.entries(values)) process.env[key] = value;
+		};
+		const FAKE_ENV_KEYS = [
+			"FAKE_USER_FRAGMENT",
+			"FAKE_USER_STATE",
+			"FAKE_USER_EXIT",
+			"FAKE_USER_STDERR",
+			"FAKE_SYSTEM_FRAGMENT",
+			"FAKE_SYSTEM_STATE",
+			"FAKE_SYSTEM_EXIT",
+		];
+
 		const originalPath = process.env.PATH;
 		process.env.PATH = `${binDir}${path.delimiter}${originalPath ?? ""}`;
 		try {
 			resetUnitStatusCache();
-			process.env.FAKE_UNIT_STATUS = "inactive";
+
+			// The issue itself: the unit lives in the user scope, the system scope has
+			// never heard of it, and `is-active` without `--user` used to say inactive.
+			fakeAnswer({ userFragment: USER_FRAGMENT, userState: "active", userExit: 0, systemState: "inactive" });
+			check(
+				"a user-scope unit is reported active even though the system scope says inactive",
+				detectUnitStatus("user-scope", { now: 1 }) === "active",
+			);
+
+			fakeAnswer({ userState: "inactive", systemFragment: SYSTEM_FRAGMENT, systemState: "active", systemExit: 0 });
+			check(
+				"a system-scope unit is still found when the user scope has no fragment",
+				detectUnitStatus("system-scope", { now: 1 }) === "active",
+			);
+
+			fakeAnswer({});
+			check("a unit that exists in neither scope reads as none", detectUnitStatus("missing-unit", { now: 1 }) === "none");
+
+			fakeAnswer({ userFragment: USER_FRAGMENT, userState: "inactive", systemFragment: SYSTEM_FRAGMENT, systemState: "active", systemExit: 0 });
+			check(
+				"a stopped user-scope unit is not overridden by an active system-scope answer",
+				detectUnitStatus("stopped-user-unit", { now: 1 }) === "inactive",
+			);
+
+			fakeAnswer({ userFragment: USER_FRAGMENT, userState: "failed", userExit: 3 });
+			check(
+				"a non-zero systemctl show still reports its printed state",
+				detectUnitStatus("failed-unit", { now: 1 }) === "failed",
+			);
+
+			fakeAnswer({ userFragment: USER_FRAGMENT, userState: "banana", userExit: 0, systemFragment: SYSTEM_FRAGMENT, systemState: "active", systemExit: 0 });
+			check(
+				"an unparsable ActiveState reads as unknown without falling back",
+				detectUnitStatus("odd-answer", { now: 1 }) === "unknown",
+			);
+
+			fakeAnswer({ userStderr: "Failed to connect to user scope bus: No such file or directory", systemFragment: SYSTEM_FRAGMENT, systemState: "active", systemExit: 0 });
+			check(
+				"an unreachable user bus reads as unknown instead of falling back",
+				detectUnitStatus("no-user-bus", { now: 1 }) === "unknown",
+			);
+
+			// Caching: the answer is trusted for 30 s and does not change per tick.
+			fakeAnswer({ userFragment: USER_FRAGMENT, userState: "inactive", userExit: 0 });
 			check("the fake systemctl answer is read", detectUnitStatus("cache-test", { now: 1_000 }) === "inactive");
-			process.env.FAKE_UNIT_STATUS = "active";
+			fakeAnswer({ userFragment: USER_FRAGMENT, userState: "active", userExit: 0 });
 			check("a second query inside 30 s uses the cache", detectUnitStatus("cache-test", { now: 20_000 }) === "inactive");
 			check("after 30 s the answer is refreshed", detectUnitStatus("cache-test", { now: 31_001 }) === "active");
-			process.env.FAKE_UNIT_STATUS = "banana";
-			check("an unknown answer is reported as unknown", detectUnitStatus("odd-answer", { now: 1 }) === "unknown");
-			process.env.FAKE_UNIT_STATUS = "failed";
-			process.env.FAKE_UNIT_EXIT = "3";
-			check("a failing systemctl still reports its printed state", detectUnitStatus("failed-unit", { now: 1 }) === "failed");
 		} finally {
-			delete process.env.FAKE_UNIT_STATUS;
-			delete process.env.FAKE_UNIT_EXIT;
+			for (const key of FAKE_ENV_KEYS) delete process.env[key];
 			process.env.PATH = originalPath;
 			resetUnitStatusCache();
 			fs.rmSync(binDir, { recursive: true, force: true });

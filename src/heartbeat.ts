@@ -56,7 +56,7 @@ export function isUnitStatus(value: unknown): value is UnitStatus {
 	return typeof value === "string" && (UNIT_STATUS_VALUES as readonly string[]).includes(value);
 }
 
-/** How long one answered `systemctl is-active` is trusted. */
+/** How long one answered `systemctl show` is trusted. */
 export const UNIT_STATUS_CACHE_MS = 30_000;
 /** A hung service manager must never hold the scheduler for longer than this. */
 export const UNIT_STATUS_TIMEOUT_MS = 2_000;
@@ -74,11 +74,23 @@ export function resetUnitStatusCache(): void {
 }
 
 /**
- * Ask `systemctl is-active` for one managed profile's unit, cached for 30 s.
+ * Ask `systemctl show` for one managed profile's unit, cached for 30 s.
+ *
+ * The user scope is asked first and the system scope is only a fallback: the
+ * runtime starts as `alive-agent@<profile>` in the *user* manager (its unit
+ * fragment lives under `~/.config/systemd/user/`), so `is-active` without
+ * `--user` answered `inactive` for every healthy managed profile.
+ *
+ * One `show` per scope replaces `is-active` because `systemctl show` answers
+ * both questions in a single spawn: `FragmentPath` says whether the unit exists
+ * in that scope at all, and `ActiveState` is its state. `is-active` only
+ * answers the second one, so a unit that is genuinely absent looked exactly
+ * like a stopped one and there was no way to fall back between scopes.
  *
  * This is diagnostics only. It never throws: a missing `systemctl` reads as
- * `none`, a timeout/failure/unknown answer as `unknown`. The call is bounded by
- * `UNIT_STATUS_TIMEOUT_MS`, so a wedged service manager cannot hang the caller.
+ * `none`, a timeout/failure/unknown answer as `unknown`. At most two spawns are
+ * made, each bounded by `UNIT_STATUS_TIMEOUT_MS`, so a wedged service manager
+ * cannot hang the caller.
  */
 export function detectUnitStatus(
 	profileId: string,
@@ -97,17 +109,81 @@ export function detectUnitStatus(
 function queryUnitStatus(unit: string, envPath = process.env.PATH ?? ""): UnitStatus {
 	const executable = findExecutable("systemctl", envPath);
 	if (!executable) return "none";
+
+	// The scope that actually owns the runtime. No fallback on a failed call:
+	// without an answer from here the system scope would only add noise.
+	const userScope = showUnitInScope(executable, ["--user"], unit);
+	if (!userScope) return "unknown";
+	if (userScope.fragmentPath) return unitStatusFromActiveState(userScope.activeState);
+
+	// Not a user unit at all: maybe this profile was installed system-wide.
+	const systemScope = showUnitInScope(executable, [], unit);
+	if (!systemScope) return "unknown";
+	if (!systemScope.fragmentPath) return "none";
+	return unitStatusFromActiveState(systemScope.activeState);
+}
+
+/** `FragmentPath`/`ActiveState` of a unit as one `systemctl show` reported them. */
+interface UnitProperties {
+	/** Empty when the unit is not loaded in the scope that was asked. */
+	fragmentPath: string;
+	activeState: string;
+}
+
+/**
+ * `systemctl [--user] show -p FragmentPath -p ActiveState <unit>`.
+ *
+ * A missing unit makes `show` exit non-zero but still print its properties, so
+ * stdout is parsed regardless of the exit status. Undefined means the call told
+ * us nothing usable (spawn error, timeout, empty or unreadable stdout — e.g. a
+ * `Failed to connect to [user scope] bus` message on stderr): the caller must
+ * report `unknown` rather than treat the unit as absent.
+ */
+function showUnitInScope(
+	executable: string,
+	scopeArgs: readonly string[],
+	unit: string,
+): UnitProperties | undefined {
+	let result: ReturnType<typeof spawnSync>;
 	try {
-		const result = spawnSync(executable, ["is-active", unit], {
+		result = spawnSync(executable, [...scopeArgs, "show", "-p", "FragmentPath", "-p", "ActiveState", unit], {
 			encoding: "utf8",
 			timeout: UNIT_STATUS_TIMEOUT_MS,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
-		if (result.error) return (result.error as NodeJS.ErrnoException).code === "ENOENT" ? "none" : "unknown";
-		const answer = String(result.stdout ?? "").trim().toLowerCase().split(/\s+/)[0] ?? "";
-		return isUnitStatus(answer) ? answer : "unknown";
 	} catch {
-		return "unknown";
+		return undefined;
+	}
+	if (result.error) return undefined;
+	return parseUnitProperties(String(result.stdout ?? ""));
+}
+
+/** Parse `key=value` output line by line; undefined when nothing looked like a property. */
+function parseUnitProperties(stdout: string): UnitProperties | undefined {
+	const properties = new Map<string, string>();
+	for (const line of stdout.split(/\r?\n/)) {
+		const separator = line.indexOf("=");
+		if (separator <= 0) continue;
+		properties.set(line.slice(0, separator).trim(), line.slice(separator + 1).trim());
+	}
+	if (properties.size === 0) return undefined;
+	return {
+		fragmentPath: properties.get("FragmentPath") ?? "",
+		activeState: properties.get("ActiveState") ?? "",
+	};
+}
+
+/** systemd `ActiveState` → `UnitStatus`; anything this build does not know reads as `unknown`. */
+function unitStatusFromActiveState(activeState: string): UnitStatus {
+	switch (activeState.toLowerCase()) {
+		case "active":
+		case "activating":
+		case "deactivating":
+		case "failed":
+		case "inactive":
+			return activeState.toLowerCase() as UnitStatus;
+		default:
+			return "unknown";
 	}
 }
 
@@ -157,7 +233,7 @@ export interface HeartbeatRecord {
 	lastTickAt?: string;
 	/** Whole seconds between `lastTickAt` and `updatedAt`; 0 when no tick was recorded (#175). */
 	staleSeconds?: number;
-	/** Best-effort `systemctl is-active alive-agent@<profile>` answer (#175). */
+	/** Best-effort unit state of `alive-agent@<profile>` (#175), from a systemd `show` in the user scope. */
 	unitStatus?: UnitStatus;
 	/** Process starts inside the rolling window (#178), written by a newer build. */
 	startLoop?: StartLoopStatus;
