@@ -30,6 +30,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { UPDATE_MARKER_FILE } from "./update.js";
 import { readJson, writeJsonAtomic } from "./util.js";
+import type { StartLoopStatus } from "./store/start-loop.js";
 
 export const HEARTBEAT_FILE = "heartbeat.json";
 
@@ -158,6 +159,8 @@ export interface HeartbeatRecord {
 	staleSeconds?: number;
 	/** Best-effort `systemctl is-active alive-agent@<profile>` answer (#175). */
 	unitStatus?: UnitStatus;
+	/** Process starts inside the rolling window (#178), written by a newer build. */
+	startLoop?: StartLoopStatus;
 }
 
 /** The subset of `Logger` the heartbeat needs; a stub is enough in tests. */
@@ -178,6 +181,8 @@ export interface HeartbeatWriteOptions {
 	lastTickAt?: number | Date;
 	/** Best-effort unit state (#175); omitted when unknown or not managed. */
 	unitStatus?: UnitStatus;
+	/** Process starts inside the rolling window (#178); omitted when not recorded. */
+	startLoop?: StartLoopStatus;
 	/** Clock seam for tests; defaults to now. */
 	now?: number | Date;
 }
@@ -216,6 +221,7 @@ export function writeHeartbeat(options: HeartbeatWriteOptions): HeartbeatRecord 
 	if (ref) record.ref = ref;
 	if (lastTickAt) record.lastTickAt = lastTickAt.toISOString();
 	if (options.unitStatus) record.unitStatus = options.unitStatus;
+	if (options.startLoop) record.startLoop = options.startLoop;
 	writeJsonAtomic(heartbeatPath(options.stateDir), record);
 	return record;
 }
@@ -243,6 +249,8 @@ export interface HeartbeatRefreshOptions {
 	lastTickAt?: number | Date;
 	/** Best-effort unit state (#175); omitted keeps the previous value. */
 	unitStatus?: UnitStatus;
+	/** Process starts inside the rolling window (#178); omitted keeps the previous value. */
+	startLoop?: StartLoopStatus;
 }
 
 /**
@@ -285,6 +293,8 @@ export function refreshHeartbeat(
 		if (lastTickAt !== undefined) record.lastTickAt = new Date(lastTickAt).toISOString();
 		const unitStatus = options.unitStatus ?? existing.unitStatus;
 		if (unitStatus) record.unitStatus = unitStatus;
+		const startLoop = options.startLoop ?? existing.startLoop;
+		if (startLoop) record.startLoop = startLoop;
 		writeJsonAtomic(file, record);
 		return true;
 	} catch (error) {
@@ -316,7 +326,34 @@ export function readHeartbeat(stateDir: string): HeartbeatRecord | undefined {
 		record.staleSeconds = Math.trunc(raw.staleSeconds);
 	}
 	if (isUnitStatus(raw.unitStatus)) record.unitStatus = raw.unitStatus;
+	const startLoop = sanitizeStartLoop(raw.startLoop);
+	if (startLoop) record.startLoop = startLoop;
 	return record;
+}
+
+/**
+ * Validate the additive `startLoop` block (#178).
+ *
+ * A hand-edited or partially written file must not invent a restart loop, so
+ * every counter has to be a finite non-negative number, `windowSeconds` and
+ * `threshold` have to be positive, and `warn` has to be a boolean. Any other
+ * shape drops the whole block instead of guessing.
+ */
+function sanitizeStartLoop(value: unknown): StartLoopStatus | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const raw = value as Record<string, unknown>;
+	const starts = typeof raw.starts === "number" && Number.isFinite(raw.starts) && raw.starts >= 0
+		? Math.trunc(raw.starts)
+		: undefined;
+	const windowSeconds = typeof raw.windowSeconds === "number" && Number.isFinite(raw.windowSeconds) && raw.windowSeconds > 0
+		? raw.windowSeconds
+		: undefined;
+	const threshold = typeof raw.threshold === "number" && Number.isFinite(raw.threshold) && raw.threshold > 0
+		? raw.threshold
+		: undefined;
+	if (starts === undefined || windowSeconds === undefined || threshold === undefined) return undefined;
+	if (typeof raw.warn !== "boolean") return undefined;
+	return { starts, windowSeconds, threshold, warn: raw.warn };
 }
 
 export type HeartbeatState = "fresh" | "stale" | "missing";
@@ -334,6 +371,8 @@ export interface HeartbeatStatus {
 	staleSeconds?: number;
 	/** `unitStatus` from the record, when an updated build wrote it (#175). */
 	unitStatus?: UnitStatus;
+	/** `startLoop` from the record, when an updated build wrote it (#178). */
+	startLoop?: StartLoopStatus;
 	heartbeat?: HeartbeatRecord;
 }
 
@@ -365,6 +404,7 @@ export function readHeartbeatStatus(stateDir: string, staleAfterMs: number, now 
 	if (Number.isFinite(startedAtMs)) status.uptimeMs = Math.max(0, now - startedAtMs);
 	if (heartbeat.staleSeconds !== undefined) status.staleSeconds = heartbeat.staleSeconds;
 	if (heartbeat.unitStatus !== undefined) status.unitStatus = heartbeat.unitStatus;
+	if (heartbeat.startLoop !== undefined) status.startLoop = heartbeat.startLoop;
 	return status;
 }
 

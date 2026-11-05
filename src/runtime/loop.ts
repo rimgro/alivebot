@@ -36,6 +36,12 @@ import {
 	type InitFailureDecision,
 	type InitFailureRecord,
 } from "../store/init-failures.js";
+import {
+	readStartLoop,
+	recordProcessStart,
+	START_LOOP_WINDOW_MS,
+	type StartLoopStatus,
+} from "../store/start-loop.js";
 import { RunEventLog } from "../store/run-events.js";
 import { ThreadStore } from "../store/threads.js";
 import { maskSecrets } from "../secrets.js";
@@ -135,6 +141,8 @@ export class AliveRuntime {
 	private stalledRunId: string | undefined;
 	/** True when repeated init failures left this process alive in `status: "error"` (#178). */
 	private initHalted = false;
+	/** Process starts in the rolling window (#178), recorded before any risky boot step. */
+	private startLoop: StartLoopStatus | undefined;
 	/** Resolves the pending `run()` when `stop()` ends a halted (status=error) process. */
 	private stopResolve: (() => void) | undefined;
 	/** Last run record to reopen on startup (#124), consumed by `loop()`. */
@@ -616,6 +624,17 @@ export class AliveRuntime {
 
 	/** Blocking loop. Resolves when stop() is called. */
 	async run(): Promise<void> {
+		// Count this boot before `init()` touches the inbox, modules, sandbox or the
+		// model (#178). A restart loop is then visible from outside even when a
+		// later boot step never completes and the process exits.
+		this.startLoop = recordProcessStart(this.config.paths.stateDir, Date.now());
+		if (this.startLoop.warn) {
+			this.log.warn(`restart loop: ${this.startLoop.starts} starts in 10m`, {
+				starts: this.startLoop.starts,
+				threshold: this.startLoop.threshold,
+				windowMs: START_LOOP_WINDOW_MS,
+			});
+		}
 		await this.init();
 		if (this.initHalted) {
 			// The process must stay alive (systemd would restart a non-zero exit
@@ -992,9 +1011,29 @@ export class AliveRuntime {
 			startedAt: this.startedAt,
 			lastTickAt: this.lastStateWriteAt || this.startedAt,
 			unitStatus: profileId ? detectUnitStatus(profileId, { now }) : undefined,
+			startLoop: this.currentStartLoop(now),
 			log: this.log,
 		});
 		if (record) this.lastHeartbeatAt = now;
+	}
+
+	/**
+	 * Start counter to write into the heartbeat *now*.
+	 *
+	 * The value captured at boot would keep `warn: true` in `heartbeat.json`
+	 * forever; an outside monitor would never see the loop end. Re-reading the
+	 * small counter file on each heartbeat update makes the alert go away with
+	 * the window. A zero can also mean the boot-time write failed, so while the
+	 * recorded start can still be inside the window, fall back to it; after the
+	 * window an empty counter is simply quiet.
+	 */
+	private currentStartLoop(now: number): StartLoopStatus | undefined {
+		const current = readStartLoop(this.config.paths.stateDir, now);
+		if (current.starts > 0) return current;
+		if (this.startLoop && this.startLoop.starts > 0 && now - this.startedAt <= START_LOOP_WINDOW_MS) {
+			return this.startLoop;
+		}
+		return current;
 	}
 
 	/** Managed profile id (directory name), or undefined for the root profile. */
@@ -1020,7 +1059,8 @@ export class AliveRuntime {
 		// Diagnostics only, cached for 30 s and bounded by a 2 s timeout inside.
 		const unitStatus = profileId ? detectUnitStatus(profileId, { now }) : undefined;
 		const lastTickAt = this.lastStateWriteAt || this.startedAt;
-		if (refreshHeartbeat(this.config.paths.stateDir, this.log, now, { lastTickAt, unitStatus })) {
+		const startLoop = this.currentStartLoop(now);
+		if (refreshHeartbeat(this.config.paths.stateDir, this.log, now, { lastTickAt, unitStatus, startLoop })) {
 			this.lastHeartbeatAt = now;
 			return;
 		}

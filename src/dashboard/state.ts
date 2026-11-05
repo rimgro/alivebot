@@ -14,6 +14,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { DEFAULT_CONTRACT, loadConfig, type LoadedConfig } from "../config.js";
 import { readHeartbeatStatus, type UnitStatus } from "../heartbeat.js";
+import type { StartLoopStatus } from "../store/start-loop.js";
 import { buildSystemPrompt } from "../runtime/prompt.js";
 import type { AliveEvent } from "../store/events.js";
 import type { Reminder } from "../store/reminders.js";
@@ -772,6 +773,8 @@ export interface DeriveStatusOptions {
 	silentMs?: number;
 	/** Best-effort systemd unit state recorded in the heartbeat (#175). */
 	unitStatus?: UnitStatus;
+	/** Process starts inside the rolling window recorded in the heartbeat (#178). */
+	startLoop?: StartLoopStatus;
 	/**
 	 * Whether the profile has at least one trace of a launch (`hasLaunchHistory`, #190).
 	 * `false` means "never started": no runtime is a normal initial state, not a death.
@@ -877,6 +880,8 @@ export interface AgentHealthView {
 	heartbeatAgeMs?: number;
 	silentMs: number;
 	unitStatus?: UnitStatus;
+	/** Process starts inside the rolling window (#178), when recorded. */
+	startLoop?: StartLoopStatus;
 }
 
 /**
@@ -901,6 +906,7 @@ export function deriveAgentHealth(
 		...(options.heartbeatAgeMs !== undefined ? { heartbeatAgeMs: options.heartbeatAgeMs } : {}),
 		silentMs,
 		...(options.unitStatus !== undefined ? { unitStatus: options.unitStatus } : {}),
+		...(options.startLoop !== undefined ? { startLoop: options.startLoop } : {}),
 	};
 }
 
@@ -967,12 +973,17 @@ export function readAgentSummary(
 		heartbeatAgeMs: options.heartbeatAgeMs ?? heartbeat.ageMs,
 		silentMs: options.silentMs ?? profile.config.config.health.silentMs,
 		unitStatus: options.unitStatus ?? heartbeat.heartbeat?.unitStatus,
+		startLoop: options.startLoop ?? heartbeat.heartbeat?.startLoop,
 		runStallMs: options.runStallMs ?? profile.config.config.loop.runStallMs,
 	});
 	const lastCompaction = runtime?.lastCompaction;
 	if (lastCompaction && !lastCompaction.ok) {
 		const label = lastCompaction.skipped ? "deferred" : "failed";
 		status.note = `${status.note} · compaction ${label}: ${lastCompaction.reasonClass ?? "provider_error"}`;
+	}
+	const startLoop = options.startLoop ?? heartbeat.heartbeat?.startLoop;
+	if (startLoop?.warn) {
+		status.note = `${status.note} · restart loop: ${startLoop.starts} starts/10m`;
 	}
 	const runs = readRunRecords(profile.stateDir);
 	const usage = readUsageToday(profile.stateDir, now);
