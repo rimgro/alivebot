@@ -1126,6 +1126,9 @@ summary в `runs.jsonl` и journal. Если бюджет истёк — пре�
 - `health.silentMs` (по умолчанию 7 200 000 мс = 2 ч, `0` = выкл) — сколько профиль
   может молчать без heartbeat, прежде чем dashboard и `alive status` покажут его
   `dead`, а не `sleeping`; корневой профиль этого репозитория задаёт 300000 мс (5 мин).
+  Профиль, который ещё ни разу не запускался (в его `state/` нет ни одного следа
+  запуска: `usage.json`, `runs/runs.jsonl`, `logs/alive.jsonl`, `heartbeat.json`),
+  показывается `sleeping (never started)` и `dead` не считается (#190).
 
 Аномалии ничего не останавливают и не попадают агенту в контекст. Каждое событие
 несёт только счётчики (`runId`, `agent`, `activeMs`, `durationMs`, `turns`,

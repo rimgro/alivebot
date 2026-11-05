@@ -42,10 +42,12 @@ import {
 	contextMetricsText,
 	formatCompactTokens,
 	COST_TREND_DAYS,
+	deriveAgentHealth,
 	deriveAgentStatus,
 	estimatePromptTokens,
 	filterTimeline,
 	findProfile,
+	hasLaunchHistory,
 	hasTimelineFilters,
 	loadAgentDetail,
 	loadDashboard,
@@ -1107,6 +1109,128 @@ async function main(): Promise<void> {
 		stalledHtml.includes("run stalled") && stalledHtml.includes('class="st long"'),
 		stalledHtml.match(/run stalled[^<]*/)?.[0],
 	);
+
+	// #190: a profile whose runtime never started is sleeping, not dead. The
+	// launch leaves traces in state/ (usage.json, runs.jsonl, the runtime log,
+	// heartbeat.json); with none of them there is nothing that failed.
+	const neverStarted = deriveAgentStatus(null, { now, launchHistory: false, silentMs: 2 * 3_600_000 });
+	check(
+		"no runtime and no launch history -> sleeping / never started (#190)",
+		neverStarted.status === "sleeping" && neverStarted.note === "never started",
+		neverStarted,
+	);
+	const neverStartedEvenSilent = deriveAgentStatus(null, { now, launchHistory: false, silentMs: 0 });
+	check(
+		"never started is its own state, not the dead rule: health.silentMs = 0 changes nothing (#190)",
+		neverStartedEvenSilent.status === "sleeping" && neverStartedEvenSilent.note === "never started",
+		neverStartedEvenSilent,
+	);
+	const launched = deriveAgentStatus(null, { now, launchHistory: true, silentMs: 2 * 3_600_000 });
+	check(
+		"with launch history the no-runtime dead rule still fires (#190)",
+		launched.status === "dead" && launched.note.includes("no runtime state") && launched.note.includes("no heartbeat"),
+		launched,
+	);
+	const unknownHistory = deriveAgentStatus(null, { now, silentMs: 2 * 3_600_000 });
+	check("an unknown launch history keeps the 0.29.0 dead rule (#190)", unknownHistory.status === "dead", unknownHistory);
+	const unknownHistoryDefault = deriveAgentStatus(null, {});
+	check(
+		"with no options at all the behavior is unchanged (sleeping / no runtime state)",
+		unknownHistoryDefault.status === "sleeping" && unknownHistoryDefault.note === "no runtime state",
+		unknownHistoryDefault,
+	);
+
+	const neverStartedHealth = deriveAgentHealth(null, { now, launchHistory: false, silentMs: 2 * 3_600_000 });
+	check(
+		"health: never started is stopped + neverStarted, without a dead reason (#190)",
+		neverStartedHealth.state === "stopped" &&
+			neverStartedHealth.neverStarted === true &&
+			neverStartedHealth.reason === undefined &&
+			neverStartedHealth.silentMs === 2 * 3_600_000,
+		neverStartedHealth,
+	);
+	const launchedHealth = deriveAgentHealth(null, { now, launchHistory: true, silentMs: 2 * 3_600_000 });
+	check(
+		"health: with launch history no runtime is still dead with a reason (#190)",
+		launchedHealth.state === "dead" && typeof launchedHealth.reason === "string" && launchedHealth.neverStarted === undefined,
+		launchedHealth,
+	);
+	const stoppedHealth = deriveAgentHealth(null, { now, silentMs: 0 });
+	check(
+		"health: an unknown launch history stays stopped and carries no neverStarted (#190)",
+		stoppedHealth.state === "stopped" && stoppedHealth.neverStarted === undefined && stoppedHealth.reason === undefined,
+		stoppedHealth,
+	);
+
+	// The dashboard answers "did this profile ever start?" from the state dir
+	// itself, so the index/agent pages get the sleeping state without extra wiring.
+	const freshRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-never-started-"));
+	fs.writeFileSync(
+		path.join(freshRoot, "alive.config.json"),
+		JSON.stringify({ name: "Fresh", health: { silentMs: 2 * 3_600_000 } }),
+		"utf8",
+	);
+	const freshProfile = loadDashboard(loadRootConfig({ rootDir: freshRoot }))[0]!;
+	const freshSummary = readAgentSummary(freshProfile, { now });
+	check(
+		"dashboard summary: a profile with no launch traces is sleeping / never started (#190)",
+		freshSummary.status === "sleeping" && freshSummary.statusNote === "never started",
+		{ status: freshSummary.status, note: freshSummary.statusNote },
+	);
+	const freshHtml = renderIndexPage([freshSummary], { secrets: DEFAULT_SECRETS_CONFIG, env: {}, now });
+	check(
+		"dashboard renders never started as a grey sleeping badge, not red",
+		freshHtml.includes('class="st sleeping"') && freshHtml.includes("never started") && !freshHtml.includes('class="st dead"'),
+		freshHtml.match(/class="st [^"]*"[^<]*/)?.[0],
+	);
+	writeJson(path.join(freshProfile.stateDir, "usage.json"), { days: {} });
+	const startedSummary = readAgentSummary(freshProfile, { now });
+	check(
+		"dashboard summary: one launch trace brings the dead rule back (#190)",
+		startedSummary.status === "dead" && startedSummary.statusNote.includes("no runtime state"),
+		{ status: startedSummary.status, note: startedSummary.statusNote },
+	);
+	fs.rmSync(freshRoot, { recursive: true, force: true });
+
+	section("launch history (#190)");
+	const launchRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-launch-history-"));
+	const launchCase = (name: string, build?: (dir: string) => void): string => {
+		const dir = path.join(launchRoot, name);
+		fs.mkdirSync(dir, { recursive: true });
+		build?.(dir);
+		return dir;
+	};
+	check("an empty state dir has no launch history", hasLaunchHistory(launchCase("empty")) === false);
+	check("a missing state dir has no launch history", hasLaunchHistory(path.join(launchRoot, "missing")) === false);
+	check(
+		"usage.json counts as a launch trace",
+		hasLaunchHistory(launchCase("usage", (dir) => writeJson(path.join(dir, "usage.json"), {}))) === true,
+	);
+	check(
+		"runs/runs.jsonl with one record counts as a launch trace",
+		hasLaunchHistory(launchCase("runs", (dir) => appendJsonl(path.join(dir, "runs", "runs.jsonl"), [{ id: "run_1" }]))) === true,
+	);
+	check(
+		"logs/alive.jsonl counts as a launch trace",
+		hasLaunchHistory(launchCase("logs", (dir) => appendJsonl(path.join(dir, "logs", "alive.jsonl"), [{ level: "info" }]))) === true,
+	);
+	check(
+		"heartbeat.json counts as a launch trace",
+		hasLaunchHistory(launchCase("heartbeat", (dir) => writeJson(path.join(dir, "heartbeat.json"), {}))) === true,
+	);
+	check(
+		"an empty (0 byte) file is not a launch trace",
+		hasLaunchHistory(launchCase("blank", (dir) => {
+			fs.mkdirSync(path.join(dir, "runs"), { recursive: true });
+			fs.writeFileSync(path.join(dir, "usage.json"), "", "utf8");
+			fs.writeFileSync(path.join(dir, "runs", "runs.jsonl"), "", "utf8");
+		})) === false,
+	);
+	check(
+		"a directory in place of the file is not a launch trace",
+		hasLaunchHistory(launchCase("dir", (dir) => fs.mkdirSync(path.join(dir, "heartbeat.json")))) === false,
+	);
+	fs.rmSync(launchRoot, { recursive: true, force: true });
 
 	section("timeline");
 	const detail = loadAgentDetail(main, { now });

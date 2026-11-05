@@ -37,7 +37,7 @@ import {
 	restartRefusalText,
 } from "./runtime/harness-guard.js";
 import { LOG_SOURCES, followFile, readLogTail, renderLogLine, resolveLogSource } from "./logs.js";
-import { findProfile, loadDashboard, loadRootConfig, cacheReadPerTurn, contextMetricsText, deriveAgentHealth } from "./dashboard/state.js";
+import { findProfile, loadDashboard, loadRootConfig, cacheReadPerTurn, contextMetricsText, deriveAgentHealth, hasLaunchHistory } from "./dashboard/state.js";
 import { DEFAULT_USAGE_DAYS, buildUsageReport, renderUsageReport } from "./usage/report.js";
 import { WorkerStore, validateWorkerId, workerLabel } from "./workers/store.js";
 import { gitDiff, gitState, isGitRepository } from "./workers/worktree.js";
@@ -1002,6 +1002,9 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 		heartbeatAgeMs: heartbeat.ageMs,
 		silentMs: config.config.health.silentMs,
 		unitStatus: heartbeat.heartbeat?.unitStatus,
+		// A profile that never ran has no runtime for a normal reason: the mark of a
+		// launch lives in usage.json / runs.jsonl / logs / heartbeat.json (#190).
+		launchHistory: hasLaunchHistory(config.paths.stateDir),
 	});
 	// An open run whose `lastTickAt` is older than `loop.runStallMs` is stalled
 	// (#173). Derived at read time, so a frozen process is visible even though it
@@ -1067,6 +1070,9 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 	line("agent", config.config.name);
 	if (health.state === "dead") {
 		line("status", `${term.red("dead")} — ${health.reason ?? "no signs of life"}`);
+	} else if (health.state === "stopped" && health.neverStarted) {
+		// Never started is neither running nor failing: say so instead of "not running" (#190).
+		line("status", "sleeping (never started)");
 	} else {
 		line("status", running && runtime ? `${stall ? term.red("stalled") : runtime.status} (pid ${runtime.pid})` : "not running");
 	}

@@ -699,6 +699,33 @@ export function buildCostTrend(
 	};
 }
 
+/** The files that only exist once a runtime has been started at least once (#190). */
+const LAUNCH_HISTORY_FILES = ["usage.json", path.join("runs", "runs.jsonl"), path.join("logs", "alive.jsonl"), "heartbeat.json"] as const;
+
+/**
+ * True when the profile carries at least one trace of a launch (#190).
+ *
+ * `runtime.json` disappears on a clean stop, so a profile that never ran looks
+ * exactly like one that died: the launch leaves other, additive marks in
+ * `state/` — the usage counter, the run log, the runtime log and the heartbeat,
+ * which the runtime writes on its first start. Any non-empty one counts.
+ *
+ * Best-effort and synchronous: a missing file, an unreadable directory or a
+ * permissions error means "no trace", never an exception — the dashboard must
+ * keep rendering even for a half-written state dir.
+ */
+export function hasLaunchHistory(stateDir: string): boolean {
+	for (const relative of LAUNCH_HISTORY_FILES) {
+		try {
+			const stats = fs.statSync(path.join(stateDir, relative));
+			if (stats.isFile() && stats.size > 0) return true;
+		} catch {
+			// Missing or unreadable: this file proves nothing about a launch.
+		}
+	}
+	return false;
+}
+
 export function readRuntimeStateFile(stateDir: string): RuntimeStateFile | null {
 	return readJson<RuntimeStateFile | null>(path.join(stateDir, "runtime.json"), null);
 }
@@ -737,6 +764,12 @@ export interface DeriveStatusOptions {
 	silentMs?: number;
 	/** Best-effort systemd unit state recorded in the heartbeat (#175). */
 	unitStatus?: UnitStatus;
+	/**
+	 * Whether the profile has at least one trace of a launch (`hasLaunchHistory`, #190).
+	 * `false` means "never started": no runtime is a normal initial state, not a death.
+	 * `undefined` means "unknown": the rule is not applied and the behavior is 0.29.0's.
+	 */
+	launchHistory?: boolean;
 }
 
 /** Why a profile is considered dead, or undefined when no dead rule fires. */
@@ -774,7 +807,8 @@ function deadAgentView(
  * Map `runtime.json` (and the heartbeat) onto the states the dashboard shows.
  *
  * working = a run is in progress; waiting = blocked in `idle` (or paused by the
- * budget); sleeping = no live runtime, i.e. the agent is between lives; dead =
+ * budget); sleeping = no live runtime, i.e. the agent is between lives (or has
+ * not started yet, `never started`, #190); dead =
  * the process is gone without a clean stop, or a live pid stopped sending
  * heartbeats (#175). A stalled open run keeps its own branch and wins over the
  * heartbeat-based dead rule (#173).
@@ -786,6 +820,9 @@ export function deriveAgentStatus(
 	const now = options.now ?? Date.now();
 	const alive = runtime ? (options.pidAlive ?? isProcessAlive)(runtime.pid) : false;
 	if (!runtime) {
+		// A profile that never started has no runtime because it has not run yet;
+		// that is a sleep, not a death, whatever `health.silentMs` says (#190).
+		if (options.launchHistory === false) return { status: "sleeping", note: "never started" };
 		return deadAgentView(null, false, options, now) ?? { status: "sleeping", note: "no runtime state" };
 	}
 	if (!alive) {
@@ -827,6 +864,8 @@ export type AgentHealthState = "dead" | "running" | "stopped";
 export interface AgentHealthView {
 	state: AgentHealthState;
 	reason?: string;
+	/** True when no trace of a launch exists yet (#190): stopped, not dead. */
+	neverStarted?: boolean;
 	heartbeatAgeMs?: number;
 	silentMs: number;
 	unitStatus?: UnitStatus;
@@ -844,10 +883,13 @@ export function deriveAgentHealth(
 	const now = options.now ?? Date.now();
 	const alive = runtime ? (options.pidAlive ?? isProcessAlive)(runtime.pid) : false;
 	const silentMs = Math.max(0, Math.trunc(options.silentMs ?? 0));
-	const dead = deadAgentView(runtime, alive, options, now);
+	// Never started is "stopped", not "dead": there is nothing that failed (#190).
+	const neverStarted = runtime === null && options.launchHistory === false;
+	const dead = neverStarted ? undefined : deadAgentView(runtime, alive, options, now);
 	return {
 		state: dead ? "dead" : alive ? "running" : "stopped",
 		...(dead ? { reason: dead.note } : {}),
+		...(neverStarted ? { neverStarted: true } : {}),
 		...(options.heartbeatAgeMs !== undefined ? { heartbeatAgeMs: options.heartbeatAgeMs } : {}),
 		silentMs,
 		...(options.unitStatus !== undefined ? { unitStatus: options.unitStatus } : {}),
@@ -911,6 +953,9 @@ export function readAgentSummary(
 	);
 	const status = deriveAgentStatus(runtime, {
 		...options,
+		// The dashboard owns the state dir, so it answers "did this profile ever
+		// start?" itself; a caller may still override the seam (#190).
+		launchHistory: options.launchHistory ?? hasLaunchHistory(profile.stateDir),
 		heartbeatAgeMs: options.heartbeatAgeMs ?? heartbeat.ageMs,
 		silentMs: options.silentMs ?? profile.config.config.health.silentMs,
 		unitStatus: options.unitStatus ?? heartbeat.heartbeat?.unitStatus,
