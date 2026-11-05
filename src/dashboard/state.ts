@@ -20,12 +20,14 @@ import type { Reminder } from "../store/reminders.js";
 import {
 	detectRunStall,
 	RUN_TURN_TRACE_LIMIT,
+	runProviderError,
 	runStoppedBy,
 	runStoppedByInferred,
 	runTurnCount,
 	type CompactionRecord,
 	type ContextResetReason,
 	type RunContextReset,
+	type RunProviderError,
 	type RunRecord,
 	type RunStoppedBy,
 	type RunStopReason,
@@ -248,6 +250,11 @@ export interface RunView {
 	stoppedByInferred: boolean;
 	outcome: RunOutcome;
 	error?: string;
+	/**
+	 * Provider failure evidence from the run record (#176), sanitized on read.
+	 * Absent for old records, non-provider failures and malformed blocks.
+	 */
+	providerError?: RunProviderError;
 	turns: number;
 	/** Per-turn usage from the run record; `undefined` when it was not recorded. */
 	steps?: RunStepView[];
@@ -285,6 +292,7 @@ export function toRunView(record: RunRecord): RunView {
 		stoppedByInferred: runStoppedByInferred(record),
 		outcome: runOutcome(record.stopReason),
 		error: record.error,
+		providerError: runProviderError(record),
 		turns: runTurnCount(record),
 		steps: toRunStepViews(record.turns),
 		promptChars: record.promptChars,
@@ -1633,9 +1641,48 @@ export function extractToolCalls(turns: SessionTurn[]): ToolCallView[] {
 	return calls;
 }
 
+/** Human bytes for the request summary: aggregate sizes only, never content. */
+function formatByteCount(bytes: number): string {
+	if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+	if (bytes < 1024) return `${Math.round(bytes)} B`;
+	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+	return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * One operator-facing line for a provider failure (#176): status, request id,
+ * model, request composition and the bounded response body. No message text and
+ * no image data: the request summary only carries counts and sizes, and the
+ * render layer masks the finished line like every other dashboard string.
+ */
+export function providerErrorLine(providerError: RunProviderError): string {
+	const parts: string[] = [];
+	if (providerError.status !== undefined) parts.push(`status ${providerError.status}`);
+	if (providerError.requestId) parts.push(`request id ${oneLine(providerError.requestId, 120)}`);
+	const model = providerError.model ?? providerError.request?.model;
+	if (model) parts.push(`model ${oneLine(model, 80)}`);
+	const request = providerError.request;
+	if (request) {
+		const messageWord = request.messages === 1 ? "message" : "messages";
+		const imageWord = request.blocks.image === 1 ? "image block" : "image blocks";
+		parts.push(`request ${request.messages} ${messageWord} / ${request.blocks.image} ${imageWord} (${formatByteCount(request.imageBytes)})`);
+		const blocks = [
+			`text ${request.blocks.text}`,
+			`tool_use ${request.blocks.tool_use}`,
+			`tool_result ${request.blocks.tool_result}`,
+		];
+		if (request.blocks.other > 0) blocks.push(`other ${request.blocks.other}`);
+		parts.push(`blocks ${blocks.join(" / ")}`);
+	}
+	if (providerError.body) parts.push(`body: ${oneLine(providerError.body, 300)}`);
+	if (providerError.attachmentsDropped) parts.push("retried without attachments");
+	return parts.length > 0 ? `provider error: ${parts.join(", ")}` : "provider error";
+}
+
 export function extractErrors(run: RunView, turns: SessionTurn[]): string[] {
 	const errors: string[] = [];
 	if (run.error) errors.push(run.error);
+	if (run.providerError) errors.push(providerErrorLine(run.providerError));
 	for (const turn of turns) {
 		if (turn.role === "assistant" && turn.errorMessage) {
 			errors.push(`${turn.at ? new Date(turn.at).toISOString() : "?"} model error: ${turn.errorMessage}`);

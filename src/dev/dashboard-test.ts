@@ -164,6 +164,24 @@ const runA = {
 	turns: 2,
 	promptChars: 1_234,
 	usage: { input: 10, output: 2, cacheRead: 30, cacheWrite: 4, total: 46, cost: 0.01 },
+	providerError: {
+		at: "2026-01-02T03:04:05.000Z",
+		status: 400,
+		requestId: "req_provider_176",
+		code: "unsupported_feature",
+		body: "this feature is not yet supported by atlas",
+		model: "atlas",
+		request: {
+			model: "atlas",
+			stream: true,
+			messages: 12,
+			blocks: { text: 2, image: 18, tool_use: 1, tool_result: 0, other: 0 },
+			imageBytes: 1_200_000,
+			bytes: 9_000_000,
+			tools: 14,
+		},
+		attachmentsDropped: true,
+	},
 };
 const runB = {
 	id: "run_b",
@@ -187,6 +205,8 @@ const runB = {
 	usage: { input: 20, output: 4, cacheRead: 40, cacheWrite: 6, total: 70, cost: 0.02 },
 	sleep: { forced: false, summaryChars: 42 },
 	contextReset: { reason: "soft" as const, tokens: 160_000, limitTokens: 150_000 },
+	// Malformed on purpose: no `at`, garbage shape. Readers must ignore it.
+	providerError: { status: 400, requestId: 42 },
 };
 const runC = {
 	id: "run_c",
@@ -1494,6 +1514,41 @@ async function main(): Promise<void> {
 	check("tool call gets a duration and short result", runDetail.toolCalls.length === 1 && runDetail.toolCalls[0]!.name === "grep" && runDetail.toolCalls[0]!.durationMs === 1_500 && runDetail.toolCalls[0]!.isError === true, runDetail.toolCalls);
 	check("tool result text is present", runDetail.toolCalls[0]!.result.includes("no such file"), runDetail.toolCalls[0]!.result);
 	check("model and tool errors are listed", runDetail.errors.some((error) => error.includes("provider timed out")) && runDetail.errors.some((error) => error.includes("grep")), runDetail.errors);
+	const providerRun = loadRunDetail(main, "run_a")!;
+	const providerLine = providerRun.errors.find((error) => error.startsWith("provider error:"));
+	check("a provider error becomes one line in errors (#176)", providerLine !== undefined, providerRun.errors);
+	check(
+		"the provider error line carries status, request id, model and request composition",
+		providerLine?.includes("status 400") === true &&
+			providerLine.includes("request id req_provider_176") &&
+			providerLine.includes("model atlas") &&
+			providerLine.includes("12 messages / 18 image blocks (1.1 MB)") &&
+			providerLine.includes("blocks text 2 / tool_use 1 / tool_result 0"),
+		providerLine,
+	);
+	check(
+		"the provider error line carries the bounded body and the retry flag",
+		providerLine?.includes("body: this feature is not yet supported by atlas") === true &&
+			providerLine.includes("retried without attachments") &&
+			providerLine.length < 600,
+		providerLine,
+	);
+	check("the provider error line has no image/base64 data", providerLine?.includes("data:image") !== true && providerLine?.includes("iVBOR") !== true, providerLine);
+	check(
+		"a run without providerError keeps its previous error list",
+		loadRunDetail(main, "run_c")!.run.providerError === undefined &&
+			loadRunDetail(main, "run_c")!.errors.every((error) => !error.startsWith("provider error:")),
+		loadRunDetail(main, "run_c")!.errors,
+	);
+	const brokenRun = loadRunDetail(main, "run_b")!;
+	check("a malformed providerError is ignored on read", brokenRun.run.providerError === undefined && brokenRun.errors.every((error) => !error.startsWith("provider error:")), brokenRun.run);
+	let brokenViewOk = false;
+	try {
+		brokenViewOk = loadAgentDetail(main, { now }).runs.some((run) => run.id === "run_b" && run.providerError === undefined);
+	} catch {
+		brokenViewOk = false;
+	}
+	check("a malformed providerError does not break the agent/status view", brokenViewOk);
 	check("missing run returns undefined", loadRunDetail(main, "run_missing") === undefined);
 	check("run A tool duration is measured too", loadRunDetail(main, "run_a")!.toolCalls[0]!.durationMs === 2_000, loadRunDetail(main, "run_a")!.toolCalls);
 
@@ -1502,6 +1557,14 @@ async function main(): Promise<void> {
 	const indexHtml = renderIndexPage([mainSummary, writerSummary], renderContext);
 	const agentHtml = renderAgentPage(detail, renderContext);
 	const runHtml = renderRunPage(runDetail, renderContext);
+	const providerRunHtml = renderRunPage(providerRun, renderContext);
+	check(
+		"the provider error line renders on the run page",
+		providerRunHtml.includes("provider error:") &&
+			providerRunHtml.includes("request id req_provider_176") &&
+			providerRunHtml.includes("12 messages / 18 image blocks"),
+		providerRunHtml.match(/provider error:[^<]*/)?.[0],
+	);
 	check(
 		"the dashboard renders the context/cacheRead metric line (#170)",
 		indexHtml.includes("context 82k · cacheRead/turn 50") && agentHtml.includes("context 82k · cacheRead/turn 50"),
