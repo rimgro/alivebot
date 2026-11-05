@@ -22,6 +22,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { main, type ServiceControl } from "../cli.js";
+import { loadConfig } from "../config.js";
+import { Logger } from "../log.js";
+import { AliveRuntime } from "../runtime/loop.js";
 import { readRuntimeState, writeRuntimeState } from "../store/runs.js";
 import { initFailuresPath, readInitFailures, writeInitFailures } from "../store/init-failures.js";
 import {
@@ -444,6 +447,41 @@ try {
 		check("SIGTERM still ends the halted process cleanly", haltedExit === 0, { exitCode: haltedExit, output: halted.output() });
 		check("the halted process is not left behind", snapshotRuntime(staying.stateDir)?.alive === false, snapshotRuntime(staying.stateDir));
 		check("the shutdown keeps the streak for the next start", readInitFailures(staying.stateDir).consecutive === 3, readInitFailures(staying.stateDir));
+
+		// A stop that lands *before* `run()` reaches its wait (SIGTERM during a slow
+		// init) must still end the process: `stop()` already ran, so its early
+		// return would swallow every later signal and a halted boot would sit on
+		// its keepalive timer forever (#173).
+		{
+			const raced = brokenProject("alive-cli-init-halt-raced-");
+			writeInitFailures(raced.stateDir, { consecutive: 2, lastFailureAt: Date.now() - 60_000 });
+			const racedConfig = loadConfig({ cwd: raced.project, configPath: raced.config });
+			const runtime = await AliveRuntime.create({
+				config: racedConfig,
+				log: new Logger({ file: racedConfig.paths.logFile, console: false, level: "info" }),
+			});
+			// The signal handler completes the whole stop while init() is still running.
+			await runtime.stop("test-before-run");
+			let timer: NodeJS.Timeout | undefined;
+			const timeout = new Promise<"timeout">((resolve) => {
+				timer = setTimeout(() => resolve("timeout"), 10_000);
+			});
+			let settled: "resolved" | "timeout" = "timeout";
+			try {
+				settled = await Promise.race([runtime.run().then(() => "resolved" as const), timeout]);
+			} finally {
+				if (timer) clearTimeout(timer);
+			}
+			check("a stop before run() still ends the halted runtime", settled === "resolved", settled);
+			check("the raced boot really halted in status=error", runtime.haltedByInitFailures, runtime.haltedByInitFailures);
+			if (settled === "timeout") {
+				// A regression here would leave the keepalive handle alive and hang the
+				// whole suite; fail loudly instead of waiting for the CI timeout.
+				process.stderr.write("\nhalted runtime did not finish after an early stop\n");
+				process.exit(1);
+			}
+			fs.rmSync(raced.project, { recursive: true, force: true });
+		}
 
 		// `--once` is a one-shot command: it must not wait in status=error.
 		const onceProject = brokenProject("alive-cli-init-halt-once-");

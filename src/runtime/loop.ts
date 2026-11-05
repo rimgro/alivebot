@@ -635,6 +635,11 @@ export class AliveRuntime {
 	 * The timer never touches runtime state, so there are still no ticks.
 	 */
 	private waitForStop(): Promise<void> {
+		// `stop()` may have completed between `init()` and this wait (SIGTERM
+		// during a slow boot): `stopping` is already set and `stopResolve` was
+		// never registered, so without this check the process would wait forever
+		// while every further signal is ignored by stop()'s early return.
+		if (this.stopping) return Promise.resolve();
 		return new Promise<void>((resolve) => {
 			const keepAlive = setInterval(() => undefined, INIT_HALT_KEEPALIVE_MS);
 			this.stopResolve = () => {
