@@ -22,6 +22,11 @@ import type { CompactionFailureClass, ContextResetReason } from "./runs.js";
  * kept failing). Unlike `context_high`, the run does not continue: its next run
  * starts with an empty context.
  *
+ * `tool_long` (#164) records one tool call that has been running longer than
+ * `loop.toolLongMs`. It is a visible anomaly, not a limit: neither the tool nor
+ * the run is stopped. The operator can abort only that tool through the
+ * dashboard button, the owner Telegram command or `alive abort-tool <agent>`.
+ *
  * One file per profile: `<stateDir>/runs/events.jsonl`, next to `runs.jsonl`.
  */
 export type RunAnomalyType =
@@ -29,6 +34,7 @@ export type RunAnomalyType =
 	| "run_no_outbound"
 	| "run_repeat_tool"
 	| "run_very_long"
+	| "tool_long"
 	| "context_high"
 	| "context_reset"
 	| "compaction_failed";
@@ -65,10 +71,12 @@ export interface RunAnomalyEvent {
 	limitTokens?: number;
 	/** `context_reset`: why `sleepForced` happened — soft grace, the hard ceiling, or repeated compaction failures. */
 	resetReason?: ContextResetReason;
-	/** `run_repeat_tool`: the tool name. Arguments are deliberately not recorded. */
+	/** `run_repeat_tool`/`tool_long`: the tool name. Arguments are deliberately not recorded. */
 	tool?: string;
 	/** `run_repeat_tool`: how many times in a row the same call was repeated. */
 	repeats?: number;
+	/** `tool_long`: how long the single tool call has been running when the anomaly fired. */
+	toolMs?: number;
 	/** `compaction_failed`: why the summarization response was rejected (#167). */
 	reasonClass?: CompactionFailureClass;
 	/** `compaction_failed`: provider attempt number that failed (0 = deferred by backoff). */

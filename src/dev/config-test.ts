@@ -22,6 +22,7 @@ import {
 	DEFAULT_LOOP_RUN_WARN_MS,
 	DEFAULT_LOOP_RESUME_WINDOW_MS,
 	DEFAULT_LOOP_SHUTDOWN_GRACE_MS,
+	DEFAULT_LOOP_TOOL_LONG_MS,
 	EMPTY_WAKE_MAX_INTERVAL_MAX_MS,
 	EMPTY_WAKE_MAX_INTERVAL_MIN_MS,
 	ensureContextTools,
@@ -374,9 +375,11 @@ section("loop run-health keys: no hard stop by default, validated thresholds (#1
 			DEFAULT_LOOP_RUN_TIMEOUT_MS === 0 &&
 			DEFAULT_LOOP_RUN_WARN_MS === 10 * 60_000 &&
 			DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS === 60 &&
-			DEFAULT_LOOP_RUN_VERY_LONG_MS === 3 * 60 * 60_000,
+			DEFAULT_LOOP_RUN_VERY_LONG_MS === 3 * 60 * 60_000 &&
+			DEFAULT_LOOP_TOOL_LONG_MS === 10 * 60_000,
 		DEFAULT_CONFIG.loop,
 	);
+	check("the single-tool anomaly defaults to 10 minutes (#164)", DEFAULT_CONFIG.loop.toolLongMs === 10 * 60_000, DEFAULT_CONFIG.loop.toolLongMs);
 	const root = tempRoot("runhealth");
 	const loaded = loadConfig({ cwd: root, secretLog: () => undefined, secretWarn: () => undefined });
 	check(
@@ -384,7 +387,8 @@ section("loop run-health keys: no hard stop by default, validated thresholds (#1
 		loaded.config.loop.runTimeoutMs === 0 &&
 			loaded.config.loop.runWarnMs === 10 * 60_000 &&
 			loaded.config.loop.runNoOutboundTurns === 60 &&
-			loaded.config.loop.runVeryLongMs === 3 * 60 * 60_000,
+			loaded.config.loop.runVeryLongMs === 3 * 60 * 60_000 &&
+			loaded.config.loop.toolLongMs === 10 * 60_000,
 		loaded.config.loop,
 	);
 
@@ -415,6 +419,9 @@ section("loop run-health keys: no hard stop by default, validated thresholds (#1
 		["a string runNoOutboundTurns", "runNoOutboundTurns", "60"],
 		["a NaN runVeryLongMs", "runVeryLongMs", Number.NaN],
 		["an infinite runWarnMs", "runWarnMs", Number.POSITIVE_INFINITY],
+		["a negative toolLongMs", "toolLongMs", -1],
+		["a fractional toolLongMs", "toolLongMs", 1.5],
+		["a string toolLongMs", "toolLongMs", "600000"],
 	];
 	for (const [label, key, value] of rejects) {
 		let message = "";
@@ -431,10 +438,11 @@ section("loop run-health keys: no hard stop by default, validated thresholds (#1
 		runWarnMs: 0,
 		runNoOutboundTurns: 0,
 		runVeryLongMs: 0,
+		toolLongMs: 0,
 	});
 	check(
 		"0 is accepted for every key, meaning disabled",
-		zeroed.runTimeoutMs === 0 && zeroed.runWarnMs === 0 && zeroed.runNoOutboundTurns === 0 && zeroed.runVeryLongMs === 0,
+		zeroed.runTimeoutMs === 0 && zeroed.runWarnMs === 0 && zeroed.runNoOutboundTurns === 0 && zeroed.runVeryLongMs === 0 && zeroed.toolLongMs === 0,
 		zeroed,
 	);
 	const partial = validateLoopConfig({
@@ -443,13 +451,15 @@ section("loop run-health keys: no hard stop by default, validated thresholds (#1
 		runWarnMs: null,
 		runNoOutboundTurns: undefined,
 		runVeryLongMs: null,
+		toolLongMs: null,
 	} as unknown as LoopConfig);
 	check(
 		"missing or null keys fall back to the defaults, not undefined",
 		partial.runTimeoutMs === 0 &&
 			partial.runWarnMs === 10 * 60_000 &&
 			partial.runNoOutboundTurns === 60 &&
-			partial.runVeryLongMs === 3 * 60 * 60_000,
+			partial.runVeryLongMs === 3 * 60 * 60_000 &&
+			partial.toolLongMs === 10 * 60_000,
 		partial,
 	);
 	fs.rmSync(root, { recursive: true, force: true });

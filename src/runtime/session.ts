@@ -22,6 +22,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { ALIVE_TOOL_NAMES, createAliveTools, type ToolDeps } from "./tools.js";
 import { SandboxManager } from "../sandbox/manager.js";
 import { createSandboxTools } from "../sandbox/tools.js";
+import type { ToolAbortGate } from "./tool-abort.js";
 
 export interface AgentBuildResult {
 	session: AgentSession;
@@ -44,6 +45,8 @@ export interface BuildAgentOptions {
 	sessionFile?: string;
 	/** Runtime-scoped owner; must be reused across context resets. */
 	sandbox?: SandboxManager;
+	/** Operator abort of the current tool (#164), shared across context resets. */
+	toolAbortGate?: ToolAbortGate;
 }
 
 /**
@@ -205,6 +208,10 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 	// The same configured allowlist is enforced by the toolbox extension for tools
 	// created or loaded after this initial activation.
 	session.setActiveToolsByName(allowedTools);
+	// Wrap every active tool (built-ins, alive tools and sandbox tools) so the
+	// operator can abort exactly the call that is running (#164). The runtime
+	// re-wraps before each model step for tools activated later.
+	options.toolAbortGate?.wrapAgent(session.agent);
 
 	if (modelFallbackMessage) log.warn("model fallback", { message: modelFallbackMessage });
 	log.info("agent session ready", {

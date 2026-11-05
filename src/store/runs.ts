@@ -439,7 +439,18 @@ export interface RuntimeStateFile {
 	lastCompaction?: CompactionRecord;
 	/** Current context (pi's prompt estimate) in tokens (#170); absent while unknown. */
 	contextTokens?: number;
+	/**
+	 * The tool call running right now (#164), so the dashboard can show it and
+	 * mark a call that has outlived `loop.toolLongMs`. Absent while no tool runs.
+	 */
+	activeTool?: RuntimeActiveTool;
 	error?: string;
+}
+
+export interface RuntimeActiveTool {
+	name: string;
+	startedAt: number;
+	runId?: string;
 }
 
 export function writeRuntimeState(stateDir: string, state: RuntimeStateFile): void {

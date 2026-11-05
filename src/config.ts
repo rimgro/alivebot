@@ -87,6 +87,15 @@ export interface LoopConfig {
 	 */
 	runVeryLongMs: number;
 	/**
+	 * Anomaly threshold for one **tool call** (#164): when a single tool has been
+	 * running this long, the runtime writes one `tool_long` event and shows a
+	 * visible marker on the dashboard agent/run pages. It never stops the tool or
+	 * the run; the operator can abort just that tool with the dashboard button,
+	 * the owner Telegram command or `alive abort-tool <agent>`. 0 = disabled.
+	 * Default 10 minutes.
+	 */
+	toolLongMs: number;
+	/**
 	 * Context-size hint (#123). When the estimated context of the pi session crosses
 	 * this many tokens, the agent is steered one service message: finish the current
 	 * coherent task, and if it is finished or you are switching to unrelated work,
@@ -222,6 +231,8 @@ export const DEFAULT_LOOP_RUN_TIMEOUT_MS = 0;
 export const DEFAULT_LOOP_RUN_WARN_MS = 10 * 60_000;
 export const DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS = 60;
 export const DEFAULT_LOOP_RUN_VERY_LONG_MS = 3 * 60 * 60_000;
+/** A single tool running longer than this is an anomaly (#164), not a stop. */
+export const DEFAULT_LOOP_TOOL_LONG_MS = 10 * 60_000;
 
 /** Context-size hint defaults (#123): warn at 150k tokens, re-arm every +50k. */
 export const DEFAULT_LOOP_CONTEXT_WARN_TOKENS = 150_000;
@@ -316,6 +327,7 @@ export function validateLoopConfig(value: LoopConfig): LoopConfig {
 		runWarnMs: runHealthMs(value.runWarnMs, "runWarnMs", DEFAULT_LOOP_RUN_WARN_MS),
 		runNoOutboundTurns: runHealthMs(value.runNoOutboundTurns, "runNoOutboundTurns", DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS),
 		runVeryLongMs: runHealthMs(value.runVeryLongMs, "runVeryLongMs", DEFAULT_LOOP_RUN_VERY_LONG_MS),
+		toolLongMs: runHealthMs(value.toolLongMs, "toolLongMs", DEFAULT_LOOP_TOOL_LONG_MS),
 		contextWarnTokens,
 		contextWarnStepTokens,
 		contextSleepTokens,
@@ -878,6 +890,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		runWarnMs: DEFAULT_LOOP_RUN_WARN_MS,
 		runNoOutboundTurns: DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS,
 		runVeryLongMs: DEFAULT_LOOP_RUN_VERY_LONG_MS,
+		toolLongMs: DEFAULT_LOOP_TOOL_LONG_MS,
 		contextWarnTokens: DEFAULT_LOOP_CONTEXT_WARN_TOKENS,
 		contextWarnStepTokens: DEFAULT_LOOP_CONTEXT_WARN_STEP_TOKENS,
 		contextSleepTokens: DEFAULT_LOOP_CONTEXT_SLEEP_TOKENS,
