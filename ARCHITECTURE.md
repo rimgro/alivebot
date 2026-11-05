@@ -110,6 +110,7 @@
 | `src/runtime/session.ts` | сборка pi-сессии: изолированный agent dir, модель, tools, resource loader |
 | `src/runtime/agent.ts` | один run: `idle`-цикл, steering, run health (warn/аномалии), settle, `rebuildSession` |
 | `src/runtime/loop.ts` | внешний цикл, scheduler, бюджет, транспорты, состояние |
+| `src/runtime/tool-abort.ts` | одноразовый флаг `abort-tool.json`, `AbortSignal` только для текущего tool call (#164) |
 | `src/transports/*` | console (stdin/stdout), HTTP (inbound/outbound pull), интерфейс для своих |
 | `src/events/api.ts` | публичный Events API: `AliveModule`, `ModuleContext`, `AliveModuleFactory` |
 | `src/events/host.ts` | хост модулей: маршрутизация outbound (claimer/listener/tap), статус, инструменты |
@@ -244,6 +245,13 @@ awake/nudge/idle-сообщениях.
   `run_no_outbound` / `run_very_long`, по одному на run.
 - `run_repeat_tool` — тот же tool с идентичными аргументами три раза подряд
   (сравнивается канонический JSON аргументов; сами аргументы не сохраняются).
+- `tool_long` (#164) — один tool call идёт дольше `loop.toolLongMs` (по
+  умолчанию 10 минут, `0` = выкл). Событие несёт имя tool и его длительность,
+  не останавливает ни tool, ни run и показывается пометкой на странице
+  агента/run. Оператор может оборвать только этот tool через dashboard,
+  `/abort_tool` в личном Telegram-чате владельца или
+  `alive abort-tool <agent>`; агент получает ошибку
+  `aborted by operator: tool <name>`, run продолжается, `stoppedBy` не пишется.
 - Все события `run_*` — только счётчики (`runId`, `agent`, `activeMs`,
   `durationMs`, `turns`, `outbound`, входящие события, порог); ни текста промпта,
   ни текста сообщений. Они не останавливают run и не попадают в контекст агента:

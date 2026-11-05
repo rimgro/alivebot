@@ -28,6 +28,7 @@ import { readStopIntent, type StopInitiator } from "./daemon.js";
 import { buildAgent, readSoul } from "./session.js";
 import { hasWakeWorthyPending, WakeScheduler } from "./wake.js";
 import { SandboxManager } from "../sandbox/manager.js";
+import { ToolAbortGate } from "./tool-abort.js";
 import { WorkerManager } from "../workers/manager.js";
 import { DashboardTool } from "../dashboard/tool.js";
 import type { RunHandle, ToolDeps } from "./tools.js";
@@ -89,6 +90,7 @@ export class AliveRuntime {
 	private history!: HistoryStore;
 	private runs!: RunLog;
 	private runEvents!: RunEventLog;
+	private toolAbort!: ToolAbortGate;
 	private runner!: AgentRunner;
 	private sandbox?: SandboxManager;
 	private workers?: WorkerManager;
@@ -155,6 +157,16 @@ export class AliveRuntime {
 		this.history = HistoryStore.open(paths.stateDir);
 		this.runs = new RunLog(paths.stateDir);
 		this.runEvents = new RunEventLog(paths.stateDir);
+		// One gate per runtime process, shared by every context reset. It owns the
+		// single "current tool" and turns `abort-tool.json` into an AbortSignal for
+		// exactly that call (#164).
+		this.toolAbort = new ToolAbortGate({
+			stateDir: paths.stateDir,
+			log: this.log.child("tool-abort"),
+			journal: this.journal,
+			currentRunId: () => this.currentRun?.id,
+			onStateChange: () => this.writeState(true),
+		});
 		// The idle-wake gate (#116): a run starts only when there is something to
 		// do, so an empty idle interval costs an inbox check, not a model call.
 		this.wake = new WakeScheduler({
@@ -224,6 +236,7 @@ export class AliveRuntime {
 			runtimeStatus: () => this.status(),
 			isStopping: () => this.stopping,
 			isBudgetExhausted: () => !this.budgetAllowsRun(),
+			toolAbortGate: this.toolAbort,
 		});
 
 		const loaded = await loadModules(this.config, this.log);
@@ -270,6 +283,7 @@ export class AliveRuntime {
 			// `config.session` (new vs continue).
 			sessionFile: forceNew || !this.pendingResume ? undefined : this.resumeSessionFile,
 			sandbox: this.sandbox,
+			toolAbortGate: this.toolAbort,
 		});
 		this.sandbox?.startMonitoring();
 		return built.session;
@@ -393,6 +407,7 @@ export class AliveRuntime {
 		await this.runner.init();
 
 		this.schedulerTimer = setInterval(() => this.schedulerTick(), this.config.config.loop.pollIntervalMs);
+		this.toolAbort.startPolling();
 		this.statusKind = "idle";
 		this.writeState(true);
 		this.initialized = true;
@@ -441,6 +456,9 @@ export class AliveRuntime {
 	async stop(reason = "requested", options: StopOptions = {}): Promise<void> {
 		if (this.stopping) return;
 		this.stopping = true;
+		// Operator tool-abort polling belongs to a live runtime; a stop/restart is
+		// the separate graceful path and must not race it (#164, #181).
+		this.toolAbort?.stopPolling();
 		// Both `alive stop` and `alive restart` arrive as SIGTERM, so the initiator
 		// comes from the explicit argument, the stop-intent marker or the SIGTERM
 		// default (a service manager restart) — never from the signal alone (#168).
@@ -526,6 +544,9 @@ export class AliveRuntime {
 
 	private schedulerTick(): void {
 		try {
+			// A one-shot operator request must be noticed within about one poll
+			// interval even while the agent is blocked inside a long tool.
+			this.toolAbort.check();
 			this.fireDueReminders();
 			this.runner.checkRunGuards();
 			this.writeState();
@@ -649,6 +670,7 @@ export class AliveRuntime {
 			emptyWakes: this.wake?.consecutiveEmptyWakes ?? 0,
 			lastCompaction: this.lastCompactionRecord(),
 			contextTokens: this.currentContextTokens(),
+			activeTool: this.toolAbort?.activeTool(),
 			mode: process.env.ALIVE_DAEMON === "1" ? "background" : "foreground",
 		};
 		writeRuntimeState(this.config.paths.stateDir, state);
@@ -730,6 +752,8 @@ export class AliveRuntime {
 			lastRun: lastRun ? { ...lastRun, summary: describeRunRecord(lastRun) } : undefined,
 			lastCompaction: this.lastCompactionRecord(),
 			contextTokens: this.currentContextTokens(),
+			activeTool: this.toolAbort?.activeTool(),
+			toolLongMs: this.config.config.loop.toolLongMs,
 			cacheReadPerTurn: lastRun && runTurnCount(lastRun) > 0
 				? (lastRun.usage?.cacheRead ?? 0) / runTurnCount(lastRun)
 				: undefined,

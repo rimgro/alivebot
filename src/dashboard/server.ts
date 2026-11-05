@@ -58,6 +58,8 @@ import {
 } from "./state.js";
 import { DashboardTicketStore, type DashboardTicketOptions } from "./tickets.js";
 import { readDashboardRuntime } from "./state-file.js";
+import { writeToolAbortRequest } from "../runtime/tool-abort.js";
+import { snapshotRuntime } from "../runtime/daemon.js";
 
 export const DEFAULT_DASHBOARD_HOST = "127.0.0.1";
 export const DEFAULT_DASHBOARD_PORT = 7777;
@@ -273,7 +275,12 @@ interface SettingsRoute {
 	agentId: string;
 }
 
-type Route = ResolvedRoute | AgentRoute | RunRoute | MemoryRoute | SettingsRoute | { kind: "not-found"; message: string };
+interface AbortToolRoute {
+	kind: "abort-tool";
+	agentId: string;
+}
+
+type Route = ResolvedRoute | AgentRoute | RunRoute | MemoryRoute | SettingsRoute | AbortToolRoute | { kind: "not-found"; message: string };
 
 function decodeSegment(segment: string): string {
 	try {
@@ -306,6 +313,11 @@ export function resolveDashboardRoute(rawUrl: string | undefined): Route {
 		const agentId = segments[1]!;
 		if (!isValidAgentId(agentId)) return { kind: "not-found", message: `invalid agent id: ${agentId}` };
 		return { kind: "settings", agentId };
+	}
+	if (segments.length === 3 && segments[0] === "agent" && segments[2] === "abort-tool") {
+		const agentId = segments[1]!;
+		if (!isValidAgentId(agentId)) return { kind: "not-found", message: `invalid agent id: ${agentId}` };
+		return { kind: "abort-tool", agentId };
 	}
 	if (segments.length === 3 && segments[0] === "run") {
 		const agentId = segments[1]!;
@@ -511,6 +523,9 @@ export function createDashboardServer(options: DashboardServerOptions): Dashboar
 	const env = options.env ?? process.env;
 	const csrfTokens = new CsrfTokenStore();
 	const logoutCsrfTokens = new CsrfTokenStore();
+	// A separate store: a token minted for the abort button must never be usable
+	// as a settings token, or vice versa.
+	const abortCsrfTokens = new CsrfTokenStore();
 	const authOptions = options.auth;
 	const authStore = authOptions
 		? new DashboardAuthStore(authOptions.stateDir, authOptions.now ?? now)
@@ -736,6 +751,67 @@ export function createDashboardServer(options: DashboardServerOptions): Dashboar
 		}
 	};
 
+	/**
+	 * POST /agent/<id>/abort-tool (#164).
+	 *
+	 * Writes the one-shot flag the runtime consumes on its next poll. This is not
+	 * a stop: the runtime aborts only the tool that is running at that moment, the
+	 * run continues and `stoppedBy` is never written.
+	 */
+	const handleAbortToolPost = async (
+		req: http.IncomingMessage,
+		res: http.ServerResponse,
+		agentId: string,
+		auth: RenderContext["auth"],
+	): Promise<void> => {
+		let profile: DashboardProfile | undefined;
+		try {
+			const profiles = loadDashboard(loadRootConfig({ rootDir: options.rootDir, configPath: options.configPath }));
+			profile = profileOrNull(profiles, agentId);
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			options.log?.(`dashboard abort-tool error: ${message}`);
+			send(res, 500, renderErrorPage(500, `internal dashboard error: ${message}`, fallbackContext(auth)), false, authHeaders());
+			return;
+		}
+		if (!profile) {
+			send(res, 404, renderErrorPage(404, `unknown agent: ${agentId}`, fallbackContext(auth)), false, authHeaders());
+			return;
+		}
+		const fallback = `/agent/${encodeURIComponent(profile.id)}`;
+		try {
+			const contentType = String(req.headers["content-type"] ?? "").split(";")[0]!.trim().toLowerCase();
+			if (contentType !== "application/x-www-form-urlencoded") {
+				throw new SettingsEditError(415, "abort-tool POST requires Content-Type: application/x-www-form-urlencoded");
+			}
+			const body = await readRequestBody(req, DASHBOARD_AUTH_MAX_BODY_BYTES);
+			const params = new URLSearchParams(body.toString("utf8"));
+			if (!abortCsrfTokens.consume(profile.id, params.get("csrf") ?? "")) {
+				throw new SettingsEditError(403, "invalid or missing CSRF token: reload the page and press the button again");
+			}
+			const rawRunId = params.get("run")?.trim() ?? "";
+			const runId = rawRunId && RUN_ID_RE.test(rawRunId) ? rawRunId : undefined;
+			const rawReturn = params.get("return")?.trim() ?? "";
+			// Only same-profile pages: no absolute URL, no protocol-relative URL.
+			const returnTo = rawReturn.startsWith(`/agent/${profile.id}`) || rawReturn.startsWith(`/run/${profile.id}/`)
+				? rawReturn
+				: fallback;
+			const runtime = snapshotRuntime(profile.stateDir);
+			if (!runtime?.alive) {
+				options.log?.(`dashboard: abort-tool for ${profile.id} ignored (runtime is not running)`);
+				redirect(res, `${returnTo}${returnTo.includes("?") ? "&" : "?"}aborted=not-running`);
+				return;
+			}
+			writeToolAbortRequest(profile.stateDir, { source: "dashboard", by: "dashboard", ...(runId ? { runId } : {}) });
+			options.log?.(`dashboard: abort-tool requested for ${profile.id}${runId ? ` run ${runId}` : ""}`);
+			redirect(res, `${returnTo}${returnTo.includes("?") ? "&" : "?"}aborted=requested`);
+		} catch (error) {
+			const status = error instanceof SettingsEditError ? error.status : 500;
+			const message = error instanceof Error ? error.message : String(error);
+			send(res, status, renderErrorPage(status, message, fallbackContext(auth)), false, authHeaders());
+		}
+	};
+
 	const server = http.createServer((req, res) => {
 		void (async () => {
 			const method = req.method ?? "GET";
@@ -851,8 +927,12 @@ export function createDashboardServer(options: DashboardServerOptions): Dashboar
 				await handleSettingsPost(req, res, route.agentId, auth);
 				return;
 			}
+			if (method === "POST" && route.kind === "abort-tool") {
+				await handleAbortToolPost(req, res, route.agentId, auth);
+				return;
+			}
 			if (method !== "GET" && !headOnly) {
-				const allow = route.kind === "settings" ? "GET, HEAD, POST" : "GET, HEAD";
+				const allow = route.kind === "settings" || route.kind === "abort-tool" ? "GET, HEAD, POST" : "GET, HEAD";
 				send(res, 405, renderErrorPage(405, `only ${allow} are allowed on this route`, fallbackContext(auth)), false, { allow, ...authHeaders() });
 				return;
 			}
@@ -889,6 +969,7 @@ export function createDashboardServer(options: DashboardServerOptions): Dashboar
 							secrets: profile.config.config.secrets,
 							env,
 							now: now(),
+							actionCsrfToken: abortCsrfTokens.issue(profile.id, now()),
 							...(auth ? { auth } : {}),
 						}), headOnly, { "content-security-policy": AGENT_PAGE_CSP });
 						return;
@@ -929,6 +1010,13 @@ export function createDashboardServer(options: DashboardServerOptions): Dashboar
 						});
 						return;
 					}
+					case "abort-tool": {
+						send(res, 405, renderErrorPage(405, "abort-tool accepts POST only", renderContext), headOnly, {
+							allow: "POST",
+							...authHeaders(),
+						});
+						return;
+					}
 					case "run": {
 						const profile = profileOrNull(profiles, route.agentId);
 						if (!profile) {
@@ -949,12 +1037,14 @@ export function createDashboardServer(options: DashboardServerOptions): Dashboar
 							secrets: profile.config.config.secrets,
 							env,
 							now: now(),
+							actionCsrfToken: abortCsrfTokens.issue(profile.id, now()),
 							...(auth ? { auth } : {}),
-						}), headOnly, authHeaders());
+						}), headOnly, { "content-security-policy": AGENT_PAGE_CSP });
 						return;
 					}
 					default: {
-						send(res, 404, renderErrorPage(404, route.message, renderContext), headOnly, authHeaders());
+						const message = route.kind === "not-found" ? route.message : "not found";
+						send(res, 404, renderErrorPage(404, message, renderContext), headOnly, authHeaders());
 						return;
 					}
 				}

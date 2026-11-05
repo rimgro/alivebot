@@ -1170,9 +1170,49 @@ export function buildTimeline(profile: DashboardProfile, options: TimelineOption
 	return items.slice(0, options.limit ?? TIMELINE_MAX_ITEMS);
 }
 
+/** The tool call running right now, as shown on the agent and run pages (#164). */
+export interface ActiveToolView {
+	name: string;
+	startedAt: number;
+	/** Wall-clock age at render time. */
+	durationMs: number;
+	/** True when the age crossed `loop.toolLongMs`; the page marks it visibly. */
+	long: boolean;
+	/** Configured threshold, 0 when the anomaly is disabled. */
+	thresholdMs: number;
+	runId?: string;
+}
+
+/**
+ * Build the active-tool view from `runtime.json`.
+ *
+ * The runtime writes the start timestamp when a tool begins; age and the long
+ * marker are computed at render time, so a page loaded ten minutes into a hung
+ * `bash` shows it without waiting for another state write.
+ */
+export function toActiveToolView(
+	active: RuntimeStateFile["activeTool"],
+	options: { now?: number; thresholdMs?: number } = {},
+): ActiveToolView | undefined {
+	if (!active || typeof active.name !== "string" || !Number.isFinite(active.startedAt)) return undefined;
+	const now = options.now ?? Date.now();
+	const thresholdMs = Math.max(0, options.thresholdMs ?? 0);
+	const durationMs = Math.max(0, now - active.startedAt);
+	return {
+		name: active.name,
+		startedAt: active.startedAt,
+		durationMs,
+		long: thresholdMs > 0 && durationMs >= thresholdMs,
+		thresholdMs,
+		...(active.runId ? { runId: active.runId } : {}),
+	};
+}
+
 export interface AgentDetail {
 	summary: AgentSummary;
 	runtime: RuntimeStateFile | null;
+	/** The tool running right now, if any (#164). */
+	activeTool?: ActiveToolView;
 	/** Items on the current timeline page (filtered and paginated). */
 	timeline: TimelineItem[];
 	/** Counts and the clamped query for the timeline page. */
@@ -1198,9 +1238,14 @@ export function loadAgentDetail(
 	const query = options.timelineQuery ?? parseTimelineQuery(new URLSearchParams());
 	const filtered = filterTimeline(buildTimeline(profile), query, { now: options.now });
 	const timelinePage = paginateTimeline(filtered, query);
+	const runtime = readRuntimeStateFile(profile.stateDir);
 	return {
 		summary: readAgentSummary(profile, options),
-		runtime: readRuntimeStateFile(profile.stateDir),
+		runtime,
+		activeTool: toActiveToolView(runtime?.activeTool, {
+			now: options.now,
+			thresholdMs: profile.config.config.loop.toolLongMs,
+		}),
 		timeline: timelinePage.items,
 		timelinePage,
 		// Newest first, bounded: the detail page is an overview, not an export.
@@ -1936,6 +1981,8 @@ export function buildPromptCostPairs(steps: RunStepsView, promptTurns: SessionTu
 export interface RunDetail {
 	agent: { id: string; name: string; model: string };
 	run: RunView;
+	/** The tool running in this run right now, if it is the live run (#164). */
+	liveTool?: ActiveToolView;
 	/** Per-turn cost breakdown and its sum check against the aggregate (#121). */
 	steps: RunStepsView;
 	/** Prompt blocks with chars, estimated tokens and shares (#121). */
@@ -1992,6 +2039,12 @@ export function loadRunDetail(
 	}
 	const steps = buildRunSteps(run);
 	const systemPrompt = reconstructSystemPrompt(profile);
+	const runtime = readRuntimeStateFile(profile.stateDir);
+	// Only the live run may show a live tool: a historical run page must never
+	// claim that today's hanging tool belongs to it.
+	const liveTool = runtime?.runId === run.id
+		? toActiveToolView(runtime.activeTool, { now: options.now, thresholdMs: profile.config.config.loop.toolLongMs })
+		: undefined;
 	return {
 		agent: {
 			id: profile.id,
@@ -1999,6 +2052,7 @@ export function loadRunDetail(
 			model: profile.config.config.model.trim() || "default",
 		},
 		run,
+		liveTool,
 		steps,
 		promptComposition: buildPromptComposition(systemPrompt, turns, run.promptChars),
 		promptCostPairs: buildPromptCostPairs(steps, promptTurns),

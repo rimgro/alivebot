@@ -19,6 +19,7 @@ import { maskSecrets } from "../secrets.js";
 import { privateMemoryScope } from "./memory-access.js";
 import { compactionMonitorFor } from "./compaction.js";
 import type { RunHandle, ToolDeps } from "./tools.js";
+import type { ToolAbortGate } from "./tool-abort.js";
 
 /**
  * A prompt may be retried only when the failure happened before any tool ran or
@@ -66,6 +67,12 @@ export interface AgentRunnerDeps {
 	runtimeStatus: () => Record<string, unknown>;
 	isStopping: () => boolean;
 	isBudgetExhausted: () => boolean;
+	/**
+	 * Operator abort of the current tool (#164). Optional so the fake-session
+	 * tests and embedders that do not expose a dashboard still work; when set,
+	 * every active tool is wrapped and can be aborted without touching the run.
+	 */
+	toolAbortGate?: ToolAbortGate;
 }
 
 /**
@@ -165,6 +172,10 @@ interface RunWatch {
 	contextReset?: { reason: ContextResetReason; tokens: number; limitTokens: number };
 	/** Turn of the previous failed compaction, for the repeated-failure window. */
 	lastCompactionFailureTurn?: number;
+	/** The tool currently executing in this run (#164), if any. */
+	activeTool?: { name: string; startedAt: number };
+	/** True once `tool_long` was emitted for the current tool invocation. */
+	toolLongFlagged: boolean;
 }
 
 /**
@@ -366,6 +377,26 @@ export class AgentRunner {
 			watch.veryLongFlagged = true;
 			this.emitAnomaly(run, { type: "run_very_long", now, activeMs, limitMs: loop.runVeryLongMs });
 		}
+
+		// One tool call that has been running longer than `toolLongMs` (#164). This
+		// is a visible anomaly, never a stop: the operator may abort only that tool
+		// (dashboard, Telegram or CLI), and the run continues afterwards. The flag
+		// is reset when the call ends or another call starts, so a single hanging
+		// invocation produces exactly one event, not one per scheduler tick.
+		if (loop.toolLongMs > 0 && watch.activeTool && !watch.toolLongFlagged) {
+			const toolMs = Math.max(0, now - watch.activeTool.startedAt);
+			if (toolMs >= loop.toolLongMs) {
+				watch.toolLongFlagged = true;
+				this.emitAnomaly(run, {
+					type: "tool_long",
+					now,
+					activeMs,
+					limitMs: loop.toolLongMs,
+					tool: watch.activeTool.name,
+					toolMs,
+				});
+			}
+		}
 	}
 
 	/**
@@ -412,6 +443,8 @@ export class AgentRunner {
 			reasonClass?: RunAnomalyEvent["reasonClass"];
 			attempt?: number;
 			maxAttempts?: number;
+			/** `tool_long`: how long the single tool call has been running. */
+			toolMs?: number;
 			/** Log-only: the short reason and masked provider excerpt, never persisted. */
 			reason?: string;
 			excerpt?: string;
@@ -439,6 +472,7 @@ export class AgentRunner {
 			reasonClass: input.reasonClass,
 			attempt: input.attempt,
 			maxAttempts: input.maxAttempts,
+			toolMs: input.toolMs,
 		};
 		this.deps.runEvents?.append(event);
 		this.deps.log.warn(event.type, {
@@ -515,6 +549,8 @@ export class AgentRunner {
 				contextSleepSteered: false,
 				contextReset: undefined,
 				lastCompactionFailureTurn: undefined,
+				activeTool: undefined,
+				toolLongFlagged: false,
 			};
 			store.beginRun(run.id);
 
@@ -550,6 +586,9 @@ export class AgentRunner {
 					first = false;
 					run.promptChars += prompt.length;
 					const tokensBeforePrompt = sessionTokenTotal(this.session);
+					// Re-wrap right before each model step: a tool activated during the
+					// previous step (e.g. by the tool registry) must also be abortable.
+					this.deps.toolAbortGate?.wrapAgent(this.session.agent);
 					const turnsBeforePrompt = run.turns;
 					const toolCallsBeforePrompt = this.toolCallsThisRun;
 					await withRetries(
@@ -916,6 +955,10 @@ export class AgentRunner {
 			case "tool_execution_start": {
 				this.trackRepeatedTool(event.toolName, event.args);
 				if (run) this.toolCallsThisRun += 1;
+				if (this.watch && this.watch.runId === run?.id && typeof event.toolName === "string") {
+					this.watch.activeTool = { name: event.toolName, startedAt: Date.now() };
+					this.watch.toolLongFlagged = false;
+				}
 				const label = oneLine(JSON.stringify(event.args ?? {}), 160);
 				if (this.deps.config.config.verbose) {
 					this.deps.log.raw(`${term.dim(stamp())} ${term.cyan(`→ ${event.toolName}`)} ${term.gray(label)}`);
@@ -923,6 +966,10 @@ export class AgentRunner {
 				break;
 			}
 			case "tool_execution_end": {
+				if (this.watch && this.watch.activeTool?.name === event.toolName) {
+					this.watch.activeTool = undefined;
+					this.watch.toolLongFlagged = false;
+				}
 				const resultText = toolResultText(event.result);
 				if (this.deps.config.config.verbose) {
 					const color = event.isError ? term.red : term.green;

@@ -62,6 +62,8 @@ import { formatThread, isTelegramTarget, parseThread, resolveThreadRef } from ".
 import type { TelegramCallbackQuery, TelegramChat, TelegramSentMessage, TelegramUpdate } from "./types.js";
 import { normalizeUpdate, type NormalizedInbound } from "./update.js";
 import { acceptBrowserPairing } from "../browser/operator.js";
+import { parseAbortToolCommand, writeToolAbortRequest } from "../../runtime/tool-abort.js";
+import { snapshotRuntime } from "../../runtime/daemon.js";
 import { classifyNetworkError, withRetries } from "../../retry.js";
 import {
 	GROQ_TRANSCRIPTION_MAX_RETRY_AFTER_MS,
@@ -836,6 +838,12 @@ export class TelegramModule implements AliveModule {
 			return;
 		}
 
+		// Owner-only control command (#164): abort only the tool that is running
+		// now. It never reaches the agent's context and never stops the run.
+		if (parseAbortToolCommand(inbound.text) && this.isOwnerPrivateChat(inbound)) {
+			await this.handleAbortToolCommand(inbound);
+			return;
+		}
 		// Edits are corrections, not new questions (#113): debounce them per message
 		// and deliver one merged event for the whole burst instead of one run per
 		// keystroke. `processInbound` receives the burst metadata for `meta.edits`.
@@ -844,6 +852,42 @@ export class TelegramModule implements AliveModule {
 			return;
 		}
 		await this.processInbound(inbound);
+	}
+
+	/** The operator is the human in their own private chat, never a group/channel. */
+	private isOwnerPrivateChat(inbound: NormalizedInbound): boolean {
+		return inbound.chat.type === "private" && !!inbound.author && String(inbound.author.id) === inbound.chatId;
+	}
+
+	/**
+	 * `/abort_tool` from the owner: write the one-shot flag and answer in the
+	 * same thread. The runtime consumes it on its next poll and returns the tool
+	 * error to the agent; the run, its context and `stoppedBy` are untouched.
+	 */
+	private async handleAbortToolCommand(inbound: NormalizedInbound): Promise<void> {
+		const ctx = this.ctx;
+		const api = this.api;
+		if (!ctx || !api) return;
+		const runtime = snapshotRuntime(ctx.paths.stateDir);
+		let text: string;
+		if (!runtime?.alive) {
+			text = "Агент не запущен: абортить нечего. Запрос не записан.";
+		} else {
+			const active = runtime.state.activeTool;
+			writeToolAbortRequest(ctx.paths.stateDir, {
+				source: "telegram",
+				by: `telegram:${inbound.author?.id ?? inbound.chatId}`,
+				...(runtime.state.runId ? { runId: runtime.state.runId } : {}),
+			});
+			text = active
+				? `Запросил аборт текущего инструмента «${active.name}». Run продолжится: агент получит ошибку тула и пойдёт дальше.`
+				: "Запросил аборт. Сейчас ни один инструмент не выполняется — запрос будет проигнорирован, run не тронут.";
+		}
+		await api.sendMessage({
+			chat_id: inbound.chatId,
+			text,
+			message_thread_id: inbound.topicId !== undefined ? Number(inbound.topicId) : undefined,
+		}).catch((error) => ctx.log.warn("telegram abort-tool reply failed", { chatId: inbound.chatId, error: message(error) }));
 	}
 
 	/**

@@ -67,6 +67,7 @@ import {
 } from "../dashboard/state.js";
 import { renderAgentPage, renderIndexPage, renderMemoryPage, renderRunPage, renderSettingsPage } from "../dashboard/render.js";
 import { createDashboardServer, resolveDashboardRoute, validateDashboardBind } from "../dashboard/server.js";
+import { readToolAbortRequest, toolAbortRequestPath } from "../runtime/tool-abort.js";
 
 let failures = 0;
 
@@ -225,6 +226,9 @@ writeJson(path.join(stateDir, "runtime.json"), {
 	openThreads: 0,
 	sleeps: 1,
 	contextTokens: 82_000,
+	// A single slow tool (#164): the agent/run pages must show it and mark it as
+	// long because its age is past the default 10-minute threshold.
+	activeTool: { name: "bash", startedAt: now - 11 * 60_000, runId: "run_c" },
 	mode: "background",
 });
 writeJson(path.join(stateDir, "reminders.json"), [
@@ -1270,7 +1274,7 @@ async function main(): Promise<void> {
 	check("run A tool duration is measured too", loadRunDetail(main, "run_a")!.toolCalls[0]!.durationMs === 2_000, loadRunDetail(main, "run_a")!.toolCalls);
 
 	section("masking");
-	const renderContext = { secrets: DEFAULT_SECRETS_CONFIG, env: {}, now };
+	const renderContext = { secrets: DEFAULT_SECRETS_CONFIG, env: {}, now, actionCsrfToken: "abort-csrf-token" };
 	const indexHtml = renderIndexPage([mainSummary, writerSummary], renderContext);
 	const agentHtml = renderAgentPage(detail, renderContext);
 	const runHtml = renderRunPage(runDetail, renderContext);
@@ -1292,6 +1296,22 @@ async function main(): Promise<void> {
 	check("run page masks the token in the reconstructed system prompt", !runHtml.includes(GITHUB_TOKEN), runHtml.includes(GITHUB_TOKEN));
 	check("masking keeps the prompt readable around the placeholder", runHtml.includes("AWAKE #3") && runHtml.includes("You are the root test agent."));
 	check("run page states when the exact system prompt is unavailable", runHtml.includes("not persisted") && runHtml.includes("reconstructed"));
+
+	section("operator abort-tool button and long-tool marker (#164)");
+	check(
+		"the agent page shows the running tool and its age",
+		detail.activeTool?.name === "bash" && agentHtml.includes("current tool") && agentHtml.includes("bash") && agentHtml.includes("11m"),
+		{ active: detail.activeTool, html: agentHtml.match(/current tool[\s\S]{0,300}/)?.[0] },
+	);
+	check("a tool past the threshold is marked visibly as long", detail.activeTool?.long === true && agentHtml.includes("tool long"), detail.activeTool);
+	check(
+		"the agent page has a CSRF-protected POST button to abort the tool",
+		agentHtml.includes('action="/agent/main/abort-tool"') && agentHtml.includes('name="csrf" value="abort-csrf-token"') && agentHtml.includes("abort current tool"),
+	);
+	const liveRun = loadRunDetail(main, "run_c")!;
+	const liveRunHtml = renderRunPage(liveRun, renderContext);
+	check("the live run page carries the same tool marker and button", liveRun.liveTool?.name === "bash" && liveRunHtml.includes("tool long") && liveRunHtml.includes('action="/agent/main/abort-tool"') && liveRunHtml.includes('name="run" value="run_c"'));
+	check("a historical run page does not claim the live tool", loadRunDetail(main, "run_a")!.liveTool === undefined && !renderRunPage(loadRunDetail(main, "run_a")!, renderContext).includes("tool long"));
 
 	section("per-turn steps (#121)");
 	const tracedProfile = findProfile(loadDashboard(loadRootConfig({ rootDir: tracedRoot })), "main")!;
@@ -2097,6 +2117,45 @@ async function main(): Promise<void> {
 		const postAgentPage = await fetch(`${baseUrl}/agent/bulk`, { method: "POST" });
 		check("POST on an agent page is still 405", postAgentPage.status === 405, postAgentPage.status);
 		await postAgentPage.text();
+
+		section("abort-tool over HTTP (#164)");
+		const abortUrl = `${baseUrl}/agent/main/abort-tool`;
+		const abortTokenFrom = (html: string): string => /name="csrf" value="([^"]+)"/.exec(html)?.[1] ?? "";
+		const abortPage = await fetch(`${baseUrl}/agent/main`);
+		const abortPageBody = await abortPage.text();
+		const abortToken = abortTokenFrom(abortPageBody);
+		check(
+			"the agent page renders a CSRF-protected abort button",
+			abortPage.status === 200 && abortPageBody.includes('action="/agent/main/abort-tool"') && abortToken.length >= 32,
+			abortPage.status,
+		);
+		const abortNoToken = await fetch(abortUrl, {
+			method: "POST",
+			headers: { "content-type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ run: "run_c" }).toString(),
+			redirect: "manual",
+		});
+		check("abort-tool POST without a CSRF token is 403", abortNoToken.status === 403, abortNoToken.status);
+		await abortNoToken.text();
+		const abortOk = await fetch(abortUrl, {
+			method: "POST",
+			headers: { "content-type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams({ csrf: abortToken, run: "run_c", return: "/run/main/run_c" }).toString(),
+			redirect: "manual",
+		});
+		check(
+			"a valid abort-tool POST redirects back to the run page",
+			abortOk.status === 303 && (abortOk.headers.get("location") ?? "").includes("/run/main/run_c") && (abortOk.headers.get("location") ?? "").includes("aborted=requested"),
+			{ status: abortOk.status, location: abortOk.headers.get("location") },
+		);
+		await abortOk.text();
+		const abortFlag = readToolAbortRequest(stateDir, { now: Date.now(), runId: "run_c" });
+		check(
+			"the dashboard button writes a dashboard-sourced flag for the live run",
+			abortFlag?.source === "dashboard" && abortFlag.runId === "run_c",
+			abortFlag,
+		);
+		fs.rmSync(toolAbortRequestPath(stateDir), { force: true });
 		const missingMemory = await fetch(`${baseUrl}/agent/nobody/memory`);
 		check("unknown agent memory page is 404", missingMemory.status === 404, missingMemory.status);
 		const missing = await fetch(`${baseUrl}/agent/nobody`);
@@ -2140,9 +2199,9 @@ async function main(): Promise<void> {
 			indexResponse.headers.get("content-security-policy"),
 		);
 		check(
-			"the agent page CSP allows only its same-origin GET filter form",
+			"the agent page CSP allows its same-origin filter and abort forms",
 			(agentResponse.headers.get("content-security-policy") ?? "").includes("form-action 'self'") &&
-				!agentBody.includes('method="post"'),
+				agentBody.includes('action="/agent/main/abort-tool"'),
 			agentResponse.headers.get("content-security-policy"),
 		);
 		const rootSettingsPage = await fetch(`${baseUrl}/agent/main/settings`);

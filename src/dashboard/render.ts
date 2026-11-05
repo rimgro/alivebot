@@ -64,6 +64,8 @@ export interface RenderContext {
 	 * itself never reaches a page.
 	 */
 	auth?: { logoutCsrfToken?: string };
+	/** Per-render, single-use CSRF token for the "abort current tool" form (#164). */
+	actionCsrfToken?: string;
 }
 
 class Masker {
@@ -175,6 +177,11 @@ table.mini th { color: var(--muted); font-weight: 500; white-space: nowrap; }
 .st.working { color: var(--working); }
 .st.waiting { color: var(--waiting); }
 .st.sleeping { color: var(--sleeping); }
+.st.long { color: var(--error); border-color: var(--error); }
+form.abort { margin: 10px 0 0; }
+form.abort button { background: transparent; color: var(--text); border: 1px solid var(--line); padding: 5px 10px; font: inherit; cursor: pointer; }
+form.abort button:hover { border-color: var(--error); color: var(--error); }
+form.abort .sub { margin-top: 6px; }
 .outcome.sleep { color: var(--sleep); }
 .outcome.idle { color: var(--waiting); }
 .outcome.interrupted { color: var(--working); }
@@ -325,12 +332,12 @@ function layout(masker: Masker, title: string, body: string, nav: string[] = [],
 <span class="brand">alive</span>
 ${navHtml}
 ${logout}
-<span class="tag">127.0.0.1 · read-only unless settings</span>
+<span class="tag">127.0.0.1 · read-only except settings/abort</span>
 </header>
 <main>
 ${body}
 </main>
-<footer>read-only snapshot of on-disk agent state — the only write route is /agent/[id]/settings (loopback, CSRF-protected, backups kept).</footer>
+<footer>read-only snapshot of on-disk agent state — the only write routes are /agent/[id]/settings (config, backups kept) and /agent/[id]/abort-tool (one-shot operator flag); both are loopback-only and CSRF-protected.</footer>
 </body>
 </html>`);
 }
@@ -354,6 +361,42 @@ function memoryHref(id: string, masker: Masker): string {
 
 function settingsHref(id: string, masker: Masker): string {
 	return `${agentHref(id, masker)}/settings`;
+}
+
+function abortToolHref(id: string, masker: Masker): string {
+	return `${agentHref(id, masker)}/abort-tool`;
+}
+
+/**
+ * The current-tool block and its abort form (#164).
+ *
+ * The form is rendered only when the page has an action CSRF token; a page
+ * without one is a plain read model, not an action surface. A long-running
+ * tool is marked visibly, and the button aborts only that call: the run and
+ * its context stay alive.
+ */
+function renderActiveTool(
+	active: AgentDetail["activeTool"],
+	agentId: string,
+	masker: Masker,
+	context: RenderContext,
+	options: { runId?: string; returnTo: string } = { returnTo: `/agent/${agentId}` },
+): string {
+	const state = active
+		? `<p>${active.long ? `<span class="st long">tool long</span> ` : ""}<span class="mono">${masker.text(active.name)}</span> · running ${masker.text(formatDuration(active.durationMs))}` +
+			`${active.thresholdMs > 0 ? ` <span class="sub">(long-tool threshold ${masker.text(formatDuration(active.thresholdMs))})</span>` : ""}</p>`
+		: `<p class="empty">No tool is running right now.</p>`;
+	const token = context.actionCsrfToken;
+	if (!token) return state;
+	const runField = options.runId ? `<input type="hidden" name="run" value="${masker.text(options.runId)}">` : "";
+	return `${state}
+<form class="abort" method="post" action="${abortToolHref(agentId, masker)}">
+<input type="hidden" name="csrf" value="${masker.text(token)}">
+<input type="hidden" name="return" value="${masker.text(options.returnTo)}">
+${runField}
+<button type="submit">abort current tool</button>
+<div class="sub">The run stays alive: the agent gets a tool error and continues with the next step.</div>
+</form>`;
 }
 
 function renderStatus(summary: AgentSummary, masker: Masker): string {
@@ -690,6 +733,7 @@ export function renderAgentPage(detail: AgentDetail, context: RenderContext): st
 <table class="kv">
 <tr><th>status</th><td>${renderStatus(summary, masker)}</td><th>model</th><td class="mono">${masker.text(summary.model)}</td></tr>
 <tr><th>current run</th><td>${masker.text(summary.currentRun)}</td><th>spend today</th><td class="mono">${masker.text(formatCost(summary.spendTodayUsd))}</td></tr>
+<tr><th>current tool</th><td colspan="3">${renderActiveTool(detail.activeTool, summary.id, masker, context, { runId: detail.activeTool?.runId, returnTo: `/agent/${summary.id}` })}</td></tr>
 <tr><th>context</th><td colspan="3" class="mono">${renderContextMetric(summary, masker)}</td></tr>
 <tr><th>runs recorded</th><td class="mono">${masker.num(detail.totals.runs)}</td><th>lifetime cost</th><td class="mono">${masker.text(formatCost(detail.totals.cost))}</td></tr>
 <tr><th>pid</th><td class="mono">${summary.pid === undefined ? "—" : masker.num(summary.pid)}</td><th>config</th><td class="mono">${masker.text(summary.configPath)}</td></tr>
@@ -910,6 +954,11 @@ ${detail.transcript.map((turn) => renderTurn(turn, masker)).join("\n")}
 <p class="sub"><a href="${agentHref(detail.agent.id, masker)}">${masker.text(detail.agent.name)}</a> ·
 run ${masker.text(run.id)} · ${masker.text(formatTimestamp(run.startedAt))} → ${masker.text(formatTimestamp(run.finishedAt))} ·
 <span class="outcome ${run.outcome.key}">${masker.text(run.outcome.label)}</span>${run.stoppedBy === run.outcome.key ? "" : ` · stopped by ${masker.text(stoppedByLabel(run))}`}${run.usageUnsettled ? " · usage unsettled" : ""}</p>
+
+<h2>live tool</h2>
+${detail.liveTool
+		? renderActiveTool(detail.liveTool, detail.agent.id, masker, context, { runId: run.id, returnTo: `/run/${detail.agent.id}/${run.id}` })
+		: `<p class="empty">${detail.run.finishedAt <= context.now ? "This run has finished; no tool is running in it." : "No tool is running in this run right now."}</p>`}
 
 <h2>totals</h2>
 <table class="kv">

@@ -27,6 +27,7 @@ import { resolveToken } from "./modules/telegram/module.js";
 import { browserCommand } from "./modules/browser/cli.js";
 import { TelegramAllowlistStore, TelegramStateStore, telegramIdentityView } from "./modules/telegram/state.js";
 import { AliveRuntime } from "./runtime/loop.js";
+import { writeToolAbortRequest } from "./runtime/tool-abort.js";
 import { readHeartbeatStatus } from "./heartbeat.js";
 import { snapshotRuntime, spawnBackground, stdoutLogPath, stopRuntime, waitForRuntime, type StopInitiator, type StopResult } from "./runtime/daemon.js";
 import {
@@ -229,6 +230,19 @@ export async function main(argv: string[], options: CliOptions = {}): Promise<nu
 				if (printServiceHelp("stop", flags)) return 0;
 				process.stderr.write(`${interruptWarningLine("stop")}\n`);
 				return await stopCommand(cwd, flags, options);
+			}
+			case "abort-tool": {
+				if (flagBool(flags, "help") || flagBool(flags, "h")) {
+					process.stdout.write(
+						"usage: alive abort-tool <agent> [--config CONFIG]\n\n" +
+							"Aborts only the tool call the agent is running right now. The run stays\n" +
+							"alive, keeps its context, and the agent receives the tool error\n" +
+							"\"aborted by operator: tool <name>\" and continues with the next step.\n" +
+							"<agent> is a managed agent id or `main` for the root profile.\n",
+					);
+					return 0;
+				}
+				return abortToolCommand(cwd, flags, positionals);
 			}
 			case "restart": {
 				if (printServiceHelp("restart", flags)) return 0;
@@ -535,6 +549,48 @@ async function startBackground(config: LoadedConfig, flags: Record<string, strin
 			`  alive logs -f     follow ${logPath}\n` +
 			`  alive status      state, inbox, threads\n` +
 			`  alive stop        graceful stop (SIGTERM, then SIGKILL)\n`,
+	);
+	return 0;
+}
+
+/**
+ * `alive abort-tool <agent>` (#164): write the one-shot flag for the tool the
+ * target profile is running right now. This is deliberately not `alive stop`:
+ * it never signals the process and never closes the run.
+ */
+function abortToolCommand(
+	cwd: string,
+	flags: Record<string, string | boolean>,
+	positionals: string[],
+): number {
+	const base = loadForCli(flags);
+	const target = positionals[0]?.trim();
+	if (positionals.length > 1) throw new Error("usage: alive abort-tool <agent> [--config CONFIG]");
+	let config = base;
+	let label = "main";
+	if (target && target !== "main") {
+		const agent = findManagedAgent(base, target);
+		config = loadConfig({ cwd: base.paths.rootDir, configPath: agent.configPath });
+		label = agent.id;
+	}
+	const runtime = snapshotRuntime(config.paths.stateDir);
+	if (!runtime?.alive) {
+		process.stderr.write(`${term.yellow("not running")} — ${label} has no live runtime; nothing to abort\n`);
+		return 1;
+	}
+	const active = runtime.state.activeTool;
+	if (!active) {
+		process.stderr.write(`${term.yellow("no tool is running")} — ${label} is between tool calls; the run was not touched\n`);
+		return 1;
+	}
+	writeToolAbortRequest(config.paths.stateDir, {
+		source: "cli",
+		by: process.env.USER?.trim() ? `cli:${process.env.USER.trim()}` : "cli",
+		...(runtime.state.runId ? { runId: runtime.state.runId } : {}),
+	});
+	process.stdout.write(
+		`abort requested for ${label}: tool ${active.name} (running ${formatDuration(Math.max(0, Date.now() - active.startedAt))})\n` +
+			term.dim("the run continues; the agent receives a tool error and moves to the next step\n"),
 	);
 	return 0;
 }
@@ -1632,6 +1688,8 @@ usage:
   alive workers models                        show the worker model/permission allowlist
   alive stop [--force] [--timeout 30s]        stop the running instance
                                               (--force: SIGKILL immediately)
+  alive abort-tool <agent>                    abort only the tool running right now
+                                              (run/context/stoppedBy are untouched)
   alive restart [--yes] [--verbose]           stop, then start in the background again
                                               (refused when run inside the harness unless --yes)
   alive update [--check] [--tag vX.Y.Z] [--force]

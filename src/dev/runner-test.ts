@@ -37,6 +37,7 @@ import { TurnTraceRecorder, residualUsage, zeroUsage } from "../runtime/run-trac
 import { hasWakeWorthyPending, WakeScheduler, wakeIntervalMs } from "../runtime/wake.js";
 import { createAliveTools, type RunHandle, type ToolDeps } from "../runtime/tools.js";
 import { installCompactionGuard } from "../runtime/compaction.js";
+import { ToolAbortGate, writeToolAbortRequest } from "../runtime/tool-abort.js";
 
 let failures = 0;
 function check(name: string, condition: boolean, detail?: unknown): void {
@@ -62,6 +63,7 @@ const config = loadConfig({
 			runWarnMs: 10 * 60_000,
 			runNoOutboundTurns: 60,
 			runVeryLongMs: 3 * 60 * 60_000,
+			toolLongMs: 10 * 60_000,
 			contextWarnTokens: 150_000,
 			contextWarnStepTokens: 50_000,
 			contextSleepTokens: 150_000,
@@ -299,6 +301,7 @@ function setRunHealth(patch: {
 	runWarnMs?: number;
 	runNoOutboundTurns?: number;
 	runVeryLongMs?: number;
+	toolLongMs?: number;
 }): void {
 	Object.assign(config.config.loop, patch);
 }
@@ -308,6 +311,7 @@ function resetRunHealth(): void {
 		runWarnMs: 10 * 60_000,
 		runNoOutboundTurns: 60,
 		runVeryLongMs: 3 * 60 * 60_000,
+		toolLongMs: 10 * 60_000,
 	});
 }
 function setContextWarn(patch: {
@@ -507,6 +511,98 @@ section("run_repeat_tool fires on the third identical call in a row");
 	};
 	const record = await runner.execute();
 	check("the anomaly did not stop the run", record?.stopReason === "slept", record?.stopReason);
+}
+
+section("tool_long fires once for a single slow tool call, never stops it (#164)");
+{
+	policy.reset();
+	setRunHealth({ runTimeoutMs: 0, runWarnMs: 0, runNoOutboundTurns: 0, runVeryLongMs: 0, toolLongMs: 10 * 60_000 });
+	handler = async (session) => {
+		const run = currentRun!;
+		session.emit({ type: "tool_execution_start", toolName: "bash", args: { command: "sleep 600" } });
+		const startedAt = Date.now();
+		runner.checkRunGuards(startedAt + 10 * 60_000 - 1_000);
+		check("no tool_long just before the threshold", anomaliesOf(run.id, "tool_long").length === 0);
+		runner.checkRunGuards(startedAt + 10 * 60_000 + 1_000);
+		const fired = anomaliesOf(run.id, "tool_long");
+		check(
+			"tool_long fires past the configured threshold with the tool name and age",
+			fired.length === 1 && fired[0]?.tool === "bash" && (fired[0]?.toolMs ?? 0) >= 10 * 60_000 && fired[0]?.limitMs === 10 * 60_000,
+			fired,
+		);
+		check("tool_long does not record tool arguments", !JSON.stringify(fired[0] ?? {}).includes("sleep 600"), fired[0]);
+		runner.checkRunGuards(startedAt + 20 * 60_000);
+		check("one long tool call produces exactly one event, not a per-tick spam", anomaliesOf(run.id, "tool_long").length === 1);
+		session.emit({ type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "ok" }] }, isError: false });
+		runner.checkRunGuards(startedAt + 30 * 60_000);
+		check("the flag is cleared when the tool ends", anomaliesOf(run.id, "tool_long").length === 1);
+		session.emit({ type: "tool_execution_start", toolName: "bash", args: { command: "sleep 600" } });
+		runner.checkRunGuards(Date.now() + 10 * 60_000 + 1_000);
+		check("a new long invocation fires its own event", anomaliesOf(run.id, "tool_long").length === 2);
+		session.emit({ type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "ok" }] }, isError: false });
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "tool-long test", summary_md: "# tool-long test\n" });
+	};
+	const record = await runner.execute();
+	check("the long-tool anomaly did not stop the run", record?.stopReason === "slept", record?.stopReason);
+	setRunHealth({ toolLongMs: 0 });
+	handler = async (session) => {
+		const run = currentRun!;
+		session.emit({ type: "tool_execution_start", toolName: "bash", args: {} });
+		runner.checkRunGuards(Date.now() + 60 * 60_000);
+		check("toolLongMs = 0 disables the anomaly", anomaliesOf(run.id, "tool_long").length === 0);
+		session.emit({ type: "tool_execution_end", toolName: "bash", result: { content: [{ type: "text", text: "ok" }] }, isError: false });
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "tool-long disabled", summary_md: "# tool-long disabled\n" });
+	};
+	await runner.execute();
+	resetRunHealth();
+}
+
+section("operator abort of the current tool keeps the run and writes no stoppedBy (#164)");
+{
+	policy.reset();
+	resetRunHealth();
+	const gate = new ToolAbortGate({
+		stateDir: config.paths.stateDir,
+		log,
+		journal,
+		currentRunId: () => currentRun?.id,
+	});
+	handler = async (session) => {
+		const run = currentRun!;
+		let toolError: string | undefined;
+		const tool = gate.wrapTool({
+			name: "bash",
+			execute: async (_id: string, _params: unknown, signal?: AbortSignal) => new Promise<string>((_resolve, reject) => {
+				const abort = () => reject(new Error("the guest command was killed"));
+				if (signal?.aborted) {
+					abort();
+					return;
+				}
+				signal?.addEventListener("abort", abort, { once: true });
+			}),
+		});
+		const running = tool.execute("call_abort", { command: "sleep 600" });
+		writeToolAbortRequest(config.paths.stateDir, { source: "dashboard", by: "dashboard", runId: run.id });
+		const decision = gate.check();
+		check("the dashboard request aborts the running tool", decision.kind === "aborted", decision);
+		try {
+			await running;
+		} catch (error) {
+			toolError = error instanceof Error ? error.message : String(error);
+		}
+		check("the tool result is the operator-abort error", toolError === "aborted by operator: tool bash", toolError);
+		check("the run is still the active run", currentRun?.id === run.id);
+		check("the marker is gone", !fs.existsSync(path.join(config.paths.stateDir, "abort-tool.json")));
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "aborted tool only", summary_md: "# aborted tool only\n" });
+	};
+	const record = await runner.execute();
+	check("the agent continued the same run after the tool error", record?.stopReason === "slept", record?.stopReason);
+	check("the run was not closed as aborted", record?.stoppedBy === "sleep", record?.stoppedBy);
+	check("no aborted/interrupted stop reason was written", record?.stopReason !== "aborted" && record?.stopReason !== "interrupted", record?.stopReason);
+	check("the journal records the abort", journal.tail(20).some((line) => line.includes("[abort-tool] bash") && line.includes("dashboard")), journal.tail(20));
 }
 
 // ---------------------------------------------------------------------------
