@@ -56,6 +56,8 @@ interface FakeRepoOptions {
 	start?: FakeRef;
 	tags?: string[];
 	dirty?: string[];
+	/** Paths `git diff --name-only --no-renames HEAD <ref>` reports; a map keys them by ref. */
+	changedPaths?: string[] | Record<string, string[]>;
 	failBuild?: (ref: FakeRef) => boolean;
 	initialFiles?: Record<string, string>;
 }
@@ -133,6 +135,11 @@ function createFakeRepo(options: FakeRepoOptions = {}): FakeRepo {
 	const fsOps = createFakeFs(options.initialFiles ?? {});
 	let ref: FakeRef = options.start ?? { kind: "branch", name: "main" };
 	const commitOf = (value: FakeRef): string => `sha-${value.kind}-${value.name}`;
+	const changedPaths = (target: string): string[] => {
+		const value = options.changedPaths;
+		if (!value) return [];
+		return Array.isArray(value) ? value : (value[target] ?? []);
+	};
 	const ok = (stdout = ""): RunResult => ({ stdout, stderr: "" });
 	const fail = (command: string, args: string[], detail: string): never => {
 		throw new CommandFailure(command, args, 1, "", detail);
@@ -156,6 +163,12 @@ function createFakeRepo(options: FakeRepoOptions = {}): FakeRepo {
 					return ok(`${ref.name}\n`);
 				case "status":
 					return ok(dirty.length ? `${dirty.join("\n")}\n` : "");
+				case "diff": {
+					if (args[1] !== "--name-only" || args[2] !== "--no-renames" || args[3] !== "HEAD" || !args[4]) {
+						return fail("git", args, `unexpected diff command: ${args.join(" ")}`);
+					}
+					return ok(changedPaths(args[4]).join("\n"));
+				}
 				case "checkout": {
 					const target = args[1];
 					if (!target) return fail("git", args, "error: missing checkout target");
@@ -424,6 +437,26 @@ async function typescriptTests(): Promise<void> {
 		check("marker has restartRequested: true", final?.restartRequested === true, final);
 		check("output explains the exit-10 contract", h.out.join("\n").includes("restart requested") && h.out.join("\n").includes("exiting 10"), h.out);
 		check("auto never restarts or stops anything", !repo.calls.some((call) => call.command === "alive" || call.args.includes("restart") || call.args.includes("stop")), commandLines(repo));
+	}
+
+	section("--auto applies over local changes the update does not touch (#182)");
+	{
+		const repo = createFakeRepo({
+			tags: TAGS,
+			dirty: [" M SOUL.md", " M alive.config.json"],
+			changedPaths: ["src/cli.ts"],
+			initialFiles: EXISTING_MARKER,
+		});
+		const h = harness(repo);
+		const code = await runUpdate({ cwd: ROOT, auto: true }, h.deps);
+		check("auto-update succeeds without --force", code === 10, { code, err: h.err });
+		check("checks out the target", repo.ref().kind === "tag" && repo.ref().name === "v0.2.0", repo.ref());
+		check("keeps the local edits", markerWrites(repo)[0]?.dirtyKept?.includes("SOUL.md") === true, markerWrites(repo)[0]);
+		check(
+			"warns that the local edits are kept",
+			h.err.join("\n").includes("does not touch") && h.err.join("\n").includes("alive.config.json"),
+			h.err,
+		);
 	}
 
 	section("--auto failure inside apply rolls back and exits 1");
