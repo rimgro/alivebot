@@ -14,6 +14,7 @@ import { Logger } from "../log.js";
 import { RunLog, providerRequestSummary, runProviderError, type ProviderRequestSummary, type RunRecord } from "../store/runs.js";
 import {
 	ATTACHMENT_OMITTED_TEXT,
+	IMAGE_OMITTED_TEXT,
 	ProviderDiagnostics,
 	describeProviderError,
 	hasImageAttachments,
@@ -35,6 +36,16 @@ function check(name: string, condition: boolean, detail?: unknown): void {
 }
 function section(name: string): void {
 	process.stdout.write(`\n${name}\n`);
+}
+
+/** A Logger whose `warn` calls are captured instead of written anywhere. */
+function captureWarnings(): { logger: Logger; warnings: Array<{ message: string; data?: unknown }> } {
+	const warnings: Array<{ message: string; data?: unknown }> = [];
+	const logger = new Logger({ console: false, level: "error", scope: "provider-diag-test" });
+	(logger as unknown as { warn: (message: string, data?: unknown) => void }).warn = (message, data) => {
+		warnings.push({ message, data });
+	};
+	return { logger, warnings };
 }
 
 const log = new Logger({ console: false, level: "error", scope: "provider-diag-test" });
@@ -252,6 +263,89 @@ section("ProviderDiagnostics: hooks, summaries, one-shot attachment drop, take")
 	check("describeError masks secrets in the body", masked.body?.includes("sk-ant-") === false && masked.body?.includes("[anthropic#1]") === true, masked.body);
 }
 
+section("ProviderDiagnostics: text-only model image placeholders (#202)");
+{
+	type FakeAgent = ProviderHookAgent & {
+		onPayload: (payload: unknown, model: unknown) => unknown | undefined | Promise<unknown | undefined>;
+		onResponse: (response: { status: number; headers: Record<string, string> }, model: unknown) => void | Promise<void>;
+	};
+	const makeAgent = (): FakeAgent => ({ onPayload: () => undefined, onResponse: () => {} });
+	const { logger, warnings } = captureWarnings();
+	const diag = new ProviderDiagnostics({ log: logger, secrets });
+	const agent = makeAgent();
+	diag.attach(agent);
+
+	const payload = {
+		model: "deepseek-v4.1-flash",
+		stream: true,
+		messages: [
+			{
+				role: "user",
+				content: [
+					{ type: "text", text: "what is on this screenshot" },
+					{ type: "image", data: pngBase64, mimeType: "image/png" },
+				],
+			},
+		],
+	};
+	const before = JSON.stringify(payload);
+	const textOnly = { id: "deepseek-v4.1-flash", input: ["text"] };
+	const omitted = await agent.onPayload(payload, textOnly);
+	const omittedText = JSON.stringify(omitted);
+	check("a text-only model gets a payload copy", omitted !== undefined && omitted !== payload, omitted);
+	check("the image block becomes the text placeholder", omittedText.includes(IMAGE_OMITTED_TEXT), omittedText);
+	check("no base64 reaches the provider copy", !omittedText.includes(pngBase64.slice(0, 16)), omittedText);
+	check("the session payload is not mutated", JSON.stringify(payload) === before);
+	check("the original still carries the image block", JSON.stringify(payload).includes('"type":"image"'));
+	check("the snapshot counts the omitted images", diag.last()?.imagesOmitted === 1, diag.last());
+	check(
+		"the recorded request has no images left",
+		diag.last()?.request?.blocks.image === 0 && diag.last()?.request?.imageBytes === 0,
+		diag.last()?.request,
+	);
+	check("one warning is logged", warnings.length === 1, warnings);
+	const warnData = warnings[0]?.data as Record<string, unknown> | undefined;
+	check(
+		"the warning names the model and the dropped image count, never the image",
+		warnData?.model === "deepseek-v4.1-flash" && warnData?.images === 1 && (warnData?.imageBytes as number) > 0,
+		warnData,
+	);
+	check("the warning has no base64", !JSON.stringify(warnings).includes(pngBase64.slice(0, 16)), warnings);
+
+	const second = await agent.onPayload(payload, textOnly);
+	check("a second request is still sent with the placeholder", JSON.stringify(second).includes(IMAGE_OMITTED_TEXT));
+	check("but the warning is per session, not per request", warnings.length === 1, warnings);
+
+	diag.reset();
+	await agent.onPayload(payload, textOnly);
+	check("reset() between runs does not re-enable the warning", warnings.length === 1, warnings);
+
+	const openaiPayload = {
+		messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64}` } }] }],
+	};
+	const openaiBefore = JSON.stringify(openaiPayload);
+	const openaiOmitted = JSON.stringify(await agent.onPayload(openaiPayload, textOnly));
+	check("image_url blocks are replaced too", openaiOmitted.includes(IMAGE_OMITTED_TEXT) && !openaiOmitted.includes("data:image/png"), openaiOmitted);
+	check("the image_url payload is not mutated", JSON.stringify(openaiPayload) === openaiBefore);
+	check("a payload without content is left alone", (await agent.onPayload({ model: "deepseek-v4.1-flash" }, textOnly)) === undefined);
+
+	const vision = await agent.onPayload(payload, { id: "vision-model", input: ["text", "image"] });
+	check("a vision model gets the payload unchanged", vision === undefined, vision);
+	check("a vision model does not log the warning", warnings.length === 1, warnings);
+	check("a vision request keeps its images in the snapshot", diag.last()?.request?.blocks.image === 1, diag.last()?.request);
+	check("a vision request is not marked as omitted", diag.last()?.imagesOmitted === undefined, diag.last());
+
+	const rebuilt = makeAgent();
+	diag.attach(rebuilt);
+	await rebuilt.onPayload(payload, textOnly);
+	check("a rebuilt session (new agent) warns again", warnings.length === 2, warnings);
+	await rebuilt.onPayload(payload, textOnly);
+	check("the rebuilt session still warns only once", warnings.length === 2, warnings);
+
+	const noInput = await rebuilt.onPayload(payload, { id: "unknown-capabilities" });
+	check("an unknown model capability is left untouched", noInput === undefined, noInput);
+}
+
 section("providerErrorRecord: the shape persisted on the run");
 {
 	const request: ProviderRequestSummary = {
@@ -278,6 +372,12 @@ section("providerErrorRecord: the shape persisted on the run");
 	check("carries the ISO timestamp", record.at === "2026-01-02T03:04:05.000Z", record.at);
 	check("carries the model and request summary", record.model === "atlas" && record.request?.blocks.image === 18, record);
 	check("carries attachmentsDropped", record.attachmentsDropped === true, record);
+	const omittedRecord = providerErrorRecord(Date.now(), { body: "rejected" }, {
+		at: Date.now(),
+		request,
+		imagesOmitted: 18,
+	});
+	check("carries imagesOmitted for a text-only model", omittedRecord.imagesOmitted === 18, omittedRecord);
 
 	const fromSnapshot = providerErrorRecord(Date.now(), { body: "rejected" }, {
 		at: Date.now(),
@@ -352,6 +452,15 @@ section("RunLog: providerError round-trip and old records");
 	check("the sanitizer returns undefined for an old record", runProviderError(old ?? {}) === undefined);
 	check("the sanitizer ignores a malformed block", runProviderError({ providerError: { status: 400 } }) === undefined);
 	check("the sanitizer ignores a non-object block", runProviderError({ providerError: "boom" }) === undefined);
+	check(
+		"the sanitizer keeps imagesOmitted",
+		runProviderError({ providerError: { at: "2026-01-02T03:04:05.000Z", imagesOmitted: 18 } })?.imagesOmitted === 18,
+		runProviderError({ providerError: { at: "2026-01-02T03:04:05.000Z", imagesOmitted: 18 } }),
+	);
+	check(
+		"the sanitizer drops a non-numeric imagesOmitted",
+		runProviderError({ providerError: { at: "2026-01-02T03:04:05.000Z", imagesOmitted: "18" } })?.imagesOmitted === undefined,
+	);
 
 	const partial = providerRequestSummary({ messages: "nope", blocks: { image: 2 }, imageBytes: 3, bytes: 4 });
 	check(

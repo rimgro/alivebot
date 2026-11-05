@@ -13,9 +13,10 @@
  *   `body`, `error`, `$response.body`) and pulls the request id out of the
  *   response headers;
  * - `ProviderDiagnostics` attaches to the pi agent through its public
- *   `onPayload`/`onResponse` hooks, remembers the last request/response pair and
+ *   `onPayload`/`onResponse` hooks, remembers the last request/response pair,
  *   can strip image blocks from exactly one outgoing payload so a format
- *   rejection can be retried without attachments.
+ *   rejection can be retried without attachments, and permanently replaces
+ *   image blocks with a text note when the model has no image input (#202).
  *
  * Pure functions plus one small stateful helper: no filesystem, no network.
  * The caller (the runtime) masks the response body before logging/persisting it.
@@ -31,6 +32,15 @@ export const MAX_PROVIDER_ERROR_BODY_CHARS = 1000;
 export const MAX_REQUEST_ID_CHARS = 200;
 /** Text that replaces a dropped image block in the retried payload. */
 export const ATTACHMENT_OMITTED_TEXT = "[attachment omitted: provider rejected the request format]";
+/**
+ * Text that permanently replaces an image block when the model has no image
+ * input (#202). Unlike `ATTACHMENT_OMITTED_TEXT`, this is not a retry: the
+ * session history keeps its images and every outgoing request gets the copy.
+ *
+ * pi's image parts are `{ type: "image", data, mimeType }` (or `image_url`
+ * with a data URI on the wire) and carry no path, so there is no `path=` here.
+ */
+export const IMAGE_OMITTED_TEXT = "[image omitted: model has no image input]";
 
 /** Header names probed for a request id, case-insensitively, in this order. */
 const REQUEST_ID_HEADERS: readonly string[] = [
@@ -341,6 +351,7 @@ export function providerErrorRecord(
 	if (snapshot?.request?.model !== undefined) record.model = snapshot.request.model;
 	if (snapshot?.request !== undefined) record.request = snapshot.request;
 	if (snapshot?.attachmentsDropped === true) record.attachmentsDropped = true;
+	if (snapshot?.imagesOmitted !== undefined && snapshot.imagesOmitted > 0) record.imagesOmitted = snapshot.imagesOmitted;
 	return record;
 }
 
@@ -350,6 +361,8 @@ export interface ProviderDiagnosticsSnapshot {
 	response?: { status?: number; requestId?: string };
 	/** True when this request was sent without the image blocks. */
 	attachmentsDropped?: boolean;
+	/** How many image blocks this request replaced because the model cannot see images (#202). */
+	imagesOmitted?: number;
 	at: number;
 }
 
@@ -377,6 +390,8 @@ export class ProviderDiagnostics {
 	private readonly secrets: SecretsConfig;
 	private state: ProviderDiagnosticsSnapshot | undefined;
 	private dropNextPayload = false;
+	/** One warning per session, not per request: a run's `reset()` must not clear it. */
+	private imagesOmittedWarned = false;
 	private readonly attachedAgents = new WeakSet<object>();
 
 	constructor(options: ProviderDiagnosticsOptions) {
@@ -392,11 +407,14 @@ export class ProviderDiagnostics {
 		if (!agent || typeof agent !== "object") return;
 		if (this.attachedAgents.has(agent)) return;
 		this.attachedAgents.add(agent);
+		// A new agent object means a rebuilt session, even though `reset()` runs on
+		// every run of the same session: the one-warning budget starts over here.
+		this.imagesOmittedWarned = false;
 		const previousPayload = agent.onPayload;
 		const previousResponse = agent.onResponse;
 
 		agent.onPayload = async (payload, model) => {
-			const ours = this.recordPayload(payload);
+			const ours = this.recordPayload(payload, model);
 			let next = ours;
 			if (previousPayload) {
 				const theirs = await previousPayload(next ?? payload, model);
@@ -427,7 +445,13 @@ export class ProviderDiagnostics {
 		return snapshot;
 	}
 
-	/** Clear everything, including a pending attachment drop (new run / new agent). */
+	/**
+	 * Clear the per-run state, including a pending attachment drop.
+	 *
+	 * `imagesOmittedWarned` deliberately survives: `reset()` runs at the start
+	 * and the end of every run of the SAME session, while #202 wants one warning
+	 * per session. Attaching a new agent (a rebuilt session) clears it.
+	 */
 	reset(): void {
 		this.state = undefined;
 		this.dropNextPayload = false;
@@ -450,16 +474,39 @@ export class ProviderDiagnostics {
 		return description;
 	}
 
-	private recordPayload(payload: unknown): unknown | undefined {
-		this.state = { at: Date.now(), request: summarizePayload(payload) };
-		if (!this.dropNextPayload) return undefined;
-		this.dropNextPayload = false;
-		const stripped = stripImageBlocks(payload);
-		if (!stripped.changed) return undefined;
-		this.state.attachmentsDropped = true;
-		this.state.request = summarizePayload(stripped.value);
-		this.log.debug("provider payload sent without attachments", { request: this.state.request });
-		return stripped.value;
+	private recordPayload(payload: unknown, model?: unknown): unknown | undefined {
+		const summary = summarizePayload(payload);
+		this.state = { at: Date.now(), request: summary };
+		if (this.dropNextPayload) {
+			this.dropNextPayload = false;
+			const stripped = stripImageBlocks(payload);
+			if (stripped.changed) {
+				this.state.attachmentsDropped = true;
+				this.state.request = summarizePayload(stripped.value);
+				this.log.debug("provider payload sent without attachments", { request: this.state.request });
+				return stripped.value;
+			}
+		}
+		// #202: a text-only model rejects a request that carries images. Replace
+		// them in the outgoing copy; the session history is never mutated. The warn
+		// is per session because every request of a text-only session gets here.
+		if (summary.blocks.image > 0 && modelHasNoImageInput(model)) {
+			const omitted = stripImageBlocks(payload, IMAGE_OMITTED_TEXT);
+			if (omitted.changed) {
+				this.state.imagesOmitted = summary.blocks.image;
+				this.state.request = summarizePayload(omitted.value);
+				if (!this.imagesOmittedWarned) {
+					this.imagesOmittedWarned = true;
+					this.log.warn("provider payload images omitted: model has no image input", {
+						model: modelId(model) ?? summary.model,
+						images: summary.blocks.image,
+						imageBytes: summary.imageBytes,
+					});
+				}
+				return omitted.value;
+			}
+		}
+		return undefined;
 	}
 
 	private recordResponse(response: { status?: number; headers?: unknown }): void {
@@ -480,17 +527,28 @@ function isImageBlock(record: UnknownRecord): boolean {
 	return record.type === "image" || record.type === "image_url";
 }
 
+/** True only when the model advertises its inputs and none of them is `image`. */
+function modelHasNoImageInput(model: unknown): boolean {
+	const input = asRecord(model)?.input;
+	return Array.isArray(input) && !input.includes("image");
+}
+
+function modelId(model: unknown): string | undefined {
+	const id = asRecord(model)?.id;
+	return typeof id === "string" && id.length > 0 ? id : undefined;
+}
+
 /**
  * Copy `value`, replacing every image block with a text placeholder.
  *
  * Returns the original reference when nothing changed, so callers can tell a
  * no-op from a real rewrite (and the history object is never mutated).
  */
-function stripImageBlocks(value: unknown): { value: unknown; changed: boolean } {
+function stripImageBlocks(value: unknown, placeholder = ATTACHMENT_OMITTED_TEXT): { value: unknown; changed: boolean } {
 	if (Array.isArray(value)) {
 		let changed = false;
 		const out = value.map((entry) => {
-			const stripped = stripImageBlocks(entry);
+			const stripped = stripImageBlocks(entry, placeholder);
 			if (stripped.changed) changed = true;
 			return stripped.value;
 		});
@@ -498,12 +556,12 @@ function stripImageBlocks(value: unknown): { value: unknown; changed: boolean } 
 	}
 	if (!isPlainObject(value)) return { value, changed: false };
 	if (isImageBlock(value)) {
-		return { value: { type: "text", text: ATTACHMENT_OMITTED_TEXT }, changed: true };
+		return { value: { type: "text", text: placeholder }, changed: true };
 	}
 	let changed = false;
 	const out: UnknownRecord = {};
 	for (const [key, entry] of Object.entries(value)) {
-		const stripped = stripImageBlocks(entry);
+		const stripped = stripImageBlocks(entry, placeholder);
 		if (stripped.changed) changed = true;
 		out[key] = stripped.value;
 	}

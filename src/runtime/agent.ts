@@ -942,6 +942,7 @@ export class AgentRunner {
 			...(record.model !== undefined ? { model: record.model } : {}),
 			...(record.request !== undefined ? { request: record.request } : {}),
 			...(record.attachmentsDropped === true ? { attachmentsDropped: true } : {}),
+			...(record.imagesOmitted !== undefined ? { imagesOmitted: record.imagesOmitted } : {}),
 		});
 		return { error, record };
 	}
