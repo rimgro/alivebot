@@ -85,6 +85,69 @@ export function runStoppedByInferred(record: { stoppedBy?: unknown; stopReason?:
 }
 
 /**
+ * True when a run's stop was an interruption: a harness restart, `alive stop`,
+ * a cancelled grace period, or the `interrupted`/`aborted` stop reasons.
+ *
+ * `sleep`, `limit`, `provider` and `model` are ordinary endings. Used by
+ * `RunLog.record()` to decide whether a superseded closure belongs in the
+ * run's interruption history (#185).
+ */
+export function isRunInterruption(record: { stoppedBy?: unknown; stopReason?: RunStopReason }): boolean {
+	const stoppedBy = runStoppedBy(record);
+	return (
+		stoppedBy === "restart" ||
+		stoppedBy === "stop" ||
+		stoppedBy === "cancel" ||
+		record.stopReason === "interrupted" ||
+		record.stopReason === "aborted"
+	);
+}
+
+/** One earlier stop of a run id that was later resumed (#185). */
+export interface RunInterruption {
+	stoppedBy: RunStoppedBy;
+	stopReason: RunStopReason;
+	at: number;
+}
+
+/** Runtime list of the allowed `RunStopReason` values, used to sanitize records read from disk. */
+const RUN_STOP_REASON_VALUES: readonly RunStopReason[] = [
+	"slept",
+	"stalled",
+	"timeout",
+	"budget",
+	"error",
+	"interrupted",
+	"aborted",
+];
+
+/**
+ * The interruption history stored on a run record, sanitized.
+ *
+ * Older records have no field at all. Anything that is not an array of
+ * well-formed entries is dropped instead of throwing, so readers can trust the
+ * shape without guarding every access.
+ */
+export function runInterruptions(record: { interruptedBy?: unknown }): RunInterruption[] {
+	if (!Array.isArray(record.interruptedBy)) return [];
+	const out: RunInterruption[] = [];
+	for (const item of record.interruptedBy) {
+		if (!item || typeof item !== "object") continue;
+		const candidate = item as Record<string, unknown>;
+		if (!isRunStoppedBy(candidate.stoppedBy)) continue;
+		if (
+			typeof candidate.stopReason !== "string" ||
+			!(RUN_STOP_REASON_VALUES as readonly string[]).includes(candidate.stopReason)
+		) {
+			continue;
+		}
+		if (typeof candidate.at !== "number" || !Number.isFinite(candidate.at)) continue;
+		out.push({ stoppedBy: candidate.stoppedBy, stopReason: candidate.stopReason as RunStopReason, at: candidate.at });
+	}
+	return out;
+}
+
+/**
  * One message the run delivered.
  *
  * `deliveryKey` is the outbox idempotency key (`OutgoingMessage.deliveryKey`)
@@ -208,6 +271,8 @@ export interface RunRecord {
 	sessionFile?: string;
 	/** Human-readable interruption summary, written when a harness restart drains the run. */
 	summary?: string;
+	/** Previous stops of this run id, oldest first (#185). Absent when the run was never interrupted. */
+	interruptedBy?: RunInterruption[];
 	events: RunEventSummary[];
 	outbound: RunOutbound[];
 	remindersCreated: string[];
@@ -370,7 +435,24 @@ export class RunLog {
 			return;
 		}
 		const previous = all[previousIndex]!;
-		all[previousIndex] = record;
+		// A replacement means the interrupted run was resumed and closed again;
+		// keep the earlier stops so the history does not lose the interruption (#185).
+		const history = runInterruptions(previous);
+		if (isRunInterruption(previous)) {
+			const entry: RunInterruption = {
+				stoppedBy: runStoppedBy(previous),
+				stopReason: previous.stopReason,
+				at: previous.finishedAt,
+			};
+			const last = history[history.length - 1];
+			const duplicate =
+				last !== undefined &&
+				last.stoppedBy === entry.stoppedBy &&
+				last.stopReason === entry.stopReason &&
+				last.at === entry.at;
+			if (!duplicate) history.push(entry);
+		}
+		all[previousIndex] = { ...record, interruptedBy: history.length > 0 ? history : undefined };
 		writeJsonlAtomic(this.file, all);
 		this.applyUsage(previous, -1);
 		this.applyUsage(record, 1);

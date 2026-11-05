@@ -26,10 +26,12 @@ import { Journal } from "../store/journal.js";
 import {
 	detectRunStall,
 	interruptedResumeDecision,
+	isRunInterruption,
 	isRunStoppedBy,
 	resumeFileUsable,
 	RUN_STOPPED_BY_VALUES,
 	RunLog,
+	runInterruptions,
 	runStoppedBy,
 	runStoppedByInferred,
 	runTurnCount,
@@ -402,6 +404,152 @@ section("run log: who stopped the run (#168)");
 		log.list(10).find((record) => record.id === "run_legacy_shape"),
 	);
 	fs.rmSync(stoppedByRoot, { recursive: true, force: true });
+}
+
+section("run log: interrupted stops survive a resume (#185)");
+{
+	const interruptedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-run-interrupted-test-"));
+	const log = new RunLog(interruptedRoot);
+	const file = path.join(interruptedRoot, "runs", "runs.jsonl");
+	const storedLines = (): RunRecord[] =>
+		fs
+			.readFileSync(file, "utf8")
+			.split("\n")
+			.filter((line) => line.trim().length > 0)
+			.map((line) => JSON.parse(line) as RunRecord);
+	const record = (input: {
+		id: string;
+		index: number;
+		stopReason: RunStopReason;
+		stoppedBy?: RunRecord["stoppedBy"];
+		finishedAt: number;
+	}): RunRecord => ({
+		id: input.id,
+		index: input.index,
+		startedAt: input.finishedAt - 60_000,
+		finishedAt: input.finishedAt,
+		durationMs: 60_000,
+		activeMs: 60_000,
+		idleMs: 0,
+		stopReason: input.stopReason,
+		...(input.stoppedBy ? { stoppedBy: input.stoppedBy } : {}),
+		events: [],
+		outbound: [],
+		remindersCreated: [],
+		notesTouched: [],
+		journalEntries: 0,
+		idleReturns: 0,
+		interruptDeliveries: 0,
+		nudges: 0,
+		turnCount: 1,
+		promptChars: 0,
+		usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, total: 15, cost: 0.001 },
+	});
+	const now = Date.now();
+
+	log.record(record({ id: "run_plain", index: 1, stopReason: "slept", stoppedBy: "sleep", finishedAt: now }));
+	const plain = storedLines().find((line) => line.id === "run_plain");
+	check("a run that was never interrupted has no interruptedBy key", plain !== undefined && !("interruptedBy" in plain), plain);
+
+	log.record(record({ id: "run_resume", index: 2, stopReason: "interrupted", stoppedBy: "restart", finishedAt: now }));
+	log.record(record({ id: "run_resume", index: 2, stopReason: "slept", stoppedBy: "sleep", finishedAt: now + 30_000 }));
+	const resumedLines = storedLines().filter((line) => line.id === "run_resume");
+	const resumed = resumedLines[0];
+	check("the resumed run is still one line, not a duplicate", resumedLines.length === 1, resumedLines);
+	check("the top-level stop is the last closure", resumed?.stopReason === "slept" && resumed.stoppedBy === "sleep", resumed);
+	check(
+		"the interrupted closure is kept in interruptedBy with its finish time",
+		JSON.stringify(resumed?.interruptedBy) ===
+			JSON.stringify([{ stoppedBy: "restart", stopReason: "interrupted", at: now }]),
+		resumed?.interruptedBy,
+	);
+
+	log.record(record({ id: "run_twice", index: 3, stopReason: "interrupted", stoppedBy: "restart", finishedAt: now + 60_000 }));
+	log.record(record({ id: "run_twice", index: 3, stopReason: "interrupted", stoppedBy: "stop", finishedAt: now + 90_000 }));
+	log.record(record({ id: "run_twice", index: 3, stopReason: "slept", stoppedBy: "sleep", finishedAt: now + 120_000 }));
+	const twice = storedLines().find((line) => line.id === "run_twice");
+	check(
+		"two interruptions keep both stops oldest first",
+		JSON.stringify(twice?.interruptedBy) ===
+			JSON.stringify([
+				{ stoppedBy: "restart", stopReason: "interrupted", at: now + 60_000 },
+				{ stoppedBy: "stop", stopReason: "interrupted", at: now + 90_000 },
+			]),
+		twice?.interruptedBy,
+	);
+
+	check(
+		"an identical closure is not recorded twice",
+		(() => {
+			const dedupeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-run-interrupted-dedupe-test-"));
+			const dedupe = new RunLog(dedupeRoot);
+			dedupe.record(record({ id: "run_dup", index: 5, stopReason: "interrupted", stoppedBy: "restart", finishedAt: now }));
+			dedupe.record(record({ id: "run_dup", index: 5, stopReason: "interrupted", stoppedBy: "restart", finishedAt: now }));
+			const history = dedupe.last()?.interruptedBy;
+			fs.rmSync(dedupeRoot, { recursive: true, force: true });
+			return history?.length === 1;
+		})(),
+	);
+
+	check(
+		"sleep/limit/provider/model stops are not interruptions",
+		!isRunInterruption({ stoppedBy: "limit", stopReason: "timeout" }) &&
+			!isRunInterruption({ stoppedBy: "sleep", stopReason: "slept" }) &&
+			!isRunInterruption({ stoppedBy: "provider", stopReason: "error" }) &&
+			!isRunInterruption({ stoppedBy: "model", stopReason: "error" }) &&
+			isRunInterruption({ stoppedBy: "restart", stopReason: "interrupted" }) &&
+			isRunInterruption({ stoppedBy: "stop", stopReason: "aborted" }) &&
+			isRunInterruption({ stoppedBy: "cancel", stopReason: "aborted" }) &&
+			isRunInterruption({ stopReason: "interrupted" }),
+	);
+	log.record(record({ id: "run_limit", index: 4, stopReason: "timeout", stoppedBy: "limit", finishedAt: now }));
+	log.record(record({ id: "run_limit", index: 4, stopReason: "slept", stoppedBy: "sleep", finishedAt: now + 30_000 }));
+	const limited = storedLines().find((line) => line.id === "run_limit");
+	check("a limit timeout leaves the history empty and the key absent", limited !== undefined && !("interruptedBy" in limited), limited);
+
+	check("runInterruptions ignores a non-array field", runInterruptions({ interruptedBy: "x" }).length === 0);
+	const sanitized = runInterruptions({
+		interruptedBy: [
+			"x",
+			null,
+			7,
+			{ stoppedBy: "nope", stopReason: "slept", at: 1 },
+			{ stoppedBy: "restart", stopReason: "interrupted", at: 2 },
+		],
+	});
+	check(
+		"runInterruptions keeps only the well-formed entry",
+		sanitized.length === 1 && sanitized[0]?.stoppedBy === "restart" && sanitized[0].stopReason === "interrupted" && sanitized[0].at === 2,
+		sanitized,
+	);
+	check("a record without the field reads as no history", runInterruptions({}).length === 0);
+
+	// Old records without the field stay readable and a resume still applies usage as a delta.
+	const usageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-run-interrupted-usage-test-"));
+	const usageLog = new RunLog(usageRoot);
+	const usageFirst = record({ id: "run_usage", index: 9, stopReason: "interrupted", stoppedBy: "restart", finishedAt: now });
+	usageLog.record(usageFirst);
+	const usageBefore = usageLog.usageToday();
+	const usageResumed = {
+		...record({ id: "run_usage", index: 9, stopReason: "slept", stoppedBy: "sleep", finishedAt: now + 30_000 }),
+		startedAt: usageFirst.startedAt,
+		durationMs: usageFirst.durationMs + 30_000,
+	};
+	usageLog.record(usageResumed);
+	const usageAfter = usageLog.usageToday();
+	check(
+		"a resume is one run in usage, not two",
+		usageBefore.runs === 1 && usageAfter.runs === 1 && usageAfter.turns === 1 && usageAfter.input === 10,
+		{ usageBefore, usageAfter },
+	);
+	check(
+		"a resume keeps the original index and start",
+		usageLog.last()?.index === 9 && usageLog.last()?.startedAt === usageFirst.startedAt,
+		usageLog.last(),
+	);
+	check("the resumed usage record carries the interruption history", usageLog.last()?.interruptedBy?.length === 1, usageLog.last()?.interruptedBy);
+	fs.rmSync(usageRoot, { recursive: true, force: true });
+	fs.rmSync(interruptedRoot, { recursive: true, force: true });
 }
 
 section("startup resume refuses a missing or empty session file (#173)");
