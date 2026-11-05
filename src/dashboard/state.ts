@@ -1687,6 +1687,7 @@ export function providerErrorLine(providerError: RunProviderError): string {
 	}
 	if (providerError.body) parts.push(`body: ${oneLine(providerError.body, 300)}`);
 	if (providerError.attachmentsDropped) parts.push("retried without attachments");
+	if (providerError.imagesOmitted) parts.push(`${providerError.imagesOmitted} image block(s) omitted: model has no image input`);
 	return parts.length > 0 ? `provider error: ${parts.join(", ")}` : "provider error";
 }
 

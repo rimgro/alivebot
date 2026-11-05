@@ -190,6 +190,8 @@ export interface RunProviderError {
 	request?: ProviderRequestSummary;
 	/** True when the failed request was a retry sent without image attachments. */
 	attachmentsDropped?: boolean;
+	/** How many image blocks the failed request replaced because the model has no image input (#202). */
+	imagesOmitted?: number;
 }
 
 function providerCount(value: unknown): number {
@@ -243,6 +245,8 @@ export function runProviderError(record: { providerError?: unknown }): RunProvid
 	const request = providerRequestSummary(candidate.request);
 	if (request !== undefined) out.request = request;
 	if (candidate.attachmentsDropped === true) out.attachmentsDropped = true;
+	const imagesOmitted = providerCount(candidate.imagesOmitted);
+	if (imagesOmitted > 0) out.imagesOmitted = imagesOmitted;
 	return out;
 }
 
