@@ -96,6 +96,14 @@ export interface LoopConfig {
 	 */
 	toolLongMs: number;
 	/**
+	 * Anomaly threshold for an **open run that stopped ticking** (#173): when the
+	 * runtime still reports a current run but `runtime.json` has not been written
+	 * for this long, the run is shown as stalled (status `stalled`, red marker in
+	 * `alive status` and on the dashboard) and one `run_stalled` anomaly is
+	 * recorded per run. It never closes the run. 0 = disabled. Default 10 minutes.
+	 */
+	runStallMs: number;
+	/**
 	 * Context-size hint (#123). When the estimated context of the pi session crosses
 	 * this many tokens, the agent is steered one service message: finish the current
 	 * coherent task, and if it is finished or you are switching to unrelated work,
@@ -233,6 +241,8 @@ export const DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS = 60;
 export const DEFAULT_LOOP_RUN_VERY_LONG_MS = 3 * 60 * 60_000;
 /** A single tool running longer than this is an anomaly (#164), not a stop. */
 export const DEFAULT_LOOP_TOOL_LONG_MS = 10 * 60_000;
+/** An open run whose runtime stopped writing state is a visible stall (#173). */
+export const DEFAULT_LOOP_RUN_STALL_MS = 10 * 60_000;
 
 /** Context-size hint defaults (#123): warn at 150k tokens, re-arm every +50k. */
 export const DEFAULT_LOOP_CONTEXT_WARN_TOKENS = 150_000;
@@ -328,6 +338,7 @@ export function validateLoopConfig(value: LoopConfig): LoopConfig {
 		runNoOutboundTurns: runHealthMs(value.runNoOutboundTurns, "runNoOutboundTurns", DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS),
 		runVeryLongMs: runHealthMs(value.runVeryLongMs, "runVeryLongMs", DEFAULT_LOOP_RUN_VERY_LONG_MS),
 		toolLongMs: runHealthMs(value.toolLongMs, "toolLongMs", DEFAULT_LOOP_TOOL_LONG_MS),
+		runStallMs: runHealthMs(value.runStallMs, "runStallMs", DEFAULT_LOOP_RUN_STALL_MS),
 		contextWarnTokens,
 		contextWarnStepTokens,
 		contextSleepTokens,
@@ -891,6 +902,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		runNoOutboundTurns: DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS,
 		runVeryLongMs: DEFAULT_LOOP_RUN_VERY_LONG_MS,
 		toolLongMs: DEFAULT_LOOP_TOOL_LONG_MS,
+		runStallMs: DEFAULT_LOOP_RUN_STALL_MS,
 		contextWarnTokens: DEFAULT_LOOP_CONTEXT_WARN_TOKENS,
 		contextWarnStepTokens: DEFAULT_LOOP_CONTEXT_WARN_STEP_TOKENS,
 		contextSleepTokens: DEFAULT_LOOP_CONTEXT_SLEEP_TOKENS,

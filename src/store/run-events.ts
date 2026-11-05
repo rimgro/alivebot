@@ -27,6 +27,11 @@ import type { CompactionFailureClass, ContextResetReason } from "./runs.js";
  * the run is stopped. The operator can abort only that tool through the
  * dashboard button, the owner Telegram command or `alive abort-tool <agent>`.
  *
+ * `run_stalled` (#173) records an open run whose runtime stopped writing its
+ * state for longer than `loop.runStallMs` (a blocked or frozen process). Like
+ * the other run anomalies it stops nothing: it makes the stall visible on the
+ * dashboard and in `alive status` instead of looking like normal work.
+ *
  * One file per profile: `<stateDir>/runs/events.jsonl`, next to `runs.jsonl`.
  */
 export type RunAnomalyType =
@@ -34,6 +39,7 @@ export type RunAnomalyType =
 	| "run_no_outbound"
 	| "run_repeat_tool"
 	| "run_very_long"
+	| "run_stalled"
 	| "tool_long"
 	| "context_high"
 	| "context_reset"

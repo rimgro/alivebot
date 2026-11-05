@@ -15,11 +15,14 @@
  *
  *   npm run test:cli-restart
  */
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { main, type ServiceControl } from "../cli.js";
-import { writeRuntimeState } from "../store/runs.js";
+import { readRuntimeState, writeRuntimeState } from "../store/runs.js";
 import {
 	detectHarnessEnvironment,
 	interruptWarningLine,
@@ -297,6 +300,60 @@ try {
 			check(`${label}: exactly one warning line`, occurrences === 1, result.err);
 		}
 	}
+	// -------------------------------------------------------------------------
+	section("a failed runtime boot is loud and exits non-zero (#173)");
+	{
+		// A regular file where the pi session directory belongs makes `init()` fail
+		// after runtime.json was already claimed. Nothing here touches the network.
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "alive-cli-dead-start-"));
+		const bootConfig = path.join(project, "alive.config.json");
+		fs.writeFileSync(bootConfig, JSON.stringify({ name: "DeadStart" }), "utf8");
+		const bootStateDir = path.join(project, ".alive");
+		fs.mkdirSync(bootStateDir, { recursive: true });
+		fs.writeFileSync(path.join(bootStateDir, "sessions"), "not a directory", "utf8");
+		const entry = fileURLToPath(new URL("../index.ts", import.meta.url));
+		const child = spawn(process.execPath, [...process.execArgv, entry, "run", "--once", "--config", bootConfig], {
+			cwd: project,
+			env: { ...process.env, ALIVE_DAEMON: "" },
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		let childOutput = "";
+		child.stdout!.on("data", (chunk) => { childOutput += String(chunk); });
+		child.stderr!.on("data", (chunk) => { childOutput += String(chunk); });
+		const exitCode = (await once(child, "exit"))[0] as number | null;
+		check("the failed boot exits with a non-zero code", typeof exitCode === "number" && exitCode !== 0, { exitCode, childOutput });
+		const bootState = readRuntimeState(bootStateDir);
+		check("runtime.json says status error", bootState?.status === "error", bootState);
+		check("runtime.json carries the failure message", (bootState?.error ?? "").length > 0, bootState?.error);
+		check("the failed pid is not the test process", bootState?.pid === child.pid, { pid: bootState?.pid, child: child.pid });
+		let inbox = "";
+		try {
+			inbox = fs.readFileSync(path.join(bootStateDir, "inbox", "events.jsonl"), "utf8");
+		} catch {
+			inbox = "";
+		}
+		check("one system event explains the failed boot", inbox.includes("runtime failed to start"), inbox.slice(-400));
+		check("the failure is reported on stderr", /runtime failed to start/.test(childOutput), childOutput.slice(-400));
+		// `alive status` must not report a dead process as alive, and must show the error.
+		const out: string[] = [];
+		const stdoutWrite = process.stdout.write;
+		const stderrWrite = process.stderr.write;
+		process.stdout.write = ((chunk: unknown) => { out.push(String(chunk)); return true; }) as typeof process.stdout.write;
+		process.stderr.write = ((chunk: unknown) => { return true; }) as typeof process.stderr.write;
+		let statusCode = -1;
+		try {
+			statusCode = await main(["status", "--config", bootConfig]);
+		} finally {
+			process.stdout.write = stdoutWrite;
+			process.stderr.write = stderrWrite;
+		}
+		const statusText = out.join("");
+		check("`alive status` exits 0 for a dead runtime", statusCode === 0, statusCode);
+		check("`alive status` does not call the dead runtime alive", statusText.includes("not running") && !statusText.includes(`(pid ${child.pid})`), statusText);
+		check("`alive status` shows the recorded error state", statusText.includes("error"), statusText);
+		fs.rmSync(project, { recursive: true, force: true });
+	}
+
 } finally {
 	fs.rmSync(root, { recursive: true, force: true });
 }

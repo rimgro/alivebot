@@ -9,7 +9,7 @@ import { EventStore, type EventPriority } from "./store/events.js";
 import { ReminderStore } from "./store/reminders.js";
 import { PolicyStore, type NotifyMode } from "./store/policy.js";
 import { ThreadStore } from "./store/threads.js";
-import { RunLog, readRuntimeState, runTurnCount } from "./store/runs.js";
+import { detectRunStall, RunLog, readRuntimeState, runTurnCount } from "./store/runs.js";
 import { HistoryStore, type HistoryDirection, type HistoryQuery } from "./store/history.js";
 import { Outbox } from "./store/outbox.js";
 import { listLocalMessages, operatorAgentThread, sendLocalAgentMessage } from "./runtime/agent-messaging.js";
@@ -460,7 +460,12 @@ async function runCommand(cwd: string, flags: Record<string, string | boolean>):
 	}
 
 	const log = makeLogger(config, false);
-	const runtime = await AliveRuntime.create({ config, log, force: flagBool(flags, "force") });
+	let runtime: AliveRuntime;
+	try {
+		runtime = await AliveRuntime.create({ config, log, force: flagBool(flags, "force") });
+	} catch (error) {
+		return failBoot(log, error);
+	}
 
 	let stopping = false;
 	const onSignal = (initiator?: StopInitiator) => {
@@ -478,14 +483,38 @@ async function runCommand(cwd: string, flags: Record<string, string | boolean>):
 	// marked mid-run and force an "interrupted run" recovery on the next start.
 	process.on("SIGHUP", () => onSignal());
 
-	if (once) {
-		await runtime.init();
-		const record = await runtime.runOnce();
-		await runtime.stop("once");
-		return record ? 0 : 0;
+	try {
+		if (once) {
+			await runtime.init();
+			const record = await runtime.runOnce();
+			await runtime.stop("once");
+			return record ? 0 : 0;
+		}
+		await runtime.run();
+		return 0;
+	} catch (error) {
+		// `init()` already wrote `status: "error"` and the inbox event (#173). A
+		// live pid with `status: "starting"` and no ticks looks healthy to systemd,
+		// so a failed boot must end the process with a non-zero code and let
+		// `Restart=` bring it back.
+		return failBoot(log, error);
 	}
-	await runtime.run();
-	return 0;
+}
+
+/**
+ * Report a failed runtime boot and terminate with a non-zero exit code (#173).
+ *
+ * The process is ended explicitly: module hosts, sandbox handles and timers
+ * started before the failure can keep the event loop alive, and returning an
+ * exit code alone would leave exactly the "alive but dead" process this issue
+ * is about.
+ */
+function failBoot(log: Logger, error: unknown): number {
+	const message = error instanceof Error ? error.message : String(error);
+	log.error("runtime failed to start; exiting so the service manager restarts it", { error: message });
+	process.stderr.write(`${term.red("runtime failed to start:")} ${message}\n`);
+	process.exit(1);
+	return 1;
 }
 
 /** Flags the detached child must inherit to behave like the command just typed. */
@@ -945,6 +974,17 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 	const usage = runs.usageToday();
 	const storeStatus = store.status();
 	const running = runtime ? isProcessAlive(runtime.pid) : false;
+	// An open run whose `lastTickAt` is older than `loop.runStallMs` is stalled
+	// (#173). Derived at read time, so a frozen process is visible even though it
+	// can no longer write runtime.json itself.
+	const stall = running && runtime
+		? detectRunStall({
+				runId: runtime.runId,
+				lastTickAt: runtime.lastTickAt,
+				now: Date.now(),
+				thresholdMs: config.config.loop.runStallMs,
+			})
+		: undefined;
 	// Telegram keeps its identity/conflict state on disk so `alive status` can
 	// report a stale bot or a duplicate poller even while the runtime is busy.
 	const telegramState = config.config.modules.telegram.enabled
@@ -983,6 +1023,7 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 					usageToday: usage,
 					lastRun: last,
 					context: { tokens: runtime?.contextTokens, cacheReadPerTurn: cachePerTurn },
+					...(stall ? { runStalled: stall } : {}),
 				},
 				null,
 				2,
@@ -994,7 +1035,16 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 	const line = (label: string, value: string) => process.stdout.write(`${label.padEnd(12)} ${value}\n`);
 	const snapshot = snapshotRuntime(config.paths.stateDir);
 	line("agent", config.config.name);
-	line("status", running && runtime ? `${runtime.status} (pid ${runtime.pid})` : "not running");
+	line("status", running && runtime ? `${stall ? term.red("stalled") : runtime.status} (pid ${runtime.pid})` : "not running");
+	if (stall && runtime) {
+		line(
+			"stalled",
+			term.red(
+				`run #${runtime.runIndex} has not ticked for ${formatDuration(stall.ageMs)}` +
+					` (threshold ${formatDuration(stall.thresholdMs)}); the run is still open`,
+			),
+		);
+	}
 	if (running && runtime) {
 		line("mode", `${runtime.mode ?? "foreground"}${snapshot?.suspended ? term.red(" — SUSPENDED (SIGSTOP/Ctrl+Z), serves nothing") : ""}`);
 		line("uptime", formatDuration(Date.now() - runtime.startedAt));

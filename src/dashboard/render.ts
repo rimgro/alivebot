@@ -400,7 +400,12 @@ ${runField}
 }
 
 function renderStatus(summary: AgentSummary, masker: Masker): string {
-	return `<span class="st ${summary.status}">${masker.text(statusLabel(summary.status))}</span>` +
+	// A stalled run is an anomaly, not a status: the red badge stays visible next
+	// to the normal working/waiting/sleeping label (#173).
+	const stalled = summary.runStalled
+		? `<span class="st long">run stalled ${masker.text(formatDuration(summary.runStalled.ageMs))}</span> `
+		: "";
+	return stalled + `<span class="st ${summary.status}">${masker.text(statusLabel(summary.status))}</span>` +
 		(summary.statusNote ? ` <span class="sub">${masker.text(summary.statusNote)}</span>` : "");
 }
 

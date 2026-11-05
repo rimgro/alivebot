@@ -1,4 +1,5 @@
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import * as fs from "node:fs";
 import { resolveMemoryDatabasePath, type LoadedConfig } from "../config.js";
 import { recordHeartbeat, refreshHeartbeat } from "../heartbeat.js";
 import type { Logger } from "../log.js";
@@ -13,17 +14,20 @@ import { dispatchDueReminders, ReminderStore } from "../store/reminders.js";
 import { AgentRunner, describeRunRecord } from "./agent.js";
 import { compactionMonitorFor } from "./compaction.js";
 import {
-	interruptedResumeDecision,
+	detectRunStall,
 	readRuntimeState,
 	runTurnCount,
 	RunLog,
+	startupResumeDecision,
 	writeRuntimeState,
 	type RunRecord,
+	type RunStalled,
 	type RuntimeStateFile,
 	type RuntimeStatusKind,
 } from "../store/runs.js";
 import { RunEventLog } from "../store/run-events.js";
 import { ThreadStore } from "../store/threads.js";
+import { maskSecrets } from "../secrets.js";
 import { readStopIntent, type StopInitiator } from "./daemon.js";
 import { buildAgent, readSoul } from "./session.js";
 import { hasWakeWorthyPending, WakeScheduler } from "./wake.js";
@@ -116,6 +120,8 @@ export class AliveRuntime {
 	private lastStateWriteAt = 0;
 	private lastHeartbeatAt = 0;
 	private lastBudgetNotice = "";
+	/** Run id whose `run_stalled` anomaly was already written (#173). */
+	private stalledRunId: string | undefined;
 	/** Last run record to reopen on startup (#124), consumed by `loop()`. */
 	private pendingResume: RunRecord | undefined;
 	/** Session file to continue across a graceful restart; set before `runner.init()`. */
@@ -274,6 +280,7 @@ export class AliveRuntime {
 	}
 
 	private async createSession(forceNew: boolean): Promise<AgentSession> {
+		const resumeSessionFile = forceNew ? undefined : this.pendingResume ? this.resumeSessionFile : undefined;
 		const built = await buildAgent({
 			config: this.config,
 			toolDeps: this.toolDeps,
@@ -283,10 +290,25 @@ export class AliveRuntime {
 			// Reopen the exact transcript of an interrupted run. `forceNew` after a
 			// sleep deliberately ignores it, and a normal start keeps respecting
 			// `config.session` (new vs continue).
-			sessionFile: forceNew || !this.pendingResume ? undefined : this.resumeSessionFile,
+			sessionFile: resumeSessionFile,
 			sandbox: this.sandbox,
 			toolAbortGate: this.toolAbort,
 		});
+		// A resume target that cannot be reopened is not a dead process (#173): the
+		// session is already a fresh one, so close the interrupted run as aborted
+		// and let the new run start from scratch instead of pretending to continue.
+		if (built.resumeFailure && this.pendingResume) {
+			const resume = this.pendingResume;
+			this.pendingResume = undefined;
+			this.resumeSessionFile = undefined;
+			const reason = `resume skipped: session file could not be reopened (${built.resumeFailure})`;
+			this.runs.reclassify(resume.id, "aborted", "interrupted", reason);
+			this.log.warn("interrupted run closed as aborted; its session file could not be reopened", {
+				runId: resume.id,
+				runIndex: resume.index,
+				error: built.resumeFailure,
+			});
+		}
 		this.sandbox?.startMonitoring();
 		return built.session;
 	}
@@ -307,16 +329,21 @@ export class AliveRuntime {
 	 * Decide what to do with the last run at startup (#124).
 	 *
 	 * A recent `interrupted` run is reopened instead of waiting for the inbox;
-	 * an older one is closed as `aborted`, which is the historical behaviour.
+	 * an older one — or one whose pi transcript is missing/empty/unreadable — is
+	 * closed as `aborted` and the runtime starts a new session (#173).
 	 */
 	private resolveStartupResume(): RunRecord | undefined {
 		const last = this.runs.last();
+		const now = Date.now();
 		const windowMs = this.config.config.loop.resumeWindowMs;
-		const decision = interruptedResumeDecision(last, Date.now(), windowMs);
+		// Prefer the file recorded on the run; fall back to the previous process
+		// state for records written before `sessionFile` was persisted.
+		const sessionFile = last?.sessionFile ?? this.resumeSessionFile;
+		const decision = startupResumeDecision(last, now, windowMs, sessionFile, sessionFile ? sessionFileSize(sessionFile) : undefined);
 		if (decision === "none" || !last) return undefined;
-		const ageMs = Math.max(0, Date.now() - last.finishedAt);
+		const ageMs = Math.max(0, now - last.finishedAt);
 		if (decision === "resume") {
-			if (last.sessionFile) this.resumeSessionFile = last.sessionFile;
+			if (sessionFile) this.resumeSessionFile = sessionFile;
 			this.log.info("interrupted run is resumable; reopening the same run and session", {
 				runId: last.id,
 				runIndex: last.index,
@@ -324,6 +351,21 @@ export class AliveRuntime {
 				windowMs,
 			});
 			return last;
+		}
+		if (decision === "unusable") {
+			// pi's `SessionManager.open` would silently create a fresh session at the
+			// missing path while the run claims to continue. Close the run instead and
+			// start clean, which is what the operator did by hand before #173.
+			this.resumeSessionFile = undefined;
+			const reason = `resume skipped: session file ${sessionFile ?? "(none)"} is missing, empty or unreadable`;
+			this.runs.reclassify(last.id, "aborted", "interrupted", reason);
+			this.log.warn("interrupted run cannot reopen its session file; closed as aborted, starting a new session", {
+				runId: last.id,
+				runIndex: last.index,
+				ageMs,
+				sessionFile: sessionFile ?? "(none)",
+			});
+			return undefined;
 		}
 		this.runs.reclassify(last.id, "aborted", "interrupted");
 		this.log.warn("interrupted run is outside the resume window; closed as aborted", {
@@ -337,7 +379,21 @@ export class AliveRuntime {
 
 	async init(): Promise<void> {
 		if (this.initialized) return;
+		// Checked *before* the guarded body: losing the single-instance race must
+		// not rewrite runtime.json, which belongs to the process that is running.
 		this.assertSingleInstance();
+		try {
+			await this.initRuntime();
+		} catch (error) {
+			// A boot that dies here used to leave a live pid with `status: "starting"`
+			// and no ticks, so systemd never restarted it (#173). Make the failure
+			// loud on disk and let the caller exit non-zero.
+			this.recordBootFailure(error);
+			throw error;
+		}
+	}
+
+	private async initRuntime(): Promise<void> {
 		// Read the previous process state *before* overwriting runtime.json: it
 		// names the pi transcript that an interrupted run must reopen (#124).
 		const previousState = readRuntimeState(this.config.paths.stateDir);
@@ -424,6 +480,69 @@ export class AliveRuntime {
 			moduleErrors: this.moduleErrors,
 			sessionFile: session.sessionFile ?? "(none)",
 		});
+	}
+
+	/**
+	 * Persist a failed boot (#173): `runtime.json` gets `status: "error"` with the
+	 * message, and one `system` inbox event explains the failure to the agent that
+	 * runs after the restart. Both writes are best effort — the caller still exits
+	 * non-zero, which is what makes the service manager retry.
+	 */
+	private recordBootFailure(error: unknown): void {
+		// The message lands in runtime.json and in the agent's inbox, so it is
+		// masked like every other text that leaves the process.
+		const message = maskSecrets(
+			error instanceof Error ? error.message : String(error),
+			this.config.config.secrets,
+		);
+		const now = Date.now();
+		this.log.error("runtime failed to start", { error: message });
+		try {
+			const previous = readRuntimeState(this.config.paths.stateDir);
+			// Only inherit fields from our own state file: a stale one belongs to the
+			// previous process, and its runId/sessionFile would describe someone else.
+			const own = previous && previous.pid === process.pid ? previous : undefined;
+			const state: RuntimeStateFile = {
+				...(own ?? {}),
+				pid: process.pid,
+				startedAt: this.startedAt,
+				lastTickAt: now,
+				status: "error",
+				runIndex: own?.runIndex ?? this.runs?.last()?.index ?? 0,
+				pending: this.store?.pendingCount() ?? own?.pending ?? 0,
+				openThreads: own?.openThreads ?? 0,
+				sleeps: this.sleepCount,
+				idling: false,
+				idleSince: undefined,
+				activeTool: undefined,
+				runStalled: undefined,
+				mode: process.env.ALIVE_DAEMON === "1" ? "background" : "foreground",
+				error: message,
+			};
+			writeRuntimeState(this.config.paths.stateDir, state);
+		} catch (writeError) {
+			this.log.error("cannot write the failed-boot runtime state", {
+				error: writeError instanceof Error ? writeError.message : String(writeError),
+			});
+		}
+		try {
+			// One event per crash-loop, not one per restart: the dedupe key keeps a
+			// broken unit from flooding the inbox while it restarts every few seconds.
+			this.store?.append({
+				kind: "system",
+				source: "runner",
+				priority: "high",
+				title: "runtime failed to start",
+				text:
+					`The alive process could not finish its startup and exited non-zero: ${message}. ` +
+					`The run was not resumed. Check the profile log before assuming work was lost.`,
+				dedupeKey: "runtime-init-failed",
+			});
+		} catch (appendError) {
+			this.log.error("cannot record the failed boot in the inbox", {
+				error: appendError instanceof Error ? appendError.message : String(appendError),
+			});
+		}
 	}
 
 	/** Blocking loop. Resolves when stop() is called. */
@@ -672,13 +791,26 @@ export class AliveRuntime {
 	private writeState(force = false): void {
 		const now = Date.now();
 		if (!force && now - this.lastStateWriteAt < 5_000) return;
+		// The previous write is the last tick this process managed to emit; a gap
+		// longer than `loop.runStallMs` means an open run stopped ticking (#173).
+		const lastTickAt = this.lastStateWriteAt || this.startedAt;
 		this.lastStateWriteAt = now;
 		const run = this.currentRun;
+		// A deliberate stop is not a stall: the final write must stay `stopped`.
+		const stall = this.statusKind === "stopped"
+			? undefined
+			: detectRunStall({
+					runId: run?.id,
+					lastTickAt,
+					now,
+					thresholdMs: this.config.config.loop.runStallMs,
+				});
+		if (stall && run) this.recordRunStall(run, stall);
 		const state: RuntimeStateFile = {
 			pid: process.pid,
 			startedAt: this.startedAt,
 			lastTickAt: now,
-			status: this.effectiveStatus(),
+			status: stall ? "stalled" : this.effectiveStatus(),
 			runIndex: run?.index ?? this.runs.last()?.index ?? 0,
 			runId: run?.id,
 			sessionFile: this.runner?.currentSession?.sessionFile ?? this.pendingResume?.sessionFile ?? this.resumeSessionFile,
@@ -692,9 +824,36 @@ export class AliveRuntime {
 			lastCompaction: this.lastCompactionRecord(),
 			contextTokens: this.currentContextTokens(),
 			activeTool: this.toolAbort?.activeTool(),
+			...(stall ? { runStalled: stall } : {}),
 			mode: process.env.ALIVE_DAEMON === "1" ? "background" : "foreground",
 		};
 		writeRuntimeState(this.config.paths.stateDir, state);
+	}
+
+	/**
+	 * One `run_stalled` anomaly per run (#173): the run is visible as stalled,
+	 * but it is never closed here — the operator (or a restart) decides.
+	 */
+	private recordRunStall(run: RunHandle, stall: RunStalled): void {
+		if (this.stalledRunId === run.id) return;
+		this.stalledRunId = run.id;
+		const now = Date.now();
+		const event = {
+			ts: now,
+			type: "run_stalled" as const,
+			agent: this.config.config.name,
+			runId: run.id,
+			runIndex: run.index,
+			activeMs: run.activeMs,
+			durationMs: Math.max(0, now - run.startedAt),
+			idleMs: run.idleMs,
+			turns: run.turns,
+			outbound: run.outbound.length,
+			events: run.events.length,
+			limitMs: stall.thresholdMs,
+		};
+		this.runEvents?.append(event);
+		this.log.warn("run_stalled", { ...event, ageMs: stall.ageMs });
 	}
 
 	private sessionModel(): string | undefined {
@@ -751,11 +910,20 @@ export class AliveRuntime {
 		const usage = this.runs.usageToday();
 		const lastRun = this.runs.last();
 		const run = this.currentRun;
+		const now = Date.now();
+		const stall = this.statusKind === "stopped"
+			? undefined
+			: detectRunStall({
+					runId: run?.id,
+					lastTickAt: this.lastStateWriteAt || this.startedAt,
+					now,
+					thresholdMs: this.config.config.loop.runStallMs,
+				});
 		return {
 			name: this.config.config.name,
 			pid: process.pid,
-			status: this.effectiveStatus(),
-			uptimeMs: Date.now() - this.startedAt,
+			status: stall ? "stalled" : this.effectiveStatus(),
+			uptimeMs: now - this.startedAt,
 			runIndex: run?.index ?? lastRun?.index ?? 0,
 			currentRunId: run?.id,
 			idling: run?.idling ?? false,
@@ -774,6 +942,7 @@ export class AliveRuntime {
 			lastCompaction: this.lastCompactionRecord(),
 			contextTokens: this.currentContextTokens(),
 			activeTool: this.toolAbort?.activeTool(),
+			runStalled: stall,
 			toolLongMs: this.config.config.loop.toolLongMs,
 			cacheReadPerTurn: lastRun && runTurnCount(lastRun) > 0
 				? (lastRun.usage?.cacheRead ?? 0) / runTurnCount(lastRun)
@@ -824,5 +993,21 @@ export class AliveRuntime {
 			);
 		}
 		this.log.warn("stale runtime state file found", { pid: state.pid, status: state.status });
+	}
+}
+
+/**
+ * Size of a resume target in bytes, or `undefined` when it cannot be read
+ * (#173). A missing, unreadable, non-file or empty transcript is unusable:
+ * `SessionManager.open` would either throw or silently create a brand-new
+ * session at that path while the run claims to continue.
+ */
+function sessionFileSize(file: string): number | undefined {
+	try {
+		fs.accessSync(file, fs.constants.R_OK);
+		const stat = fs.statSync(file);
+		return stat.isFile() ? stat.size : undefined;
+	} catch {
+		return undefined;
 	}
 }

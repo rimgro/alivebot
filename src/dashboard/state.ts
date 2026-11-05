@@ -17,6 +17,7 @@ import { buildSystemPrompt } from "../runtime/prompt.js";
 import type { AliveEvent } from "../store/events.js";
 import type { Reminder } from "../store/reminders.js";
 import {
+	detectRunStall,
 	RUN_TURN_TRACE_LIMIT,
 	runStoppedBy,
 	runStoppedByInferred,
@@ -28,6 +29,7 @@ import {
 	type RunStoppedBy,
 	type RunStopReason,
 	type RunUsage,
+	type RunStalled,
 	type RuntimeStateFile,
 	type UsageBucket,
 } from "../store/runs.js";
@@ -718,12 +720,16 @@ export type AgentStatus = "working" | "waiting" | "sleeping";
 export interface AgentStatusView {
 	status: AgentStatus;
 	note: string;
+	/** True when an open run has not ticked for longer than `loop.runStallMs` (#173). */
+	stalled?: boolean;
 }
 
 export interface DeriveStatusOptions {
 	now?: number;
 	/** Seam for tests: defaults to the real `isProcessAlive` check. */
 	pidAlive?: (pid: number) => boolean;
+	/** `loop.runStallMs`; 0 disables the stalled-run marker (#173). */
+	runStallMs?: number;
 }
 
 /**
@@ -739,7 +745,30 @@ export function deriveAgentStatus(
 ): AgentStatusView {
 	if (!runtime) return { status: "sleeping", note: "no runtime state" };
 	const alive = (options.pidAlive ?? isProcessAlive)(runtime.pid);
-	if (!alive) return { status: "sleeping", note: runtime.status === "stopped" ? "runtime stopped" : "process is not running" };
+	if (!alive) {
+		const note = runtime.status === "stopped"
+			? "runtime stopped"
+			: runtime.status === "error"
+				? `runtime failed to start: ${oneLine(runtime.error ?? "unknown error", 160)}`
+				: "process is not running";
+		return { status: "sleeping", note };
+	}
+	// An open run that stopped ticking is not "working": it is a visible failure
+	// (#173). Derived from `lastTickAt` so a frozen process is caught too.
+	const stall = detectRunStall({
+		runId: runtime.runId,
+		lastTickAt: runtime.lastTickAt,
+		now: options.now ?? Date.now(),
+		thresholdMs: options.runStallMs ?? 0,
+	}) ?? (runtime.status === "stalled" ? runtime.runStalled : undefined);
+	if (stall) {
+		return {
+			status: "working",
+			note: `run #${runtime.runIndex} stalled: no tick for ${formatDuration(stall.ageMs)}`,
+			stalled: true,
+		};
+	}
+	if (runtime.status === "error") return { status: "sleeping", note: `runtime failed to start: ${oneLine(runtime.error ?? "unknown error", 160)}` };
 	if (runtime.status === "paused-budget") return { status: "waiting", note: "paused: budget" };
 	if (runtime.idling || runtime.status === "idle") {
 		const now = options.now ?? Date.now();
@@ -765,6 +794,8 @@ export interface AgentSummary {
 	contextTokens?: number;
 	/** cacheRead per completed turn of the current/last run (#170); null when there were no turns. */
 	cacheReadPerTurn?: number | null;
+	/** An open run that stopped ticking (#173); rendered as a red anomaly. */
+	runStalled?: RunStalled;
 	pid?: number;
 	profileDir: string;
 	configPath: string;
@@ -799,7 +830,10 @@ export function readAgentSummary(
 ): AgentSummary {
 	const now = options.now ?? Date.now();
 	const runtime = readRuntimeStateFile(profile.stateDir);
-	const status = deriveAgentStatus(runtime, options);
+	const status = deriveAgentStatus(runtime, {
+		...options,
+		runStallMs: options.runStallMs ?? profile.config.config.loop.runStallMs,
+	});
 	const lastCompaction = runtime?.lastCompaction;
 	if (lastCompaction && !lastCompaction.ok) {
 		const label = lastCompaction.skipped ? "deferred" : "failed";
@@ -829,6 +863,17 @@ export function readAgentSummary(
 		runsToday: usage.runs,
 		lastFinishedAt: last?.finishedAt,
 		contextTokens: runtime?.contextTokens,
+		...(status.stalled
+			? {
+					runStalled:
+						detectRunStall({
+							runId: runtime?.runId,
+							lastTickAt: runtime?.lastTickAt,
+							now,
+							thresholdMs: options.runStallMs ?? profile.config.config.loop.runStallMs,
+						}) ?? runtime?.runStalled,
+				}
+			: {}),
 		cacheReadPerTurn: metricRun
 			? cacheReadPerTurn(metricRun.usage ?? { cacheRead: 0 }, runTurnCount(metricRun))
 			: null,

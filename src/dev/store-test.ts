@@ -14,13 +14,16 @@ import { ThreadStore } from "../store/threads.js";
 import { NoteStore } from "../store/notes.js";
 import { Journal } from "../store/journal.js";
 import {
+	detectRunStall,
 	interruptedResumeDecision,
 	isRunStoppedBy,
+	resumeFileUsable,
 	RUN_STOPPED_BY_VALUES,
 	RunLog,
 	runStoppedBy,
 	runStoppedByInferred,
 	runTurnCount,
+	startupResumeDecision,
 	type RunRecord,
 	type RunStopReason,
 } from "../store/runs.js";
@@ -389,6 +392,81 @@ section("run log: who stopped the run (#168)");
 		log.list(10).find((record) => record.id === "run_legacy_shape"),
 	);
 	fs.rmSync(stoppedByRoot, { recursive: true, force: true });
+}
+
+section("startup resume refuses a missing or empty session file (#173)");
+{
+	const now = Date.now();
+	const interrupted: RunRecord = {
+		id: "run_gone_session",
+		index: 3,
+		startedAt: now - 120_000,
+		finishedAt: now - 60_000,
+		durationMs: 60_000,
+		activeMs: 60_000,
+		idleMs: 0,
+		stopReason: "interrupted",
+		sessionFile: "/tmp/archived-session.jsonl",
+		events: [],
+		outbound: [],
+		remindersCreated: [],
+		notesTouched: [],
+		journalEntries: 0,
+		idleReturns: 0,
+		interruptDeliveries: 0,
+		nudges: 0,
+		turnCount: 1,
+		promptChars: 0,
+		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 },
+	};
+	check("a missing session file is not resumable", startupResumeDecision(interrupted, now, 600_000, interrupted.sessionFile, undefined) === "unusable");
+	check("an empty session file is not resumable", startupResumeDecision(interrupted, now, 600_000, interrupted.sessionFile, 0) === "unusable");
+	check("a readable non-empty session file resumes", startupResumeDecision(interrupted, now, 600_000, interrupted.sessionFile, 4_096) === "resume");
+	check(
+		"a record without a session file keeps the configured session mode",
+		startupResumeDecision({ ...interrupted, sessionFile: undefined }, now, 600_000, undefined, undefined) === "resume",
+	);
+	check(
+		"outside the resume window the file does not matter",
+		startupResumeDecision(interrupted, now + 600_000, 600_000, interrupted.sessionFile, undefined) === "expire",
+	);
+	check(
+		"a non-interrupted run is never resumed",
+		startupResumeDecision({ ...interrupted, stopReason: "slept" }, now, 600_000, interrupted.sessionFile, 4_096) === "none",
+	);
+	check(
+		"resumeFileUsable rejects missing, empty and blank paths",
+		!resumeFileUsable(undefined, 10) && !resumeFileUsable("  ", 10) && !resumeFileUsable("/tmp/x", undefined) && !resumeFileUsable("/tmp/x", 0),
+	);
+	check("resumeFileUsable accepts a non-empty file", resumeFileUsable("/tmp/x", 1));
+
+	// What the runtime does with an "unusable" decision: close the run, do not resume.
+	const resumeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-run-unusable-resume-test-"));
+	const runs = new RunLog(resumeRoot);
+	runs.record(interrupted);
+	const decision = startupResumeDecision(runs.last(), now, 600_000, interrupted.sessionFile, undefined);
+	const closed = decision === "unusable"
+		? runs.reclassify(interrupted.id, "aborted", "interrupted", "resume skipped: session file is missing, empty or unreadable")
+		: undefined;
+	check("an unusable resume target closes the run as aborted", decision === "unusable" && closed?.stopReason === "aborted" && runs.last()?.stopReason === "aborted", { decision, last: runs.last()?.stopReason });
+	check("the reason is persisted in the record's error field", (runs.last()?.error ?? "").includes("resume skipped"), runs.last()?.error);
+	check("the aborted run is no longer resumable", startupResumeDecision(runs.last(), now, 600_000, interrupted.sessionFile, 4_096) === "none");
+	fs.rmSync(resumeRoot, { recursive: true, force: true });
+}
+
+section("an open run without ticks is a stall (#173)");
+{
+	const now = Date.now();
+	check("a fresh open run is not stalled", detectRunStall({ runId: "run_1", lastTickAt: now - 1_000, now, thresholdMs: 600_000 }) === undefined);
+	const stalled = detectRunStall({ runId: "run_1", lastTickAt: now - 600_000, now, thresholdMs: 600_000 });
+	check(
+		"an open run past the threshold reports the age and the threshold",
+		stalled?.ageMs === 600_000 && stalled.thresholdMs === 600_000 && stalled.runId === "run_1" && stalled.since === now - 600_000,
+		stalled,
+	);
+	check("threshold 0 disables the check", detectRunStall({ runId: "run_1", lastTickAt: now - 10 * 600_000, now, thresholdMs: 0 }) === undefined);
+	check("no open run is never a stall", detectRunStall({ lastTickAt: now - 10 * 600_000, now, thresholdMs: 600_000 }) === undefined);
+	check("a missing tick timestamp is not a stall", detectRunStall({ runId: "run_1", now, thresholdMs: 600_000 }) === undefined);
 }
 
 section("loop shutdown/resume config is validated and interrupted is not an error (#124)");
