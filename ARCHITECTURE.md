@@ -417,12 +417,16 @@ worker'а и его pi-сессия лежат в `.alive/workers/<id>/`; при
 
 `id, index, startedAt, finishedAt, durationMs, activeMs, idleMs, stopReason, error,
 events[], outbound[], remindersCreated[], notesTouched[], journalEntries, idleReturns,
-interruptDeliveries, nudges, turnCount, promptChars, usage, turns?[], sleep?`
+interruptDeliveries, nudges, turnCount, promptChars, usage, turns?[], sleep?,
+interruptedBy?[]`
 
 `stopReason`: `slept | stalled | timeout | budget | error | interrupted | aborted`.
 `interrupted` — плановый рестарт harness; такая запись может быть продолжена
 (см. 5.8.1). `sessionFile` хранит pi transcript, `summary` — краткое описание
 прерванного run'а; `outbound[]` хранит `deliveryKey` для dedupe при resume.
+`interruptedBy[]` (#185) — прежние прерывания этого run'а (`{ stoppedBy,
+stopReason, at }`, oldest first), которые иначе терялись бы при resume; поля нет,
+если run ни разу не прерывался.
 Это одновременно аудит, телеметрия и «сонник» для секции `Recent runs` в промпте.
 
 `turns` — необязательный per-turn разрез стоимости, который пишется новыми
