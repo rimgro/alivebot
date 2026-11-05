@@ -22,8 +22,10 @@
  *   - never touch `.alive/`, `alive.config.json`, `SOUL.md`, `.env` or any path
  *     outside the checkout;
  *   - never `git push`, never `git checkout --force`, never delete a ref;
- *   - a dirty tree is refused unless `--force`, and even then the checkout is
- *     plain (git refuses rather than discarding local changes);
+ *   - a dirty tree is refused unless `--force`, but only when the dirty paths
+ *     differ between HEAD and the target: local edits the update does not touch
+ *     are kept and recorded as `dirtyKept` in the marker. Even with a conflict
+ *     the checkout is plain (git refuses rather than discarding local changes);
  *   - every mutating apply is preceded by `.alive-update.json`, and every
  *     failure updates it after the rollback attempt.
  *
@@ -227,6 +229,8 @@ export interface UpdateMarker {
 	outcome: UpdateOutcome;
 	/** Set by a successful `alive update --auto`: a watchdog should restart the harness. */
 	restartRequested?: boolean;
+	/** Local paths kept across the apply because the target does not change them. */
+	dirtyKept?: string[];
 }
 
 type MarkerRead =
@@ -558,9 +562,21 @@ async function inspectAndReport(options: UpdateOptions, d: ResolvedDeps): Promis
 	}
 	const next = [`alive update`];
 	if (options.tag !== undefined) next.push(`--tag ${target}`);
-	if (!snapshot.clean) next.push("--force");
+	let conflicting: string[] = [];
+	if (!snapshot.clean) {
+		conflicting = await conflictingDirtyPaths(d, snapshot.root, snapshot.dirty, target);
+		if (conflicting.length > 0) next.push("--force");
+	}
 	d.out(`next: ${next.join(" ")}`);
-	if (!snapshot.clean) d.out("note: the working tree is dirty, so apply requires --force (local changes are never discarded)");
+	if (conflicting.length > 0) {
+		d.out(
+			`note: ${summarizePaths(conflicting)} change${conflicting.length === 1 ? "s" : ""} between HEAD and ${target}; apply refuses without --force (local changes are never discarded)`,
+		);
+	} else if (!snapshot.clean) {
+		d.out(
+			`note: ${snapshot.dirty.length} local change(s) this update does not touch; apply keeps them and does not need --force`,
+		);
+	}
 	await reportUpdateArtifacts(d, snapshot.root);
 }
 
@@ -591,13 +607,24 @@ async function applyAndReport(options: UpdateOptions, d: ResolvedDeps, prepared?
 			`refusing to update a detached HEAD (${short}) that is not on a tag; check out a branch or a stable tag first`,
 		);
 	}
-	if (!snapshot.clean && !options.force) {
-		throw new UpdateError(
-			`working tree is ${describeWorktree(snapshot)}; commit or stash the changes, or re-run with --force`,
-		);
-	}
+	let keptDirty: string[] = [];
 	if (!snapshot.clean) {
-		d.err("warning: working tree is dirty; continuing because --force was given (local changes are never discarded)");
+		if (options.force) {
+			d.err("warning: working tree is dirty; continuing because --force was given (local changes are never discarded)");
+		} else {
+			// Only paths the target actually changes would make the plain checkout
+			// fail; everything else stays untouched and must not require --force.
+			const conflicting = await conflictingDirtyPaths(d, snapshot.root, snapshot.dirty, target);
+			if (conflicting.length > 0) {
+				throw new UpdateError(
+					`working tree is dirty (${summarizePaths(conflicting)} changed between HEAD and ${target}); commit or stash the changes, or re-run with --force`,
+				);
+			}
+			d.err(
+				`note: ${snapshot.dirty.length} local change(s) this update does not touch; they are kept (${samplePaths(snapshot.dirty.map(porcelainPath))})`,
+			);
+		}
+		keptDirty = snapshot.dirty.map(porcelainPath);
 	}
 
 	// Prefer the branch when HEAD is on one (a branch tip may also carry a tag):
@@ -613,6 +640,7 @@ async function applyAndReport(options: UpdateOptions, d: ResolvedDeps, prepared?
 		targetTag: target,
 		startedAt: d.now(),
 		outcome: "in-progress",
+		...(keptDirty.length > 0 ? { dirtyKept: keptDirty } : {}),
 	};
 
 	// The marker must exist before the first mutating command so an interrupted
@@ -686,14 +714,20 @@ async function rollbackAndReport(options: UpdateOptions, d: ResolvedDeps): Promi
 	const marker = read.marker;
 
 	const dirty = await readDirty(d, root);
-	if (dirty.length > 0 && !options.force) {
-		const sample = dirty.slice(0, 3).join(", ");
-		throw new UpdateError(
-			`working tree is dirty (${dirty.length} path${dirty.length === 1 ? "" : "s"}: ${sample}${dirty.length > 3 ? ", …" : ""}); commit or stash the changes, or re-run with --force`,
-		);
-	}
 	if (dirty.length > 0) {
-		d.err("warning: working tree is dirty; continuing because --force was given (local changes are never discarded)");
+		if (options.force) {
+			d.err("warning: working tree is dirty; continuing because --force was given (local changes are never discarded)");
+		} else {
+			const conflicting = await conflictingDirtyPaths(d, root, dirty, marker.previousRef);
+			if (conflicting.length > 0) {
+				throw new UpdateError(
+					`working tree is dirty (${summarizePaths(conflicting)} changed between HEAD and ${marker.previousRef}); commit or stash the changes, or re-run with --force`,
+				);
+			}
+			d.err(
+				`note: ${dirty.length} local change(s) this rollback does not touch; they are kept (${samplePaths(dirty.map(porcelainPath))})`,
+			);
+		}
 	}
 
 	d.out(`rolling back to ${marker.previousRef} (last target: ${marker.targetTag})...`);
@@ -816,6 +850,87 @@ function isUpdateArtifact(line: string): boolean {
 	return file === UPDATE_MARKER_FILE || file === DIST_PREV_DIR || file.startsWith(`${DIST_PREV_DIR}/`);
 }
 
+/**
+ * The dirty subset that a plain `git checkout <target>` would refuse to
+ * overwrite. Paths the target does not change are safe to keep: the checkout
+ * leaves them alone. A failed `git diff` (for example an unknown target) is
+ * reported instead of being mistaken for "no conflicts".
+ */
+async function conflictingDirtyPaths(
+	d: ResolvedDeps,
+	root: string,
+	dirty: readonly string[],
+	target: string,
+): Promise<string[]> {
+	if (dirty.length === 0) return [];
+	let stdout: string;
+	try {
+		const result = await d.run("git", ["diff", "--name-only", "--no-renames", "HEAD", target], {
+			cwd: root,
+			timeoutMs: GIT_TIMEOUT_MS,
+		});
+		stdout = result.stdout;
+	} catch (error) {
+		throw new UpdateError(
+			`could not compare HEAD with ${target} (${oneLine(errorMessage(error))}); refusing to touch local changes`,
+		);
+	}
+	const changed = new Set(
+		stdout
+			.split("\n")
+			.map((line) => normalizeGitPath(line))
+			.filter((line) => line.length > 0),
+	);
+	return dirty.filter((line) => touchesChangedPath(porcelainPath(line), changed));
+}
+
+/** A changed file below an untracked directory (`?? dir/`) still conflicts. */
+function touchesChangedPath(path: string, changed: ReadonlySet<string>): boolean {
+	if (changed.has(path)) return true;
+	return path.endsWith("/") && [...changed].some((candidate) => candidate.startsWith(path));
+}
+
+/** Repository-relative path from one `git status --porcelain` line. */
+function porcelainPath(line: string): string {
+	let file = line.length > 3 ? line.slice(3) : line.trim();
+	const rename = file.lastIndexOf(" -> ");
+	if (rename >= 0) file = file.slice(rename + 4);
+	return normalizeGitPath(file);
+}
+
+/** Compare quoted and unquoted git output on the same value. */
+function normalizeGitPath(value: string): string {
+	const trimmed = value.trim();
+	const quoted = trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"');
+	return quoted ? unquoteGitPath(trimmed) : trimmed;
+}
+
+/** Minimal C-style unquoting for paths git prints with special characters. */
+function unquoteGitPath(value: string): string {
+	const inner = value.slice(1, -1);
+	let result = "";
+	for (let index = 0; index < inner.length; index += 1) {
+		const character = inner[index];
+		if (character !== "\\") {
+			result += character;
+			continue;
+		}
+		const next = inner[(index += 1)];
+		if (next === undefined) break;
+		if (next === "n") result += "\n";
+		else if (next === "t") result += "\t";
+		else if (next === "r") result += "\r";
+		else if (/[0-7]/.test(next)) {
+			const code = Number.parseInt(inner.slice(index, index + 3), 8);
+			if (Number.isFinite(code)) {
+				result += String.fromCharCode(code);
+				index += 2;
+			} else result += next;
+		} else result += next;
+	}
+	return result;
+}
+
 async function readHead(d: ResolvedDeps, root: string): Promise<string> {
 	return (await d.run("git", ["rev-parse", "HEAD"], { cwd: root, timeoutMs: GIT_TIMEOUT_MS })).stdout.trim();
 }
@@ -862,9 +977,16 @@ function currentLabel(current: CurrentRef): string {
 
 function describeWorktree(snapshot: RepositorySnapshot): string {
 	if (snapshot.dirty.length === 0) return "clean";
-	const sample = snapshot.dirty.slice(0, 3).join(", ");
-	const suffix = snapshot.dirty.length > 3 ? ", …" : "";
-	return `dirty (${snapshot.dirty.length} path${snapshot.dirty.length === 1 ? "" : "s"}: ${sample}${suffix})`;
+	return `dirty (${summarizePaths(snapshot.dirty)})`;
+}
+
+function samplePaths(paths: readonly string[], limit = 3): string {
+	const sample = paths.slice(0, limit).join(", ");
+	return paths.length > limit ? `${sample}, …` : sample;
+}
+
+function summarizePaths(paths: readonly string[]): string {
+	return `${paths.length} path${paths.length === 1 ? "" : "s"}: ${samplePaths(paths)}`;
 }
 
 function markerPath(root: string): string {
@@ -919,7 +1041,8 @@ function validateMarker(value: unknown): UpdateMarker {
 	const previousTag = optionalString(record, "previousTag");
 	const finishedAt = optionalString(record, "finishedAt");
 	const restartRequested = optionalBoolean(record, "restartRequested");
-	return { previousRef, previousTag, targetTag, startedAt, finishedAt, outcome, restartRequested };
+	const dirtyKept = optionalStringArray(record, "dirtyKept");
+	return { previousRef, previousTag, targetTag, startedAt, finishedAt, outcome, restartRequested, dirtyKept };
 }
 
 function requiredString(record: Record<string, unknown>, key: string): string {
@@ -942,6 +1065,15 @@ function optionalBoolean(record: Record<string, unknown>, key: string): boolean 
 	return value;
 }
 
+function optionalStringArray(record: Record<string, unknown>, key: string): string[] | undefined {
+	const value = record[key];
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+		throw new Error(`${key} must be an array of strings`);
+	}
+	return value as string[];
+}
+
 async function reportUpdateArtifacts(d: ResolvedDeps, root: string): Promise<void> {
 	const read = await readMarker(d, root);
 	if (read.status === "missing") {
@@ -958,6 +1090,9 @@ async function reportUpdateArtifacts(d: ResolvedDeps, root: string): Promise<voi
 		d.out(`  started:      ${marker.startedAt}`);
 		d.out(`  finished:     ${marker.finishedAt ?? "not finished"}`);
 		d.out(`  restart:      ${marker.restartRequested ? "requested" : "not requested"}`);
+		if (marker.dirtyKept && marker.dirtyKept.length > 0) {
+			d.out(`  dirty kept:   ${marker.dirtyKept.join(", ")}`);
+		}
 	}
 	d.out(`dist:      ${(await d.fs.exists(path.join(root, DIST_DIR))) ? "present" : "absent"}`);
 	d.out(`dist.prev: ${(await d.fs.exists(path.join(root, DIST_PREV_DIR))) ? "present" : "absent"}`);

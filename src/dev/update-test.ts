@@ -57,6 +57,10 @@ interface FakeRepoOptions {
 	failCheckout?: boolean;
 	/** Simulate git refusing a checkout because local changes would be overwritten. */
 	dirtyBlocksCheckout?: boolean;
+	/** Paths `git diff --name-only --no-renames HEAD <ref>` reports; a map keys them by ref. */
+	changedPaths?: string[] | Record<string, string[]>;
+	/** Make the HEAD/target comparison fail, as for an unknown target ref. */
+	failDiff?: boolean;
 	failInstall?: boolean;
 	/** Return true to make `npm run build` fail for the ref that is checked out. */
 	failBuild?: (ref: FakeRef) => boolean;
@@ -155,6 +159,11 @@ function createFakeRepo(options: FakeRepoOptions = {}): FakeRepo {
 	const fs = createFakeFs(log, options.initialFiles ?? {});
 	let ref: FakeRef = options.start ?? { kind: "branch", name: "main" };
 	const commitOf = (value: FakeRef): string => `sha-${value.kind}-${value.name}`;
+	const changedPaths = (target: string): string[] => {
+		const value = options.changedPaths;
+		if (!value) return [];
+		return Array.isArray(value) ? value : (value[target] ?? []);
+	};
 	const ok = (stdout = ""): RunResult => ({ stdout, stderr: "" });
 	const fail = (command: string, args: string[], detail: string): never => {
 		throw new CommandFailure(command, args, 1, "", detail);
@@ -188,6 +197,14 @@ function createFakeRepo(options: FakeRepoOptions = {}): FakeRepo {
 				}
 				case "status":
 					return ok(dirty.length ? `${dirty.join("\n")}\n` : "");
+				case "diff": {
+					if (args[1] !== "--name-only" || args[2] !== "--no-renames" || args[3] !== "HEAD" || !args[4]) {
+						return fail("git", args, `unexpected diff command: ${args.join(" ")}`);
+					}
+					if (options.failDiff) return fail("git", args, `fatal: bad revision '${args[4]}'`);
+					const paths = changedPaths(args[4]);
+					return ok(paths.length ? `${paths.join("\n")}\n` : "");
+				}
 				case "checkout": {
 					const target = args[1];
 					if (!target) return fail("git", args, "error: missing checkout target");
@@ -349,7 +366,7 @@ async function main(): Promise<void> {
 
 	section("dirty tree");
 	{
-		const repo = createFakeRepo({ tags: TAGS, dirty: [" M src/cli.ts", "?? .env"] });
+		const repo = createFakeRepo({ tags: TAGS, dirty: [" M src/cli.ts", "?? .env"], changedPaths: ["src/cli.ts", ".env"] });
 		const h = harness(repo);
 		const code = await runUpdate({ cwd: ROOT }, h.deps);
 		check("apply refuses a dirty tree without --force", code === 1, code);
@@ -358,6 +375,74 @@ async function main(): Promise<void> {
 		check("no checkout/install/build/marker happened", mutations(repo).join("|") === "git fetch --tags --quiet origin", mutations(repo));
 		check("no marker was written", markerWrites(repo).length === 0, markerWrites(repo));
 		check("the current ref is unchanged", refName(repo.ref()) === "branch:main", refName(repo.ref()));
+	}
+
+	section("dirty tree: paths the update does not touch are kept");
+	{
+		const repo = createFakeRepo({ tags: TAGS, dirty: [" M SOME.md"], changedPaths: ["src/cli.ts"] });
+		const h = harness(repo);
+		const code = await runUpdate({ cwd: ROOT }, h.deps);
+		check("apply proceeds without --force", code === 0, { code, err: h.err });
+		check(
+			"checks out the target plainly",
+			repo.calls.some((call) => call.command === "git" && call.args[0] === "checkout" && call.args[1] === "v0.2.0" && call.args.length === 2),
+			repo.calls,
+		);
+		check("never force-checks out", repo.calls.every((call) => !call.args.includes("--force") && !call.args.includes("-f")), repo.calls);
+		check(
+			"says the local change is kept",
+			lines(h.err).includes("does not touch") && lines(h.err).includes("they are kept") && lines(h.err).includes("SOME.md"),
+			h.err,
+		);
+		const writes = markerWrites(repo);
+		check("marker ends success", writes.at(-1)?.outcome === "success", writes.at(-1));
+		check("marker records the kept dirty path", (writes.at(-1)?.dirtyKept ?? []).includes("SOME.md"), writes.at(-1));
+		check("the in-progress marker already records it", (writes[0]?.dirtyKept ?? []).includes("SOME.md"), writes[0]);
+	}
+
+	section("dirty tree: only paths the target changes block apply");
+	{
+		const repo = createFakeRepo({ tags: TAGS, dirty: [" M SOUL.md", " M SOME.md"], changedPaths: ["SOUL.md"] });
+		const h = harness(repo);
+		const code = await runUpdate({ cwd: ROOT }, h.deps);
+		check("apply refuses without --force", code === 1, code);
+		check("error keeps the recognizable dirty-tree wording", lines(h.err).includes("working tree is dirty"), h.err);
+		check("error names the conflicting path", lines(h.err).includes("SOUL.md"), h.err);
+		check("error offers --force", lines(h.err).includes("--force"), h.err);
+		check("error does not blame the untouched path", !lines(h.err).includes("SOME.md"), h.err);
+		check("nothing was checked out", mutations(repo).join("|") === "git fetch --tags --quiet origin", mutations(repo));
+		check("no marker was written", markerWrites(repo).length === 0, markerWrites(repo));
+	}
+	{
+		// git status collapses an untracked directory to `?? dir/`; a file the
+		// target adds below it would still make the plain checkout refuse.
+		const repo = createFakeRepo({ tags: TAGS, dirty: ["?? newdir/"], changedPaths: ["newdir/file.ts"] });
+		const h = harness(repo);
+		const code = await runUpdate({ cwd: ROOT }, h.deps);
+		check("an untracked directory the target fills is a conflict", code === 1, code);
+		check("the directory is named in the error", lines(h.err).includes("newdir/"), h.err);
+		check("the directory conflict changes nothing", mutations(repo).join("|") === "git fetch --tags --quiet origin", mutations(repo));
+	}
+
+	section("--check on a dirty tree");
+	{
+		const repo = createFakeRepo({ tags: TAGS, dirty: [" M SOME.md"], changedPaths: ["SOUL.md"] });
+		const h = harness(repo);
+		const code = await runUpdate({ cwd: ROOT, check: true }, h.deps);
+		const next = h.out.find((line) => line.startsWith("next:")) ?? "";
+		check("check exits 0", code === 0, code);
+		check("does not suggest --force for an untouched path", next === "next: alive update", next);
+		check("says apply keeps the local edits", lines(h.out).includes("apply keeps them and does not need --force"), h.out);
+		check("is still read-only", mutations(repo).join("|") === "git fetch --tags --quiet origin", mutations(repo));
+	}
+	{
+		const repo = createFakeRepo({ tags: TAGS, dirty: [" M SOUL.md"], changedPaths: ["SOUL.md"] });
+		const h = harness(repo);
+		const code = await runUpdate({ cwd: ROOT, check: true }, h.deps);
+		const next = h.out.find((line) => line.startsWith("next:")) ?? "";
+		check("check still exits 0 for a conflict", code === 0, code);
+		check("suggests --force for a conflicting path", next.includes("--force"), next);
+		check("explains the conflict", lines(h.out).includes("changes between HEAD and v0.2.0"), h.out);
 	}
 
 	section("update artifacts never count as dirty");
@@ -556,6 +641,7 @@ async function main(): Promise<void> {
 		const repo = createFakeRepo({
 			tags: TAGS,
 			dirty: [" M src/cli.ts"],
+			changedPaths: ["src/cli.ts"],
 			dirtyBlocksCheckout: true,
 		});
 		const h = harness(repo);
@@ -570,13 +656,14 @@ async function main(): Promise<void> {
 
 	section("--force overrides only the dirty guard");
 	{
-		const repo = createFakeRepo({ tags: TAGS, dirty: [" M src/cli.ts"] });
+		const repo = createFakeRepo({ tags: TAGS, dirty: [" M src/cli.ts"], changedPaths: ["src/cli.ts"] });
 		const h = harness(repo);
 		const code = await runUpdate({ cwd: ROOT, force: true }, h.deps);
-		check("apply proceeds", code === 0, code);
+		check("apply proceeds despite a real conflict", code === 0, code);
 		check("checks out plainly", repo.calls.filter((call) => call.args[0] === "checkout").every((call) => call.args.length === 2), repo.calls);
 		check("warns about the dirty tree", lines(h.err).includes("working tree is dirty"), h.err);
 		check("marker ends success", markerWrites(repo).at(-1)?.outcome === "success", markerWrites(repo));
+		check("marker records the forced-through dirty path", (markerWrites(repo).at(-1)?.dirtyKept ?? []).includes("src/cli.ts"), markerWrites(repo).at(-1));
 	}
 
 	section("--tag override");
@@ -743,6 +830,7 @@ async function main(): Promise<void> {
 			start: { kind: "tag", name: "v0.2.0" },
 			tags: TAGS,
 			dirty: [" M src/cli.ts"],
+			changedPaths: { main: ["src/cli.ts"] },
 			initialFiles: {
 				[UPDATE_MARKER_FILE]: markerContents(),
 				[path.join(DIST_DIR, "index.js")]: "new-build",
@@ -760,6 +848,25 @@ async function main(): Promise<void> {
 		const repo = createFakeRepo({
 			start: { kind: "tag", name: "v0.2.0" },
 			tags: TAGS,
+			dirty: [" M SOME.md"],
+			changedPaths: { main: ["src/cli.ts"] },
+			initialFiles: {
+				[UPDATE_MARKER_FILE]: markerContents(),
+				[path.join(DIST_DIR, "index.js")]: "new-build",
+				[path.join(DIST_PREV_DIR, "index.js")]: "old-build",
+			},
+		});
+		const h = harness(repo);
+		const code = await runUpdate({ cwd: ROOT, rollback: true }, h.deps);
+		check("rollback proceeds over an untouched dirty path without --force", code === 0, { code, err: h.err });
+		check("rollback warns that the local change is kept", lines(h.err).includes("does not touch") && lines(h.err).includes("SOME.md"), h.err);
+		check("rollback checks out the previous ref plainly", mutations(repo).join("|") === "git checkout main", mutations(repo));
+		check("rollback still ends rolled-back", markerWrites(repo).at(-1)?.outcome === "rolled-back", markerWrites(repo));
+	}
+	{
+		const repo = createFakeRepo({
+			start: { kind: "tag", name: "v0.2.0" },
+			tags: TAGS,
 			dirty: [" M src/cli.ts"],
 			initialFiles: {
 				[UPDATE_MARKER_FILE]: markerContents(),
@@ -772,6 +879,34 @@ async function main(): Promise<void> {
 		check("dirty rollback proceeds with --force", code === 0, code);
 		check("dirty rollback checks out plainly", mutations(repo).join("|") === "git checkout main", mutations(repo));
 		check("dirty rollback restores dist.prev", repo.fs.files.get(DIST_FILE) === "old-build", repo.fs.files.get(DIST_FILE));
+	}
+
+	section("marker compatibility");
+	{
+		const legacy = markerContents();
+		check("the legacy fixture has no dirtyKept", !legacy.includes("dirtyKept"));
+		const repo = createFakeRepo({
+			start: { kind: "tag", name: "v0.2.0" },
+			tags: TAGS,
+			initialFiles: { [UPDATE_MARKER_FILE]: legacy },
+		});
+		const h = harness(repo);
+		const code = await runUpdate({ cwd: ROOT, status: true }, h.deps);
+		check("an old marker without dirtyKept still reads", code === 0 && lines(h.out).includes("outcome:      success"), h.out);
+	}
+	{
+		const repo = createFakeRepo({
+			tags: TAGS,
+			initialFiles: { [UPDATE_MARKER_FILE]: markerContents({ dirtyKept: "SOME.md" as unknown as string[] }) },
+		});
+		const h = harness(repo);
+		const code = await runUpdate({ cwd: ROOT, status: true }, h.deps);
+		check("status still exits 0 for a malformed dirtyKept", code === 0, code);
+		check(
+			"a malformed dirtyKept is reported as a format error",
+			lines(h.out).includes("update marker: corrupt") && lines(h.out).includes("dirtyKept must be an array of strings"),
+			h.out,
+		);
 	}
 
 	section("--status");
