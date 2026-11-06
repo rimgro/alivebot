@@ -18,6 +18,9 @@ import {
 	DEFAULT_LOOP_CONTEXT_SLEEP_TOKENS,
 	DEFAULT_LOOP_CONTEXT_WARN_STEP_TOKENS,
 	DEFAULT_LOOP_CONTEXT_WARN_TOKENS,
+	DEFAULT_LOOP_REPEAT_TOOL_ABORT,
+	DEFAULT_LOOP_REPEAT_TOOL_THRESHOLD,
+	DEFAULT_LOOP_REPEAT_TOOL_WINDOW,
 	DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS,
 	DEFAULT_LOOP_RUN_STALL_MS,
 	DEFAULT_LOOP_RUN_TIMEOUT_MS,
@@ -523,6 +526,126 @@ section("loop run-health keys: no hard stop by default, validated thresholds (#1
 			partial.runStallMs === 10 * 60_000,
 		partial,
 	);
+	fs.rmSync(root, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+section("loop repeated-tool keys: sliding-window defaults and validation (#70)");
+{
+	check(
+		"the defaults are threshold 0 (off), window 12, abort off",
+		DEFAULT_CONFIG.loop.repeatToolThreshold === 0 &&
+			DEFAULT_CONFIG.loop.repeatToolWindow === 12 &&
+			DEFAULT_CONFIG.loop.repeatToolAbort === false &&
+			DEFAULT_LOOP_REPEAT_TOOL_THRESHOLD === 0 &&
+			DEFAULT_LOOP_REPEAT_TOOL_WINDOW === 12 &&
+			DEFAULT_LOOP_REPEAT_TOOL_ABORT === false,
+		DEFAULT_CONFIG.loop,
+	);
+	const root = tempRoot("repeattool");
+	const loaded = loadConfig({ cwd: root, secretLog: () => undefined, secretWarn: () => undefined });
+	check(
+		"a config file without the keys keeps detection off and the window valid",
+		loaded.config.loop.repeatToolThreshold === 0 &&
+			loaded.config.loop.repeatToolWindow === 12 &&
+			loaded.config.loop.repeatToolAbort === false,
+		loaded.config.loop,
+	);
+	const disabledInFile = loadConfig({
+		cwd: root,
+		secretLog: () => undefined,
+		secretWarn: () => undefined,
+		overrides: { loop: { ...DEFAULT_CONFIG.loop, repeatToolThreshold: 0, repeatToolWindow: 0 } },
+	});
+	check(
+		"threshold 0 in the config disables detection and does not break the window",
+		disabledInFile.config.loop.repeatToolThreshold === 0 &&
+			disabledInFile.config.loop.repeatToolWindow === 12 &&
+			disabledInFile.config.loop.repeatToolAbort === false,
+		disabledInFile.config.loop,
+	);
+	const overridden = loadConfig({
+		cwd: root,
+		secretLog: () => undefined,
+		secretWarn: () => undefined,
+		overrides: {
+			loop: {
+				...DEFAULT_CONFIG.loop,
+				repeatToolThreshold: 5,
+				repeatToolWindow: 8,
+				repeatToolAbort: true,
+			},
+		},
+	});
+	check(
+		"explicit values win",
+		overridden.config.loop.repeatToolThreshold === 5 &&
+			overridden.config.loop.repeatToolWindow === 8 &&
+			overridden.config.loop.repeatToolAbort === true,
+		overridden.config.loop,
+	);
+	const disabled = validateLoopConfig({ ...DEFAULT_CONFIG.loop, repeatToolThreshold: 0 });
+	check("threshold 0 is accepted and disables detection", disabled.repeatToolThreshold === 0, disabled);
+	const disabledWithWindow = validateLoopConfig({
+		...DEFAULT_CONFIG.loop,
+		repeatToolThreshold: 0,
+		repeatToolWindow: 5,
+	});
+	const zeroBoth = validateLoopConfig({ ...DEFAULT_CONFIG.loop, repeatToolThreshold: 0, repeatToolWindow: 0 });
+	check(
+		"with detection off, a configured window is kept and an explicit 0 falls back to 12",
+		disabledWithWindow.repeatToolThreshold === 0 &&
+			disabledWithWindow.repeatToolWindow === 5 &&
+			zeroBoth.repeatToolThreshold === 0 &&
+			zeroBoth.repeatToolWindow === 12,
+		{ disabledWithWindow, zeroBoth },
+	);
+	const enabled = validateLoopConfig({ ...DEFAULT_CONFIG.loop, repeatToolThreshold: 3, repeatToolWindow: 12 });
+	const zeroWindow = validateLoopConfig({ ...DEFAULT_CONFIG.loop, repeatToolThreshold: 4, repeatToolWindow: 0 });
+	const smallWindow = validateLoopConfig({ ...DEFAULT_CONFIG.loop, repeatToolThreshold: 4, repeatToolWindow: 2 });
+	check(
+		"an explicit threshold 3 is kept and a window below the threshold is raised to it",
+		enabled.repeatToolThreshold === 3 &&
+			enabled.repeatToolWindow === 12 &&
+			zeroWindow.repeatToolWindow === 4 &&
+			smallWindow.repeatToolWindow === 4,
+		{
+			enabled: { threshold: enabled.repeatToolThreshold, window: enabled.repeatToolWindow },
+			zeroWindow: zeroWindow.repeatToolWindow,
+			smallWindow: smallWindow.repeatToolWindow,
+		},
+	);
+	const filled = validateLoopConfig({
+		...DEFAULT_CONFIG.loop,
+		repeatToolThreshold: undefined,
+		repeatToolWindow: null,
+		repeatToolAbort: undefined,
+	} as unknown as LoopConfig);
+	check(
+		"missing or null keys fall back to the defaults, not undefined",
+		filled.repeatToolThreshold === 0 && filled.repeatToolWindow === 12 && filled.repeatToolAbort === false,
+		filled,
+	);
+	const rejects: Array<[string, string, unknown]> = [
+		["a negative repeatToolThreshold", "repeatToolThreshold", -1],
+		["a fractional repeatToolThreshold", "repeatToolThreshold", 1.5],
+		["a string repeatToolThreshold", "repeatToolThreshold", "3"],
+		["a NaN repeatToolThreshold", "repeatToolThreshold", Number.NaN],
+		["a negative repeatToolWindow", "repeatToolWindow", -1],
+		["a fractional repeatToolWindow", "repeatToolWindow", 12.5],
+		["a string repeatToolWindow", "repeatToolWindow", "12"],
+		["a non-boolean repeatToolAbort", "repeatToolAbort", "true"],
+		["a numeric repeatToolAbort", "repeatToolAbort", 1],
+	];
+	for (const [label, key, value] of rejects) {
+		let message = "";
+		try {
+			validateLoopConfig({ ...DEFAULT_CONFIG.loop, [key]: value } as LoopConfig);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		check(`${label} is rejected`, message.startsWith(`loop.${key}`), message || "accepted");
+	}
 	fs.rmSync(root, { recursive: true, force: true });
 }
 
