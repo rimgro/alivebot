@@ -551,7 +551,9 @@ function printLogTail(file: string, lines: number): void {
 }
 
 async function startBackground(config: LoadedConfig, flags: Record<string, string | boolean>): Promise<number> {
-	const existing = snapshotRuntime(config.paths.stateDir);
+	// Identity-checked: a pid left over from a crashed VM may belong to an
+	// unrelated process, which must not read as "already running" (#207).
+	const existing = snapshotRuntime(config.paths.stateDir, { configPath: config.paths.configPath });
 	if (existing?.alive) {
 		if (!flagBool(flags, "force")) {
 			process.stderr.write(
@@ -1612,9 +1614,11 @@ function thoughtsCommand(_cwd: string, flags: Record<string, string | boolean>):
 }
 
 function runningHint(config: LoadedConfig): string {
-	const runtime = readRuntimeState(config.paths.stateDir);
-	if (runtime && isProcessAlive(runtime.pid)) {
-		return ` — runtime running (pid ${runtime.pid}), will pick it up within ~${config.config.loop.pollIntervalMs}ms`;
+	// Same identity check as the runtime's own single-instance guard (#207): a
+	// recycled pid is not a runtime, and the hint must not promise a pickup.
+	const snapshot = snapshotRuntime(config.paths.stateDir, { configPath: config.paths.configPath });
+	if (snapshot?.alive) {
+		return ` — runtime running (pid ${snapshot.pid}), will pick it up within ~${config.config.loop.pollIntervalMs}ms`;
 	}
 	return " — no runtime running; it will be processed on next start";
 }

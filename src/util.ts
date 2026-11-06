@@ -188,6 +188,37 @@ export function processState(pid: number): string | undefined {
 }
 
 /**
+ * Working directory of a process, from procfs. Best effort: the link is
+ * unreadable for other users' processes (and on platforms without procfs), and
+ * every caller treats `undefined` as "unknown", never as a mismatch on its own.
+ */
+export function processCwd(pid: number): string | undefined {
+	if (!Number.isInteger(pid) || pid <= 0) return undefined;
+	try {
+		return fs.readlinkSync(`/proc/${pid}/cwd`);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * argv of a process, from procfs: the kernel joins the arguments with NULs and
+ * terminates the last one. `undefined` means "cannot tell" (no procfs, no such
+ * pid, no permission), which is different from an empty argv (kernel threads).
+ */
+export function readProcessCmdline(pid: number): string[] | undefined {
+	if (!Number.isInteger(pid) || pid <= 0) return undefined;
+	try {
+		const raw = fs.readFileSync(`/proc/${pid}/cmdline`, "utf8");
+		const parts = raw.split("\0");
+		while (parts.length > 0 && parts[parts.length - 1] === "") parts.pop();
+		return parts;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
  * Alive but stopped by SIGSTOP/Ctrl+Z. Such a process still owns the pid and
  * the runtime lock, yet serves nothing until it is continued.
  */
@@ -204,6 +235,23 @@ export function isProcessAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		return true;
+	} catch (err) {
+		return (err as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+/**
+ * A pid owned by another user: `kill(pid, 0)` answers EPERM instead of ESRCH.
+ *
+ * `isProcessAlive` counts EPERM as alive — correct for "something is there" —
+ * but such a process can never be our runtime, and signalling it is not even
+ * possible. Pid reuse after a crash hands us exactly this case (#207).
+ */
+export function isForeignProcess(pid: number): boolean {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return false;
 	} catch (err) {
 		return (err as NodeJS.ErrnoException).code === "EPERM";
 	}

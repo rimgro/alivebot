@@ -15,7 +15,17 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Paths } from "../config.js";
 import { readRuntimeState, writeRuntimeState, type RuntimeStateFile } from "../store/runs.js";
-import { ensureDir, isProcessAlive, isProcessSuspended, readJson, sleep, writeJsonAtomic } from "../util.js";
+import {
+	ensureDir,
+	isForeignProcess,
+	isProcessAlive,
+	isProcessSuspended,
+	processCwd,
+	readJson,
+	readProcessCmdline,
+	sleep,
+	writeJsonAtomic,
+} from "../util.js";
 
 /** File the detached runtime writes its stdout/stderr to. */
 export const STDOUT_LOG_NAME = "stdout.log";
@@ -124,6 +134,89 @@ export function stdoutLogPath(paths: Paths): string {
 	return path.join(paths.logsDir, STDOUT_LOG_NAME);
 }
 
+/**
+ * Why an alive-looking pid in `runtime.json` is *not* this profile's runtime.
+ *
+ * After a crash the pid may be reused by an unrelated process (a root-owned
+ * dockerd, say). `kill(pid, 0)` answers EPERM for it and `isProcessAlive`
+ * treats EPERM as alive, so the next boot refuses to start and systemd burns
+ * through StartLimitBurst (#207). Identity, not mere liveness, decides.
+ */
+export type StaleRuntimeReason = "pid-dead" | "foreign-user" | "cmdline-mismatch" | "cmdline-unreadable";
+
+/** procfs root; its absence is how "this platform cannot tell" is detected. */
+const PROC_ROOT = "/proc";
+
+function realpathOrResolved(file: string): string {
+	// realpath catches symlinked profiles (e.g. /tmp on macOS); the fallback keeps
+	// a path that does not exist yet comparable instead of throwing.
+	try {
+		return fs.realpathSync(file);
+	} catch {
+		return path.resolve(file);
+	}
+}
+
+/** The runtime entry script is always an `index.js`/`index.ts` (dist or tsx). */
+function isRuntimeEntry(arg: string): boolean {
+	const base = path.basename(arg);
+	return base === "index.js" || base === "index.ts";
+}
+
+/**
+ * Value of `--config` in an argv (both `--config X` and `--config=X`); `null`
+ * when the flag is absent at all. `parseArgs` accepts both spellings, so a
+ * runtime started either way must be recognised.
+ */
+function configFlagValue(cmdline: string[]): string | null {
+	for (let i = 0; i < cmdline.length; i += 1) {
+		const arg = cmdline[i]!;
+		if (arg === "--config") return cmdline[i + 1] ?? "";
+		if (arg.startsWith("--config=")) return arg.slice("--config=".length);
+	}
+	return null;
+}
+
+/**
+ * Decide whether `pid` is *our* runtime for `configPath`, i.e. the same entry
+ * script started with the same profile. `undefined` means "yes, it is ours".
+ *
+ * Every "cannot tell" case falls back to the historical "alive means ours":
+ * declaring a live runtime stale would start a second owner of the state dir,
+ * which is worse than the stale-pid bug this check fixes.
+ */
+export function staleRuntimeReason(pid: number, configPath: string): StaleRuntimeReason | undefined {
+	if (!isProcessAlive(pid)) return "pid-dead";
+	// Another user's process: we cannot even signal it, so it cannot be ours.
+	if (isForeignProcess(pid)) return "foreign-user";
+	const cmdline = readProcessCmdline(pid);
+	if (cmdline === undefined) {
+		// No procfs at all (macOS): nothing to compare, keep the old behaviour.
+		return fs.existsSync(PROC_ROOT) ? "cmdline-unreadable" : undefined;
+	}
+	if (!cmdline.some(isRuntimeEntry)) return "cmdline-mismatch";
+	const cwd = processCwd(pid);
+	const wanted = realpathOrResolved(configPath);
+	const configured = configFlagValue(cmdline);
+	if (configured !== null) {
+		if (!configured) return "cmdline-mismatch";
+		// A relative --config is relative to the *child's* cwd (spawnBackground
+		// chdirs into rootDir), not to ours. An unreadable cwd is "cannot tell".
+		if (path.isAbsolute(configured)) {
+			return realpathOrResolved(configured) === wanted ? undefined : "cmdline-mismatch";
+		}
+		if (cwd === undefined) return undefined;
+		return realpathOrResolved(path.resolve(cwd, configured)) === wanted ? undefined : "cmdline-mismatch";
+	}
+	// No --config flag: the runtime defaulted to `<cwd>/alive.config.json`.
+	if (cwd === undefined) return undefined;
+	return realpathOrResolved(cwd) === realpathOrResolved(path.dirname(configPath)) ? undefined : "cmdline-mismatch";
+}
+
+export function isRuntimeProcess(pid: number, configPath: string): boolean {
+	return staleRuntimeReason(pid, configPath) === undefined;
+}
+
 export interface RuntimeSnapshot {
 	state: RuntimeStateFile;
 	pid: number;
@@ -134,19 +227,31 @@ export interface RuntimeSnapshot {
 	/** The runtime shut down on purpose, so a dead pid here is expected. */
 	cleanStop: boolean;
 	uptimeMs: number;
+	/** Set only when `configPath` was passed and the pid is not our runtime (#207). */
+	staleReason?: StaleRuntimeReason;
 }
 
-export function snapshotRuntime(stateDir: string): RuntimeSnapshot | null {
+/**
+ * Read `runtime.json` and report liveness.
+ *
+ * With `configPath` the pid is also checked for identity, so a recycled pid no
+ * longer reads as "running"; without it the historical pid-only behaviour is
+ * kept for callers that have no config at hand.
+ */
+export function snapshotRuntime(stateDir: string, options: { configPath?: string } = {}): RuntimeSnapshot | null {
 	const state = readRuntimeState(stateDir);
 	if (!state || !Number.isInteger(state.pid) || state.pid <= 0) return null;
 	const alive = isProcessAlive(state.pid);
+	const staleReason = options.configPath === undefined ? undefined : staleRuntimeReason(state.pid, options.configPath);
+	const running = options.configPath === undefined ? alive : staleReason === undefined;
 	return {
 		state,
 		pid: state.pid,
-		alive,
-		suspended: alive && isProcessSuspended(state.pid),
+		alive: running,
+		suspended: running && isProcessSuspended(state.pid),
 		cleanStop: state.status === "stopped",
 		uptimeMs: Math.max(0, Date.now() - state.startedAt),
+		...(staleReason === undefined ? {} : { staleReason }),
 	};
 }
 
