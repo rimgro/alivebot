@@ -48,7 +48,6 @@ import { createExecRunner, runUpdate } from "./update.js";
 import {
 	formatDuration,
 	iso,
-	isProcessAlive,
 	oneLine,
 	parseDurationMs,
 	parseTimeSpec,
@@ -622,7 +621,7 @@ function abortToolCommand(
 		config = loadConfig({ cwd: base.paths.rootDir, configPath: agent.configPath });
 		label = agent.id;
 	}
-	const runtime = snapshotRuntime(config.paths.stateDir);
+	const runtime = snapshotRuntime(config.paths.stateDir, { configPath: config.paths.configPath });
 	if (!runtime?.alive) {
 		process.stderr.write(`${term.yellow("not running")} — ${label} has no live runtime; nothing to abort\n`);
 		return 1;
@@ -750,7 +749,7 @@ async function agentsCommand(cwd: string, flags: Record<string, string | boolean
 					id: agent.id,
 					name: loaded.config.name,
 					enabled: getAgentEnabled(agent),
-					running: snapshotRuntime(loaded.paths.stateDir)?.alive ?? false,
+					running: snapshotRuntime(loaded.paths.stateDir, { configPath: loaded.paths.configPath })?.alive ?? false,
 				};
 			}),
 			listMessages: async (id) => {
@@ -771,7 +770,7 @@ async function agentsCommand(cwd: string, flags: Record<string, string | boolean
 		if (!agents.length) process.stdout.write("no agents; create one with: alive agents create <id>\n");
 		for (const agent of agents) {
 			const loaded = loadConfig({ cwd, configPath: agent.configPath });
-			const snapshot = snapshotRuntime(loaded.paths.stateDir);
+			const snapshot = snapshotRuntime(loaded.paths.stateDir, { configPath: loaded.paths.configPath });
 			const running = snapshot?.alive ? `running pid=${snapshot.pid}` : "stopped";
 			const enabled = getAgentEnabled(agent) ? "enabled" : "disabled";
 			process.stdout.write(`${agent.id.padEnd(20)} ${loaded.config.name}  ${enabled}  ${running}  workspace=${loaded.paths.workspaceDir}\n`);
@@ -991,16 +990,18 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 	const policy = new PolicyStore(config.paths.stateDir);
 	const runs = new RunLog(config.paths.stateDir);
 	const runtime = readRuntimeState(config.paths.stateDir);
+	// Identity-checked: a recycled pid must not read as this profile's runtime (#207/#212).
+	const snapshot = snapshotRuntime(config.paths.stateDir, { configPath: config.paths.configPath });
 	const usage = runs.usageToday();
 	const storeStatus = store.status();
-	const running = runtime ? isProcessAlive(runtime.pid) : false;
+	const running = snapshot?.alive ?? false;
 	const heartbeat = readHeartbeatStatus(config.paths.stateDir, config.config.updates.heartbeatStaleMs);
 	// Process-level health (#175): a dead pid without a clean stop, a live pid whose
 	// heartbeat went silent, or no runtime and no heartbeat at all. The existing
 	// working/waiting/sleeping state remains separate (`alive status` shows the
 	// runtime status while the process is alive).
 	const health = deriveAgentHealth(runtime, {
-		pidAlive: () => running,
+		configPath: config.paths.configPath,
 		heartbeatAgeMs: heartbeat.ageMs,
 		silentMs: config.config.health.silentMs,
 		unitStatus: heartbeat.heartbeat?.unitStatus,
@@ -1069,7 +1070,6 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 	}
 
 	const line = (label: string, value: string) => process.stdout.write(`${label.padEnd(12)} ${value}\n`);
-	const snapshot = snapshotRuntime(config.paths.stateDir);
 	line("agent", config.config.name);
 	if (health.state === "dead") {
 		line("status", `${term.red("dead")} — ${health.reason ?? "no signs of life"}`);

@@ -34,6 +34,7 @@ import {
 	restartRefusalText,
 } from "../runtime/harness-guard.js";
 import { snapshotRuntime, type StopResult } from "../runtime/daemon.js";
+import { sleep } from "../util.js";
 
 let failures = 0;
 function check(name: string, condition: boolean, detail?: unknown): void {
@@ -46,6 +47,15 @@ function check(name: string, condition: boolean, detail?: unknown): void {
 }
 function section(name: string): void {
 	process.stdout.write(`\n${name}\n`);
+}
+
+async function waitForFile(file: string, timeoutMs = 5_000): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (fs.existsSync(file)) return true;
+		await sleep(25);
+	}
+	return false;
 }
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-cli-restart-test-"));
@@ -398,22 +408,46 @@ try {
 			{ runtime: dead.payload.runtime, staleRuntime: dead.payload.staleRuntime },
 		);
 
-		writeRuntimeState(healthStateDir, {
-			pid: process.pid,
-			startedAt: now - 60_000,
-			lastTickAt: now,
-			status: "idle",
-			runIndex: 1,
-			pending: 0,
-			openThreads: 0,
-			sleeps: 0,
-		});
-		writeHeartbeat({ stateDir: healthStateDir, pid: process.pid, startedAt: now - 60_000, lastTickAt: now });
-		const running = await statusJson();
-		const runningHealth = running.payload.health as Record<string, unknown> | undefined;
-		check("a live pid with a fresh heartbeat is health.state=running", runningHealth?.state === "running", runningHealth);
-		check("a running health block has no dead reason", runningHealth?.reason === undefined, runningHealth);
-		fs.rmSync(healthProject, { recursive: true, force: true });
+		// Since #212 status verifies that the pid is this profile's runtime, not
+		// merely alive: the "running" fixture must be a real runtime-shaped process.
+		const runningMarker = path.join(healthProject, "runtime.ready");
+		const runningScript = path.join(healthProject, "index.js");
+		fs.writeFileSync(
+			runningScript,
+			`require("node:fs").writeFileSync(${JSON.stringify(runningMarker)}, "ready");\nsetTimeout(() => {}, 60000);\n`,
+			"utf8",
+		);
+		const runningRuntime = spawn(
+			process.execPath,
+			[runningScript, "run", "--foreground", "--config", healthConfig],
+			{ cwd: healthProject, stdio: "ignore" },
+		);
+		try {
+			if (!(await waitForFile(runningMarker))) throw new Error("running runtime stub never became ready");
+			const runningPid = runningRuntime.pid!;
+			writeRuntimeState(healthStateDir, {
+				pid: runningPid,
+				startedAt: now - 60_000,
+				lastTickAt: now,
+				status: "idle",
+				runIndex: 1,
+				pending: 0,
+				openThreads: 0,
+				sleeps: 0,
+			});
+			writeHeartbeat({ stateDir: healthStateDir, pid: runningPid, startedAt: now - 60_000, lastTickAt: now });
+			const running = await statusJson();
+			const runningHealth = running.payload.health as Record<string, unknown> | undefined;
+			check("a live pid with a fresh heartbeat is health.state=running", runningHealth?.state === "running", runningHealth);
+			check("a running health block has no dead reason", runningHealth?.reason === undefined, runningHealth);
+		} finally {
+			try {
+				process.kill(runningRuntime.pid!, "SIGKILL");
+			} catch {
+				// already gone
+			}
+			fs.rmSync(healthProject, { recursive: true, force: true });
+		}
 
 		// #190: a profile that never started is sleeping, not dead. Nothing was
 		// written into its state dir, so there is no trace of a launch.

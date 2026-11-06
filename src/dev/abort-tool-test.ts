@@ -8,6 +8,7 @@
  * does, so the test exercises the real wrapper, flag consumption, TTL and the
  * exact agent-visible error.
  */
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -23,6 +24,7 @@ import {
 	toolAbortRequestPath,
 	writeToolAbortRequest,
 } from "../runtime/tool-abort.js";
+import { sleep } from "../util.js";
 
 let failures = 0;
 function check(name: string, condition: boolean, detail?: unknown): void {
@@ -35,6 +37,15 @@ function check(name: string, condition: boolean, detail?: unknown): void {
 }
 function section(name: string): void {
 	process.stdout.write(`\n${name}\n`);
+}
+
+async function waitForFile(file: string, timeoutMs = 5_000): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (fs.existsSync(file)) return true;
+		await sleep(25);
+	}
+	return false;
 }
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-abort-tool-test-"));
@@ -162,6 +173,7 @@ section("CLI: alive abort-tool <agent> writes the one-shot flag");
 	const project = fs.mkdtempSync(path.join(root, "cli-"));
 	const previous = process.cwd();
 	const previousUser = process.env.USER;
+	let runtime: ReturnType<typeof spawn> | undefined;
 	try {
 		process.env.USER = "tester";
 		fs.writeFileSync(
@@ -170,10 +182,22 @@ section("CLI: alive abort-tool <agent> writes the one-shot flag");
 			"utf8",
 		);
 		fs.mkdirSync(path.join(project, ".alive"), { recursive: true });
+		// #212: abort-tool verifies that the pid is this profile's runtime, not
+		// merely alive, so the fixture needs a real runtime-shaped process.
+		const runtimeMarker = path.join(project, "runtime.ready");
+		const runtimeScript = path.join(project, "index.js");
+		fs.writeFileSync(
+			runtimeScript,
+			`require("node:fs").writeFileSync(${JSON.stringify(runtimeMarker)}, "ready");\nsetTimeout(() => {}, 60000);\n`,
+			"utf8",
+		);
+		runtime = spawn(process.execPath, [runtimeScript, "run", "--foreground"], { cwd: project, stdio: "ignore" });
+		if (!(await waitForFile(runtimeMarker))) throw new Error("runtime stub never became ready");
+		const runtimePid = runtime.pid!;
 		fs.writeFileSync(
 			path.join(project, ".alive", "runtime.json"),
 			`${JSON.stringify({
-				pid: process.pid,
+				pid: runtimePid,
 				startedAt: Date.now() - 60_000,
 				lastTickAt: Date.now(),
 				status: "working",
@@ -200,7 +224,7 @@ section("CLI: alive abort-tool <agent> writes the one-shot flag");
 		fs.writeFileSync(
 			path.join(project, ".alive", "runtime.json"),
 			`${JSON.stringify({
-				pid: process.pid,
+				pid: runtimePid,
 				startedAt: Date.now() - 60_000,
 				lastTickAt: Date.now(),
 				status: "working",
@@ -216,6 +240,13 @@ section("CLI: alive abort-tool <agent> writes the one-shot flag");
 		check("the CLI exits 1 when no tool is running", noToolCode === 1, noToolCode);
 		check("no marker is written when no tool is running", !fs.existsSync(toolAbortRequestPath(path.join(project, ".alive"))));
 	} finally {
+		if (runtime) {
+			try {
+				process.kill(runtime.pid!, "SIGKILL");
+			} catch {
+				// already gone
+			}
+		}
 		process.chdir(previous);
 		if (previousUser === undefined) delete process.env.USER;
 		else process.env.USER = previousUser;

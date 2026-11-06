@@ -16,6 +16,7 @@ import { DEFAULT_CONTRACT, loadConfig, type LoadedConfig } from "../config.js";
 import { readHeartbeatStatus, type UnitStatus } from "../heartbeat.js";
 import type { StartLoopStatus } from "../store/start-loop.js";
 import { buildSystemPrompt } from "../runtime/prompt.js";
+import { staleRuntimeReason, type StaleRuntimeReason } from "../runtime/daemon.js";
 import type { AliveEvent } from "../store/events.js";
 import type { Reminder } from "../store/reminders.js";
 import {
@@ -765,6 +766,12 @@ export interface DeriveStatusOptions {
 	now?: number;
 	/** Seam for tests: defaults to the real `isProcessAlive` check. */
 	pidAlive?: (pid: number) => boolean;
+	/**
+	 * Profile config path: when known, liveness also checks that the pid is this
+	 * profile's runtime and not a recycled pid owned by something else (#212).
+	 * `pidAlive` takes precedence so tests can keep injecting liveness.
+	 */
+	configPath?: string;
 	/** `loop.runStallMs`; 0 disables the stalled-run marker (#173). */
 	runStallMs?: number;
 	/** Age of the heartbeat file's mtime; undefined when there is no heartbeat (#175). */
@@ -783,12 +790,23 @@ export interface DeriveStatusOptions {
 	launchHistory?: boolean;
 }
 
+/** Liveness plus, when a config path is known, why a live pid is not our runtime. */
+function processLiveness(pid: number, options: DeriveStatusOptions): { alive: boolean; staleReason?: StaleRuntimeReason } {
+	if (options.pidAlive) return { alive: options.pidAlive(pid) };
+	if (options.configPath !== undefined) {
+		const staleReason = staleRuntimeReason(pid, options.configPath);
+		return staleReason === undefined ? { alive: true } : { alive: false, staleReason };
+	}
+	return { alive: isProcessAlive(pid) };
+}
+
 /** Why a profile is considered dead, or undefined when no dead rule fires. */
 function deadAgentView(
 	runtime: RuntimeStateFile | null,
 	alive: boolean,
 	options: DeriveStatusOptions,
 	now: number,
+	staleReason?: StaleRuntimeReason,
 ): AgentStatusView | undefined {
 	const silentMs = Math.max(0, Math.trunc(options.silentMs ?? 0));
 	const ageMs = options.heartbeatAgeMs;
@@ -801,7 +819,13 @@ function deadAgentView(
 		return { status: "dead", note: `no runtime state; ${heartbeatText}` };
 	}
 	if (!alive && runtime.status !== "stopped") {
-		const parts = ["process is not running", heartbeatText];
+		// A recycled pid belongs to some other live process, so "not running" would
+		// be a lie: name the identity mismatch instead (#212). A dead pid keeps the
+		// historical wording.
+		const livenessText = staleReason !== undefined && staleReason !== "pid-dead"
+			? `process pid ${runtime.pid} is not this profile's runtime (${staleReason})`
+			: "process is not running";
+		const parts = [livenessText, heartbeatText];
 		if (options.unitStatus && options.unitStatus !== "active" && options.unitStatus !== "none") {
 			parts.push(`unit ${options.unitStatus}`);
 		}
@@ -829,7 +853,8 @@ export function deriveAgentStatus(
 	options: DeriveStatusOptions = {},
 ): AgentStatusView {
 	const now = options.now ?? Date.now();
-	const alive = runtime ? (options.pidAlive ?? isProcessAlive)(runtime.pid) : false;
+	const liveness = runtime ? processLiveness(runtime.pid, options) : { alive: false };
+	const alive = liveness.alive;
 	if (!runtime) {
 		// A profile that never started has no runtime because it has not run yet;
 		// that is a sleep, not a death, whatever `health.silentMs` says (#190).
@@ -839,7 +864,7 @@ export function deriveAgentStatus(
 	if (!alive) {
 		// A clean stop is a sleep, not a failure. Anything else with a dead pid is
 		// visible as dead instead of looking like a normal sleep (#175).
-		return deadAgentView(runtime, false, options, now) ?? { status: "sleeping", note: "runtime stopped" };
+		return deadAgentView(runtime, false, options, now, liveness.staleReason) ?? { status: "sleeping", note: "runtime stopped" };
 	}
 	// An open run that stopped ticking is not "working": it is a visible failure
 	// (#173). Derived from `lastTickAt` so a frozen process is caught too.
@@ -894,11 +919,12 @@ export function deriveAgentHealth(
 	options: DeriveStatusOptions = {},
 ): AgentHealthView {
 	const now = options.now ?? Date.now();
-	const alive = runtime ? (options.pidAlive ?? isProcessAlive)(runtime.pid) : false;
+	const liveness = runtime ? processLiveness(runtime.pid, options) : { alive: false };
+	const alive = liveness.alive;
 	const silentMs = Math.max(0, Math.trunc(options.silentMs ?? 0));
 	// Never started is "stopped", not "dead": there is nothing that failed (#190).
 	const neverStarted = runtime === null && options.launchHistory === false;
-	const dead = neverStarted ? undefined : deadAgentView(runtime, alive, options, now);
+	const dead = neverStarted ? undefined : deadAgentView(runtime, alive, options, now, liveness.staleReason);
 	return {
 		state: dead ? "dead" : alive ? "running" : "stopped",
 		...(dead ? { reason: dead.note } : {}),
@@ -967,6 +993,9 @@ export function readAgentSummary(
 	);
 	const status = deriveAgentStatus(runtime, {
 		...options,
+		// The dashboard knows the profile, so a recycled pid is classified as stale
+		// instead of looking like a running runtime (#212).
+		configPath: options.configPath ?? profile.configPath,
 		// The dashboard owns the state dir, so it answers "did this profile ever
 		// start?" itself; a caller may still override the seam (#190).
 		launchHistory: options.launchHistory ?? hasLaunchHistory(profile.stateDir),
