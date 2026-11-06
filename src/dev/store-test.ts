@@ -100,6 +100,78 @@ section("event store: rollback redelivers");
 	check("acked after retry", store.status().ackedSeq === 4, store.status());
 }
 
+section("event store: redelivery counters are bounded and pruned (#219)");
+{
+	const dir = path.join(root, ".alive-redelivery");
+	const store = EventStore.open(dir);
+	const a = store.append({ kind: "user_message", source: "test", priority: "normal", title: "ra", text: "ra" });
+	const b = store.append({ kind: "user_message", source: "test", priority: "normal", title: "rb", text: "rb" });
+	store.beginRun("r1");
+	store.claim(10);
+	store.rollbackClaim();
+	check(
+		"rollback increments every claimed event",
+		store.redeliveryCount(a.seq) === 1 && store.redeliveryCount(b.seq) === 1,
+		{ a: store.redeliveryCount(a.seq), b: store.redeliveryCount(b.seq) },
+	);
+	check("rolled back events are pending again", store.pendingCount() === 2, store.status());
+	store.beginRun("r2");
+	store.claim(10);
+	store.rollbackClaim();
+	check(
+		"a second rollback increments again",
+		store.redeliveryCount(a.seq) === 2 && store.redeliveryCount(b.seq) === 2,
+		{ a: store.redeliveryCount(a.seq), b: store.redeliveryCount(b.seq) },
+	);
+	store.beginRun("r3");
+	store.claim(10);
+	store.ack();
+	check(
+		"ack clears the counters of acknowledged events",
+		store.redeliveryCount(a.seq) === 0 && store.redeliveryCount(b.seq) === 0,
+		{ a: store.redeliveryCount(a.seq), b: store.redeliveryCount(b.seq) },
+	);
+	check("ack keeps the run open", store.openRunId === "r3", store.status());
+	store.endRun();
+
+	// Mixed range: the exhausted head is acknowledged through ackThrough, the tail rolls back.
+	const c = store.append({ kind: "user_message", source: "test", priority: "normal", title: "rc", text: "rc" });
+	const d = store.append({ kind: "user_message", source: "test", priority: "normal", title: "rd", text: "rd" });
+	store.beginRun("r4");
+	store.claim(10);
+	store.rollbackClaim();
+	store.beginRun("r5");
+	store.claim(10);
+	store.ackThrough(c.seq);
+	check("ackThrough advances ackedSeq", store.ackedSeq === c.seq, store.status());
+	check("ackThrough prunes the acknowledged head", store.redeliveryCount(c.seq) === 0, store.redeliveryCount(c.seq));
+	check("ackThrough leaves the tail counter", store.redeliveryCount(d.seq) === 1, store.redeliveryCount(d.seq));
+	store.rollbackClaim();
+	check("the tail still counts a rollback after ackThrough", store.redeliveryCount(d.seq) === 2, store.redeliveryCount(d.seq));
+	check("only the tail remains pending", store.pendingCount() === 1, store.status());
+	store.beginRun("r6");
+	store.claim(10);
+	store.endRun();
+	check("endRun clears the counter too", store.redeliveryCount(d.seq) === 0, store.redeliveryCount(d.seq));
+}
+
+section("event store: an old cursor without redeliveries still reads (#219)");
+{
+	const dir = path.join(root, ".alive-old-cursor");
+	const inbox = path.join(dir, "inbox");
+	fs.mkdirSync(inbox, { recursive: true });
+	fs.writeFileSync(path.join(inbox, "cursor.json"), JSON.stringify({ ackedSeq: 0, openRun: null }), "utf8");
+	const store = EventStore.open(dir);
+	const e = store.append({ kind: "user_message", source: "test", priority: "normal", title: "old", text: "old" });
+	check("the missing field reads as an empty budget", store.redeliveryCount(e.seq) === 0, store.redeliveryCount(e.seq));
+	store.beginRun("old-cursor");
+	store.claim(10);
+	store.rollbackClaim();
+	check("a rollback starts the counter", store.redeliveryCount(e.seq) === 1, store.redeliveryCount(e.seq));
+	const saved = JSON.parse(fs.readFileSync(path.join(inbox, "cursor.json"), "utf8")) as { redeliveries?: Record<string, number> };
+	check("the new field is persisted", saved.redeliveries?.[String(e.seq)] === 1, saved);
+}
+
 section("event store: crash recovery");
 {
 	const store = EventStore.open(stateDir);

@@ -47,6 +47,15 @@ export type NewEvent = Omit<AliveEvent, "seq" | "id" | "ts"> & {
 export interface RunCursor {
 	ackedSeq: number;
 	openRun: { runId: string; lastSeq: number } | null;
+	/**
+	 * How many times each event was rolled back for redelivery, keyed by its seq.
+	 *
+	 * The runtime uses this as a bounded retry budget for the context-sleep case:
+	 * an event that keeps waking a run whose context is already too large must
+	 * eventually be dropped instead of looping forever. Entries are pruned as
+	 * soon as the event is acknowledged, so the map never grows with the inbox.
+	 */
+	redeliveries: Record<string, number>;
 }
 
 export interface StoreStatus {
@@ -81,7 +90,7 @@ export class EventStore {
 	private readonly file: string;
 	private readonly cursorFile: string;
 	private events: AliveEvent[] = [];
-	private cursor: RunCursor = { ackedSeq: 0, openRun: null };
+	private cursor: RunCursor = { ackedSeq: 0, openRun: null, redeliveries: {} };
 	private offset = 0;
 	private dedupe = new Map<string, AliveEvent>();
 
@@ -242,6 +251,39 @@ export class EventStore {
 	}
 
 	/**
+	 * Acknowledge the claimed prefix up to `seq` without closing the run.
+	 *
+	 * Used by the context-sleep redelivery cap when only the exhausted head of a
+	 * mixed range is given up on: the rest is rolled back and delivered again.
+	 */
+	ackThrough(seq: number): void {
+		const open = this.cursor.openRun;
+		if (!open) return;
+		const target = Math.min(Math.max(seq, this.cursor.ackedSeq), open.lastSeq);
+		if (target <= this.cursor.ackedSeq) return;
+		this.cursor.ackedSeq = target;
+		this.pruneRedeliveries(target);
+		this.saveCursor();
+	}
+
+	/** How many times `seq` has been rolled back for redelivery (0 when unknown). */
+	redeliveryCount(seq: number): number {
+		return this.cursor.redeliveries[String(seq)] ?? 0;
+	}
+
+	/**
+	 * The seq range currently claimed by the open run (`ackedSeq+1 .. lastSeq`),
+	 * or null when no run is open or it has not claimed anything.
+	 */
+	claimedRange(): { fromSeq: number; toSeq: number } | null {
+		this.refresh();
+		const open = this.cursor.openRun;
+		if (!open) return null;
+		const fromSeq = this.cursor.ackedSeq + 1;
+		return open.lastSeq >= fromSeq ? { fromSeq, toSeq: open.lastSeq } : null;
+	}
+
+	/**
 	 * Mark everything handed to the current run as handled, but keep the run open.
 	 *
 	 * The idle tool calls this on entry: the agent only returns to idle once it is
@@ -253,6 +295,7 @@ export class EventStore {
 		if (!this.cursor.openRun) return;
 		this.cursor.ackedSeq = this.cursor.openRun.lastSeq;
 		this.cursor.openRun.lastSeq = this.cursor.ackedSeq;
+		this.pruneRedeliveries(this.cursor.ackedSeq);
 		this.saveCursor();
 	}
 
@@ -261,6 +304,7 @@ export class EventStore {
 		if (!this.cursor.openRun) return;
 		this.cursor.ackedSeq = this.cursor.openRun.lastSeq;
 		this.cursor.openRun = null;
+		this.pruneRedeliveries(this.cursor.ackedSeq);
 		this.saveCursor();
 	}
 
@@ -270,7 +314,14 @@ export class EventStore {
 	 * instead of being lost.
 	 */
 	rollbackClaim(): void {
-		if (!this.cursor.openRun) return;
+		const open = this.cursor.openRun;
+		if (!open) return;
+		// Count the retry before dropping the claim: the next run will receive
+		// these seqs again, and the context-sleep cap needs to know how often.
+		for (let seq = this.cursor.ackedSeq + 1; seq <= open.lastSeq; seq += 1) {
+			const key = String(seq);
+			this.cursor.redeliveries[key] = (this.cursor.redeliveries[key] ?? 0) + 1;
+		}
 		this.cursor.openRun = null;
 		this.saveCursor();
 	}
@@ -331,6 +382,13 @@ export class EventStore {
 		return `${header}\n    title: ${event.title}\n${indent(event.text)}${payload}`;
 	}
 
+	/** Drop retry counters for events that are now acknowledged. */
+	private pruneRedeliveries(throughSeq: number): void {
+		for (const key of Object.keys(this.cursor.redeliveries)) {
+			if (Number(key) <= throughSeq) delete this.cursor.redeliveries[key];
+		}
+	}
+
 	private saveCursor(): void {
 		writeJsonAtomic(this.cursorFile, this.cursor);
 	}
@@ -338,11 +396,25 @@ export class EventStore {
 
 /** Accept cursor files written by the wake-per-batch runtime. */
 function normalizeCursor(value: unknown): RunCursor {
-	const fallback: RunCursor = { ackedSeq: 0, openRun: null };
+	const fallback: RunCursor = { ackedSeq: 0, openRun: null, redeliveries: {} };
 	if (!value || typeof value !== "object") return fallback;
 	const raw = value as Record<string, unknown>;
 	const ackedSeq = typeof raw.ackedSeq === "number" ? raw.ackedSeq : 0;
+	// Old cursor files predate the redelivery budget: treat the missing field as empty.
+	const redeliveries = normalizeRedeliveries(raw.redeliveries);
 	const open = (raw.openRun ?? raw.openWake) as { wakeId?: string; runId?: string; lastSeq?: number } | null | undefined;
-	if (!open || typeof open.lastSeq !== "number") return { ackedSeq, openRun: null };
-	return { ackedSeq, openRun: { runId: open.runId ?? open.wakeId ?? "unknown", lastSeq: open.lastSeq } };
+	if (!open || typeof open.lastSeq !== "number") return { ackedSeq, openRun: null, redeliveries };
+	return { ackedSeq, openRun: { runId: open.runId ?? open.wakeId ?? "unknown", lastSeq: open.lastSeq }, redeliveries };
+}
+
+function normalizeRedeliveries(value: unknown): Record<string, number> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+	const out: Record<string, number> = {};
+	for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+		const seq = Number(key);
+		if (!Number.isInteger(seq) || seq <= 0) continue;
+		if (typeof raw !== "number" || !Number.isFinite(raw) || raw <= 0) continue;
+		out[String(seq)] = Math.floor(raw);
+	}
+	return out;
 }

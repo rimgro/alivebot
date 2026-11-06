@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import { appendJsonl, ensureDir, readJsonl } from "../util.js";
-import type { CompactionFailureClass, ContextResetReason } from "./runs.js";
+import type { CompactionFailureClass, ContextResetReason, RunStopReason } from "./runs.js";
 
 /**
  * Run-anomaly events the runtime records about its own runs (#127, #123).
@@ -32,6 +32,13 @@ import type { CompactionFailureClass, ContextResetReason } from "./runs.js";
  * the other run anomalies it stops nothing: it makes the stall visible on the
  * dashboard and in `alive status` instead of looking like normal work.
  *
+ * `events_dropped` (#219) records that a run ended by a context-sleep directive
+ * without handling the events it had claimed, and the bounded redelivery budget
+ * was exhausted: the runtime acknowledged those events instead of looping
+ * forever. `events` is the number of dropped events, `seqs` names them and
+ * `kinds` carries their event kinds so the operator can find them in
+ * `inbox/events.jsonl` and resend them by hand.
+ *
  * One file per profile: `<stateDir>/runs/events.jsonl`, next to `runs.jsonl`.
  */
 export type RunAnomalyType =
@@ -43,7 +50,8 @@ export type RunAnomalyType =
 	| "tool_long"
 	| "context_high"
 	| "context_reset"
-	| "compaction_failed";
+	| "compaction_failed"
+	| "events_dropped";
 
 export interface RunAnomalyEvent {
 	/** Wall clock of the event. */
@@ -62,7 +70,7 @@ export interface RunAnomalyEvent {
 	turns: number;
 	/** Outbound messages sent so far. */
 	outbound: number;
-	/** Inbound events delivered to the run so far. */
+	/** Inbound events delivered to the run so far; for `events_dropped`, the number dropped. */
 	events: number;
 	/** `run_long`/`run_very_long`: the threshold that fired, for reference. */
 	limitMs?: number;
@@ -89,6 +97,12 @@ export interface RunAnomalyEvent {
 	attempt?: number;
 	/** `compaction_failed`: attempt budget for one summarization call. */
 	maxAttempts?: number;
+	/** `events_dropped`: the sequence numbers acknowledged instead of redelivered. */
+	seqs?: number[];
+	/** `events_dropped`: event kind for each seq, in the same order as `seqs`. */
+	kinds?: string[];
+	/** `events_dropped`: why the run stopped when its events were dropped. */
+	stopReason?: RunStopReason;
 }
 
 /** Anything that can persist a run-anomaly event (the runtime uses `RunEventLog`). */

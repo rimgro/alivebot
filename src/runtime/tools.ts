@@ -85,6 +85,12 @@ export interface RunHandle {
 	sleepOfferedAfterMs?: number;
 	sleepRequested: boolean;
 	sleepForced: boolean;
+	/**
+	 * Set once the context-sleep directive was steered in this run (#219).
+	 * The `sleep` tool leaves the claim open when it is set, so the run can roll
+	 * back events it never handled instead of acknowledging them.
+	 */
+	contextSleepDirected?: boolean;
 	retainedThisRun: boolean;
 	sleepSummary?: string;
 	lastStopReason?: string;
@@ -1083,7 +1089,10 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 				deps.notes.set(params.note_key, params.note_value);
 				run.noteKeys.push(params.note_key);
 			}
-			deps.store.ack();
+			// A directive-induced sleep may not have handled the claimed events. Leave
+			// the claim open so `execute()` can roll it back (#219); a normal sleep
+			// acknowledges the previous batch right here.
+			if (!run.contextSleepDirected) deps.store.ack();
 			run.sleepRequested = true;
 			run.sleepForced = false;
 			run.sleepSummary = summary;
