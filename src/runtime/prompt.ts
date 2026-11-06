@@ -2,6 +2,7 @@ import type { AliveEvent } from "../store/events.js";
 import type { NotifyPolicyFile } from "../store/policy.js";
 import type { Reminder } from "../store/reminders.js";
 import { runTurnCount, type RunRecord } from "../store/runs.js";
+import { cacheHitRate, formatRate } from "../usage/cache.js";
 import type { ThreadState } from "../store/threads.js";
 import { formatDuration, iso, localTime, oneLine, truncate } from "../util.js";
 import { DEFAULT_CONTRACT } from "../config.js";
@@ -283,6 +284,8 @@ export interface AwakePromptInput {
 	recentRuns: RunRecord[];
 	policy: NotifyPolicyFile;
 	costTodayUsd: number;
+	/** Prompt-cache tokens of the local day (#76); absent when the day has no counter. */
+	cacheToday?: { input: number; cacheRead: number; cacheWrite: number };
 	maxDailyCostUsd: number;
 	pendingAfterClaim: number;
 	/** Secret rules for agent-visible event text and runtime errors. */
@@ -345,7 +348,7 @@ function carriedOver(input: AwakePromptInput, context: MaskContext): string[] {
 					.slice(-3)
 					.map((r) => {
 						const out = r.outbound.length > 0 ? `→ ${r.outbound.length} msg` : "no outbound";
-						return `- #${r.index} ${localTime(r.finishedAt)} ${formatDuration(r.durationMs)}: ${r.events.length} events, ${out}, ${runTurnCount(r)} turns, ended: ${r.stopReason}`;
+						return `- #${r.index} ${localTime(r.finishedAt)} ${formatDuration(r.durationMs)}: ${r.events.length} events, ${out}, ${runTurnCount(r)} turns, ended: ${r.stopReason}, cache ${formatRate(cacheHitRate(r.usage))}`;
 					})
 					.join("\n"),
 		);
@@ -440,6 +443,22 @@ function renderBudgetSection(input: AwakePromptInput): string {
 	const budget: string[] = [`- cost today: $${input.costTodayUsd.toFixed(4)}`];
 	if (input.maxDailyCostUsd > 0) {
 		budget[0] += ` of $${input.maxDailyCostUsd.toFixed(2)}`;
+	}
+	// Cache hit (#76): today's rate and the last run's rate, two short lines.
+	// The cache-write anomaly is a log/operator signal and deliberately not
+	// explained here: prompt text is agent behaviour, not operator diagnostics.
+	const today = input.cacheToday;
+	const todayRate = today ? cacheHitRate(today) : null;
+	budget.push(
+		todayRate === null || today === undefined
+			? "- cache hit today: — (no prompt tokens recorded)"
+			: `- cache hit today: ${formatRate(todayRate)} = cacheRead ${today.cacheRead.toLocaleString("en-US")} / (input ${today.input.toLocaleString("en-US")} + cacheRead ${today.cacheRead.toLocaleString("en-US")}) · agent runs only`,
+	);
+	const lastRun = input.recentRuns[input.recentRuns.length - 1];
+	if (!lastRun) {
+		budget.push("- cache hit last run: — (no completed run yet)");
+	} else {
+		budget.push(`- cache hit last run: ${formatRate(cacheHitRate(lastRun.usage))} (#${lastRun.index})`);
 	}
 	return `### Budget\n\n${budget.join("\n")}`;
 }

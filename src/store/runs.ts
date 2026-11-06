@@ -500,6 +500,13 @@ export interface UsageBucket {
 	turns: number;
 	input: number;
 	output: number;
+	/**
+	 * Prompt cache tokens of the day (#76). Optional on purpose: `usage.json`
+	 * files written before the fields existed do not carry them, and readers
+	 * treat a missing value as 0 instead of re-deriving or rewriting history.
+	 */
+	cacheRead?: number;
+	cacheWrite?: number;
 }
 
 interface UsageFile {
@@ -625,7 +632,17 @@ export class RunLog {
 		bucket.turns += direction * runTurnCount(record);
 		bucket.input += direction * record.usage.input;
 		bucket.output += direction * record.usage.output;
-		if (bucket.runs <= 0 && bucket.turns <= 0 && bucket.cost <= 0 && bucket.input <= 0 && bucket.output <= 0) {
+		bucket.cacheRead = (bucket.cacheRead ?? 0) + direction * (record.usage.cacheRead ?? 0);
+		bucket.cacheWrite = (bucket.cacheWrite ?? 0) + direction * (record.usage.cacheWrite ?? 0);
+		if (
+			bucket.runs <= 0 &&
+			bucket.turns <= 0 &&
+			bucket.cost <= 0 &&
+			bucket.input <= 0 &&
+			bucket.output <= 0 &&
+			(bucket.cacheRead ?? 0) <= 0 &&
+			(bucket.cacheWrite ?? 0) <= 0
+		) {
 			delete usage.days[day];
 		} else {
 			usage.days[day] = bucket;
