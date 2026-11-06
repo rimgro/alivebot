@@ -65,6 +65,11 @@ const config = loadConfig({
 			runNoOutboundTurns: 60,
 			runVeryLongMs: 3 * 60 * 60_000,
 			toolLongMs: 10 * 60_000,
+			// The runner test config explicitly enables repeated-tool detection;
+			// the product default is 0 (off).
+			repeatToolThreshold: 3,
+			repeatToolWindow: 12,
+			repeatToolAbort: false,
 			runStallMs: 10 * 60_000,
 			contextWarnTokens: 150_000,
 			contextWarnStepTokens: 50_000,
@@ -133,6 +138,8 @@ class FakeSession {
 	listeners: Array<(event: unknown) => void> = [];
 	steered: string[] = [];
 	aborted = false;
+	/** How many times `abort()` was called, so a guard can assert a single abort. */
+	abortCalls = 0;
 	disposed = false;
 	prompts: string[] = [];
 	onAbort?: () => void;
@@ -185,6 +192,7 @@ class FakeSession {
 		this.steered.push(text);
 	}
 	async abort(): Promise<void> {
+		this.abortCalls += 1;
 		this.aborted = true;
 		this.onAbort?.();
 	}
@@ -315,6 +323,16 @@ function resetRunHealth(): void {
 		runVeryLongMs: 3 * 60 * 60_000,
 		toolLongMs: 10 * 60_000,
 	});
+}
+function setRepeatTool(patch: {
+	repeatToolThreshold?: number;
+	repeatToolWindow?: number;
+	repeatToolAbort?: boolean;
+}): void {
+	Object.assign(config.config.loop, patch);
+}
+function resetRepeatTool(): void {
+	setRepeatTool({ repeatToolThreshold: 3, repeatToolWindow: 12, repeatToolAbort: false });
 }
 function setContextWarn(patch: {
 	contextWarnTokens?: number;
@@ -482,9 +500,16 @@ section("run_repeat_tool fires on the third identical call in a row");
 {
 	policy.reset();
 	resetRunHealth();
+	resetRepeatTool();
 	handler = async (session) => {
 		const run = currentRun!;
 		const toolCall = (args: Record<string, unknown>) => session.emit({ type: "tool_execution_start", toolName: "bash", args });
+		// Same tool, different arguments: never the same fingerprint.
+		toolCall({ command: "echo hi", cwd: "/tmp" });
+		toolCall({ command: "echo hi", cwd: "/tmp" });
+		toolCall({ command: "echo hi", cwd: "/var" });
+		toolCall({ command: "echo hi", cwd: "/var" });
+		check("different arguments never count as the same call", anomaliesOf(run.id, "run_repeat_tool").length === 0);
 		// Same arguments, different key order: the fingerprint is canonical.
 		toolCall({ command: "ls -la", cwd: "/tmp" });
 		toolCall({ cwd: "/tmp", command: "ls -la" });
@@ -502,17 +527,137 @@ section("run_repeat_tool fires on the third identical call in a row");
 			fired[0],
 		);
 		toolCall({ command: "ls -la", cwd: "/tmp" });
-		check("it fires once per streak, not on every further repeat", anomaliesOf(run.id, "run_repeat_tool").length === 1);
+		check("it fires once per fingerprint, not on every further repeat", anomaliesOf(run.id, "run_repeat_tool").length === 1);
 		toolCall({ command: "pwd", cwd: "/tmp" });
 		toolCall({ command: "ls -la", cwd: "/tmp" });
 		toolCall({ command: "ls -la", cwd: "/tmp" });
 		toolCall({ command: "ls -la", cwd: "/tmp" });
-		check("a new streak of three fires again", anomaliesOf(run.id, "run_repeat_tool").length === 2);
+		// The already-flagged fingerprint stays silent; a different repeated call
+		// inside the same window gets its own event.
+		toolCall({ command: "pwd", cwd: "/tmp" });
+		toolCall({ command: "pwd", cwd: "/tmp" });
+		const next = anomaliesOf(run.id, "run_repeat_tool");
+		check(
+			"a different repeated call fires its own event, the old one stays quiet",
+			next.length === 2 && next[1]?.repeats === 3,
+			next,
+		);
+		toolCall({ command: "pwd", cwd: "/tmp" });
+		check("the second fingerprint also fires only once", anomaliesOf(run.id, "run_repeat_tool").length === 2);
 		await call(retainTool, { facts: [], scopes: [] });
 		await call(sleepTool, { summary: "repeat-tool test", summary_md: "# repeat-tool test\n" });
 	};
 	const record = await runner.execute();
 	check("the anomaly did not stop the run", record?.stopReason === "slept", record?.stopReason);
+}
+
+section("run_repeat_tool uses a sliding window, so an A/B loop is detected (#70)");
+{
+	policy.reset();
+	resetRepeatTool();
+	// Window 12 and threshold 3: strict consecutive detection would never fire here.
+	handler = async (session) => {
+		const run = currentRun!;
+		const a = { command: "step-a" };
+		const b = { command: "step-b" };
+		const toolCall = (args: Record<string, unknown>) => session.emit({ type: "tool_execution_start", toolName: "bash", args });
+		toolCall(a);
+		toolCall(b);
+		toolCall(a);
+		toolCall(b);
+		check("an alternating A,B,A,B pair is not yet at the threshold", anomaliesOf(run.id, "run_repeat_tool").length === 0);
+		toolCall(a);
+		let fired = anomaliesOf(run.id, "run_repeat_tool");
+		check(
+			"the third A in the window fires despite the interleaving",
+			fired.length === 1 && fired[0]?.tool === "bash" && fired[0]?.repeats === 3,
+			fired,
+		);
+		toolCall(b);
+		fired = anomaliesOf(run.id, "run_repeat_tool");
+		check("the third B fires its own event", fired.length === 2 && fired[1]?.repeats === 3, fired);
+		toolCall(a);
+		toolCall(b);
+		toolCall(a);
+		toolCall(b);
+		check(
+			"further A/B repeats produce no more events",
+			anomaliesOf(run.id, "run_repeat_tool").length === 2,
+			anomaliesOf(run.id, "run_repeat_tool"),
+		);
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "repeat-tool window test", summary_md: "# repeat-tool window test\n" });
+	};
+	const record = await runner.execute();
+	check("the A/B anomaly did not stop the run", record?.stopReason === "slept", record?.stopReason);
+}
+
+section("the default threshold (0) disables detection: no run_repeat_tool and no warn (#70)");
+{
+	policy.reset();
+	resetRepeatTool();
+	// This is the product default, not the runner config's explicit threshold 3.
+	setRepeatTool({
+		repeatToolThreshold: DEFAULT_CONFIG.loop.repeatToolThreshold,
+		repeatToolWindow: DEFAULT_CONFIG.loop.repeatToolWindow,
+	});
+	check("the product default threshold is 0 (off)", config.config.loop.repeatToolThreshold === 0);
+	const warnings: string[] = [];
+	const originalWarn = log.warn.bind(log);
+	log.warn = ((message: string) => {
+		warnings.push(message);
+	}) as typeof log.warn;
+	let record: RunRecord | null = null;
+	try {
+		handler = async (session) => {
+			const run = currentRun!;
+			const toolCall = (args: Record<string, unknown>) => session.emit({ type: "tool_execution_start", toolName: "bash", args });
+			for (let i = 0; i < 10; i += 1) toolCall({ command: "still-the-same" });
+			check("threshold 0 records no run_repeat_tool", anomaliesOf(run.id, "run_repeat_tool").length === 0);
+			await call(retainTool, { facts: [], scopes: [] });
+			await call(sleepTool, { summary: "repeat-tool disabled", summary_md: "# repeat-tool disabled\n" });
+		};
+		record = await runner.execute();
+	} finally {
+		log.warn = originalWarn;
+	}
+	check(
+		"threshold 0 emits no repeated-tool warning",
+		warnings.filter((message) => message === "repeated tool call detected").length === 0,
+		warnings,
+	);
+	check("the run continues when detection is off", record?.stopReason === "slept", record?.stopReason);
+	resetRepeatTool();
+}
+
+section("repeatToolAbort aborts the run once at the threshold (#70)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetRepeatTool();
+	setRepeatTool({ repeatToolAbort: true });
+	handler = async (session) => {
+		const run = currentRun!;
+		const toolCall = (args: Record<string, unknown>) => session.emit({ type: "tool_execution_start", toolName: "bash", args });
+		toolCall({ command: "spin" });
+		toolCall({ command: "spin" });
+		check("below the threshold the run is not aborted", session.abortCalls === 0 && session.aborted === false);
+		toolCall({ command: "spin" });
+		check(
+			"the threshold fires the anomaly and aborts the session",
+			anomaliesOf(run.id, "run_repeat_tool").length === 1 && session.aborted === true,
+			anomaliesOf(run.id, "run_repeat_tool"),
+		);
+		// The guard must keep this a single abort even when the loop continues.
+		toolCall({ command: "spin" });
+		toolCall({ command: "spin" });
+		check("further repeats do not abort again", session.abortCalls === 1, session.abortCalls);
+	};
+	const record = await runner.execute();
+	check("the aborted run reuses the existing safety-limit stop reason", record?.stopReason === "timeout", record?.stopReason);
+	check("the aborted run is labelled as a limit stop", record?.stoppedBy === "limit", record?.stoppedBy);
+	check("repeatToolAbort adds no new stop reason to the record", record?.stopReason !== "aborted", record?.stopReason);
+	resetRepeatTool();
 }
 
 section("tool_long fires once for a single slow tool call, never stops it (#164)");

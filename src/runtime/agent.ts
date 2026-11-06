@@ -96,9 +96,6 @@ export function runActiveMs(run: RunHandle, now = Date.now()): number {
 	return run.activeMs + Math.max(0, now - (run.activeSince ?? run.startedAt));
 }
 
-/** How many identical tool calls in a row count as `run_repeat_tool`. */
-export const RUN_REPEAT_TOOL_THRESHOLD = 3;
-
 /**
  * Who ended a run, from how it ended (#168).
  *
@@ -165,11 +162,14 @@ interface RunWatch {
 	warningsSent: number;
 	noOutboundFlagged: boolean;
 	veryLongFlagged: boolean;
-	/** Stable fingerprint of the last tool call: name + canonical arguments. */
-	lastToolKey?: string;
-	/** Consecutive calls with the same tool and identical arguments. */
-	repeatCount: number;
-	repeatFlagged: boolean;
+	/**
+	 * Bounded sliding window of the most recent tool-call fingerprints (#70):
+	 * `tool name + sha1(canonical args)`, at most `repeatToolWindow` entries.
+	 * Short strings only — never prompt, message or argument text.
+	 */
+	recentToolKeys: string[];
+	/** Fingerprints already reported in this run, so one repeat pattern warns once. */
+	repeatToolFlagged: Set<string>;
 	/** Context size (tokens) at the last `context_high` hint; undefined until the first. */
 	contextWarnedAt?: number;
 	/** First turn at/above the soft threshold; undefined while below it. */
@@ -204,6 +204,8 @@ export class AgentRunner {
 	private session!: AgentSession;
 	private unsubscribe?: () => void;
 	private timedOutRunId: string | null = null;
+	/** Run id whose repeated tool calls already triggered `repeatToolAbort` (#70). */
+	private repeatAbortRunId: string | null = null;
 	private budgetRunId: string | null = null;
 	private aborting = false;
 	private interruptInFlight = false;
@@ -393,6 +395,9 @@ export class AgentRunner {
 		if (!run || run.idling) return;
 		const watch = this.watch?.runId === run.id ? this.watch : undefined;
 		if (!watch) return;
+		// A repeated-tool abort (#70) has already ended this run: no further guard or
+		// warning should race a second `session.abort()`.
+		if (this.repeatAbortRunId === run.id) return;
 		const loop = this.deps.config.config.loop;
 		const activeMs = runActiveMs(run, now);
 
@@ -610,8 +615,8 @@ export class AgentRunner {
 				warningsSent: 0,
 				noOutboundFlagged: false,
 				veryLongFlagged: false,
-				repeatCount: 0,
-				repeatFlagged: false,
+				repeatToolFlagged: new Set<string>(),
+				recentToolKeys: [],
 				contextWarnedAt: undefined,
 				contextSoftSince: undefined,
 				contextSleepSteered: false,
@@ -747,7 +752,7 @@ export class AgentRunner {
 					stopReason = "slept";
 					break;
 				}
-				if (this.timedOutRunId === run.id) {
+				if (this.timedOutRunId === run.id || this.repeatAbortRunId === run.id) {
 					stopReason = "timeout";
 					break;
 				}
@@ -882,6 +887,7 @@ export class AgentRunner {
 
 			this.deps.runs.record(record);
 			this.timedOutRunId = null;
+			this.repeatAbortRunId = null;
 			this.budgetRunId = null;
 			this.watch = undefined;
 			this.promptRetryAbort = undefined;
@@ -1208,35 +1214,69 @@ export class AgentRunner {
 	}
 
 	/**
-	 * Detect the same tool call repeated with identical arguments (#127).
+	 * Detect repeated identical tool calls (#70).
 	 *
-	 * Only the tool name and a canonical fingerprint of its arguments are kept,
-	 * so this can never store prompt or message text. Fires once per run when the
-	 * streak reaches `RUN_REPEAT_TOOL_THRESHOLD`; a different call resets it.
+	 * Only a bounded sliding window of the most recent fingerprints is kept: the
+	 * tool name plus `sha1(stableJson(args))`, at most `repeatToolWindow` short
+	 * strings. Arguments are hashed and never stored, so this can never leak
+	 * prompt, message or tool-argument text into an event or the log.
+	 *
+	 * Each call pushes its fingerprint and counts how many times that same
+	 * fingerprint occurs in the window. Reaching `repeatToolThreshold` records one
+	 * `run_repeat_tool` anomaly (`tool` + `repeats`) and one warning log line.
+	 * A window, unlike the old strict streak, also catches an alternating
+	 * A,B,A,B loop where no two identical calls are adjacent; at the same time a
+	 * one-off retry after some other call still counts toward the same fingerprint.
+	 * A fingerprint is reported at most once per run, so a long loop produces one
+	 * event, not one per repeat. `repeatToolThreshold: 0` disables the check
+	 * completely.
+	 *
+	 * With `repeatToolAbort` the same point aborts the run once via the existing
+	 * `session.abort()` safety path. It reuses the existing `timeout` stop reason
+	 * (`stoppedBy: "limit"`) instead of growing the record schema. Otherwise the
+	 * event is observation-only and the runtime never steers the turn.
 	 */
 	private trackRepeatedTool(toolName: string | undefined, args: unknown): void {
 		const run = this.deps.getRun();
 		const watch = this.watch;
 		if (!run || !watch || watch.runId !== run.id || typeof toolName !== "string") return;
+		const loop = this.deps.config.config.loop;
+		const threshold = loop.repeatToolThreshold;
+		if (threshold <= 0) return;
+		// Normalisation also happens in validateLoopConfig; keep a direct assignment
+		// safe when a caller mutates the loaded config at runtime (tests do).
+		const windowSize = Math.max(loop.repeatToolWindow, threshold);
 		// Hash keeps the memory bounded even when a tool argument carries a file.
 		const key = `${toolName}\u0000${createHash("sha1").update(stableJson(args)).digest("hex")}`;
-		if (key === watch.lastToolKey) {
-			watch.repeatCount += 1;
-		} else {
-			watch.lastToolKey = key;
-			watch.repeatCount = 1;
-			watch.repeatFlagged = false;
+		watch.recentToolKeys.push(key);
+		if (watch.recentToolKeys.length > windowSize) {
+			watch.recentToolKeys.splice(0, watch.recentToolKeys.length - windowSize);
 		}
-		if (watch.repeatFlagged || watch.repeatCount < RUN_REPEAT_TOOL_THRESHOLD) return;
-		watch.repeatFlagged = true;
+		let repeats = 0;
+		for (const seen of watch.recentToolKeys) if (seen === key) repeats += 1;
+		if (repeats < threshold || watch.repeatToolFlagged.has(key)) return;
+		watch.repeatToolFlagged.add(key);
 		const now = Date.now();
 		this.emitAnomaly(run, {
 			type: "run_repeat_tool",
 			now,
 			activeMs: runActiveMs(run, now),
 			tool: toolName,
-			repeats: watch.repeatCount,
+			repeats,
 		});
+		this.deps.log.warn("repeated tool call detected", { tool: toolName, repeats });
+		if (!loop.repeatToolAbort || this.repeatAbortRunId === run.id) return;
+		// Same single-abort guard as `timedOutRunId`: further repeats and scheduler
+		// ticks must not call `session.abort()` again for this run.
+		this.repeatAbortRunId = run.id;
+		this.deps.log.warn(`run #${run.index} repeated tool call; aborting`, {
+			tool: toolName,
+			repeats,
+			threshold,
+			window: windowSize,
+		});
+		this.abortRetryDelay();
+		void this.session.abort();
 	}
 
 	/**

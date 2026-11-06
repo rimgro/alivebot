@@ -96,6 +96,37 @@ export interface LoopConfig {
 	 */
 	toolLongMs: number;
 	/**
+	 * Anomaly threshold for **repeated identical tool calls** (#70): when the same
+	 * tool is called with canonical-identical arguments this many times inside the
+	 * sliding window of the last `repeatToolWindow` calls, the runtime records one
+	 * `run_repeat_tool` event and a warning log line. Arguments are hashed, never
+	 * stored. The event fires once per fingerprint per run, so a long loop cannot
+	 * spam the sink. 0 = disabled, and that is the default: detection is opt-in,
+	 * enabled deliberately with a threshold such as 3.
+	 *
+	 * Detection is observation-only unless `repeatToolAbort` is enabled.
+	 */
+	repeatToolThreshold: number;
+	/**
+	 * Sliding window of the most recent tool calls used by `repeatToolThreshold`
+	 * (#70). A window, unlike a consecutive streak, also catches an alternating
+	 * A,B,A,B loop; a one-off retry after a different call still counts toward the
+	 * same fingerprint.
+	 *
+	 * The window is normalised to at least the threshold: `0` (or any value below
+	 * the threshold) becomes the threshold, so a window can always hold enough
+	 * calls to trigger detection. With detection disabled the value is unused but
+	 * kept valid: an explicit `0` becomes the default 12. Default 12.
+	 */
+	repeatToolWindow: number;
+	/**
+	 * Repeated-tool stop (#70). When `true` and `repeatToolThreshold` is reached,
+	 * the runtime aborts the run once through the existing `session.abort()` safety
+	 * path (`stopReason: "timeout"`, `stoppedBy: "limit"`); otherwise the anomaly
+	 * is observation-only. It never steers a message into the turn. Default false.
+	 */
+	repeatToolAbort: boolean;
+	/**
 	 * Anomaly threshold for an **open run that stopped ticking** (#173): when the
 	 * runtime still reports a current run but `runtime.json` has not been written
 	 * for this long, the run is shown as stalled (status `stalled`, red marker in
@@ -241,6 +272,14 @@ export const DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS = 60;
 export const DEFAULT_LOOP_RUN_VERY_LONG_MS = 3 * 60 * 60_000;
 /** A single tool running longer than this is an anomaly (#164), not a stop. */
 export const DEFAULT_LOOP_TOOL_LONG_MS = 10 * 60_000;
+/**
+ * Repeated-identical-tool-call anomaly (#70): disabled by default (0). Enabling
+ * it is deliberate, usually with threshold 3 and a window of the last 12 calls;
+ * when enabled it is observation-only unless `repeatToolAbort` is set.
+ */
+export const DEFAULT_LOOP_REPEAT_TOOL_THRESHOLD = 0;
+export const DEFAULT_LOOP_REPEAT_TOOL_WINDOW = 12;
+export const DEFAULT_LOOP_REPEAT_TOOL_ABORT = false;
 /** An open run whose runtime stopped writing state is a visible stall (#173). */
 export const DEFAULT_LOOP_RUN_STALL_MS = 10 * 60_000;
 
@@ -278,8 +317,9 @@ export const DEFAULT_LOOP_RESUME_WINDOW_MS = 10 * 60_000;
  * values accepts 0 ("disabled") and any non-negative whole number, so the
  * historical permissive `runTimeoutMs` still works. The context-size hint adds
  * one cross-field rule: its re-arm step must be positive whenever warnings are
- * enabled. Other scalars such as `pollIntervalMs` keep their historical
- * permissive behaviour.
+ * enabled, and the repeated-tool window is raised to the threshold (or kept at
+ * the default when detection is off). Other scalars such as `pollIntervalMs`
+ * keep their historical permissive behaviour.
  */
 export function validateLoopConfig(value: LoopConfig): LoopConfig {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("loop must be an object");
@@ -331,6 +371,28 @@ export function validateLoopConfig(value: LoopConfig): LoopConfig {
 				"(set either to 0 to disable that threshold)",
 		);
 	}
+	const repeatToolThreshold = runHealthMs(
+		value.repeatToolThreshold,
+		"repeatToolThreshold",
+		DEFAULT_LOOP_REPEAT_TOOL_THRESHOLD,
+	);
+	// A window smaller than the threshold could never contain enough matches to
+	// fire, so it is silently raised instead of configured into uselessness. With
+	// detection off the window is unused, but it still must not collapse to 0: an
+	// explicit 0 falls back to the default so the config stays meaningful.
+	const configuredRepeatToolWindow = runHealthMs(
+		value.repeatToolWindow,
+		"repeatToolWindow",
+		DEFAULT_LOOP_REPEAT_TOOL_WINDOW,
+		"0 falls back to the default window",
+	);
+	const repeatToolWindow =
+		repeatToolThreshold > 0
+			? Math.max(configuredRepeatToolWindow, repeatToolThreshold)
+			: configuredRepeatToolWindow > 0
+				? configuredRepeatToolWindow
+				: DEFAULT_LOOP_REPEAT_TOOL_WINDOW;
+	const repeatToolAbort = loopBoolean(value.repeatToolAbort, "repeatToolAbort", DEFAULT_LOOP_REPEAT_TOOL_ABORT);
 	return {
 		...value,
 		runTimeoutMs: runHealthMs(value.runTimeoutMs, "runTimeoutMs", DEFAULT_LOOP_RUN_TIMEOUT_MS),
@@ -338,6 +400,9 @@ export function validateLoopConfig(value: LoopConfig): LoopConfig {
 		runNoOutboundTurns: runHealthMs(value.runNoOutboundTurns, "runNoOutboundTurns", DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS),
 		runVeryLongMs: runHealthMs(value.runVeryLongMs, "runVeryLongMs", DEFAULT_LOOP_RUN_VERY_LONG_MS),
 		toolLongMs: runHealthMs(value.toolLongMs, "toolLongMs", DEFAULT_LOOP_TOOL_LONG_MS),
+		repeatToolThreshold,
+		repeatToolWindow,
+		repeatToolAbort,
 		runStallMs: runHealthMs(value.runStallMs, "runStallMs", DEFAULT_LOOP_RUN_STALL_MS),
 		contextWarnTokens,
 		contextWarnStepTokens,
@@ -356,13 +421,23 @@ export function validateLoopConfig(value: LoopConfig): LoopConfig {
 
 /**
  * Validate one run-health scalar: a whole number of milliseconds (or turns),
- * `>= 0`, where 0 means "disabled". Missing or null falls back to the default so
- * a partial block cannot leave the runtime comparing against `undefined`.
+ * `>= 0`, where 0 normally means "disabled" (`zeroNote` documents the exception).
+ * Missing or null falls back to the default so a partial block cannot leave the
+ * runtime comparing against `undefined`.
  */
-function runHealthMs(value: unknown, key: string, fallback: number): number {
+function runHealthMs(value: unknown, key: string, fallback: number, zeroNote = "0 disables it"): number {
 	if (value === undefined || value === null) return fallback;
 	if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-		throw new Error(`loop.${key} must be a whole number >= 0 (0 disables it), got "${String(value)}"`);
+		throw new Error(`loop.${key} must be a whole number >= 0 (${zeroNote}), got "${String(value)}"`);
+	}
+	return value;
+}
+
+/** Validate one optional loop boolean, with the same fallback/typing rules as tools. */
+function loopBoolean(value: unknown, key: string, fallback: boolean): boolean {
+	if (value === undefined || value === null) return fallback;
+	if (typeof value !== "boolean") {
+		throw new Error(`loop.${key} must be a boolean, got "${String(value)}"`);
 	}
 	return value;
 }
@@ -1017,6 +1092,9 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		runNoOutboundTurns: DEFAULT_LOOP_RUN_NO_OUTBOUND_TURNS,
 		runVeryLongMs: DEFAULT_LOOP_RUN_VERY_LONG_MS,
 		toolLongMs: DEFAULT_LOOP_TOOL_LONG_MS,
+		repeatToolThreshold: DEFAULT_LOOP_REPEAT_TOOL_THRESHOLD,
+		repeatToolWindow: DEFAULT_LOOP_REPEAT_TOOL_WINDOW,
+		repeatToolAbort: DEFAULT_LOOP_REPEAT_TOOL_ABORT,
 		runStallMs: DEFAULT_LOOP_RUN_STALL_MS,
 		contextWarnTokens: DEFAULT_LOOP_CONTEXT_WARN_TOKENS,
 		contextWarnStepTokens: DEFAULT_LOOP_CONTEXT_WARN_STEP_TOKENS,
