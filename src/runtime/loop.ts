@@ -45,7 +45,7 @@ import {
 import { RunEventLog } from "../store/run-events.js";
 import { ThreadStore } from "../store/threads.js";
 import { maskSecrets } from "../secrets.js";
-import { readStopIntent, type StopInitiator } from "./daemon.js";
+import { readStopIntent, staleRuntimeReason, type StopInitiator } from "./daemon.js";
 import { buildAgent, readSoul } from "./session.js";
 import { hasWakeWorthyPending, WakeScheduler } from "./wake.js";
 import { SandboxManager } from "../sandbox/manager.js";
@@ -61,7 +61,7 @@ import { ModuleHost } from "../events/host.js";
 import { loadModules } from "../events/loader.js";
 import type { AliveModule } from "../events/api.js";
 import { term } from "../term.js";
-import { formatDuration, isProcessAlive, nextMidnight, sleep } from "../util.js";
+import { formatDuration, nextMidnight, sleep } from "../util.js";
 
 export interface AliveRuntimeOptions {
 	config: LoadedConfig;
@@ -1146,7 +1146,12 @@ export class AliveRuntime {
 		const state = readRuntimeState(this.config.paths.stateDir);
 		if (!state || state.status === "stopped") return;
 		if (state.pid === process.pid) return;
-		if (isProcessAlive(state.pid)) {
+		// Identity, not mere liveness: after a VM crash the recorded pid can belong
+		// to an unrelated (even another user's) process, and `kill(pid, 0)` then
+		// says "alive" forever — the boot refuses to start and systemd gives up
+		// after StartLimitBurst (#207).
+		const reason = staleRuntimeReason(state.pid, this.config.paths.configPath);
+		if (reason === undefined) {
 			throw new Error(
 				`another alive runtime is already running (pid ${state.pid}, started ${new Date(state.startedAt).toISOString()}). ` +
 					(this.config.config.sandbox.enabled
@@ -1154,7 +1159,9 @@ export class AliveRuntime {
 						: `Use --force to start anyway (not recommended: cursor writes will race).`),
 			);
 		}
-		this.log.warn("stale runtime state file found", { pid: state.pid, status: state.status });
+		// Say *why* the state file is ignored: a silent recovery looks like a
+		// second instance to whoever reads the log after a crash.
+		this.log.warn("stale runtime state file found", { pid: state.pid, status: state.status, reason });
 	}
 }
 

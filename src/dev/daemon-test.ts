@@ -18,8 +18,10 @@ import { loadConfig } from "../config.js";
 import { followFile, readLogTail, renderLogLine, resolveLogSource } from "../logs.js";
 import {
 	clearStopIntent,
+	isRuntimeProcess,
 	readStopIntent,
 	snapshotRuntime,
+	staleRuntimeReason,
 	spawnBackground,
 	STOP_INTENT_TTL_MS,
 	stopIntentPath,
@@ -157,6 +159,116 @@ section("snapshotRuntime");
 
 	writeRuntimeState(stateDir, { ...readRuntimeState(stateDir)!, status: "stopped" });
 	check("clean stop is reported", snapshotRuntime(stateDir)?.cleanStop === true);
+}
+
+section("stale runtime identity (#207)");
+{
+	// The whole check reads /proc: on a platform without it `staleRuntimeReason`
+	// deliberately falls back to pid-only liveness, so there is nothing to prove.
+	if (!fs.existsSync("/proc")) {
+		process.stdout.write("  skip  no procfs on this platform\n");
+	} else {
+		const identityRoot = path.join(root, "stale-identity");
+		const configPath = path.join(identityRoot, "alive.config.json");
+		const identityState = path.join(identityRoot, "state");
+		fs.mkdirSync(identityRoot, { recursive: true });
+		// A real file, so realpath() resolves it exactly like a live profile's config.
+		fs.writeFileSync(configPath, "{}\n", "utf8");
+
+		const children: ChildProcess[] = [];
+		let readySeq = 0;
+
+		const writeState = (pid: number): void => {
+			writeRuntimeState(identityState, {
+				pid,
+				startedAt: Date.now() - 1_000,
+				lastTickAt: Date.now(),
+				status: "idle",
+				runIndex: 1,
+				pending: 0,
+				openThreads: 0,
+				sleeps: 0,
+			});
+		};
+
+		/**
+		 * Spawn the runtime entry script and wait until it has *started*: the pid
+		 * exists a moment before exec, so reading /proc too early would see this
+		 * test's own argv instead of the child's.
+		 */
+		const spawnRuntimeScript = async (args: string[], cwd: string): Promise<number> => {
+			const marker = path.join(identityRoot, `ready-${(readySeq += 1)}`);
+			const scriptPath = path.join(identityRoot, "index.js");
+			fs.writeFileSync(
+				scriptPath,
+				`require("node:fs").writeFileSync(${JSON.stringify(marker)}, "ready");\nsetTimeout(() => {}, 60000);\n`,
+				"utf8",
+			);
+			const child = spawn(process.execPath, [scriptPath, ...args], { cwd, stdio: "ignore" });
+			children.push(child);
+			if (!(await waitForFile(marker))) throw new Error("stale-identity stub never became ready");
+			return child.pid!;
+		};
+
+		try {
+			// A same-user process that is not a runtime: the pid-reuse case from the
+			// issue, minus the different owner (that one is `foreign-user`).
+			const foreignMarker = path.join(identityRoot, "foreign-ready");
+			const foreign = spawn(
+				process.execPath,
+				["-e", `require("node:fs").writeFileSync(${JSON.stringify(foreignMarker)}, "ready"); setTimeout(() => {}, 60000);`],
+				{ stdio: "ignore" },
+			);
+			children.push(foreign);
+			if (!(await waitForFile(foreignMarker))) throw new Error("foreign stub never became ready");
+			const foreignPid = foreign.pid!;
+			writeState(foreignPid);
+			check("an unrelated live pid is not our runtime", staleRuntimeReason(foreignPid, configPath) === "cmdline-mismatch", staleRuntimeReason(foreignPid, configPath));
+			check("isRuntimeProcess agrees", !isRuntimeProcess(foreignPid, configPath));
+			const foreignSnapshot = snapshotRuntime(identityState, { configPath });
+			check("a recycled pid reads as not alive with a config", foreignSnapshot?.alive === false, foreignSnapshot);
+			check("the snapshot names the reason", foreignSnapshot?.staleReason === "cmdline-mismatch", foreignSnapshot);
+			check("without a configPath the old pid-only behaviour is kept", snapshotRuntime(identityState)?.alive === true);
+
+			// The real thing: our entry script, started with this profile's config.
+			const withConfig = await spawnRuntimeScript(["run", "--foreground", "--config", configPath], identityRoot);
+			writeState(withConfig);
+			check("the runtime entry script with the same --config is ours", staleRuntimeReason(withConfig, configPath) === undefined, staleRuntimeReason(withConfig, configPath));
+			const ownSnapshot = snapshotRuntime(identityState, { configPath });
+			check("our runtime reads as alive", ownSnapshot?.alive === true, ownSnapshot);
+			check("our runtime carries no stale reason", ownSnapshot?.staleReason === undefined, ownSnapshot);
+
+			// spawnBackground forwards the raw flag value, so a relative --config
+			// reaches the child and is resolved against the child's cwd (rootDir).
+			const relativeConfig = await spawnRuntimeScript(["run", "--foreground", "--config", path.basename(configPath)], identityRoot);
+			check("a relative --config is resolved against the runtime's cwd", staleRuntimeReason(relativeConfig, configPath) === undefined, staleRuntimeReason(relativeConfig, configPath));
+
+			// No --config: the runtime defaulted to `<cwd>/alive.config.json`.
+			const inProfile = await spawnRuntimeScript(["run", "--foreground"], identityRoot);
+			check("no --config from the profile directory is ours", staleRuntimeReason(inProfile, configPath) === undefined, staleRuntimeReason(inProfile, configPath));
+			const elsewhere = await spawnRuntimeScript(["run", "--foreground"], os.tmpdir());
+			check("no --config from another directory is a mismatch", staleRuntimeReason(elsewhere, configPath) === "cmdline-mismatch", staleRuntimeReason(elsewhere, configPath));
+
+			// The original bug: a pid that is simply gone.
+			const dying = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+			const dyingPid = dying.pid!;
+			await once(dying, "exit");
+			check("a dead pid is reported as dead", staleRuntimeReason(dyingPid, configPath) === "pid-dead", staleRuntimeReason(dyingPid, configPath));
+			writeState(dyingPid);
+			const deadSnapshot = snapshotRuntime(identityState, { configPath });
+			check("a dead pid is not alive and says why", deadSnapshot?.alive === false && deadSnapshot.staleReason === "pid-dead", deadSnapshot);
+		} finally {
+			// The stubs sleep for a minute: the test must never wait for them.
+			for (const child of children) {
+				try {
+					process.kill(child.pid!, "SIGKILL");
+				} catch {
+					// already gone
+				}
+			}
+			for (const child of children) await waitGone(child.pid!);
+		}
+	}
 }
 
 section("background spawn + readiness detection");
