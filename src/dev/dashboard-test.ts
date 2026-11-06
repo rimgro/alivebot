@@ -6,6 +6,7 @@
  * Filesystem fixtures only. The parser checks need no socket; the small route
  * check binds an ephemeral loopback port (127.0.0.1:0) and closes it again.
  */
+import { spawn, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -34,7 +35,7 @@ import {
 import { DEFAULT_SECRETS_CONFIG, createMaskContext, maskSecrets } from "../secrets.js";
 import { MemoryStore } from "../store/memory.js";
 import type { RunRecord } from "../store/runs.js";
-import { formatDuration, localDay } from "../util.js";
+import { formatDuration, localDay, sleep } from "../util.js";
 import {
 	buildCostTrend,
 	buildTimeline,
@@ -94,6 +95,15 @@ function writeJson(file: string, value: unknown): void {
 function appendJsonl(file: string, values: unknown[]): void {
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	fs.writeFileSync(file, values.map((value) => `${JSON.stringify(value)}\n`).join(""), "utf8");
+}
+
+async function waitForFile(file: string, timeoutMs = 5_000): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (fs.existsSync(file)) return true;
+		await sleep(25);
+	}
+	return false;
 }
 
 function snapshotTree(dir: string): string {
@@ -967,7 +977,9 @@ async function main(): Promise<void> {
 	check("unknown agent is not found", findProfile(profiles, "nobody") === undefined);
 
 	section("agents list");
-	const mainSummary = readAgentSummary(main, { now });
+	// The fixture runtime pid is this test process; keep injecting liveness so the
+	// summary is about status derivation, not about the test's own argv (#212).
+	const mainSummary = readAgentSummary(main, { now, pidAlive: () => true });
 	check("summary uses name, model", mainSummary.name === "Root Alive" && mainSummary.model === "anthropic/claude-test", mainSummary);
 	check("working runtime -> status working", mainSummary.status === "working", mainSummary.status);
 	check("active run is reported as current run", mainSummary.currentRun === "run #3 in progress", mainSummary.currentRun);
@@ -1012,6 +1024,7 @@ async function main(): Promise<void> {
 	check("spend falls back to today's run records when usage.json is absent", Math.abs(writerSummary.spendTodayUsd - 0.005) < 1e-9, writerSummary.spendTodayUsd);
 	const loopSummary = readAgentSummary(main, {
 		now,
+		pidAlive: () => true,
 		startLoop: { starts: 6, windowSeconds: 600, threshold: 5, warn: true },
 	});
 	check(
@@ -1021,6 +1034,7 @@ async function main(): Promise<void> {
 	);
 	const quietLoopSummary = readAgentSummary(main, {
 		now,
+		pidAlive: () => true,
 		startLoop: { starts: 2, windowSeconds: 600, threshold: 5, warn: false },
 	});
 	check(
@@ -1177,6 +1191,88 @@ async function main(): Promise<void> {
 		unknownHistoryDefault.status === "sleeping" && unknownHistoryDefault.note === "no runtime state",
 		unknownHistoryDefault,
 	);
+
+	// #212: a runtime.json pid reused by an unrelated live process must not read
+	// as this profile's runtime; the dashboard names the identity mismatch.
+	section("stale runtime identity (#212)");
+	if (!fs.existsSync("/proc")) {
+		process.stdout.write("  skip  no procfs on this platform\n");
+	} else {
+		const identityRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-dashboard-identity-"));
+		const identityConfig = path.join(identityRoot, "alive.config.json");
+		// A real file, so realpath() resolves it exactly like a live profile's config.
+		fs.writeFileSync(identityConfig, "{}\n", "utf8");
+		const children: ChildProcess[] = [];
+		const identityRuntime = (pid: number) => ({
+			pid,
+			startedAt: base,
+			lastTickAt: base,
+			status: "working" as const,
+			runIndex: 3,
+			pending: 0,
+			openThreads: 0,
+			sleeps: 0,
+		});
+		try {
+			const foreignMarker = path.join(identityRoot, "foreign.ready");
+			const foreign = spawn(
+				process.execPath,
+				["-e", `require("node:fs").writeFileSync(${JSON.stringify(foreignMarker)}, "ready"); setTimeout(() => {}, 60000);`],
+				{ stdio: "ignore" },
+			);
+			children.push(foreign);
+			if (!(await waitForFile(foreignMarker))) throw new Error("foreign stub never became ready");
+			const staleStatus = deriveAgentStatus(identityRuntime(foreign.pid!), { now, configPath: identityConfig });
+			check(
+				"a recycled pid is not working/waiting and the note names the mismatch (#212)",
+				staleStatus.status !== "working" && staleStatus.status !== "waiting" && staleStatus.note.includes("cmdline-mismatch"),
+				staleStatus,
+			);
+			const staleHealth = deriveAgentHealth(identityRuntime(foreign.pid!), { now, configPath: identityConfig });
+			check(
+				"health: a recycled pid is dead with the identity reason (#212)",
+				staleHealth.state === "dead" &&
+					typeof staleHealth.reason === "string" &&
+					staleHealth.reason.includes("cmdline-mismatch"),
+				staleHealth,
+			);
+
+			// Our own runtime: the same entry script with this profile's --config
+			// still counts as alive, so the identity check cannot flip a live runtime.
+			const runtimeMarker = path.join(identityRoot, "runtime.ready");
+			const runtimeScript = path.join(identityRoot, "index.js");
+			fs.writeFileSync(
+				runtimeScript,
+				`require("node:fs").writeFileSync(${JSON.stringify(runtimeMarker)}, "ready");\nsetTimeout(() => {}, 60000);\n`,
+				"utf8",
+			);
+			const own = spawn(process.execPath, [runtimeScript, "run", "--foreground", "--config", identityConfig], {
+				cwd: identityRoot,
+				stdio: "ignore",
+			});
+			children.push(own);
+			if (!(await waitForFile(runtimeMarker))) throw new Error("runtime stub never became ready");
+			const ownStatus = deriveAgentStatus(identityRuntime(own.pid!), { now, configPath: identityConfig });
+			const ownHealth = deriveAgentHealth(identityRuntime(own.pid!), { now, configPath: identityConfig });
+			check(
+				"our runtime stays working with a matching config path (#212)",
+				ownStatus.status === "working" && ownStatus.note === "run #3" && !ownStatus.note.includes("not this profile's runtime"),
+				ownStatus,
+			);
+			check("health: our runtime stays running (#212)", ownHealth.state === "running" && ownHealth.reason === undefined, ownHealth);
+		} finally {
+			// The stubs sleep for a minute: the test must never wait for them.
+			for (const child of children) {
+				try {
+					process.kill(child.pid!, "SIGKILL");
+				} catch {
+					// already gone
+				}
+			}
+			await sleep(25);
+			fs.rmSync(identityRoot, { recursive: true, force: true });
+		}
+	}
 
 	const neverStartedHealth = deriveAgentHealth(null, { now, launchHistory: false, silentMs: 2 * 3_600_000 });
 	check(
@@ -2452,25 +2548,56 @@ async function main(): Promise<void> {
 		});
 		check("abort-tool POST without a CSRF token is 403", abortNoToken.status === 403, abortNoToken.status);
 		await abortNoToken.text();
-		const abortOk = await fetch(abortUrl, {
-			method: "POST",
-			headers: { "content-type": "application/x-www-form-urlencoded" },
-			body: new URLSearchParams({ csrf: abortToken, run: "run_c", return: "/run/main/run_c" }).toString(),
-			redirect: "manual",
-		});
-		check(
-			"a valid abort-tool POST redirects back to the run page",
-			abortOk.status === 303 && (abortOk.headers.get("location") ?? "").includes("/run/main/run_c") && (abortOk.headers.get("location") ?? "").includes("aborted=requested"),
-			{ status: abortOk.status, location: abortOk.headers.get("location") },
+		// Since #212 the abort route also verifies that the pid is this profile's
+		// runtime, so the fixture needs a real runtime-shaped process instead of
+		// this test's own pid.
+		const abortRuntimeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-dashboard-abort-runtime-"));
+		const abortRuntimeMarker = path.join(abortRuntimeRoot, "ready");
+		const abortRuntimeScript = path.join(abortRuntimeRoot, "index.js");
+		fs.writeFileSync(
+			abortRuntimeScript,
+			`require("node:fs").writeFileSync(${JSON.stringify(abortRuntimeMarker)}, "ready");\nsetTimeout(() => {}, 60000);\n`,
+			"utf8",
 		);
-		await abortOk.text();
-		const abortFlag = readToolAbortRequest(stateDir, { now: Date.now(), runId: "run_c" });
-		check(
-			"the dashboard button writes a dashboard-sourced flag for the live run",
-			abortFlag?.source === "dashboard" && abortFlag.runId === "run_c",
-			abortFlag,
+		const abortRuntime = spawn(
+			process.execPath,
+			[abortRuntimeScript, "run", "--foreground", "--config", path.join(root, "alive.config.json")],
+			{ cwd: root, stdio: "ignore" },
 		);
-		fs.rmSync(toolAbortRequestPath(stateDir), { force: true });
+		const runtimeFile = path.join(stateDir, "runtime.json");
+		const runtimeBefore = fs.readFileSync(runtimeFile, "utf8");
+		try {
+			if (!(await waitForFile(abortRuntimeMarker))) throw new Error("abort runtime stub never became ready");
+			fs.writeFileSync(runtimeFile, `${JSON.stringify({ ...JSON.parse(runtimeBefore), pid: abortRuntime.pid! }, null, 2)}\n`, "utf8");
+			const abortOk = await fetch(abortUrl, {
+				method: "POST",
+				headers: { "content-type": "application/x-www-form-urlencoded" },
+				body: new URLSearchParams({ csrf: abortToken, run: "run_c", return: "/run/main/run_c" }).toString(),
+				redirect: "manual",
+			});
+			check(
+				"a valid abort-tool POST redirects back to the run page",
+				abortOk.status === 303 && (abortOk.headers.get("location") ?? "").includes("/run/main/run_c") && (abortOk.headers.get("location") ?? "").includes("aborted=requested"),
+				{ status: abortOk.status, location: abortOk.headers.get("location") },
+			);
+			await abortOk.text();
+			const abortFlag = readToolAbortRequest(stateDir, { now: Date.now(), runId: "run_c" });
+			check(
+				"the dashboard button writes a dashboard-sourced flag for the live run",
+				abortFlag?.source === "dashboard" && abortFlag.runId === "run_c",
+				abortFlag,
+			);
+			fs.rmSync(toolAbortRequestPath(stateDir), { force: true });
+		} finally {
+			fs.writeFileSync(runtimeFile, runtimeBefore, "utf8");
+			try {
+				process.kill(abortRuntime.pid!, "SIGKILL");
+			} catch {
+				// already gone
+			}
+			await sleep(25);
+			fs.rmSync(abortRuntimeRoot, { recursive: true, force: true });
+		}
 		const missingMemory = await fetch(`${baseUrl}/agent/nobody/memory`);
 		check("unknown agent memory page is 404", missingMemory.status === 404, missingMemory.status);
 		const missing = await fetch(`${baseUrl}/agent/nobody`);

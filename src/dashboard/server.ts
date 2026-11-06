@@ -796,7 +796,7 @@ export function createDashboardServer(options: DashboardServerOptions): Dashboar
 			const returnTo = rawReturn.startsWith(`/agent/${profile.id}`) || rawReturn.startsWith(`/run/${profile.id}/`)
 				? rawReturn
 				: fallback;
-			const runtime = snapshotRuntime(profile.stateDir);
+			const runtime = snapshotRuntime(profile.stateDir, { configPath: profile.configPath });
 			if (!runtime?.alive) {
 				options.log?.(`dashboard: abort-tool for ${profile.id} ignored (runtime is not running)`);
 				redirect(res, `${returnTo}${returnTo.includes("?") ? "&" : "?"}aborted=not-running`);

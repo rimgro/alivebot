@@ -225,7 +225,7 @@ export async function updateManagedAgentProfile(
 	const agent = findManagedAgent(base, idInput);
 	return withAgentLifecycleLock(base, agent.id, async () => {
 		const config = loadAgentConfig(base, agent);
-		const wasRunning = snapshotRuntime(config.paths.stateDir)?.alive ?? false;
+		const wasRunning = snapshotRuntime(config.paths.stateDir, { configPath: config.paths.configPath })?.alive ?? false;
 		updateAgentProfile(base, agent.id, updates);
 		if (wasRunning) {
 			await stopManagedAgentUnlocked(base, agent, "restart");
@@ -315,7 +315,7 @@ async function startManagedAgentUnlocked(
 ): Promise<{ pid: number; logFile: string }> {
 	if (!getAgentEnabled(agent)) throw new Error(`agent ${agent.id} is disabled and cannot be started`);
 	const config = loadAgentConfig(base, agent);
-	const current = snapshotRuntime(config.paths.stateDir);
+	const current = snapshotRuntime(config.paths.stateDir, { configPath: config.paths.configPath });
 	if (current?.alive) return { pid: current.pid, logFile: path.join(config.paths.logsDir, "stdout.log") };
 	const child = operations.spawn({ paths: config.paths, args: ["--config", agent.configPath] });
 	const started = await operations.wait(config.paths.stateDir, child.pid, { child: child.child });
@@ -362,7 +362,7 @@ export async function disableManagedAgent(
 		writeAgentEnabled(agent, false);
 		await stopManagedAgentUnlocked(base, agent, "stop");
 		const config = loadAgentConfig(base, agent);
-		if (snapshotRuntime(config.paths.stateDir)?.alive) throw new Error(`agent ${agent.id} remains running; it is disabled but must be stopped manually`);
+		if (snapshotRuntime(config.paths.stateDir, { configPath: config.paths.configPath })?.alive) throw new Error(`agent ${agent.id} remains running; it is disabled but must be stopped manually`);
 	}, options);
 }
 
