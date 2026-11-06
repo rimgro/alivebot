@@ -43,6 +43,9 @@ export const EXEC_DEADLINE_GRACE_MS = 10_000;
 export const BOOT_DEADLINE_MS = 180_000;
 /** Guest filesystem RPC deadline; mirrors the SDK exec timeout. */
 export const GUEST_FS_DEADLINE_MS = 30_000;
+/** Idle inspection pages are bounded as well: a guest that never answers must
+ * not stall the most frequent path ("may the VM sleep?"). */
+const MAX_JOB_PAGES = 100;
 /** Teardown must be bounded too, otherwise a killed stream still blocks the queue. */
 const TEARDOWN_DEADLINE_MS = 5_000;
 
@@ -92,7 +95,8 @@ export class SandboxManager {
 	constructor(private readonly loaded: LoadedConfig, private readonly log: Pick<Logger, "warn" | "info">,
 		private readonly loadSdk: () => Promise<typeof import("microsandbox")> = () => import("microsandbox"),
 		private readonly checkHardware: () => void = checkLocalHardware,
-		private readonly bootDeadlineMs: number = BOOT_DEADLINE_MS) {
+		private readonly bootDeadlineMs: number = BOOT_DEADLINE_MS,
+		private readonly guestRpcDeadlineMs: number = GUEST_FS_DEADLINE_MS) {
 		this.config = validateSandboxConfig(loaded.config.sandbox);
 		this.workspaceDir = guestHome(loaded.config.name);
 		this.guestEnv = { HOME: this.workspaceDir, XDG_CACHE_HOME: `${this.workspaceDir}/.cache`, ...this.config.env };
@@ -307,7 +311,7 @@ export class SandboxManager {
 		let timer: NodeJS.Timeout | undefined;
 		try {
 			return await Promise.race([operation, new Promise<never>((_, reject) => {
-				timer = setTimeout(() => reject(new Error(`Guest filesystem ${op} timed out after ${GUEST_FS_DEADLINE_MS} ms`)), GUEST_FS_DEADLINE_MS);
+				timer = setTimeout(() => reject(new Error(`Guest filesystem ${op} timed out after ${this.guestRpcDeadlineMs} ms`)), this.guestRpcDeadlineMs);
 			})]);
 		} finally { if (timer) clearTimeout(timer); }
 	}
@@ -415,7 +419,7 @@ export class SandboxManager {
 
 	private async inspectActivity(): Promise<IdleEvidence> {
 		const vm = await this.running();
-		const result = await vm.execWith("python3", (b) => b.args(["-I", "-S", "-c", IDLE_PROBE, this.workspaceDir]).user("0:0").timeout(10_000).stdinNull());
+		const result = await this.guestRpc("activity probe", vm.execWith("python3", (b) => b.args(["-I", "-S", "-c", IDLE_PROBE, this.workspaceDir]).user("0:0").timeout(10_000).stdinNull()));
 		if (!result.success) throw new Error(`VM activity probe failed: ${result.stderr().slice(0, 2000)}`);
 		const evidence = parseIdleEvidence(result.stdout());
 		// Detached jobs can be admitted before they get a /proc PID. A lost job
@@ -424,8 +428,10 @@ export class SandboxManager {
 		let cursor: string | undefined;
 		let inspected = 0;
 		const seen = new Set<string>();
-		for (;;) {
-			const jobs = await vm.listJobsWith((b) => cursor ? b.all().limit(100).cursor(cursor) : b.all().limit(100));
+		for (let page = 0; ; page++) {
+			if (page >= MAX_JOB_PAGES) throw new Error(`VM job inventory exceeds ${MAX_JOB_PAGES} pages; shutdown refused`);
+			// A dead guest must not wedge the idle check, which is the most frequent path.
+			const jobs = await this.guestRpc("job inventory", vm.listJobsWith((b) => cursor ? b.all().limit(100).cursor(cursor) : b.all().limit(100)));
 			inspected += jobs.items.length;
 			if (inspected > 10000) throw new Error("VM job inventory exceeds safe scan limit; shutdown refused");
 			evidence.jobs.push(...jobs.items.filter((job) => job.state !== "exited" && job.state !== "failed")
