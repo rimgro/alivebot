@@ -28,6 +28,16 @@ import { browserCommand } from "./modules/browser/cli.js";
 import { TelegramAllowlistStore, TelegramStateStore, telegramIdentityView } from "./modules/telegram/state.js";
 import { AliveRuntime } from "./runtime/loop.js";
 import { writeToolAbortRequest } from "./runtime/tool-abort.js";
+import {
+	DEFAULT_SESSION_KEEP,
+	DEFAULT_SESSION_MAX_SIZE_MB,
+	DEFAULT_SESSION_OLDER_THAN_DAYS,
+	measureSessionStats,
+	measureSessions,
+	runSessionGc,
+	type SessionGcResult,
+	type SessionStatsResult,
+} from "./runtime/session-retention.js";
 import { readHeartbeatStatus } from "./heartbeat.js";
 import { snapshotRuntime, spawnBackground, stdoutLogPath, stopRuntime, waitForRuntime, type StopInitiator, type StopResult } from "./runtime/daemon.js";
 import {
@@ -218,6 +228,9 @@ export async function main(argv: string[], options: CliOptions = {}): Promise<nu
 			}
 			case "workers": {
 				return workersCommand(cwd, flags, positionals);
+			}
+			case "sessions": {
+				return sessionsCommand(flags, positionals);
 			}
 			case "sandbox": {
 				if (positionals.length && positionals[0] !== "status") throw new Error("usage: alive sandbox status [--config CONFIG]");
@@ -1052,6 +1065,11 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 	const workerWorktrees = config.config.workers.enabled && !config.config.sandbox.enabled
 		? measureWorktrees(worktreesRoot(config.paths, config.config.workers.worktreesDirectory), { timeoutMs: 2_000 })
 		: undefined;
+	// Same budget for the pi transcripts (#222): they reached 886 MB on one
+	// profile. `state/sessions` is a host state directory even for a sandboxed
+	// profile — only the workspace lives in the guest VM — so it is always
+	// measured from here rather than guessed.
+	const sessions = measureSessions(config.paths.sessionsDir, { timeoutMs: 2_000 });
 
 	if (flagBool(flags, "json")) {
 		process.stdout.write(
@@ -1070,6 +1088,7 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 					...(telegramReport ? { telegram: telegramReport } : {}),
 					workers: config.config.workers.enabled ? new WorkerStore(config.paths).list() : undefined,
 					...(workerWorktrees ? { workerWorktrees } : {}),
+					sessions,
 					usageToday: usage,
 					lastRun: last,
 					context: { tokens: runtime?.contextTokens, cacheReadPerTurn: cachePerTurn },
@@ -1148,6 +1167,11 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 	line("budget", `$${usage.cost.toFixed(4)} today, ${usage.runs} runs, ${usage.turns} turns`);
 	line("context", contextMetric);
 	line("last run", last ? `#${last.index} ${formatDuration(last.durationMs)} ${last.stopReason}${last.contextReset ? ` (context reset: ${last.contextReset.reason})` : ""}` : "never");
+	line(
+		"sessions",
+		`${sessions.files} file(s), ${sessions.bytes === null ? "size n/a (scan timed out)" : formatBytes(sessions.bytes)}` +
+			`  (${term.dim("alive sessions gc")})`,
+	);
 	line("workspace", config.paths.workspaceDir);
 	line("journal", config.paths.journalDir);
 	if (config.config.workers.enabled) {
@@ -1397,6 +1421,133 @@ async function pruneWorktreesCommand(config: LoadedConfig, flags: Record<string,
 		process.stdout.write(renderWorktreePrune(result));
 	}
 	return 0;
+}
+
+const SESSIONS_USAGE =
+	"usage: alive sessions gc [--dry-run] [--older-than-days N] [--max-size-mb M] [--keep N] [--json] [--config CONFIG]\n" +
+	"       alive sessions stats [--json] [--config CONFIG]\n" +
+	"\n" +
+	"  gc --dry-run            print the plan and the bytes that would be freed; move nothing\n" +
+	"  gc --older-than-days N  archive transcripts older than N days (default 14)\n" +
+	"  gc --max-size-mb M      when all transcripts exceed M MB, archive the oldest until they fit\n" +
+	"                          (default 0 = no size limit, age alone decides)\n" +
+	"  gc --keep N             always leave the N newest transcripts alone (default 3)\n" +
+	"  gc --json               machine-readable plan/result\n" +
+	"  stats                   read-only: size, age, messages, bytes by content kind,\n" +
+	"                          inline base64 payloads and image attachments\n" +
+	"\n" +
+	"gc never deletes a transcript: files are moved to <stateDir>/sessions-archive-YYYYMMDD-HHMM/.\n" +
+	"The active transcript (runtime.json: sessionFile) and files modified in the last\n" +
+	"10 minutes are never moved.\n";
+
+function renderSessionGc(result: SessionGcResult): string {
+	const lines: string[] = [
+		`sessions: ${result.sessionsDir} (${result.scanned} file(s), ${formatBytes(result.totalBytes)})`,
+		`archive:  ${result.archiveDir}${result.dryRun ? "  (dry run, nothing moved)" : ""}`,
+	];
+	for (const entry of result.entries) {
+		const age = `${entry.ageDays.toFixed(1)}d`;
+		if (entry.action === "archived") {
+			const why = entry.reason === "max-size" ? "size budget" : "older than the retention age";
+			lines.push(`  archived ${entry.name}  ${formatBytes(entry.bytes)}  ${age}${result.dryRun ? "  (dry run)" : ""} — ${why}`);
+			continue;
+		}
+		const detail = entry.detail ? ` (${oneLine(entry.detail, 160)})` : "";
+		lines.push(`  skipped: ${entry.reason}  ${entry.name}  ${formatBytes(entry.bytes)}  ${age}${detail}`);
+	}
+	lines.push(
+		`${result.dryRun ? "would archive" : "archived"}: ${result.archived} moved, ${result.skipped} skipped, ` +
+			`${formatBytes(result.freedBytes)} ${result.dryRun ? "would be freed" : "freed"}`,
+	);
+	return `${lines.join("\n")}\n`;
+}
+
+function renderSessionStats(result: SessionStatsResult): string {
+	const bytes = (value: number): string => formatBytes(value);
+	const lines: string[] = [
+		`sessions: ${result.sessionsDir} (${result.files} file(s), ${bytes(result.bytes)})`,
+	];
+	for (const entry of result.entries) {
+		lines.push(
+			`  ${entry.name}  ${bytes(entry.bytes)}  ${entry.ageDays.toFixed(1)}d  ${entry.messages} msg` +
+				`  text ${bytes(entry.contentBytes.text)}  thinking ${bytes(entry.contentBytes.thinking)}` +
+				`  tool ${bytes(entry.contentBytes.tool)}  image ${bytes(entry.contentBytes.image)}` +
+				`  base64 ${entry.base64Blocks} block(s) ${bytes(entry.base64Bytes)}`,
+		);
+	}
+	lines.push(
+		`totals: text ${bytes(result.contentBytes.text)}, thinking ${bytes(result.contentBytes.thinking)}, ` +
+			`tool ${bytes(result.contentBytes.tool)}, image ${bytes(result.contentBytes.image)}, ` +
+			`base64 ${bytes(result.contentBytes.base64)} in ${result.base64Blocks} block(s), ` +
+			`${result.imageBlocks} image attachment(s) ${bytes(result.imageBytes)}`,
+	);
+	return `${lines.join("\n")}\n`;
+}
+
+/**
+ * `alive sessions`: transcript hygiene (#222).
+ *
+ * `gc` archives old transcripts by age and/or total size; `stats` measures
+ * where the bytes go (inline base64 frames) without changing anything. Both
+ * read `paths.sessionsDir`, which is a host state directory for every profile.
+ */
+function sessionsCommand(flags: Record<string, string | boolean>, positionals: string[]): number {
+	const action = positionals[0];
+	const known = new Set([
+		"dry-run",
+		"older-than-days",
+		"max-size-mb",
+		"keep",
+		"json",
+		"config",
+		"verbose",
+		"help",
+		"h",
+	]);
+	const unknown = Object.keys(flags).filter((key) => !known.has(key));
+	if (unknown.length > 0) {
+		throw new Error(`unknown flag${unknown.length === 1 ? "" : "s"}: --${unknown.join(", --")} (alive sessions gc|stats)`);
+	}
+	if (flagBool(flags, "help") || flagBool(flags, "h") || !action) {
+		process.stdout.write(SESSIONS_USAGE);
+		return action ? 0 : 1;
+	}
+	if (positionals.length > 1) throw new Error("usage: alive sessions gc|stats [--json] [--config CONFIG]");
+	const config = loadForCli(flags);
+
+	if (action === "gc") {
+		const keep = parseNonNegativeNumber(flags, "keep");
+		if (keep !== undefined && !Number.isInteger(keep)) throw new Error("--keep must be a non-negative integer");
+		const olderThanDays = parseNonNegativeNumber(flags, "older-than-days");
+		const maxSizeMb = parseNonNegativeNumber(flags, "max-size-mb");
+		// Whatever runtime.json names is never moved, running or not: it is the
+		// transcript the next `continue` start resumes. The mtime guard inside gc
+		// additionally covers a boot that has not published its file yet.
+		const result = runSessionGc({
+			sessionsDir: config.paths.sessionsDir,
+			stateDir: config.paths.stateDir,
+			log: makeLogger(config, !flagBool(flags, "verbose")),
+			keep: keep ?? DEFAULT_SESSION_KEEP,
+			olderThanDays: olderThanDays ?? DEFAULT_SESSION_OLDER_THAN_DAYS,
+			maxSizeMb: maxSizeMb ?? DEFAULT_SESSION_MAX_SIZE_MB,
+			activeSessionFile: readRuntimeState(config.paths.stateDir)?.sessionFile,
+			dryRun: flagBool(flags, "dry-run"),
+		});
+		process.stdout.write(
+			flagBool(flags, "json") ? `${JSON.stringify(result, null, 2)}\n` : renderSessionGc(result),
+		);
+		return 0;
+	}
+	if (action === "stats") {
+		const gcOnly = ["dry-run", "older-than-days", "max-size-mb", "keep"].filter((key) => flags[key] !== undefined);
+		if (gcOnly.length > 0) throw new Error(`--${gcOnly.join(", --")} only applies to \`alive sessions gc\``);
+		const result = measureSessionStats(config.paths.sessionsDir);
+		process.stdout.write(
+			flagBool(flags, "json") ? `${JSON.stringify(result, null, 2)}\n` : renderSessionStats(result),
+		);
+		return 0;
+	}
+	throw new Error(`unknown sessions action: ${action} (expected gc or stats)`);
 }
 
 function runsCommand(_cwd: string, flags: Record<string, string | boolean>): number {
@@ -1924,6 +2075,9 @@ usage:
   alive workers models                        show the worker model/permission allowlist
   alive workers prune [--dry-run] [--keep 5] [--older-than-days M] [--json]
                                               remove stale worktrees; keep active/dirty ones
+  alive sessions gc [--dry-run] [--older-than-days N] [--max-size-mb M] [--keep N] [--json]
+                                              archive old pi transcripts; nothing is deleted
+  alive sessions stats [--json]               read-only transcript sizes, messages, base64/images
   alive git-check [--repo PATH] [--range A..B] [--json]
                                               detect empty/corrupt git objects before merge or push
   alive stop [--force] [--timeout 30s]        stop the running instance
