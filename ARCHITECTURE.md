@@ -107,7 +107,8 @@
 | `src/store/run-events.ts` | наблюдаемые события `run_*` (аномалии долгих run, только счётчики) |
 | `src/runtime/prompt.ts` | system prompt + awake/nudge/idle/interrupt сообщения, секция политики |
 | `src/runtime/tools.ts` | 11 инструментов агента; `idle`/`sleep`/`notifications` — ядро цикла |
-| `src/runtime/session.ts` | сборка pi-сессии: изолированный agent dir, модель, tools, resource loader |
+| `src/runtime/session.ts` | сборка pi-сессии: изолированный agent dir, модель, tools, resource loader; выбор транскрипта на старте (в т.ч. отказ от раздутого, #222) |
+| `src/runtime/session-retention.ts` | `alive sessions gc`/`stats`: архив старых jsonl по возрасту/размеру, замер base64/картинок, оценка контекста для resume (#222) |
 | `src/runtime/agent.ts` | один run: `idle`-цикл, steering, run health (warn/аномалии), settle, `rebuildSession` |
 | `src/runtime/loop.ts` | внешний цикл, scheduler, бюджет, транспорты, состояние |
 | `src/runtime/tool-abort.ts` | одноразовый флаг `abort-tool.json`, `AbortSignal` только для текущего tool call (#164) |
@@ -333,6 +334,18 @@ awake/nudge/idle-сообщениях.
 **Решение.** Свой `agentDir` (`.alive/agent`), свой `SettingsManager` (in-memory),
 свой system prompt. Креды и каталог моделей — из общего `~/.pi/agent`. При
 `sleep` сессия пересобирается с `forceNewSession`.
+
+**Выбор транскрипта на старте (#222).** `session: "continue"` не продолжает
+транскрипт, который уже несёт `loop.contextSleepTokens` (с учётом
+`context.sleepTokens`): размер берётся из хвоста jsonl (usage последнего
+assistant-сообщения + грубая оценка последующих сообщений, compaction после usage
+= «неизвестно»), и при превышении порога стартует новый пустой файл, а старый
+остаётся на диске. Иначе первый же шаг run'а упирается в context-sleep, outbound
+пустой и работа не делается (наблюдалось на 886 МБ сессий за трое суток).
+Явный `sessionFile` прерванного run'а (resume, #124/#173) guard не затрагивает;
+порог `0` выключает проверку. Гигиена каталога — `alive sessions gc`: файлы
+только переносятся в `<stateDir>/sessions-archive-YYYYMMDD-HHMM/`, никогда не
+удаляются; активный файл из `runtime.json` и свежие (<10 мин) файлы не трогаются.
 
 ### 5.10 Где enforcement, а где — промпт
 | Правило | Промпт | Рантайм |

@@ -12,11 +12,12 @@ import {
 	SettingsManager,
 	type AgentSession,
 } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_COMPACT_KEEP_TOOLS, DEFAULT_CONTRACT, defaultModelSpec, ensureCompactCatalogTools, type LoadedConfig } from "../config.js";
+import { DEFAULT_COMPACT_KEEP_TOOLS, DEFAULT_CONTRACT, defaultModelSpec, ensureCompactCatalogTools, resolveContextPolicy, type LoadedConfig } from "../config.js";
 import type { Logger } from "../log.js";
 import { ensureDir } from "../util.js";
 import { maskSecrets } from "../secrets.js";
 import { installCompactionGuard } from "./compaction.js";
+import { measureSessionFileContext, mostRecentSessionFile } from "./session-retention.js";
 import { buildSystemPrompt } from "./prompt.js";
 import { ALIVE_TOOL_NAMES, createAliveTools, type CompactToolBridge, type CompactToolDefinition, type ToolDeps } from "./tools.js";
 import { SandboxManager } from "../sandbox/manager.js";
@@ -369,6 +370,12 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
  * process alive with `status: "starting"` and no ticks. The failure is reported
  * to the caller through `resumeFailure` (logged as a warning here), which closes
  * the interrupted run as `aborted` and starts a new session instead.
+ *
+ * A `continue` start also refuses a transcript that already carries the
+ * context-sleep threshold or more (#222). Resuming it means the first model
+ * step is a context-sleep directive and no work happens; the fix is to start an
+ * empty transcript and leave the old file untouched (memory lives in
+ * `summary.md`, the journal, notes and reminders, not in the transcript).
  */
 export function openSessionManager(options: {
 	config: LoadedConfig;
@@ -378,10 +385,27 @@ export function openSessionManager(options: {
 }): { sessionManager: SessionManager; resumeFailure?: string } {
 	const { log } = options;
 	const { config: cfg, paths } = options.config;
+	// Only the configured `continue` mode is guarded. An explicit `sessionFile`
+	// (resume of an interrupted run) keeps its own resume logic below.
+	const continueRecent = (): SessionManager => {
+		const threshold = resolveContextPolicy(cfg).sleepTokens;
+		const recent = threshold > 0 ? mostRecentSessionFile(paths.sessionsDir, paths.workspaceDir) : undefined;
+		if (recent) {
+			const contextTokens = measureSessionFileContext(recent);
+			if (contextTokens > 0 && contextTokens >= threshold) {
+				log.warn(
+					"recent session is at the context-sleep threshold; starting a new transcript and keeping the old file",
+					{ sessionFile: recent, contextTokens, threshold },
+				);
+				return SessionManager.create(paths.workspaceDir, paths.sessionsDir);
+			}
+		}
+		return SessionManager.continueRecent(paths.workspaceDir, paths.sessionsDir);
+	};
 	// `forceNewSession` (a sleep) ignores the configured `continue` on purpose.
 	const fresh = () =>
 		cfg.session === "continue" && !options.forceNewSession
-			? SessionManager.continueRecent(paths.workspaceDir, paths.sessionsDir)
+			? continueRecent()
 			: SessionManager.create(paths.workspaceDir, paths.sessionsDir);
 	if (options.forceNewSession || !options.sessionFile) return { sessionManager: fresh() };
 	try {
