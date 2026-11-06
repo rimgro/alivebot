@@ -42,6 +42,7 @@ import { DEFAULT_USAGE_DAYS, buildUsageReport, renderUsageReport } from "./usage
 import { WorkerStore, validateWorkerId, workerLabel } from "./workers/store.js";
 import { gitDiff, gitState, isGitRepository } from "./workers/worktree.js";
 import { createHostWorkerEnvironment } from "./workers/environment.js";
+import { checkRepositoryIntegrity } from "./git/integrity.js";
 import { renderWorkerRecord } from "./workers/manager.js";
 import { term } from "./term.js";
 import { createExecRunner, runUpdate } from "./update.js";
@@ -371,6 +372,9 @@ export async function main(argv: string[], options: CliOptions = {}): Promise<nu
 			}
 			case "dashboard": {
 				return await dashboardCommand(cwd, flags);
+			}
+			case "git-check": {
+				return await gitCheckCommand(cwd, flags);
 			}
 			default: {
 				printHelp();
@@ -1765,6 +1769,29 @@ async function dashboardCommand(cwd: string, flags: Record<string, string | bool
 	return 0;
 }
 
+/**
+ * Pre-merge gate for the manual step in a main checkout: cheap fsck plus the
+ * zero-byte loose-object scan that plain connectivity-only fsck misses.
+ */
+async function gitCheckCommand(cwd: string, flags: Record<string, string | boolean>): Promise<number> {
+	if (flags.repo === true) throw new Error("--repo requires a path");
+	if (flags.range === true) throw new Error("--range requires a value (A..B)");
+	const repositoryPath = path.resolve(cwd, flagString(flags, "repo") ?? ".");
+	const runner = createHostWorkerEnvironment(repositoryPath);
+	const report = await checkRepositoryIntegrity(runner, repositoryPath, { range: flagString(flags, "range") });
+	if (flagBool(flags, "json")) {
+		process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+	} else {
+		for (const problem of report.problems) {
+			process.stdout.write(`${problem.kind}: ${oneLine(problem.detail)}\n`);
+		}
+		process.stdout.write(
+			`git-check: ${report.emptyObjects.length} empty object(s), fsck ${report.fsckOk ? "ok" : "failed"}\n`,
+		);
+	}
+	return report.blocking.length > 0 ? 1 : 0;
+}
+
 function printHelp(): void {
 	process.stdout.write(`alive — a long-lived agent runtime on top of pi
 
@@ -1792,6 +1819,8 @@ usage:
   alive workers status <id>                   inspect a worker and its git state
   alive workers diff <id> [--full]            review worker changes
   alive workers models                        show the worker model/permission allowlist
+  alive git-check [--repo PATH] [--range A..B] [--json]
+                                              detect empty/corrupt git objects before merge or push
   alive stop [--force] [--timeout 30s]        stop the running instance
                                               (--force: do not wait for the drain, close the run now)
   alive abort-tool <agent>                    abort only the tool running right now

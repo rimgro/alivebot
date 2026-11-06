@@ -43,6 +43,7 @@ import {
 } from "./worktree.js";
 import { MAX_PROVIDER_RETRY_DELAY_MS } from "./retry.js";
 import { classifyNetworkError, withRetries } from "../retry.js";
+import { assertRepositoryIntegrity, checkRepositoryIntegrity } from "../git/integrity.js";
 import { createWorkerEnvironment, type WorkerEnvironment } from "./environment.js";
 import {
 	validateWorkerId,
@@ -571,6 +572,21 @@ export class WorkerManager {
 		const { stdout: aheadRaw } = await runGit(this.environment, record.workspacePath, ["rev-list", "--count", `${record.baseCommit ?? "HEAD"}..HEAD`]);
 		const ahead = Number.parseInt(aheadRaw.trim(), 10);
 		if (!Number.isFinite(ahead) || ahead < 1) throw new Error("worker branch has no commits ahead of its base commit");
+		// Resolve the range in the worker worktree: `HEAD` there is the commit being
+		// pushed. The integrity check still scans the shared .git object store via
+		// `--git-common-dir`, so objects created by any linked worktree are covered.
+		const integrity = await checkRepositoryIntegrity(this.environment, record.workspacePath, {
+			range: record.baseCommit ? `${record.baseCommit}..HEAD` : undefined,
+		});
+		if (integrity.blocking.length > 0) {
+			this.log.warn("repository integrity check found damage", {
+				id,
+				fsckOk: integrity.fsckOk,
+				emptyObjects: integrity.emptyObjects.slice(0, 10),
+				blocking: integrity.blocking.length,
+			});
+		}
+		assertRepositoryIntegrity(integrity);
 		await pushBranch(this.environment, record.workspacePath, this.cfg.remote, record.branch);
 		const baseBranch = validateGitRef(options.baseBranch ?? "") || baseBranchName(this.cfg.baseRef);
 		const result = await createPullRequest(this.environment, record.workspacePath, {
