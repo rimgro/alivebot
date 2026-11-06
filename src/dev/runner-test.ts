@@ -1277,6 +1277,98 @@ section("the context-sleep redelivery cap drops the event after N rounds (#219)"
 	resetContextWarn();
 }
 
+section("a forced context reset without outbound leaves events unacknowledged (#219)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	// Soft sleep is off; only the hard ceiling fires. It must still count as a
+	// context-sleep end for redelivery purposes.
+	setContextWarn({ contextWarnTokens: 0, contextWarnStepTokens: 50_000, contextSleepTokens: 0, contextSleepGraceTurns: 0, contextHardTokens: 100_000 });
+	drainInbox();
+	const event = store.append({
+		kind: "user_message",
+		source: "test",
+		priority: "normal",
+		title: "hard-reset pending",
+		text: "hard reset must not lose this",
+		thread: "erin",
+		expectsReply: true,
+	});
+	handler = async (session) => {
+		session.setContextTokens(100_000);
+		await session.turn();
+	};
+	const record = await runner.execute();
+	check(
+		"the hard ceiling ends the run as slept",
+		record?.stopReason === "slept" && record?.contextReset?.reason === "hard",
+		{ stopReason: record?.stopReason, contextReset: record?.contextReset },
+	);
+	check("the forced reset sent nothing", (record?.outbound.length ?? -1) === 0, record?.outbound);
+	check(
+		"the event stays pending after the forced reset",
+		store.pendingCount() === 1 && store.redeliveryCount(event.seq) === 1,
+		{ pending: store.pendingCount(), count: store.redeliveryCount(event.seq) },
+	);
+	drainInbox();
+	resetContextWarn();
+}
+
+section("a mixed context-sleep range records the dropped head as an anomaly (#219)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	setContextWarn({ contextWarnTokens: 0, contextWarnStepTokens: 50_000, contextSleepTokens: 100_000, contextSleepGraceTurns: 10, contextHardTokens: 0 });
+	drainInbox();
+	const head = store.append({
+		kind: "user_message",
+		source: "test",
+		priority: "normal",
+		title: "exhausted head",
+		text: "this one has used its budget",
+		thread: "frank",
+		expectsReply: true,
+	});
+	handler = async (session) => {
+		session.setContextTokens(100_000);
+		await session.turn();
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "mixed range round", summary_md: "# mixed range round\n" });
+	};
+	for (let round = 1; round <= CONTEXT_SLEEP_REDELIVER_MAX; round += 1) {
+		await runner.execute();
+	}
+	check("the head exhausted its redelivery budget", store.redeliveryCount(head.seq) === CONTEXT_SLEEP_REDELIVER_MAX, store.redeliveryCount(head.seq));
+	const tail = store.append({
+		kind: "observability",
+		source: "test",
+		priority: "normal",
+		title: "retryable tail",
+		text: "this one still has budget",
+	});
+	const record = await runner.execute();
+	check(
+		"the exhausted head is dropped and the tail is redelivered",
+		record?.stopReason === "slept" && store.pendingCount() === 1 && store.redeliveryCount(tail.seq) === 1,
+		{ pending: store.pendingCount(), tailCount: store.redeliveryCount(tail.seq) },
+	);
+	const dropped = anomaliesOf(record?.id ?? "", "events_dropped");
+	check(
+		"the mixed range records the dropped head with seqs and kinds",
+		dropped.length === 1 &&
+			dropped[0]?.events === 1 &&
+			dropped[0]?.seqs?.length === 1 &&
+			dropped[0]?.seqs?.[0] === head.seq &&
+			dropped[0]?.kinds?.[0] === "user_message" &&
+			dropped[0]?.stopReason === "slept",
+		dropped,
+	);
+	drainInbox();
+	resetContextWarn();
+}
+
 section("a repeated compaction failure within grace forces reason=compaction (#170)");
 {
 	policy.reset();

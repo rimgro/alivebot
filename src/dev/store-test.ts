@@ -106,18 +106,28 @@ section("event store: redelivery counters are bounded and pruned (#219)");
 	const store = EventStore.open(dir);
 	const a = store.append({ kind: "user_message", source: "test", priority: "normal", title: "ra", text: "ra" });
 	const b = store.append({ kind: "user_message", source: "test", priority: "normal", title: "rb", text: "rb" });
-	store.beginRun("r1");
+	// A plain rollback (error/timeout/abort, planned restart) must not spend the
+	// context-sleep redelivery budget.
+	store.beginRun("plain");
 	store.claim(10);
 	store.rollbackClaim();
 	check(
-		"rollback increments every claimed event",
+		"a plain rollback leaves the redelivery counters at zero",
+		store.redeliveryCount(a.seq) === 0 && store.redeliveryCount(b.seq) === 0,
+		{ a: store.redeliveryCount(a.seq), b: store.redeliveryCount(b.seq) },
+	);
+	store.beginRun("r1");
+	store.claim(10);
+	store.rollbackClaimForRedelivery();
+	check(
+		"a context-sleep rollback increments every claimed event",
 		store.redeliveryCount(a.seq) === 1 && store.redeliveryCount(b.seq) === 1,
 		{ a: store.redeliveryCount(a.seq), b: store.redeliveryCount(b.seq) },
 	);
 	check("rolled back events are pending again", store.pendingCount() === 2, store.status());
 	store.beginRun("r2");
 	store.claim(10);
-	store.rollbackClaim();
+	store.rollbackClaimForRedelivery();
 	check(
 		"a second rollback increments again",
 		store.redeliveryCount(a.seq) === 2 && store.redeliveryCount(b.seq) === 2,
@@ -139,15 +149,15 @@ section("event store: redelivery counters are bounded and pruned (#219)");
 	const d = store.append({ kind: "user_message", source: "test", priority: "normal", title: "rd", text: "rd" });
 	store.beginRun("r4");
 	store.claim(10);
-	store.rollbackClaim();
+	store.rollbackClaimForRedelivery();
 	store.beginRun("r5");
 	store.claim(10);
 	store.ackThrough(c.seq);
 	check("ackThrough advances ackedSeq", store.ackedSeq === c.seq, store.status());
 	check("ackThrough prunes the acknowledged head", store.redeliveryCount(c.seq) === 0, store.redeliveryCount(c.seq));
 	check("ackThrough leaves the tail counter", store.redeliveryCount(d.seq) === 1, store.redeliveryCount(d.seq));
-	store.rollbackClaim();
-	check("the tail still counts a rollback after ackThrough", store.redeliveryCount(d.seq) === 2, store.redeliveryCount(d.seq));
+	store.rollbackClaimForRedelivery();
+	check("the tail still counts a context-sleep rollback after ackThrough", store.redeliveryCount(d.seq) === 2, store.redeliveryCount(d.seq));
 	check("only the tail remains pending", store.pendingCount() === 1, store.status());
 	store.beginRun("r6");
 	store.claim(10);
@@ -166,8 +176,8 @@ section("event store: an old cursor without redeliveries still reads (#219)");
 	check("the missing field reads as an empty budget", store.redeliveryCount(e.seq) === 0, store.redeliveryCount(e.seq));
 	store.beginRun("old-cursor");
 	store.claim(10);
-	store.rollbackClaim();
-	check("a rollback starts the counter", store.redeliveryCount(e.seq) === 1, store.redeliveryCount(e.seq));
+	store.rollbackClaimForRedelivery();
+	check("a context-sleep rollback starts the counter", store.redeliveryCount(e.seq) === 1, store.redeliveryCount(e.seq));
 	const saved = JSON.parse(fs.readFileSync(path.join(inbox, "cursor.json"), "utf8")) as { redeliveries?: Record<string, number> };
 	check("the new field is persisted", saved.redeliveries?.[String(e.seq)] === 1, saved);
 }

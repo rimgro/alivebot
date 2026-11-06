@@ -310,14 +310,27 @@ export class EventStore {
 
 	/**
 	 * Drop the current claim without acknowledging: used when the run did not
-	 * finish cleanly (error/timeout/abort), so in-flight events are redelivered
-	 * instead of being lost.
+	 * finish cleanly (error/timeout/abort) or never reached the model, so
+	 * in-flight events are redelivered instead of being lost.
+	 *
+	 * Deliberately does NOT touch the redelivery budget: planned harness
+	 * restarts and provider errors are not context-sleep rounds, and counting
+	 * them could exhaust the cap without a single real delivery attempt (#219).
 	 */
 	rollbackClaim(): void {
+		if (!this.cursor.openRun) return;
+		this.cursor.openRun = null;
+		this.saveCursor();
+	}
+
+	/**
+	 * Roll back the claim AND spend one redelivery attempt for every claimed
+	 * event. Only the context-sleep path calls this (#219): it is the only loop
+	 * that the bounded retry budget exists to stop.
+	 */
+	rollbackClaimForRedelivery(): void {
 		const open = this.cursor.openRun;
 		if (!open) return;
-		// Count the retry before dropping the claim: the next run will receive
-		// these seqs again, and the context-sleep cap needs to know how often.
 		for (let seq = this.cursor.ackedSeq + 1; seq <= open.lastSeq; seq += 1) {
 			const key = String(seq);
 			this.cursor.redeliveries[key] = (this.cursor.redeliveries[key] ?? 0) + 1;

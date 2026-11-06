@@ -1037,9 +1037,24 @@ export class AgentRunner {
 		// is already at the cap; that only delays their drop by a round.
 		const firstRetryable = retryable[0]!;
 		if (firstRetryable > range.fromSeq) store.ackThrough(firstRetryable - 1);
-		store.rollbackClaim();
+		store.rollbackClaimForRedelivery();
 		const droppedHead = seqs.filter((seq) => seq < firstRetryable);
 		const redelivered = seqs.filter((seq) => seq >= firstRetryable);
+		if (droppedHead.length > 0) {
+			// The exhausted head is lost even though the tail is redelivered: the
+			// dashboard must show it as a drop, not only the redelivery warn.
+			const dropped = this.describeSeqs(droppedHead);
+			const now = Date.now();
+			this.emitAnomaly(run, {
+				type: "events_dropped",
+				now,
+				activeMs: runActiveMs(run, now),
+				events: droppedHead.length,
+				seqs: droppedHead,
+				kinds: dropped.map((entry) => entry.kind),
+				stopReason,
+			});
+		}
 		this.deps.log.warn(`run #${run.index} left events unacknowledged; they will be redelivered`, {
 			reason: "context-sleep",
 			stopReason,
@@ -1503,8 +1518,17 @@ export class AgentRunner {
 		if (run.sleepRequested) return;
 		run.sleepRequested = true;
 		run.sleepForced = true;
+		// A forced reset ends the run exactly like the soft context-sleep directive:
+		// if it sent nothing, its claimed events were never handled and must not be
+		// acknowledged (#219). This covers the hard ceiling, soft grace and repeated
+		// compaction failures, including `sleepTokens = 0` where no directive is
+		// ever steered.
+		run.contextSleepDirected = true;
 		const watch = this.watch?.runId === run.id ? this.watch : undefined;
-		if (watch) watch.contextReset = { ...reset };
+		if (watch) {
+			watch.contextReset = { ...reset };
+			watch.contextSleepDirected = true;
+		}
 		this.deps.toolDeps.journal.append(
 			`[context-reset] forced sleep (${reset.reason}): context ${reset.tokens} tokens reached ${reset.limitTokens}; ` +
 				"memory survives through summary.md and journal; the next run starts with an empty context",
