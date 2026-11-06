@@ -17,6 +17,7 @@ import { readHeartbeatStatus, type UnitStatus } from "../heartbeat.js";
 import type { StartLoopStatus } from "../store/start-loop.js";
 import { buildSystemPrompt } from "../runtime/prompt.js";
 import { staleRuntimeReason, type StaleRuntimeReason } from "../runtime/daemon.js";
+import { cacheHitRate } from "../usage/cache.js";
 import type { AliveEvent } from "../store/events.js";
 import type { Reminder } from "../store/reminders.js";
 import {
@@ -466,16 +467,7 @@ function addUsage(target: RunUsageView, usage: RunUsageView): void {
 }
 
 /** `cacheRead / (input + cacheRead)`, the usual cache hit rate; null when there is no prompt tokens. */
-export function cacheHitRate(usage: RunUsageView): number | null {
-	const prompt = usage.input + usage.cacheRead;
-	if (prompt <= 0) return null;
-	return usage.cacheRead / prompt;
-}
-
-export function formatRate(rate: number | null): string {
-	if (rate === null || !Number.isFinite(rate)) return "—";
-	return `${(rate * 100).toFixed(1)}%`;
-}
+export { cacheHitRate, formatRate } from "../usage/cache.js";
 
 /**
  * Build the per-step view for a run page.

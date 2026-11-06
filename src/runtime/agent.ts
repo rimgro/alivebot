@@ -16,6 +16,7 @@ import type { RunAnomalyEvent, RunEventSink } from "../store/run-events.js";
 import { hasWakeWorthyPending } from "./wake.js";
 import { classifyNetworkError, withRetries } from "../retry.js";
 import { maskSecrets } from "../secrets.js";
+import { cacheHitRate, isColdCacheRun } from "../usage/cache.js";
 import { privateMemoryScope } from "./memory-access.js";
 import { compactionMonitorFor } from "./compaction.js";
 import {
@@ -894,8 +895,15 @@ export class AgentRunner {
 				turns: record.turns,
 				outbound: record.outbound.length,
 				usage: usage.cost,
+				promptTokens: usage.input,
+				cacheRead: usage.cacheRead,
+				cacheWrite: usage.cacheWrite,
+				cacheHitRate: cacheHitRate(usage),
 				resumed: Boolean(previous),
 			});
+			if (isColdCacheRun(usage)) {
+				log.warn(`run #${run.index} wrote ${usage.cacheWrite} cache tokens and read none`);
+			}
 			if (usageUnsettled) {
 				log.warn(`run #${run.index} spent tokens that no turn_end accounts for`, {
 					residualInput: residual.input,
@@ -1001,6 +1009,7 @@ export class AgentRunner {
 		const relevantMemories = config.config.memory.enabled !== false && memoryQuery.trim()
 			? await this.deps.toolDeps.memory.search(memoryQuery, 6, [privateMemoryScope(this.deps.config)])
 			: [];
+		const today = runs.usageToday();
 		return {
 			runIndex: run.index,
 			runId: run.id,
@@ -1018,7 +1027,8 @@ export class AgentRunner {
 			relevantMemories,
 			recentRuns: runs.list(3),
 			policy: this.deps.policy.load(),
-			costTodayUsd: runs.usageToday().cost + (this.deps.toolDeps.workers?.usageToday() ?? 0),
+			costTodayUsd: today.cost + (this.deps.toolDeps.workers?.usageToday() ?? 0),
+			cacheToday: { input: today.input, cacheRead: today.cacheRead ?? 0, cacheWrite: today.cacheWrite ?? 0 },
 			maxDailyCostUsd: config.config.budget.maxDailyCostUsd,
 			pendingAfterClaim: store.pendingCount(),
 			secrets: config.config.secrets,
