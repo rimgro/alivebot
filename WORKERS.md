@@ -51,7 +51,8 @@ Workers — отдельное операторское разрешение. О
     "worktreesDirectory": "",
     "baseRef": "origin/main",
     "remote": "origin",
-    "notifyOnFinish": true
+    "notifyOnFinish": true,
+    "keepWorktreeAfterPr": false
   }
 }
 ```
@@ -253,7 +254,17 @@ alive workers list
 alive workers status <worker-id>
 alive workers diff <worker-id> [--full]
 alive workers models
+alive workers prune [--dry-run] [--keep 5] [--older-than-days M] [--json]
 ```
+
+`alive workers prune` работает и в host-, и в sandbox-профиле: в sandbox обход и
+удаление выполняются внутри guest VM. Он удаляет только каталоги из
+worktrees-корня, никогда не трогает worktree активных (`starting`/`running`/
+`interrupted`) и грязных воркеров, не удаляет ветки, а `--dry-run` только
+печатает план. `--keep N` (по умолчанию 5) оставляет N самых свежих чистых
+каталогов, `--older-than-days M` дополнительно ограничивает возраст; отдельного
+retention-правила нет. `--json` печатает стабильную структуру: `entries`,
+счётчики `scanned/removed/skipped/skippedByReason` и `freedBytes`.
 
 `stop`/`remove`/`pr` из CLI намеренно не дублируются: worker-сессии принадлежат
 процессу агента, поэтому управлять ими должен агент. CLI читает durable-записи;
@@ -273,7 +284,10 @@ git-состояние находится в VM, поэтому `status`/`diff` 
 - Модели ограничены `workers.models`; инструменты — `workers.tools` (только
   built-in coding tools).
 - Push/PR не происходят автоматически: публикация — явный `pr` с отдельным
-  permission.
+  permission. После успешного PR чистый worktree удаляется по умолчанию
+  (`workers.keepWorktreeAfterPr: false`); ветка и запись worker'а остаются, а
+  `send` пересоздаёт worktree из ветки. Грязный worktree сохраняется с
+  предупреждением `worktree kept: uncommitted changes`.
 - `pr`/checkout PR рассчитаны на GitHub (`gh`, `refs/pull/<n>/head`) и требуют
   `gh`/credentials в окружении worker'а. Для других forge используйте свои
   команды/интеграции или `isolation: "shared"`.

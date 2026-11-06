@@ -73,6 +73,11 @@ export interface WorkersConfig {
 	remote: string;
 	/** Default for completion events. A start call may override it. */
 	notifyOnFinish: boolean;
+	/**
+	 * Keep the worktree after a successful pull request. Off by default: the
+	 * branch and durable worker record stay, so a follow-up can reattach it.
+	 */
+	keepWorktreeAfterPr: boolean;
 }
 
 export const DEFAULT_WORKERS_CONFIG: WorkersConfig = {
@@ -98,6 +103,7 @@ export const DEFAULT_WORKERS_CONFIG: WorkersConfig = {
 	baseRef: "",
 	remote: "origin",
 	notifyOnFinish: true,
+	keepWorktreeAfterPr: false,
 };
 
 const MODEL_PATTERN_RE = /^[^\s]+$/;
@@ -166,6 +172,7 @@ export function validateWorkersConfig(value: WorkersConfig): WorkersConfig {
 	}
 	if (typeof value.remote !== "string" || !REMOTE_RE.test(value.remote)) throw new Error("workers.remote must be a git remote name");
 	if (typeof value.notifyOnFinish !== "boolean") throw new Error("workers.notifyOnFinish must be boolean");
+	if (typeof value.keepWorktreeAfterPr !== "boolean") throw new Error("workers.keepWorktreeAfterPr must be boolean");
 	return {
 		enabled: value.enabled,
 		permissions: { ...permissions },
@@ -182,6 +189,7 @@ export function validateWorkersConfig(value: WorkersConfig): WorkersConfig {
 		baseRef,
 		remote: value.remote,
 		notifyOnFinish: value.notifyOnFinish,
+		keepWorktreeAfterPr: value.keepWorktreeAfterPr,
 	};
 }
 

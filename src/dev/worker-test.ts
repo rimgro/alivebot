@@ -183,6 +183,7 @@ function makeConfig(root: string, overrides: Record<string, unknown> = {}): Load
 				baseRef: "",
 				remote: "origin",
 				notifyOnFinish: true,
+				keepWorktreeAfterPr: false,
 				...overrides,
 			},
 		},

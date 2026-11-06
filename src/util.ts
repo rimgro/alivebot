@@ -150,6 +150,16 @@ export function iso(ts: number): string {
 	return new Date(ts).toISOString();
 }
 
+/** Human-readable byte size for status/prune output (`625.0 MB`, `21.03 GB`). */
+export function formatBytes(bytes: number): string {
+	if (!Number.isFinite(bytes)) return "n/a";
+	const value = Math.max(0, bytes);
+	if (value < 1024) return `${Math.round(value)} B`;
+	if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+	if (value < 1024 * 1024 * 1024) return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+	return `${(value / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+
 export function localTime(ts: number): string {
 	return new Date(ts).toLocaleTimeString(undefined, { hour12: false });
 }
