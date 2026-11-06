@@ -3138,7 +3138,7 @@ section("telegram send_message buttons and managed-bot inline requests (#84, #85
 		await new Promise((resolve) => setTimeout(resolve, 40));
 		calls.length = 0;
 
-		const run = { id: "run_buttons", outbound: [] as Array<{ thread: string; text: string; delivered: boolean }> } as unknown as RunHandle;
+		let run = { id: "run_buttons", outbound: [] as Array<{ thread: string; text: string; delivered: boolean }> } as unknown as RunHandle;
 		const deps = {
 			config,
 			history,
@@ -3158,6 +3158,81 @@ section("telegram send_message buttons and managed-bot inline requests (#84, #85
 				details: Record<string, unknown>;
 			}>;
 		const lastSend = () => calls.filter((call) => call.method === "sendMessage").at(-1);
+
+		section("send_message default thread (#2)");
+		const eventIn = (thread: string | undefined, expectsReply: boolean, seq: number): AliveEvent => ({
+			seq,
+			id: `evt_routing_${seq}`,
+			ts: Date.now(),
+			kind: "user_message",
+			source: "test",
+			priority: "normal",
+			title: "event",
+			text: "event",
+			thread,
+			expectsReply,
+		});
+		const useRun = (events: AliveEvent[]): void => {
+			run = {
+				id: "run_routing",
+				events,
+				outbound: [],
+				currentThreads: [...new Set(events.flatMap((event) => (event.thread ? [event.thread] : [])))],
+			} as unknown as RunHandle;
+		};
+
+		useRun([eventIn("telegram:42", false, 1)]);
+		const monoThread = await send({ text: "mono thread" });
+		check(
+			"a single-thread run without an addressed event still replies in that thread",
+			monoThread.details.thread === "telegram:42" && String(lastSend()?.params.chat_id) === "42",
+			monoThread.details,
+		);
+
+		useRun([eventIn("telegram:42", true, 1), eventIn("telegram:99", false, 2)]);
+		const addressed = await send({ text: "answer the asker" });
+		check(
+			"the newest event addressed to the agent wins over a newer unaddressed one",
+			addressed.details.thread === "telegram:42" && String(lastSend()?.params.chat_id) === "42",
+			addressed.details,
+		);
+
+		useRun([eventIn("telegram:42", false, 1), eventIn(undefined, true, 2)]);
+		const threadless = await send({ text: "threadless event" });
+		check(
+			"an addressed event without a thread does not take part in the choice",
+			threadless.details.thread === "telegram:42",
+			threadless.details,
+		);
+
+		useRun([eventIn("telegram:42", false, 1), eventIn("telegram:99", false, 2)]);
+		const outboxBeforeAmbiguity = outbox.list(100).length;
+		const callsBeforeAmbiguity = calls.length;
+		let ambiguityError: Error | undefined;
+		try {
+			await send({ text: "who is this for?" });
+		} catch (error) {
+			ambiguityError = error as Error;
+		}
+		check(
+			"several threads and no addressed event fails with an explicit-thread error",
+			ambiguityError !== undefined &&
+				/needs an explicit thread: this run/.test(ambiguityError.message) &&
+				/has 2 threads \(telegram:42, telegram:99\)/.test(ambiguityError.message),
+			ambiguityError?.message,
+		);
+		check(
+			"the ambiguity error writes nothing to the outbox and sends nothing",
+			outbox.list(100).length === outboxBeforeAmbiguity && calls.length === callsBeforeAmbiguity,
+			{ outbox: outbox.list(100).length - outboxBeforeAmbiguity, calls: calls.length - callsBeforeAmbiguity },
+		);
+
+		const explicit = await send({ thread: "telegram:99", text: "explicit wins" });
+		check(
+			"an explicit thread still works when the run has several threads",
+			explicit.details.thread === "telegram:99" && String(lastSend()?.params.chat_id) === "99",
+			explicit.details,
+		);
 
 		section("send_message callback buttons");
 		const withButtons = await send({

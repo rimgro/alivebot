@@ -819,7 +819,11 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		parameters: Type.Object({
 			text: Type.String({ description: "Message body. Write like a person: short, concrete, no process narration." }),
 			thread: Type.Optional(
-				Type.String({ description: "Conversation / person to send to. Defaults to the thread of the newest event." }),
+				Type.String({
+					description:
+						"Conversation / person to send to. Defaults to the thread of the newest event addressed to you; " +
+						"required when this run has several threads and none of them is addressed to you.",
+				}),
 			),
 			reply_to: Type.Optional(Type.String({ description: "Event id or message id this replies to, if any." })),
 			attachment: Type.Optional(
@@ -855,7 +859,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		execute: async (_toolCallId, params): Promise<ToolResult> => {
 			const run = requireRun(deps, "send_message");
 			if (!params.text.trim()) throw new Error("send_message requires non-empty text");
-			const thread = params.thread ?? defaultThread(run) ?? "console";
+			const thread = params.thread ?? resolveSendThread(run);
 			// The operator TUI has no chat module and reads this profile's local
 			// history directly. Recording the outbound row is the delivery point for
 			// that thread; without it, the host would (correctly) report that no
@@ -1605,6 +1609,37 @@ function defaultThread(run: RunHandle): string | undefined {
 		if (thread) return thread;
 	}
 	return undefined;
+}
+
+/**
+ * The thread a `send_message` without an explicit `thread` goes to (#2).
+ *
+ * A run can glue together events from several chats, so "the newest event" is
+ * not the same as "the newest event addressed to me": an unaddressed group
+ * event that merely arrived last must not steal the answer from the person who
+ * actually asked. Prefer the newest event with `expectsReply === true` (the
+ * modules set it only for genuinely addressed traffic); otherwise fall back to
+ * the run's single thread, and when there are several threads and none is
+ * addressed, refuse to guess.
+ *
+ * The ambiguity is an error rather than "just pick the newest" because a wrong
+ * pick is a silent misroute: the message is delivered successfully to the wrong
+ * person and nothing signals the mistake. Failing loudly keeps the mistake
+ * visible and fixable by the caller supplying `thread`.
+ */
+function resolveSendThread(run: RunHandle): string {
+	for (let i = run.events.length - 1; i >= 0; i -= 1) {
+		const event = run.events[i];
+		if (event?.thread && event.expectsReply === true) return event.thread;
+	}
+	// Events without a thread carry no address and never take part in the choice.
+	const threads = [...new Set(run.events.flatMap((event) => (event.thread ? [event.thread] : [])))];
+	if (threads.length === 0) return "console";
+	if (threads.length === 1) return threads[0]!;
+	throw new Error(
+		`send_message needs an explicit thread: this run has ${threads.length} threads (${threads.join(", ")}) ` +
+			"and none of the events is addressed to you",
+	);
 }
 
 /**
