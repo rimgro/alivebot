@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { loadConfig } from "../config.js";
-import { SandboxManager, guestHome, guestPath } from "../sandbox/manager.js";
+import { SandboxManager, guestHome, guestPath, EXEC_DEADLINE_GRACE_MS } from "../sandbox/manager.js";
 import { createSandboxTools } from "../sandbox/tools.js";
 import { DEFAULT_SANDBOX_CONFIG, validateSandboxConfig } from "../sandbox/config.js";
 import { IDLE_PROBE, parseIdleEvidence } from "../sandbox/probe.js";
@@ -25,6 +25,7 @@ function fakeBackend() {
 	let labels: Record<string, string> = {};
 	let probe = { processes: [] as Array<{ pid: number; command: string }>, containers: [] as unknown[], workspaceMounts: [] as string[] };
 	let probeFails = false;
+	let probeHangs = false;
 	let jobs: Array<{ id: string; state: string }> = [];
 	let nextCursor: string | null = null;
 	let created = 0;
@@ -35,6 +36,13 @@ function fakeBackend() {
 	let user = "";
 	let execDelayMs = 0;
 	let execEvents: Array<{ kind: "stdout" | "stderr"; data: Buffer } | { kind: "exited"; code: number }> = [{ kind: "exited", code: 0 }];
+	// A dead guest: exec never emits, never closes; boot never completes.
+	let execHangs = false;
+	let bootHangs = false;
+	let execKilled = 0;
+	let execDisposed = 0;
+	const killWaiters: Array<() => void> = [];
+	const releaseKilled = () => { for (const resolve of killWaiters.splice(0)) resolve(); };
 	const files = new Map<string, Buffer>();
 	const dirs = new Set(["/"]);
 	const modes = new Map<string, number>();
@@ -62,7 +70,7 @@ function fakeBackend() {
 	const handle = {
 		id: "identity", backendKind: "local", get status() { return status; },
 		config: () => ({ labels }),
-		async connectOrStart() { status = "running"; return vm; },
+		async connectOrStart() { if (bootHangs) return new Promise<never>(() => {}); status = "running"; return vm; },
 		async stopWithTimeout() { stopped++; status = "stopped"; },
 	};
 	const vm = {
@@ -77,11 +85,12 @@ function fakeBackend() {
 			return {
 				async *[Symbol.asyncIterator]() {
 					if (execDelayMs) await new Promise((resolve) => setTimeout(resolve, execDelayMs));
+					if (execHangs) { await new Promise<void>((resolve) => killWaiters.push(resolve)); return; }
 					yield* execEvents;
 				},
 				async wait() { throw new Error("exec session ended without exit event"); },
-				async kill() {},
-				async [Symbol.asyncDispose]() {},
+				async kill() { execKilled++; releaseKilled(); },
+				async [Symbol.asyncDispose]() { execDisposed++; releaseKilled(); },
 			};
 		},
 		async execWith(_command: string, configure: (b: any) => unknown) {
@@ -93,6 +102,8 @@ function fakeBackend() {
 				assert.match(args.at(-1)!, /^\/home\//);
 				assert.deepEqual(args.slice(0, 3), ["-I", "-S", "-c"], "probe must not import project or user-site Python modules");
 				if (probeFails) throw new Error("probe failed");
+				// A dead guest never answers the probe.
+				if (probeHangs) return new Promise<never>(() => {});
 				return { success: true, stdout: () => JSON.stringify(probe), stderr: () => "" };
 			}
 			const request = JSON.parse(stdin.toString());
@@ -126,9 +137,13 @@ function fakeBackend() {
 		setJobs(value: typeof jobs, cursor: string | null = null) { jobs = value; nextCursor = cursor; },
 		setStatus(value: string) { status = value; },
 		setExec(events: typeof execEvents, delayMs = 0) { execEvents = events; execDelayMs = delayMs; },
+		setExecHang(value: boolean) { execHangs = value; },
+		setBootHang(value: boolean) { bootHangs = value; },
+		setProbeHang(value: boolean) { probeHangs = value; },
 		setReadGate(gate?: Promise<void>, started?: () => void) { readGate = gate; readStarted = started; },
 		get networkPolicy() { return networkPolicy; }, get networkDisabled() { return networkDisabled; },
 		get created() { return created; }, get stopped() { return stopped; }, get liveWrites() { return liveWrites; }, get user() { return user; },
+		get execKilled() { return execKilled; }, get execDisposed() { return execDisposed; },
 	};
 }
 
@@ -207,6 +222,21 @@ async function testManager() {
 	fake.setExec([{ kind: "stdout", data: Buffer.from("out") }, { kind: "exited", code: 0 }]);
 	const cancelled = new AbortController();
 	await assert.rejects(manager.exclusive(() => manager.execute("test", 30_000, cancelled.signal, () => cancelled.abort())), /abort/i);
+	// A dead guest never emits and never closes the stream: only the host-side
+	// deadline can release the lifecycle queue.
+	const killedBefore = fake.execKilled;
+	const disposedBefore = fake.execDisposed;
+	fake.setExecHang(true);
+	const hungAt = Date.now();
+	await assert.rejects(manager.exclusive(() => manager.execute("test", 200)), new RegExp(`did not finish within ${200 + EXEC_DEADLINE_GRACE_MS} ms`));
+	const hungFor = Date.now() - hungAt;
+	assert.ok(hungFor >= 200 + EXEC_DEADLINE_GRACE_MS, `exec deadline fired too early (${hungFor} ms)`);
+	assert.ok(hungFor < 200 + EXEC_DEADLINE_GRACE_MS + 5_000, `exec deadline fired too late (${hungFor} ms)`);
+	assert.equal(fake.execKilled, killedBefore + 1, "the deadline must kill the guest exec");
+	assert.equal(fake.execDisposed, disposedBefore + 1, "killed exec must still be disposed");
+	fake.setExecHang(false);
+	fake.setExec([{ kind: "exited", code: 0 }]);
+	assert.equal((await manager.exclusive(() => manager.execute("test", 30_000))).code, 0, "a timed-out command must not poison the lifecycle queue");
 	const metadata = await invoke("file", { action: "stat", path: "data.txt" });
 	assert.equal((metadata.details as any).metadataSource, "guest", "permission metadata must come from the guest, not raw backing volume stat");
 	const future = Date.now() + 100_000;
@@ -296,6 +326,48 @@ async function testManager() {
 	await successor;
 	assert.equal(successorRan, true);
 	await io.close();
+}
+
+async function testIdleProbeDeadline() {
+	// The idle probe is the most frequent SDK path: a dead guest must not wedge it.
+	// checkIdle() never throws by design (it reports and returns false), so the
+	// deadline shows up in lastError and the queue must stay usable.
+	const loaded = loadConfig({ cwd: path.join(temp, "idle-deadline") });
+	const fake = fakeBackend();
+	const manager = new SandboxManager(loaded, log, async () => fake.sdk, () => {}, 150, 150);
+	try {
+		assert.equal((await manager.exclusive(() => manager.execute("test", 30_000))).code, 0);
+		fake.setProbeHang(true);
+		const future = Date.now() + 3_600_000; // beyond idleTimeoutMs, or the probe is never reached
+		const startedAt = Date.now();
+		assert.equal(await manager.checkIdle(future), false, "a timed-out probe must refuse shutdown");
+		const elapsed = Date.now() - startedAt;
+		assert.ok(elapsed >= 150 && elapsed < 5_000, `activity probe deadline fired after ${elapsed} ms`);
+		const status = await manager.control("status") as { lastError?: string; evidence?: unknown };
+		assert.match(status.lastError ?? "", /activity probe timed out after 150 ms/);
+		assert.equal(status.evidence, undefined, "a failed probe must not record idle evidence");
+		fake.setProbeHang(false);
+		assert.equal((await manager.exclusive(() => manager.execute("test", 30_000))).code, 0, "a timed-out probe must not poison the lifecycle queue");
+	} finally { await manager.close(); }
+}
+
+async function testBootDeadline() {
+	// A boot deadlock must be bounded too, otherwise the very first tool call
+	// wedges the queue. The deadline is overridable so the test stays fast.
+	const loaded = loadConfig({ cwd: path.join(temp, "boot-deadline") });
+	const fake = fakeBackend();
+	const manager = new SandboxManager(loaded, log, async () => fake.sdk, () => {}, 150);
+	try {
+		assert.equal((await manager.exclusive(() => manager.execute("test", 30_000))).code, 0);
+		fake.setStatus("stopped");
+		fake.setBootHang(true);
+		const startedAt = Date.now();
+		await assert.rejects(manager.exclusive(() => manager.execute("test", 30_000)), /Sandbox boot did not complete in 150 ms/);
+		const elapsed = Date.now() - startedAt;
+		assert.ok(elapsed >= 150 && elapsed < 5_000, `boot deadline rejected after ${elapsed} ms`);
+		fake.setBootHang(false);
+		assert.equal((await manager.exclusive(() => manager.execute("test", 30_000))).code, 0, "a timed-out boot must leave neither a half-attached VM nor a wedged queue");
+	} finally { await manager.close(); }
 }
 
 async function testSessionBoundary() {
@@ -439,6 +511,8 @@ try {
 	assert.deepEqual(oneManager.config.sharedVolumes, twoManager.config.sharedVolumes);
 	await Promise.all([oneManager.close(), twoManager.close()]);
 	await testManager();
+	await testBootDeadline();
+	await testIdleProbeDeadline();
 	await testSessionBoundary();
 	await testTelegramBridge();
 	await testRealOfflineFiles();

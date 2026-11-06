@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { Sandbox, SandboxHandle, VolumeFs } from "microsandbox";
+import type { ExecHandle, Sandbox, SandboxHandle, VolumeFs } from "microsandbox";
 import type { LoadedConfig } from "../config.js";
 import type { Logger } from "../log.js";
 import { validateSandboxConfig, type SandboxConfig } from "./config.js";
@@ -33,6 +33,32 @@ export function guestPath(file: string, workspace: string): string {
 
 const digest = (text: string) => createHash("sha256").update(text).digest("hex").slice(0, 24);
 const hasCode = (error: unknown, code: string) => (error as { code?: string })?.code === code;
+
+/** Host-side slack on top of the guest exec timeout. SDK timeouts only cover the
+ * guest process; a dead guest never closes the event stream. Not part of the
+ * boot fingerprint: these are runtime limits, not VM configuration. */
+export const EXEC_DEADLINE_GRACE_MS = 10_000;
+/** Upper bound for attach/boot. Image pulls are slow, a stuck hypervisor is not.
+ * Overridable per manager so tests never wait minutes. */
+export const BOOT_DEADLINE_MS = 180_000;
+/** Guest filesystem RPC deadline; mirrors the SDK exec timeout. */
+export const GUEST_FS_DEADLINE_MS = 30_000;
+/** Idle inspection pages are bounded as well: a guest that never answers must
+ * not stall the most frequent path ("may the VM sleep?"). */
+const MAX_JOB_PAGES = 100;
+/** Teardown must be bounded too, otherwise a killed stream still blocks the queue. */
+const TEARDOWN_DEADLINE_MS = 5_000;
+
+/** Settle a promise within `ms`; late outcomes and failures are ignored. */
+async function bounded(promise: Promise<unknown>, ms: number): Promise<void> {
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		await Promise.race([
+			promise.then(() => undefined, () => undefined),
+			new Promise<void>((resolve) => { timer = setTimeout(resolve, ms); }),
+		]);
+	} finally { if (timer) clearTimeout(timer); }
+}
 
 function checkLocalHardware(): void {
 	if (process.platform !== "linux") return; // macOS HVF / Windows WHP are validated by the SDK.
@@ -68,7 +94,9 @@ export class SandboxManager {
 
 	constructor(private readonly loaded: LoadedConfig, private readonly log: Pick<Logger, "warn" | "info">,
 		private readonly loadSdk: () => Promise<typeof import("microsandbox")> = () => import("microsandbox"),
-		private readonly checkHardware: () => void = checkLocalHardware) {
+		private readonly checkHardware: () => void = checkLocalHardware,
+		private readonly bootDeadlineMs: number = BOOT_DEADLINE_MS,
+		private readonly guestRpcDeadlineMs: number = GUEST_FS_DEADLINE_MS) {
 		this.config = validateSandboxConfig(loaded.config.sandbox);
 		this.workspaceDir = guestHome(loaded.config.name);
 		this.guestEnv = { HOME: this.workspaceDir, XDG_CACHE_HOME: `${this.workspaceDir}/.cache`, ...this.config.env };
@@ -151,6 +179,24 @@ export class SandboxManager {
 		}
 	}
 
+	/** Attach/create is the other unbounded SDK operation: a stuck boot would hold
+	 * the exclusive queue forever. A late VM from a timed-out attempt is detached. */
+	private async boot<T>(start: Promise<T>, onLate: (value: T) => unknown): Promise<T> {
+		let timer: NodeJS.Timeout | undefined;
+		let settled = false;
+		try {
+			return await Promise.race([
+				start.then((value) => { settled = true; return value; }),
+				new Promise<never>((_, reject) => {
+					timer = setTimeout(() => reject(new Error(`Sandbox boot did not complete in ${this.bootDeadlineMs} ms`)), this.bootDeadlineMs);
+				}),
+			]);
+		} catch (error) {
+			if (!settled) void start.then((value) => onLate(value), () => undefined).catch(() => undefined);
+			throw error;
+		} finally { if (timer) clearTimeout(timer); }
+	}
+
 	private async running(): Promise<Sandbox> {
 		const handle = await this.handle();
 		if (handle) {
@@ -158,7 +204,12 @@ export class SandboxManager {
 			if (!this.vm || handle.status !== "running") {
 				if (handle.status !== "running") this.checkHardware();
 				await this.vm?.detach();
-				this.vm = await handle.connectOrStart({ detached: true });
+				try { this.vm = await this.boot(handle.connectOrStart({ detached: true }), (late) => late.detach()); }
+				catch (error) {
+					// Never keep a half-attached VM: the next operation must retry cleanly.
+					this.vm = undefined;
+					throw error;
+				}
 			}
 			return this.vm;
 		}
@@ -184,7 +235,7 @@ export class SandboxManager {
 		if (this.config.dockerDiskMiB) {
 			builder = builder.volume("/var/lib/docker", (mount) => mount.owned({ kind: "disk", sizeMib: this.config.dockerDiskMiB }));
 		}
-		this.vm = await builder.create();
+		this.vm = await this.boot(builder.create(), (late) => late.detach());
 		if (this.vm.backendKind !== "local") { await this.vm.detach(); this.vm = undefined; throw new Error("Alive requires local microsandbox"); }
 		this.log.info("sandbox booted", { name: this.name, memoryMiB: this.config.memoryMiB });
 		return this.vm;
@@ -193,46 +244,84 @@ export class SandboxManager {
 	/** Called inside exclusive(), never exposes host environment or host credentials. */
 	async execute(command: string, timeoutMs: number, signal?: AbortSignal, onData?: (data: Buffer) => void, cwd = this.workspaceDir): Promise<{ text: string; code: number; truncated: boolean }> {
 		signal?.throwIfAborted();
-		const vm = await this.running();
-		signal?.throwIfAborted();
-		const startedAt = Date.now();
-		const exec = await vm.execStreamWith("/bin/bash", (b) => b.args(["-c", command]).cwd(guestPath(cwd, this.workspaceDir))
-			.user(`${this.config.uid}:${this.config.gid}`).timeout(timeoutMs).stdinNull());
-		const abort = () => { void exec.kill().catch((error) => this.report(error)); };
-		signal?.addEventListener("abort", abort, { once: true });
-		if (signal?.aborted) abort();
+		const deadlineMs = timeoutMs + EXEC_DEADLINE_GRACE_MS;
+		let exec: ExecHandle | undefined;
+		let consumed: Promise<void> | undefined;
 		let output = Buffer.alloc(0);
 		let truncated = false;
 		let exitCode: number | undefined;
+		let timer: NodeJS.Timeout | undefined;
+		const abort = () => { if (exec) void exec.kill().catch((error) => this.report(error)); };
 		try {
-			for await (const event of exec) {
-				if (event.kind === "exited") { exitCode = event.code; break; }
-				if (event.kind !== "stdout" && event.kind !== "stderr") continue;
-				const bytes = Buffer.from(event.data);
-				output = Buffer.concat([output, bytes]);
-				if (output.length > 64 * 1024) { output = output.subarray(output.length - 64 * 1024); truncated = true; }
-				onData?.(output);
-			}
+			signal?.addEventListener("abort", abort, { once: true });
+			// Boot carries its own deadline. The command timeout must not be spent on
+			// attaching, or a slow first boot would report a fake command timeout.
+			const vm = await this.running();
+			signal?.throwIfAborted();
+			const startedAt = Date.now();
+			// Bounds the command itself (stream, exit). The SDK only bounds the guest
+			// process; a dead guest never closes the event stream.
+			const deadline = new Promise<never>((_, reject) => {
+				timer = setTimeout(() => {
+					// Command text may contain secrets: only its length is safe to log.
+					this.log.warn("sandbox command deadline exceeded", { deadlineMs, commandLength: command.length });
+					abort();
+					reject(new Error(`Sandbox command did not finish within ${deadlineMs} ms (no exit event from guest); killed`));
+				}, deadlineMs);
+			});
+			void deadline.catch(() => undefined); // A later throw may discard the race.
+			const session = await Promise.race([vm.execStreamWith("/bin/bash", (b) => b.args(["-c", command]).cwd(guestPath(cwd, this.workspaceDir))
+				.user(`${this.config.uid}:${this.config.gid}`).timeout(timeoutMs).stdinNull()), deadline]);
+			exec = session;
+			if (signal?.aborted) abort();
+			consumed = (async () => {
+				for await (const event of session) {
+					if (event.kind === "exited") { exitCode = event.code; break; }
+					if (event.kind !== "stdout" && event.kind !== "stderr") continue;
+					const bytes = Buffer.from(event.data);
+					output = Buffer.concat([output, bytes]);
+					if (output.length > 64 * 1024) { output = output.subarray(output.length - 64 * 1024); truncated = true; }
+					onData?.(output);
+				}
+			})();
+			void consumed.catch(() => undefined); // The deadline may win; teardown still settles it.
+			await Promise.race([consumed, deadline]);
 			// microsandbox 0.7.8 wait() consumes the same event queue as the
 			// iterator; calling it after consuming `exited` loses the exit event.
 			// Raw events don't surface ExecTimeout, so retain deadline reporting
 			// after the SDK has confirmed termination (never unlock on a timer).
-			if (exitCode === undefined) exitCode = (await exec.wait()).code;
+			if (exitCode === undefined) exitCode = (await Promise.race([session.wait(), deadline])).code;
 			signal?.throwIfAborted();
 			if (Date.now() - startedAt >= timeoutMs) throw new Error(`Sandbox command timed out after ${timeoutMs} ms`);
 			return { text: output.toString("utf8"), code: exitCode, truncated };
 		} finally {
 			signal?.removeEventListener("abort", abort);
-			await exec[Symbol.asyncDispose]();
+			if (timer) clearTimeout(timer);
+			if (exec) {
+				const session = exec;
+				// Bounded teardown; a dead guest must never leave the exclusive queue locked.
+				await bounded(Promise.resolve().then(() => session[Symbol.asyncDispose]()), TEARDOWN_DEADLINE_MS);
+				if (consumed) await bounded(consumed, TEARDOWN_DEADLINE_MS);
+			}
 		}
+	}
+
+	/** Guest RPC has no host-side wait: a dead guest must not wedge a file operation. */
+	private async guestRpc<T>(op: string, operation: Promise<T>): Promise<T> {
+		let timer: NodeJS.Timeout | undefined;
+		try {
+			return await Promise.race([operation, new Promise<never>((_, reject) => {
+				timer = setTimeout(() => reject(new Error(`Guest filesystem ${op} timed out after ${this.guestRpcDeadlineMs} ms`)), this.guestRpcDeadlineMs);
+			})]);
+		} finally { if (timer) clearTimeout(timer); }
 	}
 
 	private liveFiles(): VirtualFiles {
 		const rpc = async (op: string, file: string, data?: string) => {
 			const vm = await this.running();
-			const result = await vm.execWith("python3", (b) => b.args(["-I", "-S", "-c", FILE_RPC])
-				.user(`${this.config.uid}:${this.config.gid}`).timeout(30_000)
-				.stdinBytes(Buffer.from(JSON.stringify({ op, path: this.path(file), maxBytes: this.config.maxFileBytes, data }))));
+			const result = await this.guestRpc(op, vm.execWith("python3", (b) => b.args(["-I", "-S", "-c", FILE_RPC])
+				.user(`${this.config.uid}:${this.config.gid}`).timeout(GUEST_FS_DEADLINE_MS)
+				.stdinBytes(Buffer.from(JSON.stringify({ op, path: this.path(file), maxBytes: this.config.maxFileBytes, data })))));
 			if (!result.success) throw new Error(`Guest filesystem ${op} failed: ${result.stderr().slice(0, 4000)}`);
 			return JSON.parse(result.stdout());
 		};
@@ -330,7 +419,7 @@ export class SandboxManager {
 
 	private async inspectActivity(): Promise<IdleEvidence> {
 		const vm = await this.running();
-		const result = await vm.execWith("python3", (b) => b.args(["-I", "-S", "-c", IDLE_PROBE, this.workspaceDir]).user("0:0").timeout(10_000).stdinNull());
+		const result = await this.guestRpc("activity probe", vm.execWith("python3", (b) => b.args(["-I", "-S", "-c", IDLE_PROBE, this.workspaceDir]).user("0:0").timeout(10_000).stdinNull()));
 		if (!result.success) throw new Error(`VM activity probe failed: ${result.stderr().slice(0, 2000)}`);
 		const evidence = parseIdleEvidence(result.stdout());
 		// Detached jobs can be admitted before they get a /proc PID. A lost job
@@ -339,8 +428,10 @@ export class SandboxManager {
 		let cursor: string | undefined;
 		let inspected = 0;
 		const seen = new Set<string>();
-		for (;;) {
-			const jobs = await vm.listJobsWith((b) => cursor ? b.all().limit(100).cursor(cursor) : b.all().limit(100));
+		for (let page = 0; ; page++) {
+			if (page >= MAX_JOB_PAGES) throw new Error(`VM job inventory exceeds ${MAX_JOB_PAGES} pages; shutdown refused`);
+			// A dead guest must not wedge the idle check, which is the most frequent path.
+			const jobs = await this.guestRpc("job inventory", vm.listJobsWith((b) => cursor ? b.all().limit(100).cursor(cursor) : b.all().limit(100)));
 			inspected += jobs.items.length;
 			if (inspected > 10000) throw new Error("VM job inventory exceeds safe scan limit; shutdown refused");
 			evidence.jobs.push(...jobs.items.filter((job) => job.state !== "exited" && job.state !== "failed")
