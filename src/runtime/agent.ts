@@ -37,6 +37,21 @@ const AGENT_PROVIDER_RETRY_ATTEMPTS = 3;
 const AGENT_PROVIDER_RETRY_BASE_MS = 1_000;
 const AGENT_PROVIDER_RETRY_MAX_DELAY_MS = 15_000;
 
+/**
+ * How many times a context-sleep run may roll its claim back for redelivery.
+ *
+ * This is a safety cap, not a configuration knob (#219). A run that wakes on an
+ * event, gets the context-sleep directive and sleeps without sending anything
+ * must not acknowledge the event, otherwise the sender sees a successful
+ * delivery and never gets an answer. Redelivering it is only safe while the
+ * loop is bounded: the next run starts on a fresh context, but if it grows past
+ * the threshold again before handling the event, the same event comes back.
+ * After {@link CONTEXT_SLEEP_REDELIVER_MAX} redeliveries the runtime accepts the
+ * loss (acknowledges the events) and records `events_dropped` instead of
+ * looping forever.
+ */
+export const CONTEXT_SLEEP_REDELIVER_MAX = 2;
+
 export interface ExecuteOptions {
 	redeliveryRange?: { fromSeq: number; toSeq: number };
 	requireEvents?: boolean;
@@ -176,6 +191,15 @@ interface RunWatch {
 	contextSoftSince?: number;
 	/** True once the soft sleep directive has been steered for this crossing. */
 	contextSleepSteered: boolean;
+	/**
+	 * True once the context-sleep directive has been steered in this run.
+	 *
+	 * Unlike `contextSleepSteered` this is never re-armed when the context falls
+	 * back below the soft threshold: it survives until the run ends, so the
+	 * runtime can tell at the end of `execute()` that a sleep came from the
+	 * directive rather than from the agent's own decision (#219).
+	 */
+	contextSleepDirected: boolean;
 	/** Forced reset that ended this run; persisted on the record. */
 	contextReset?: { reason: ContextResetReason; tokens: number; limitTokens: number };
 	/** Turn of the previous failed compaction, for the repeated-failure window. */
@@ -513,6 +537,14 @@ export class AgentRunner {
 			reasonClass?: RunAnomalyEvent["reasonClass"];
 			attempt?: number;
 			maxAttempts?: number;
+			/** `events_dropped`: override the base inbound-event count with the dropped count. */
+			events?: number;
+			/** `events_dropped`: the sequence numbers dropped. */
+			seqs?: number[];
+			/** `events_dropped`: event kind for each seq, in the same order. */
+			kinds?: string[];
+			/** `events_dropped`: why the run stopped. */
+			stopReason?: RunStopReason;
 			/** `tool_long`: how long the single tool call has been running. */
 			toolMs?: number;
 			/** Log-only: the short reason and masked provider excerpt, never persisted. */
@@ -531,7 +563,7 @@ export class AgentRunner {
 			idleMs: Math.round(run.idleMs),
 			turns: run.turns,
 			outbound: run.outbound.length,
-			events: run.events.length,
+			events: input.events ?? run.events.length,
 			limitMs: input.limitMs,
 			limitTurns: input.limitTurns,
 			contextTokens: input.contextTokens,
@@ -543,6 +575,9 @@ export class AgentRunner {
 			attempt: input.attempt,
 			maxAttempts: input.maxAttempts,
 			toolMs: input.toolMs,
+			seqs: input.seqs,
+			kinds: input.kinds,
+			stopReason: input.stopReason,
 		};
 		this.deps.runEvents?.append(event);
 		this.deps.log.warn(event.type, {
@@ -620,6 +655,7 @@ export class AgentRunner {
 				contextWarnedAt: undefined,
 				contextSoftSince: undefined,
 				contextSleepSteered: false,
+				contextSleepDirected: false,
 				contextReset: undefined,
 				lastCompactionFailureTurn: undefined,
 				activeTool: undefined,
@@ -810,8 +846,15 @@ export class AgentRunner {
 
 			const reachedModel = run.lastStopReason !== undefined || run.turns > 0 || run.idleReturns > 0;
 			const redeliver = stopReason === "error" || stopReason === "timeout" || stopReason === "aborted";
+			// #219: a sleep caused by the context-sleep directive before any outbound
+			// means the claimed events were never handled. Acknowledge nothing in that
+			// case: the sender would otherwise see a successful delivery with no answer.
+			const contextSleepDirected =
+				stopReason === "slept" && this.watch?.contextSleepDirected === true && run.outbound.length === 0;
 			this.deps.setRun(undefined);
-			if (reachedModel && !redeliver) {
+			if (contextSleepDirected) {
+				this.settleContextSleepClaim(run, finalStopReason);
+			} else if (reachedModel && !redeliver) {
 				store.endRun();
 			} else {
 				store.rollbackClaim();
@@ -931,6 +974,96 @@ export class AgentRunner {
 			if (this.executionSettled?.promise === settled) this.executionSettled = undefined;
 			settle();
 		}
+	}
+
+	/**
+	 * `{seq, kind}` for each seq, in ascending order, read from the durable inbox.
+	 * Used by the redelivery/drop warnings so an operator can find the event in
+	 * `inbox/events.jsonl` and resend it by hand. Never includes event text.
+	 */
+	private describeSeqs(seqs: number[]): Array<{ seq: number; kind: string }> {
+		const kinds = new Map(this.deps.store.all().map((event) => [event.seq, event.kind]));
+		return [...seqs].sort((left, right) => left - right).map((seq) => ({ seq, kind: kinds.get(seq) ?? "unknown" }));
+	}
+
+	/**
+	 * Settle the claim of a run that slept on the context-sleep directive without
+	 * sending anything (#219).
+	 *
+	 * The events were delivered but never handled, so they are rolled back for
+	 * redelivery. To keep the wake → directive → sleep loop bounded, every event
+	 * carries a redelivery counter in the cursor; once the whole claimed range
+	 * has exhausted {@link CONTEXT_SLEEP_REDELIVER_MAX}, the runtime accepts the
+	 * loss: it acknowledges the range, warns with the seqs and records an
+	 * `events_dropped` anomaly. A mixed range gives up on the exhausted head
+	 * only (via `ackThrough`) and redelivers the rest, which is simple and
+	 * guarantees the loop terminates.
+	 */
+	private settleContextSleepClaim(run: RunHandle, stopReason: RunStopReason): void {
+		const store = this.deps.store;
+		const range = store.claimedRange();
+		if (!range) {
+			store.endRun();
+			return;
+		}
+		const seqs: number[] = [];
+		for (let seq = range.fromSeq; seq <= range.toSeq; seq += 1) seqs.push(seq);
+		const retryable = seqs.filter((seq) => store.redeliveryCount(seq) < CONTEXT_SLEEP_REDELIVER_MAX);
+		if (retryable.length === 0) {
+			store.endRun();
+			const dropped = this.describeSeqs(seqs);
+			this.deps.log.warn(`run #${run.index} dropping events unprocessed by context-sleep`, {
+				reason: "context-sleep",
+				stopReason,
+				events: seqs.length,
+				seqs,
+				dropped,
+				maxRedeliveries: CONTEXT_SLEEP_REDELIVER_MAX,
+			});
+			const now = Date.now();
+			this.emitAnomaly(run, {
+				type: "events_dropped",
+				now,
+				activeMs: runActiveMs(run, now),
+				events: seqs.length,
+				seqs,
+				kinds: dropped.map((entry) => entry.kind),
+				stopReason,
+			});
+			return;
+		}
+		// Mixed range: acknowledge the exhausted head, roll back the rest. Events
+		// after the first retryable seq are redelivered even if their own counter
+		// is already at the cap; that only delays their drop by a round.
+		const firstRetryable = retryable[0]!;
+		if (firstRetryable > range.fromSeq) store.ackThrough(firstRetryable - 1);
+		store.rollbackClaimForRedelivery();
+		const droppedHead = seqs.filter((seq) => seq < firstRetryable);
+		const redelivered = seqs.filter((seq) => seq >= firstRetryable);
+		if (droppedHead.length > 0) {
+			// The exhausted head is lost even though the tail is redelivered: the
+			// dashboard must show it as a drop, not only the redelivery warn.
+			const dropped = this.describeSeqs(droppedHead);
+			const now = Date.now();
+			this.emitAnomaly(run, {
+				type: "events_dropped",
+				now,
+				activeMs: runActiveMs(run, now),
+				events: droppedHead.length,
+				seqs: droppedHead,
+				kinds: dropped.map((entry) => entry.kind),
+				stopReason,
+			});
+		}
+		this.deps.log.warn(`run #${run.index} left events unacknowledged; they will be redelivered`, {
+			reason: "context-sleep",
+			stopReason,
+			events: redelivered.length,
+			seqs: redelivered,
+			redelivered: this.describeSeqs(redelivered),
+			dropped: droppedHead.length > 0 ? this.describeSeqs(droppedHead) : undefined,
+			maxRedeliveries: CONTEXT_SLEEP_REDELIVER_MAX,
+		});
 	}
 
 	/**
@@ -1310,6 +1443,10 @@ export class AgentRunner {
 			if (watch.contextSoftSince === undefined) watch.contextSoftSince = run.turns;
 			if (!watch.contextSleepSteered) {
 				watch.contextSleepSteered = true;
+				watch.contextSleepDirected = true;
+				// The sleep tool reads the run handle, not the private watch: expose the
+				// same fact there so it does not acknowledge an unhandled claim (#219).
+				run.contextSleepDirected = true;
 				void this.steerContextSleep(run, contextTokens, policy.sleepTokens);
 			}
 			return;
@@ -1381,8 +1518,17 @@ export class AgentRunner {
 		if (run.sleepRequested) return;
 		run.sleepRequested = true;
 		run.sleepForced = true;
+		// A forced reset ends the run exactly like the soft context-sleep directive:
+		// if it sent nothing, its claimed events were never handled and must not be
+		// acknowledged (#219). This covers the hard ceiling, soft grace and repeated
+		// compaction failures, including `sleepTokens = 0` where no directive is
+		// ever steered.
+		run.contextSleepDirected = true;
 		const watch = this.watch?.runId === run.id ? this.watch : undefined;
-		if (watch) watch.contextReset = { ...reset };
+		if (watch) {
+			watch.contextReset = { ...reset };
+			watch.contextSleepDirected = true;
+		}
 		this.deps.toolDeps.journal.append(
 			`[context-reset] forced sleep (${reset.reason}): context ${reset.tokens} tokens reached ${reset.limitTokens}; ` +
 				"memory survives through summary.md and journal; the next run starts with an empty context",

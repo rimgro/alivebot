@@ -31,7 +31,7 @@ import { interruptedResumeDecision, RUN_TURN_TRACE_LIMIT, RunLog, runTurnCount, 
 import { ThreadStore } from "../store/threads.js";
 import { HistoryStore } from "../store/history.js";
 import { RunEventLog } from "../store/run-events.js";
-import { AgentRunner, CONTEXT_SLEEP_MESSAGE, CONTEXT_WARN_MESSAGE, runActiveMs } from "../runtime/agent.js";
+import { AgentRunner, CONTEXT_SLEEP_MESSAGE, CONTEXT_SLEEP_REDELIVER_MAX, CONTEXT_WARN_MESSAGE, runActiveMs } from "../runtime/agent.js";
 import { openSessionManager } from "../runtime/session.js";
 import { isOutboundRecorded } from "../runtime/tools.js";
 import { TurnTraceRecorder, residualUsage, zeroUsage } from "../runtime/run-trace.js";
@@ -87,7 +87,28 @@ const config = loadConfig({
 	},
 });
 config.config.memory.sharedScopes = ["user:alice", "project:alive"];
-const log = new Logger({ console: false, level: "error", scope: "runner-test" });
+const logFile = path.join(root, "runner-test.log");
+const log = new Logger({ console: false, level: "error", scope: "runner-test", file: logFile });
+
+/** Structured log records written so far (the file sink receives every level). */
+function logRecords(): Array<{ level: string; msg: string; data?: Record<string, unknown> }> {
+	try {
+		return fs
+			.readFileSync(logFile, "utf8")
+			.split("\n")
+			.filter((line) => line.trim())
+			.map((line) => JSON.parse(line) as { level: string; msg: string; data?: Record<string, unknown> });
+	} catch {
+		return [];
+	}
+}
+
+/** Warnings with a given structured `reason`, optionally matching the message. */
+function warnsWithReason(reason: string, message?: string): Array<{ level: string; msg: string; data?: Record<string, unknown> }> {
+	return logRecords().filter(
+		(record) => record.level === "warn" && record.data?.reason === reason && (!message || record.msg.includes(message)),
+	);
+}
 const store = EventStore.open(config.paths.stateDir);
 const reminders = new ReminderStore(config.paths.stateDir);
 const notes = new NoteStore(config.paths.stateDir);
@@ -351,6 +372,14 @@ function resetContextWarn(): void {
 		contextSleepGraceTurns: 3,
 		contextHardTokens: 250_000,
 	});
+}
+
+/** Claim and acknowledge everything pending, so a section starts from a clean cursor. */
+function drainInbox(): void {
+	if (store.openRunId) store.endRun();
+	store.beginRun("drain-test");
+	store.claim(1_000);
+	store.endRun();
 }
 
 section("a 20-minute active run is warned, never killed, with runTimeoutMs = 0 (#127)");
@@ -1043,6 +1072,300 @@ section("the profile context block overrides the loop thresholds (#170)");
 		record?.contextReset,
 	);
 	config.config.context = undefined;
+	resetContextWarn();
+}
+
+section("context-sleep without outbound leaves events unacknowledged (#219)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	setContextWarn({ contextWarnTokens: 0, contextWarnStepTokens: 50_000, contextSleepTokens: 100_000, contextSleepGraceTurns: 10, contextHardTokens: 0 });
+	drainInbox();
+	const event = store.append({
+		kind: "user_message",
+		source: "test",
+		priority: "normal",
+		title: "context-sleep pending",
+		text: "this needs an answer",
+		thread: "alice",
+		expectsReply: true,
+	});
+	const warnsBefore = warnsWithReason("context-sleep", "left events unacknowledged").length;
+	handler = async (session) => {
+		session.setContextTokens(100_000);
+		await session.turn();
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "slept by directive", summary_md: "# slept by directive\n" });
+	};
+	const record = await runner.execute();
+	check("the run ended as slept", record?.stopReason === "slept", record?.stopReason);
+	check("the run sent nothing", (record?.outbound.length ?? -1) === 0, record?.outbound);
+	check(
+		"the event is still pending and not acknowledged",
+		store.pendingCount() === 1 && store.ackedSeq < event.seq,
+		store.status(),
+	);
+	check("the redelivery counter grew", store.redeliveryCount(event.seq) === 1, store.redeliveryCount(event.seq));
+	const warns = warnsWithReason("context-sleep", "left events unacknowledged");
+	const last = warns.at(-1);
+	check(
+		"a context-sleep warn names the redelivered seq",
+		warns.length === warnsBefore + 1 && Array.isArray(last?.data?.seqs) && (last.data.seqs as number[]).includes(event.seq),
+		last,
+	);
+	const redeliveredEntries = Array.isArray(last?.data?.redelivered)
+		? (last.data.redelivered as Array<{ seq: number; kind: string }>)
+		: [];
+	check(
+		"the redelivery warn carries the seq and kind too",
+		redeliveredEntries.some((entry) => entry.seq === event.seq && entry.kind === "user_message"),
+		last,
+	);
+	drainInbox();
+	resetContextWarn();
+}
+
+section("a redelivered event reaches the next run after a context-sleep (#219)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	setContextWarn({ contextWarnTokens: 0, contextWarnStepTokens: 50_000, contextSleepTokens: 100_000, contextSleepGraceTurns: 10, contextHardTokens: 0 });
+	drainInbox();
+	const event = store.append({
+		kind: "user_message",
+		source: "test",
+		priority: "normal",
+		title: "redelivered once",
+		text: "please answer after the sleep",
+		thread: "bob",
+		expectsReply: true,
+	});
+	handler = async (session) => {
+		session.setContextTokens(100_000);
+		await session.turn();
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "first run slept", summary_md: "# first run slept\n" });
+	};
+	const first = await runner.execute();
+	check(
+		"the first run slept without acknowledging the event",
+		first?.stopReason === "slept" && store.pendingCount() === 1 && !first?.events.some((e) => e.seq === event.seq && e.redelivered),
+		{ stopReason: first?.stopReason, pending: store.pendingCount() },
+	);
+	// The next run has a fresh context below every threshold: it must get the same seq again.
+	setContextWarn({ contextWarnTokens: 0, contextWarnStepTokens: 50_000, contextSleepTokens: 0, contextSleepGraceTurns: 0, contextHardTokens: 0 });
+	handler = async () => {
+		const run = currentRun!;
+		check("the second run received the same seq", run.events.some((e) => e.seq === event.seq), run.events.map((e) => e.seq));
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "handled the redelivery", summary_md: "# handled the redelivery\n" });
+	};
+	const second = await runner.execute();
+	check(
+		"the redelivered event is in the second run record",
+		Boolean(second?.events.some((e) => e.seq === event.seq)),
+		second?.events.map((e) => e.seq),
+	);
+	check(
+		"the second run acknowledges it",
+		store.pendingCount() === 0 && store.redeliveryCount(event.seq) === 0,
+		store.status(),
+	);
+	drainInbox();
+	resetContextWarn();
+}
+
+section("the agent's own sleep still acknowledges events (#219)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	setContextWarn({ contextWarnTokens: 0, contextWarnStepTokens: 50_000, contextSleepTokens: 0, contextSleepGraceTurns: 0, contextHardTokens: 0 });
+	drainInbox();
+	const event = store.append({
+		kind: "user_message",
+		source: "test",
+		priority: "normal",
+		title: "own sleep",
+		text: "handled before sleeping",
+		thread: "carol",
+		expectsReply: true,
+	});
+	const warnsBefore = warnsWithReason("context-sleep").length;
+	handler = async (session) => {
+		const run = currentRun!;
+		check("no context-sleep directive was steered", !session.steered.includes(CONTEXT_SLEEP_MESSAGE), session.steered);
+		check("the event was delivered to the run", run.events.some((e) => e.seq === event.seq), run.events.map((e) => e.seq));
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "own decision", summary_md: "# own decision\n" });
+	};
+	const record = await runner.execute();
+	check("the run ended by its own sleep", record?.stopReason === "slept", record?.stopReason);
+	check("the event is acknowledged", store.pendingCount() === 0 && store.ackedSeq >= event.seq, store.status());
+	check("no context-sleep redelivery warn was added", warnsWithReason("context-sleep").length === warnsBefore);
+	drainInbox();
+	resetContextWarn();
+}
+
+section("the context-sleep redelivery cap drops the event after N rounds (#219)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	setContextWarn({ contextWarnTokens: 0, contextWarnStepTokens: 50_000, contextSleepTokens: 100_000, contextSleepGraceTurns: 10, contextHardTokens: 0 });
+	drainInbox();
+	const event = store.append({
+		kind: "user_message",
+		source: "test",
+		priority: "normal",
+		title: "looping event",
+		text: "context is always too large",
+		thread: "dave",
+		expectsReply: true,
+	});
+	handler = async (session) => {
+		session.setContextTokens(100_000);
+		await session.turn();
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "loop round", summary_md: "# loop round\n" });
+	};
+	for (let round = 1; round <= CONTEXT_SLEEP_REDELIVER_MAX; round += 1) {
+		const record = await runner.execute();
+		check(
+			`round ${round}: the run sleeps and the event is pending again`,
+			record?.stopReason === "slept" && store.pendingCount() === 1,
+			{ stopReason: record?.stopReason, pending: store.pendingCount(), count: store.redeliveryCount(event.seq) },
+		);
+		check(`round ${round}: the counter matches`, store.redeliveryCount(event.seq) === round, store.redeliveryCount(event.seq));
+	}
+	const dropWarnsBefore = warnsWithReason("context-sleep", "dropping events").length;
+	const final = await runner.execute();
+	check(
+		"after the cap the event is dropped instead of redelivered",
+		final?.stopReason === "slept" && store.pendingCount() === 0,
+		{ stopReason: final?.stopReason, pending: store.pendingCount() },
+	);
+	check("the counter is pruned with the acknowledgement", store.redeliveryCount(event.seq) === 0, store.redeliveryCount(event.seq));
+	const dropWarns = warnsWithReason("context-sleep", "dropping events");
+	const dropWarn = dropWarns.at(-1);
+	check(
+		"a drop warn names the lost seq",
+		dropWarns.length === dropWarnsBefore + 1 && Array.isArray(dropWarn?.data?.seqs) && (dropWarn.data.seqs as number[]).includes(event.seq),
+		dropWarn,
+	);
+	const dropEntries = Array.isArray(dropWarn?.data?.dropped)
+		? (dropWarn.data.dropped as Array<{ seq: number; kind: string }>)
+		: [];
+	check(
+		"a drop warn carries the seq and kind of each lost event",
+		dropEntries.some((entry) => entry.seq === event.seq && entry.kind === "user_message"),
+		dropWarn,
+	);
+	const dropped = anomaliesOf(final?.id ?? "", "events_dropped");
+	check(
+		"one events_dropped anomaly carries count, seqs, kinds and stopReason",
+		dropped.length === 1 &&
+			dropped[0]?.events === 1 &&
+			dropped[0]?.seqs?.[0] === event.seq &&
+			dropped[0]?.kinds?.[0] === "user_message" &&
+			dropped[0]?.stopReason === "slept",
+		dropped,
+	);
+	drainInbox();
+	resetContextWarn();
+}
+
+section("a forced context reset without outbound leaves events unacknowledged (#219)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	// Soft sleep is off; only the hard ceiling fires. It must still count as a
+	// context-sleep end for redelivery purposes.
+	setContextWarn({ contextWarnTokens: 0, contextWarnStepTokens: 50_000, contextSleepTokens: 0, contextSleepGraceTurns: 0, contextHardTokens: 100_000 });
+	drainInbox();
+	const event = store.append({
+		kind: "user_message",
+		source: "test",
+		priority: "normal",
+		title: "hard-reset pending",
+		text: "hard reset must not lose this",
+		thread: "erin",
+		expectsReply: true,
+	});
+	handler = async (session) => {
+		session.setContextTokens(100_000);
+		await session.turn();
+	};
+	const record = await runner.execute();
+	check(
+		"the hard ceiling ends the run as slept",
+		record?.stopReason === "slept" && record?.contextReset?.reason === "hard",
+		{ stopReason: record?.stopReason, contextReset: record?.contextReset },
+	);
+	check("the forced reset sent nothing", (record?.outbound.length ?? -1) === 0, record?.outbound);
+	check(
+		"the event stays pending after the forced reset",
+		store.pendingCount() === 1 && store.redeliveryCount(event.seq) === 1,
+		{ pending: store.pendingCount(), count: store.redeliveryCount(event.seq) },
+	);
+	drainInbox();
+	resetContextWarn();
+}
+
+section("a mixed context-sleep range records the dropped head as an anomaly (#219)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	setContextWarn({ contextWarnTokens: 0, contextWarnStepTokens: 50_000, contextSleepTokens: 100_000, contextSleepGraceTurns: 10, contextHardTokens: 0 });
+	drainInbox();
+	const head = store.append({
+		kind: "user_message",
+		source: "test",
+		priority: "normal",
+		title: "exhausted head",
+		text: "this one has used its budget",
+		thread: "frank",
+		expectsReply: true,
+	});
+	handler = async (session) => {
+		session.setContextTokens(100_000);
+		await session.turn();
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "mixed range round", summary_md: "# mixed range round\n" });
+	};
+	for (let round = 1; round <= CONTEXT_SLEEP_REDELIVER_MAX; round += 1) {
+		await runner.execute();
+	}
+	check("the head exhausted its redelivery budget", store.redeliveryCount(head.seq) === CONTEXT_SLEEP_REDELIVER_MAX, store.redeliveryCount(head.seq));
+	const tail = store.append({
+		kind: "observability",
+		source: "test",
+		priority: "normal",
+		title: "retryable tail",
+		text: "this one still has budget",
+	});
+	const record = await runner.execute();
+	check(
+		"the exhausted head is dropped and the tail is redelivered",
+		record?.stopReason === "slept" && store.pendingCount() === 1 && store.redeliveryCount(tail.seq) === 1,
+		{ pending: store.pendingCount(), tailCount: store.redeliveryCount(tail.seq) },
+	);
+	const dropped = anomaliesOf(record?.id ?? "", "events_dropped");
+	check(
+		"the mixed range records the dropped head with seqs and kinds",
+		dropped.length === 1 &&
+			dropped[0]?.events === 1 &&
+			dropped[0]?.seqs?.length === 1 &&
+			dropped[0]?.seqs?.[0] === head.seq &&
+			dropped[0]?.kinds?.[0] === "user_message" &&
+			dropped[0]?.stopReason === "slept",
+		dropped,
+	);
+	drainInbox();
 	resetContextWarn();
 }
 
