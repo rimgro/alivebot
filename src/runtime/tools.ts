@@ -675,7 +675,12 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 						draft: params.draft,
 						commitMessage: params.commit_message,
 					});
-					return ok(`Pull request created: ${result.url} (branch ${result.branch}).`, { url: result.url, branch: result.branch });
+					const warning = result.warning ? `\n\n${result.warning}` : "";
+					return ok(`Pull request created: ${result.url} (branch ${result.branch}).${warning}`, {
+						url: result.url,
+						branch: result.branch,
+						...(result.warning ? { warning: result.warning } : {}),
+					});
 				}
 				default:
 					throw new Error(`unsupported worker action ${String(action)}`);

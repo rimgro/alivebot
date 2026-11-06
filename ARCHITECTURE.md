@@ -398,8 +398,14 @@ Managed-профили получают workers только явным изме
 worker'а и его pi-сессия лежат в `.alive/workers/<id>/`; при рестарте процесса
 запись помечается `interrupted`, а `send` возобновляет сохранённую сессию.
 Публикация отделена от работы: `pr` — явное действие с отдельным permission,
-которое коммитит/пушит ветку и вызывает `gh`, а `remove` удаляет worktree,
-оставляя ветку. Подробности — в [WORKERS.md](./WORKERS.md).
+которое коммитит/пушит ветку и вызывает `gh`. После успешного PR чистый worktree
+удаляется (ветка и запись worker'а остаются, follow-up пересоздаёт worktree из
+ветки); грязный worktree сохраняется с предупреждением
+`worktree kept: uncommitted changes`. Это поведение отключается
+`workers.keepWorktreeAfterPr`. `remove` удаляет worktree, оставляя ветку, а
+`alive workers prune` вручную сносит старые worktree по `--keep` /
+`--older-than-days`, не трогая активных и грязных. Подробности — в
+[WORKERS.md](./WORKERS.md).
 
 ## 6. Форматы данных
 

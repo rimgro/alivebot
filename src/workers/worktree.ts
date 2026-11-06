@@ -89,6 +89,27 @@ export interface PullRequestResult {
 	head?: string;
 }
 
+/** Warning attached to a successful PR result when the worktree is retained. */
+export const WORKTREE_KEPT_DIRTY = "worktree kept: uncommitted changes";
+
+/**
+ * Decide whether a worker worktree is removed after its branch was pushed and
+ * the pull request was opened.
+ *
+ * `clean: undefined` means the git state could not be read; deleting an
+ * unverified worktree is never the safe choice. The decision is pure so the
+ * publish flow can be tested without a real push/PR.
+ */
+export function worktreeAfterPullRequest(options: {
+	keepWorktree: boolean;
+	clean: boolean | undefined;
+}): { remove: boolean; warning?: string } {
+	if (options.keepWorktree) return { remove: false };
+	if (options.clean === undefined) return { remove: false, warning: "worktree kept: git state could not be verified" };
+	if (!options.clean) return { remove: false, warning: WORKTREE_KEPT_DIRTY };
+	return { remove: true };
+}
+
 export async function runGit(
 	env: WorkerEnvironment,
 	cwd: string,

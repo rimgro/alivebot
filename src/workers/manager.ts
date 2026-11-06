@@ -40,9 +40,11 @@ import {
 	removeWorktree,
 	repositoryHead,
 	runGit,
+	worktreeAfterPullRequest,
 } from "./worktree.js";
 import { MAX_PROVIDER_RETRY_DELAY_MS } from "./retry.js";
 import { classifyNetworkError, withRetries } from "../retry.js";
+import { workerWorktreesRoot } from "./prune.js";
 import { assertRepositoryIntegrity, checkRepositoryIntegrity } from "../git/integrity.js";
 import { createWorkerEnvironment, type WorkerEnvironment } from "./environment.js";
 import {
@@ -53,7 +55,6 @@ import {
 	type WorkerRecord,
 	type WorkerStatus,
 	WorkerStore,
-	worktreesRoot,
 } from "./store.js";
 import type { SandboxManager } from "../sandbox/manager.js";
 
@@ -548,7 +549,7 @@ export class WorkerManager {
 	async createPullRequest(
 		id: string,
 		options: { title: string; body?: string; baseBranch?: string; draft?: boolean; commitMessage?: string } = { title: "" },
-	): Promise<{ url: string; branch: string }> {
+	): Promise<{ url: string; branch: string; warning?: string }> {
 		this.requirePermission("pullRequest");
 		const record = this.handleFor(id).record;
 		this.assertRecordEnvironment(record);
@@ -600,7 +601,24 @@ export class WorkerManager {
 		record.pullRequestUrl = result.url;
 		record.updatedAt = Date.now();
 		this.store.save(record);
-		return { url: result.url, branch: result.branch };
+
+		// The branch and the durable record are the deliverables; a clean worktree
+		// is disposable. A follow-up reattaches the branch in `prepare()`.
+		const afterPublish = await gitState(this.environment, record.workspacePath).catch(() => undefined);
+		const retention = worktreeAfterPullRequest({
+			keepWorktree: this.cfg.keepWorktreeAfterPr,
+			clean: afterPublish?.clean,
+		});
+		let warning = retention.warning;
+		if (retention.remove) {
+			try {
+				await removeWorktree(this.environment, record.repositoryPath, record.workspacePath, { force: true });
+				this.log.info("worker worktree removed after pull request", { id: record.id, branch: record.branch });
+			} catch (error) {
+				warning = `worktree kept: ${error instanceof Error ? error.message : String(error)}`;
+			}
+		}
+		return { url: result.url, branch: result.branch, ...(warning ? { warning } : {}) };
 	}
 
 	// ---------------------------------------------------------------------
@@ -1183,10 +1201,7 @@ export class WorkerManager {
 	}
 
 	private worktreeRoot(): string {
-		if (this.environment.kind === "sandbox") {
-			return this.environment.resolve(this.cfg.worktreesDirectory || ".alive-workers/worktrees");
-		}
-		return worktreesRoot(this.config.paths, this.cfg.worktreesDirectory);
+		return workerWorktreesRoot(this.config, this.environment);
 	}
 
 	private assertRecordEnvironment(record: WorkerRecord): void {

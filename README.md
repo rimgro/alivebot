@@ -1331,7 +1331,28 @@ alive workers list
 alive workers status <worker-id>
 alive workers diff <worker-id> [--full]
 alive workers models
+alive workers prune [--dry-run] [--keep 5] [--older-than-days M] [--json]
 ```
+
+После успешного `pr` (push ветки + pull request) чистый worktree удаляется
+автоматически: ветка и durable-запись worker'а остаются, поэтому follow-up
+`send` при необходимости пересоздаст worktree из той же ветки. Если после PR в
+worktree остались незакоммиченные изменения, он сохраняется, а результат
+публикации содержит предупреждение `worktree kept: uncommitted changes`.
+Автоудаление отключается ключом `workers.keepWorktreeAfterPr: true` (по умолчанию
+`false`).
+
+`alive workers prune` — ручная уборка старых каталогов. Он смотрит тот же
+worktrees-корень, что и `WorkerManager`, никогда не трогает активных
+(`starting`/`running`/`interrupted`) и грязных воркеров, удаляет каталоги через
+`git worktree remove --force` с фолбэком `rm -rf` + `git worktree prune` и не
+удаляет ветки. `--keep N` (по умолчанию 5) оставляет N самых свежих чистых
+каталогов, `--older-than-days M` ограничивает удаление возрастом. Отдельного
+retention-правила нет: этих двух флагов достаточно. `--dry-run` печатает план и
+освобождаемые байты без удаления, `--json` даёт машинный результат.
+`alive status` показывает строку `worktrees` (число каталогов и суммарный размер,
+в `--json` — поле `workerWorktrees`); обход ограничен двумя секундами, поэтому
+на очень большом каталоге размер может быть `n/a`, а не подвешивать status.
 
 Один worker-run ограничен двумя лимитами. `workers.idleTimeoutMs` (по умолчанию
 10 минут) — лимит бездействия: таймер сбрасывается на каждом событии сессии

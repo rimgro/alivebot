@@ -39,14 +39,17 @@ import {
 import { LOG_SOURCES, followFile, readLogTail, renderLogLine, resolveLogSource } from "./logs.js";
 import { findProfile, loadDashboard, loadRootConfig, cacheReadPerTurn, contextMetricsText, deriveAgentHealth, hasLaunchHistory } from "./dashboard/state.js";
 import { DEFAULT_USAGE_DAYS, buildUsageReport, renderUsageReport } from "./usage/report.js";
-import { WorkerStore, validateWorkerId, workerLabel } from "./workers/store.js";
+import { WorkerStore, validateWorkerId, workerLabel, worktreesRoot } from "./workers/store.js";
 import { gitDiff, gitState, isGitRepository } from "./workers/worktree.js";
-import { createHostWorkerEnvironment } from "./workers/environment.js";
+import { createHostWorkerEnvironment, createWorkerEnvironment } from "./workers/environment.js";
+import { DEFAULT_WORKTREE_KEEP, measureWorktrees, pruneWorkerWorktrees, workerWorktreesRoot, type WorktreePruneResult } from "./workers/prune.js";
+import type { SandboxManager } from "./sandbox/manager.js";
 import { checkRepositoryIntegrity } from "./git/integrity.js";
 import { renderWorkerRecord } from "./workers/manager.js";
 import { term } from "./term.js";
 import { createExecRunner, runUpdate } from "./update.js";
 import {
+	formatBytes,
 	formatDuration,
 	iso,
 	oneLine,
@@ -1044,6 +1047,11 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 	// Current context is written by the runtime into runtime.json (#170); the
 	// cacheRead/turn metric is derived from the last recorded run, never invented.
 	const contextMetric = contextMetricsText({ contextTokens: runtime?.contextTokens, cacheReadPerTurn: cachePerTurn });
+	// Worktrees can be tens of gigabytes; never let `status` hang on a full scan.
+	// Sandboxed worktrees live inside the guest VM and are not host-visible.
+	const workerWorktrees = config.config.workers.enabled && !config.config.sandbox.enabled
+		? measureWorktrees(worktreesRoot(config.paths, config.config.workers.worktreesDirectory), { timeoutMs: 2_000 })
+		: undefined;
 
 	if (flagBool(flags, "json")) {
 		process.stdout.write(
@@ -1061,6 +1069,7 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 					modules: describeModules(config.config),
 					...(telegramReport ? { telegram: telegramReport } : {}),
 					workers: config.config.workers.enabled ? new WorkerStore(config.paths).list() : undefined,
+					...(workerWorktrees ? { workerWorktrees } : {}),
 					usageToday: usage,
 					lastRun: last,
 					context: { tokens: runtime?.contextTokens, cacheReadPerTurn: cachePerTurn },
@@ -1145,6 +1154,12 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 		const workerRecords = new WorkerStore(config.paths).list();
 		const active = workerRecords.filter((record) => record.status === "running" || record.status === "starting").length;
 		line("workers", `${active}/${config.config.workers.maxConcurrent} active, ${workerRecords.length} total`);
+		line(
+			"worktrees",
+			workerWorktrees
+				? `${workerWorktrees.count} dirs, ${workerWorktrees.bytes === null ? "size n/a (scan timed out)" : formatBytes(workerWorktrees.bytes)}`
+				: "inside sandbox VM (not measured from host)",
+		);
 	}
 	return 0;
 }
@@ -1243,6 +1258,10 @@ async function workersCommand(cwd: string, flags: Record<string, string | boolea
 	const config = loadForCli(flags);
 	const action = positionals[0] ?? "list";
 	const store = new WorkerStore(config.paths);
+	if (action === "prune") {
+		if (positionals.length > 1) throw new Error("usage: alive workers prune [--dry-run] [--keep N] [--older-than-days M] [--json]");
+		return await pruneWorktreesCommand(config, flags);
+	}
 	if (action === "list") {
 		const records = store.list();
 		if (records.length === 0) {
@@ -1293,7 +1312,91 @@ async function workersCommand(cwd: string, flags: Record<string, string | boolea
 		process.stdout.write(`permissions: ${Object.entries(workers.permissions).filter(([, value]) => value).map(([key]) => key).join(", ") || "(none)"}\n`);
 		return 0;
 	}
-	throw new Error("usage: alive workers list | status <id> | diff <id> [--full] | models");
+	throw new Error("usage: alive workers list | status <id> | diff <id> [--full] | models | prune [--dry-run] [--keep N] [--older-than-days M] [--json]");
+}
+
+const WORKTREES_PRUNE_USAGE =
+	"usage: alive workers prune [--dry-run] [--keep N] [--older-than-days M] [--json] [--config CONFIG]\n" +
+	"\n" +
+	"  --dry-run            report what would be removed; delete nothing\n" +
+	"  --keep N             keep the N newest clean worktrees (default 5)\n" +
+	"  --older-than-days M  only remove worktrees at least M days old\n" +
+	"  --json               machine-readable result (entries, counters, freed bytes)\n" +
+	"\n" +
+	"Active/interrupted workers and worktrees with uncommitted changes are never\n" +
+	"touched. Branches are left in the repository. For sandboxed profiles the scan\n" +
+	"and removal run inside the agent VM.\n";
+
+function parseNonNegativeNumber(flags: Record<string, string | boolean>, key: string): number | undefined {
+	if (flags[key] === undefined) return undefined;
+	if (flags[key] === true) throw new Error(`--${key} requires a value`);
+	const value = Number(flags[key]);
+	if (!Number.isFinite(value) || value < 0) throw new Error(`--${key} must be a non-negative number`);
+	return value;
+}
+
+function renderWorktreePrune(result: WorktreePruneResult): string {
+	const lines: string[] = [`worktrees: ${result.root} (${result.scanned} dir(s))`];
+	for (const entry of result.entries) {
+		const age = `${entry.ageDays.toFixed(1)}d`;
+		if (entry.action === "removed") {
+			lines.push(`  removed  ${entry.name}  ${formatBytes(entry.bytes ?? 0)}  ${age}${result.dryRun ? "  (dry run)" : ""}`);
+			continue;
+		}
+		const detail = entry.detail ? `: ${oneLine(entry.detail, 160)}` : "";
+		lines.push(`  skipped: ${entry.reason}  ${entry.name}  ${age}${detail}`);
+	}
+	const reasons = Object.entries(result.skippedByReason)
+		.filter(([, count]) => count > 0)
+		.map(([reason, count]) => `${reason} ${count}`)
+		.join(", ");
+	lines.push(
+		`${result.dryRun ? "would prune" : "pruned"}: ${result.removed} removed, ${result.skipped} skipped` +
+			`${reasons ? ` (${reasons})` : ""}, ${formatBytes(result.freedBytes)} ${result.dryRun ? "would be freed" : "freed"}`,
+	);
+	return `${lines.join("\n")}\n`;
+}
+
+async function pruneWorktreesCommand(config: LoadedConfig, flags: Record<string, string | boolean>): Promise<number> {
+	const known = new Set(["dry-run", "keep", "older-than-days", "json", "config", "help", "h"]);
+	const unknown = Object.keys(flags).filter((key) => !known.has(key));
+	if (unknown.length > 0) {
+		throw new Error(`unknown flag${unknown.length === 1 ? "" : "s"}: --${unknown.join(", --")} (${WORKTREES_PRUNE_USAGE.split("\n")[0]})`);
+	}
+	if (flagBool(flags, "help") || flagBool(flags, "h")) {
+		process.stdout.write(WORKTREES_PRUNE_USAGE);
+		return 0;
+	}
+	const keepValue = parseNonNegativeNumber(flags, "keep");
+	if (keepValue !== undefined && !Number.isInteger(keepValue)) throw new Error("--keep must be a non-negative integer");
+	const olderThanDays = parseNonNegativeNumber(flags, "older-than-days");
+	let sandbox: SandboxManager | undefined;
+	let result: WorktreePruneResult;
+	try {
+		if (config.config.sandbox.enabled) {
+			// Worker worktrees live inside the same VM as the agent. Booting the
+			// manager here is the same trade-off as `alive sandbox status`.
+			const { SandboxManager: SandboxManagerImpl } = await import("./sandbox/manager.js");
+			sandbox = new SandboxManagerImpl(config, makeLogger(config));
+		}
+		const environment = createWorkerEnvironment(config, sandbox);
+		result = await pruneWorkerWorktrees({
+			root: workerWorktreesRoot(config, environment),
+			environment,
+			records: new WorkerStore(config.paths).list(),
+			keep: keepValue ?? DEFAULT_WORKTREE_KEEP,
+			olderThanDays,
+			dryRun: flagBool(flags, "dry-run"),
+		});
+	} finally {
+		await sandbox?.close();
+	}
+	if (flagBool(flags, "json")) {
+		process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+	} else {
+		process.stdout.write(renderWorktreePrune(result));
+	}
+	return 0;
 }
 
 function runsCommand(_cwd: string, flags: Record<string, string | boolean>): number {
@@ -1819,6 +1922,8 @@ usage:
   alive workers status <id>                   inspect a worker and its git state
   alive workers diff <id> [--full]            review worker changes
   alive workers models                        show the worker model/permission allowlist
+  alive workers prune [--dry-run] [--keep 5] [--older-than-days M] [--json]
+                                              remove stale worktrees; keep active/dirty ones
   alive git-check [--repo PATH] [--range A..B] [--json]
                                               detect empty/corrupt git objects before merge or push
   alive stop [--force] [--timeout 30s]        stop the running instance
