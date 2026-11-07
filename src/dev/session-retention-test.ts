@@ -12,21 +12,27 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { gunzipSync } from "node:zlib";
 import { loadConfig, type AliveConfig, type LoadedConfig } from "../config.js";
 import { Logger } from "../log.js";
 import { main } from "../cli.js";
 import { openSessionManager } from "../runtime/session.js";
 import {
 	ACTIVE_SESSION_MTIME_GUARD_MS,
+	DEFAULT_ARCHIVE_DELETE_AFTER_DAYS,
+	DEFAULT_ARCHIVE_GZIP_AFTER_DAYS,
 	DEFAULT_SESSION_KEEP,
 	DEFAULT_SESSION_MAX_SIZE_MB,
 	DEFAULT_SESSION_OLDER_THAN_DAYS,
+	measureSessionArchives,
 	measureSessionFileContext,
 	measureSessionStats,
 	measureSessions,
 	mostRecentSessionFile,
+	rotateSessionArchives,
 	runSessionGc,
 	sessionArchiveDirName,
+	STALE_GZIP_TEMP_AGE_MS,
 } from "../runtime/session-retention.js";
 
 let failures = 0;
@@ -110,6 +116,45 @@ function age(file: string, days: number): void {
 
 function exists(file: string): boolean {
 	return fs.existsSync(file);
+}
+
+/** `stateDir/sessions-archive-YYYYMMDD-HHMM` fixture directory. */
+function archiveDir(fx: Fixture, name: string): string {
+	const dir = path.join(fx.stateDir, name);
+	fs.mkdirSync(dir, { recursive: true });
+	return dir;
+}
+
+/** Names, sizes and mtimes of one directory; equal strings mean "nothing changed". */
+function snapshot(dir: string): string {
+	return fs
+		.readdirSync(dir)
+		.sort()
+		.map((name) => {
+			const stats = fs.statSync(path.join(dir, name));
+			return `${name}:${stats.size}:${stats.mtimeMs}`;
+		})
+		.join("|");
+}
+
+/** Run `alive ...` against the fixture root and return everything printed. */
+async function runCli(root: string, argv: string[]): Promise<string> {
+	const out: string[] = [];
+	const stdoutWrite = process.stdout.write;
+	const cwd = process.cwd();
+	process.stdout.write = ((chunk: unknown) => {
+		out.push(String(chunk));
+		return true;
+	}) as typeof process.stdout.write;
+	try {
+		process.chdir(root);
+		const code = await main(argv);
+		if (code !== 0) throw new Error(`alive ${argv.join(" ")} exited ${code}`);
+	} finally {
+		process.chdir(cwd);
+		process.stdout.write = stdoutWrite;
+	}
+	return out.join("");
 }
 
 try {
@@ -427,6 +472,315 @@ try {
 		const explicit = openSessionManager({ config, log: silent, sessionFile: recent });
 		check("an explicit resume target is opened as given", explicit.sessionManager.getSessionFile() === recent, explicit.sessionManager.getSessionFile());
 		check("the guard did not touch the file", exists(recent));
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("archive rotation: off by default, a partial config block is merged with defaults");
+	{
+		const fx = fixture("rotate-defaults");
+		const defaults = fx.config.config.sessions.archiveRotate;
+		check(
+			"enabled=false, gzipAfterDays=7, deleteAfterDays=30 by default",
+			defaults.enabled === false &&
+				defaults.gzipAfterDays === DEFAULT_ARCHIVE_GZIP_AFTER_DAYS &&
+				defaults.deleteAfterDays === DEFAULT_ARCHIVE_DELETE_AFTER_DAYS,
+			defaults,
+		);
+		check(
+			"the module defaults are 7 and 30 days",
+			DEFAULT_ARCHIVE_GZIP_AFTER_DAYS === 7 && DEFAULT_ARCHIVE_DELETE_AFTER_DAYS === 30,
+			{ DEFAULT_ARCHIVE_GZIP_AFTER_DAYS, DEFAULT_ARCHIVE_DELETE_AFTER_DAYS },
+		);
+		fs.writeFileSync(
+			path.join(fx.root, "alive.config.json"),
+			JSON.stringify({ sessions: { archiveRotate: { enabled: true } } }),
+			"utf8",
+		);
+		const merged = loadConfig({ cwd: fx.root, migrateSecrets: false }).config.sessions.archiveRotate;
+		check(
+			"a partial block is filled from the defaults",
+			merged.enabled === true && merged.gzipAfterDays === 7 && merged.deleteAfterDays === 30,
+			merged,
+		);
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("archive rotation disabled changes nothing on disk");
+	{
+		const fx = fixture("rotate-disabled");
+		const dir = archiveDir(fx, "sessions-archive-20260101-0000");
+		const file = path.join(dir, "2026-01-01T00-00-00-000Z_old.jsonl");
+		writeTranscript(file);
+		age(file, 40);
+		const before = snapshot(dir);
+		const result = await rotateSessionArchives({ stateDir: fx.stateDir, enabled: false, log: silent });
+		check("the result reports the switch", result.enabled === false && result.dryRun === false, result);
+		check(
+			"nothing is scanned or reported",
+			result.dirs === 0 && result.files === 0 && result.entries.length === 0 && result.gzipped === 0 && result.deleted === 0,
+			result,
+		);
+		check("the archive file is untouched", exists(file) && snapshot(dir) === before, snapshot(dir));
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("archive rotation --dry-run previews even while it is disabled");
+	{
+		const fx = fixture("rotate-preview");
+		const dir = archiveDir(fx, "sessions-archive-20260102-0000");
+		const gzipFile = path.join(dir, "2026-01-02T00-00-00-000Z_gzip.jsonl");
+		const deleteFile = path.join(dir, "2026-01-03T00-00-00-000Z_delete.jsonl");
+		writeTranscript(gzipFile);
+		writeTranscript(deleteFile);
+		age(gzipFile, 10);
+		age(deleteFile, 40);
+		const before = snapshot(dir);
+		const result = await rotateSessionArchives({ stateDir: fx.stateDir, enabled: false, dryRun: true, log: silent });
+		check("the preview reports the switch and the dry run", result.enabled === false && result.dryRun === true, result);
+		check(
+			"the 10-day file is a gzip candidate with an unknown result size",
+			result.gzipped === 1 &&
+				result.entries.some(
+					(entry) => entry.name.includes("gzip") && entry.action === "gzipped" && entry.bytesAfter === null,
+				),
+			result.entries,
+		);
+		check(
+			"the 40-day file is a delete candidate with a known result size",
+			result.deleted === 1 &&
+				result.entries.some(
+					(entry) => entry.name.includes("delete") && entry.action === "deleted" && entry.bytesAfter === 0,
+				),
+			result.entries,
+		);
+		check(
+			"only deletions count as freed bytes in a preview",
+			result.freedBytes === fs.statSync(deleteFile).size && result.freedBytes < fs.statSync(gzipFile).size + fs.statSync(deleteFile).size,
+			result.freedBytes,
+		);
+		check("the remaining total is unknown while a gzip candidate exists", result.bytesAfter === null, result.bytesAfter);
+		check("nothing changed on disk", exists(gzipFile) && exists(deleteFile) && snapshot(dir) === before, snapshot(dir));
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("archive rotation gzips and deletes, and never touches the live sessions dir");
+	{
+		const fx = fixture("rotate-enabled");
+		const freshDir = archiveDir(fx, "sessions-archive-20260110-0000");
+		const agedDir = archiveDir(fx, "sessions-archive-20260111-0000");
+		const doomedDir = archiveDir(fx, "sessions-archive-20260112-0000");
+		const fresh = path.join(freshDir, "2026-01-10T00-00-00-000Z_fresh.jsonl");
+		const aged = path.join(agedDir, "2026-01-11T00-00-00-000Z_ten.jsonl");
+		const doomed = path.join(doomedDir, "2026-01-12T00-00-00-000Z_forty.jsonl");
+		writeTranscript(fresh);
+		writeTranscript(aged);
+		writeTranscript(doomed);
+		const agedContent = fs.readFileSync(aged, "utf8");
+		age(fresh, 1);
+		age(aged, 10);
+		age(doomed, 40);
+		const agedMtime = fs.statSync(aged).mtimeMs;
+		// A live transcript, old enough to be deleted if rotation ever looked at `sessions/`.
+		const live = path.join(fx.sessions, "2026-01-13T00-00-00-000Z_live.jsonl");
+		writeTranscript(live);
+		age(live, 40);
+
+		const result = await rotateSessionArchives({ stateDir: fx.stateDir, enabled: true, log: silent });
+		const gz = `${aged}.gz`;
+		check("a fresh archive file is untouched", exists(fresh) && !exists(`${fresh}.gz`), fs.readdirSync(freshDir));
+		check("the 10-day file is replaced by .gz", !exists(aged) && exists(gz), fs.readdirSync(agedDir));
+		check("the decompressed content is identical", gunzipSync(fs.readFileSync(gz)).toString("utf8") === agedContent);
+		check(
+			"the .gz keeps the original mtime",
+			Math.abs(fs.statSync(gz).mtimeMs - agedMtime) < 1,
+			{ before: agedMtime, after: fs.statSync(gz).mtimeMs },
+		);
+		check(
+			"the gzip is reported with before/after bytes",
+			result.entries.some(
+				(entry) => entry.action === "gzipped" && entry.bytesAfter !== null && entry.bytesAfter < entry.bytesBefore,
+			),
+			result.entries,
+		);
+		check(
+			"the 40-day file is gone and its now-empty dir is removed",
+			!exists(doomed) && !exists(doomedDir) && result.removedDirs.includes(doomedDir),
+			result.removedDirs,
+		);
+		check("the live sessions dir is never touched", exists(live) && fs.readdirSync(fx.sessions).length === 1, fs.readdirSync(fx.sessions));
+		check("directories that still hold files stay", exists(freshDir) && exists(agedDir), result.removedDirs);
+		check(
+			"counters and the known remaining total are reported",
+			result.gzipped === 1 && result.deleted === 1 && result.freedBytes > 0 && typeof result.bytesAfter === "number" && result.bytesAfter < result.bytesBefore,
+			result,
+		);
+
+		const gzSize = fs.statSync(gz).size;
+		const second = await rotateSessionArchives({ stateDir: fx.stateDir, enabled: true, log: silent });
+		check(
+			"a second run is a no-op for the existing .gz",
+			second.gzipped === 0 &&
+				!second.entries.some((entry) => entry.action === "gzipped") &&
+				fs.statSync(gz).size === gzSize &&
+				fs.readdirSync(agedDir).join(",") === path.basename(gz),
+			{ entries: second.entries, files: fs.readdirSync(agedDir) },
+		);
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("a failed gzip of an archive file is a warning, not a failure");
+	{
+		const fx = fixture("rotate-error");
+		const dir = archiveDir(fx, "sessions-archive-20260120-0000");
+		const file = path.join(dir, "2026-01-20T00-00-00-000Z_blocked.jsonl");
+		writeTranscript(file);
+		age(file, 10);
+		// A DIRECTORY where the gzip target goes: rotation must refuse to overwrite it.
+		fs.mkdirSync(`${file}.gz`);
+		const warnings: string[] = [];
+		const log = new Logger({ console: false });
+		const originalWarn = log.warn.bind(log);
+		log.warn = ((message: string) => {
+			warnings.push(message);
+			originalWarn(message);
+		}) as typeof log.warn;
+		const result = await rotateSessionArchives({ stateDir: fx.stateDir, enabled: true, log });
+		check("the original file stays", exists(file));
+		check(
+			"the conflict is reported as an error entry with a detail",
+			result.entries.some((entry) => entry.action === "error" && entry.name === path.basename(file) && Boolean(entry.detail)),
+			result.entries,
+		);
+		check("a warning is logged", warnings.includes("cannot rotate session archive file; leaving it in place"), warnings);
+		check("nothing was gzipped or freed", result.gzipped === 0 && result.freedBytes === 0, result);
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("stale gzip temp files are swept without touching a fresh one");
+	{
+		const fx = fixture("rotate-temp");
+		const dir = archiveDir(fx, "sessions-archive-20260125-0000");
+		const staleTemp = path.join(dir, "x.jsonl.gz.tmp-12345");
+		const freshTemp = path.join(dir, "y.jsonl.gz.tmp-999");
+		const aged = path.join(dir, "2026-01-25T00-00-00-000Z_ten.jsonl");
+		fs.writeFileSync(staleTemp, "half-written gzip", "utf8");
+		fs.writeFileSync(freshTemp, "half-written gzip", "utf8");
+		writeTranscript(aged);
+		age(aged, 10);
+		const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60_000);
+		fs.utimesSync(staleTemp, twoHoursAgo, twoHoursAgo);
+		check("the temp age guard is one hour", STALE_GZIP_TEMP_AGE_MS === 60 * 60_000, STALE_GZIP_TEMP_AGE_MS);
+
+		const preview = await rotateSessionArchives({ stateDir: fx.stateDir, enabled: true, dryRun: true, log: silent });
+		check("a dry run removes no temp", preview.removedTemps === 0 && exists(staleTemp) && exists(freshTemp), preview);
+		check(
+			"temps are not reported as archive files",
+			preview.files === 1 && !preview.entries.some((entry) => entry.name.includes(".gz.tmp-")),
+			preview.entries,
+		);
+
+		const result = await rotateSessionArchives({ stateDir: fx.stateDir, enabled: true, log: silent });
+		check("the stale temp is removed", result.removedTemps === 1 && !exists(staleTemp), result);
+		check("the fresh temp can belong to a live writer and stays", exists(freshTemp));
+		check("normal rotation still happens", result.gzipped === 1 && exists(`${aged}.gz`) && !exists(aged), result.entries);
+		check(
+			"temps are not counted as archive files or entries",
+			result.files === 1 && !result.entries.some((entry) => entry.name.includes(".gz.tmp-")),
+			result.entries,
+		);
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("archive usage is measured read-only");
+	{
+		const fx = fixture("rotate-measure");
+		const older = archiveDir(fx, "sessions-archive-20260201-0000");
+		const newer = archiveDir(fx, "sessions-archive-20260202-0000");
+		const a = path.join(older, "a.jsonl");
+		const b = path.join(newer, "b.jsonl.gz");
+		fs.writeFileSync(a, "a".repeat(100), "utf8");
+		fs.writeFileSync(b, "b".repeat(50), "utf8");
+		age(a, 40);
+		age(b, 5);
+		fs.mkdirSync(path.join(newer, "subdir"));
+		const usage = measureSessionArchives(fx.stateDir);
+		check("dirs and files are counted, subdirectories are not", usage.dirs === 2 && usage.files === 2, usage);
+		check("bytes are summed", usage.bytes === 150, usage);
+		check("the oldest age is reported", usage.oldestAgeDays !== null && usage.oldestAgeDays >= 39.9 && usage.oldestAgeDays < 41, usage);
+		check("a missing state dir measures zero", measureSessionArchives(path.join(fx.root, "nope")).dirs === 0);
+		check(
+			"measurement changes nothing",
+			fs.readdirSync(older).join(",") === "a.jsonl" && fs.readdirSync(newer).sort().join(",") === "b.jsonl.gz,subdir",
+			{ older: fs.readdirSync(older), newer: fs.readdirSync(newer) },
+		);
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("alive sessions gc|stats surface rotation and archives (№228)");
+	{
+		const fx = fixture("rotate-cli");
+		const dir = archiveDir(fx, "sessions-archive-20260301-0000");
+		const ten = path.join(dir, "2026-03-01T00-00-00-000Z_ten.jsonl");
+		writeTranscript(ten);
+		age(ten, 10);
+
+		const gc = JSON.parse(await runCli(fx.root, ["sessions", "gc", "--json", "--dry-run"])) as Record<string, unknown>;
+		const rotation = gc.rotation as Record<string, unknown>;
+		check(
+			"gc json keeps its counters and adds rotation",
+			typeof gc.scanned === "number" && Array.isArray(gc.entries) && Boolean(rotation),
+			Object.keys(gc),
+		);
+		check(
+			"rotation carries the documented fields",
+			[
+				"enabled",
+				"dryRun",
+				"gzipAfterDays",
+				"deleteAfterDays",
+				"stateDir",
+				"dirs",
+				"files",
+				"gzipped",
+				"deleted",
+				"removedTemps",
+				"removedDirs",
+				"bytesBefore",
+				"bytesAfter",
+				"freedBytes",
+				"entries",
+			].every((key) => key in rotation),
+			Object.keys(rotation),
+		);
+		check(
+			"a dry run previews rotation while the config keeps it off",
+			rotation.enabled === false && rotation.dryRun === true && rotation.gzipped === 1,
+			rotation,
+		);
+		check("the preview moved nothing", exists(ten));
+
+		const text = await runCli(fx.root, ["sessions", "gc"]);
+		check(
+			"the text output names the disabled switch",
+			text.includes("archive rotation: disabled (sessions.archiveRotate.enabled)"),
+			text,
+		);
+
+		const stats = JSON.parse(await runCli(fx.root, ["sessions", "stats", "--json"])) as Record<string, unknown>;
+		const archives = stats.archives as Record<string, unknown>;
+		check(
+			"stats json carries archives",
+			Boolean(archives) && archives.dirs === 1 && archives.files === 1 && typeof archives.bytes === "number" && archives.oldestAgeDays !== null,
+			archives,
+		);
 		fs.rmSync(fx.root, { recursive: true, force: true });
 	}
 

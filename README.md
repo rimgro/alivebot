@@ -193,7 +193,7 @@ alive telegram whitelist remove 123456789
 | `alive heartbeat [--status] [--json]` | живость процесса: pid, `startedAt`, версия, возраст heartbeat; код 0 — свежий, 1 — нет/устарел |
 | `alive runs [-n 10]` | история run'ов (алиас: `wakes`) |
 | `alive usage [--days 14] [--agent <id>] [--json]` | куда ушли токены и деньги: итоги по дням, chat vs workers, топ-10 run'ов, расход провалов, пустые пробуждения; только метаданные, без текста промптов и сообщений |
-| `alive sessions gc [--dry-run] [--older-than-days N] [--max-size-mb M] [--keep N] [--json]` | архивирует старые pi-транскрипты из `state/sessions` в `state/sessions-archive-YYYYMMDD-HHMM/`; ничего не удаляет |
+| `alive sessions gc [--dry-run] [--older-than-days N] [--max-size-mb M] [--keep N] [--json]` | архивирует старые pi-транскрипты из `state/sessions` в `state/sessions-archive-YYYYMMDD-HHMM/`; сам ничего не удаляет, а при включённом `sessions.archiveRotate` (по умолчанию выключено) сжимает и удаляет файлы внутри архивов; `--dry-run` показывает и этот план |
 | `alive sessions stats [--json]` | read-only: размер и возраст транскриптов, сообщения, байты по типам контента, base64 и картинки |
 | `alive policy [list\|add\|remove\|default\|reset]` | показать/править политику уведомлений |
 | `alive modules [--json]` | какие event-модули загружены и включены |
@@ -294,7 +294,20 @@ alive sessions gc --older-than-days 7 --max-size-mb 500 --keep 3 --json
 Каждое решение пишется в лог (`log.info` на архив, `log.warn` на ошибку
 перемещения; файл в этом случае остаётся на месте, gc продолжает).
 `--json` отдаёт стабильную структуру: `entries[]` с `name/bytes/ageDays/action/reason`
-(+`detail` у `skipped`) и счётчики `archived/skipped/freedBytes/archiveDir`.
+(+`detail` у `skipped`) и счётчики `archived/skipped/freedBytes/archiveDir`; поле
+`rotation` добавлено для ротации архива (#228), остальные поля не изменились.
+
+Ротация архива (#228) по умолчанию выключена: `sessions.archiveRotate.enabled`
+(`false`), `gzipAfterDays` (`7`), `deleteAfterDays` (`30`). Пока она выключена,
+`gc` ведёт себя ровно как раньше — только переносит файлы. После включения
+файлы внутри `<stateDir>/sessions-archive-*/` старше `gzipAfterDays` сжимаются в
+`.gz` (mtime сохраняется, поэтому возраст не сбрасывается), а старше
+`deleteAfterDays` — удаляются; опустевшие архивные каталоги убираются. Живой
+`sessions/` не затрагивается никогда, а решение принимается по каждому файлу
+отдельно: в одном архиве лежат файлы разного возраста, и удалять каталог целиком
+нельзя — вместе со старыми ушёл бы свежий транскрипт. `gc --dry-run` показывает
+и план ротации, причём даже при выключенной настройке — чтобы посмотреть, что
+будет, прежде чем включать. Ошибка gzip/unlink — только warning, gc не падает.
 
 `alive sessions stats [--json]` — только замер: размер, mtime/возраст, число
 сообщений, байты по типам контента (text/thinking/tool/image/base64), число и
@@ -984,7 +997,8 @@ heartbeat.json          признак жизни процесса: pid, started
 logs/alive.jsonl        структурный лог рантайма
 logs/thoughts.jsonl     приватный монолог (текст и thinking)
 sessions/               jsonl-сессии pi (контекст живёт здесь, пока агент не уснул)
-sessions-archive-*/     архив старых транскриптов из `alive sessions gc` (не удаляются)
+sessions-archive-*/     архив старых транскриптов из `alive sessions gc` (ротация #228:
+                        gzip через 7 дней, удаление через 30, по умолчанию выключена)
 workspace/              рабочая директория агента для read/write/bash
 agent/                  изолированный pi agent dir (расширения, skills)
 tools/                  созданные агентом Node.js-инструменты и npm-зависимости

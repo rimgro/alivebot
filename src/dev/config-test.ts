@@ -29,6 +29,7 @@ import {
 	DEFAULT_LOOP_RESUME_WINDOW_MS,
 	DEFAULT_LOOP_SHUTDOWN_GRACE_MS,
 	DEFAULT_LOOP_TOOL_LONG_MS,
+	DEFAULT_SESSIONS_CONFIG,
 	EMPTY_WAKE_MAX_INTERVAL_MAX_MS,
 	EMPTY_WAKE_MAX_INTERVAL_MIN_MS,
 	ensureContextTools,
@@ -38,6 +39,7 @@ import {
 	validateHealthConfig,
 	validateLoopConfig,
 	validateProfileContextConfig,
+	validateSessionsConfig,
 	type LoopConfig,
 } from "../config.js";
 import { findSecretFields, migrateConfigSecrets } from "../config-secrets.js";
@@ -928,6 +930,104 @@ section("loop context-sleep thresholds and profile overrides are validated (#170
 		profileLoaded.config.context?.sleepTokens === 90_000 &&
 			resolveContextPolicy(profileLoaded.config).sleepGraceTurns === 1,
 		profileLoaded.config.context,
+	);
+	fs.rmSync(root, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+section("sessions.archiveRotate: off by default, validated, merged from defaults (#228)");
+{
+	check(
+		"the schema default is off, gzip after 7 days, delete after 30",
+		DEFAULT_CONFIG.sessions.archiveRotate.enabled === false &&
+			DEFAULT_CONFIG.sessions.archiveRotate.gzipAfterDays === 7 &&
+			DEFAULT_CONFIG.sessions.archiveRotate.deleteAfterDays === 30 &&
+			DEFAULT_SESSIONS_CONFIG.archiveRotate.enabled === false,
+		DEFAULT_SESSIONS_CONFIG,
+	);
+	const root = tempRoot("sessions-rotate");
+	const load = (): ReturnType<typeof loadConfig> =>
+		loadConfig({ cwd: root, secretLog: () => undefined, secretWarn: () => undefined });
+	const loaded = load();
+	check(
+		"a config without a sessions block inherits the defaults",
+		loaded.config.sessions.archiveRotate.enabled === false &&
+			loaded.config.sessions.archiveRotate.gzipAfterDays === 7 &&
+			loaded.config.sessions.archiveRotate.deleteAfterDays === 30,
+		loaded.config.sessions,
+	);
+	writeConfig(root, { sessions: { archiveRotate: { enabled: true } } });
+	const partial = load();
+	check(
+		"a partial block is filled from the defaults",
+		partial.config.sessions.archiveRotate.enabled === true &&
+			partial.config.sessions.archiveRotate.gzipAfterDays === 7 &&
+			partial.config.sessions.archiveRotate.deleteAfterDays === 30,
+		partial.config.sessions,
+	);
+	writeConfig(root, { sessions: { archiveRotate: { enabled: true, gzipAfterDays: 3, deleteAfterDays: 10 } } });
+	const explicit = load();
+	check(
+		"explicit values win",
+		explicit.config.sessions.archiveRotate.gzipAfterDays === 3 && explicit.config.sessions.archiveRotate.deleteAfterDays === 10,
+		explicit.config.sessions,
+	);
+
+	const filled = validateSessionsConfig(undefined);
+	const nulled = validateSessionsConfig(null);
+	check(
+		"a missing or null block falls back to the default",
+		filled.archiveRotate.enabled === false && nulled.archiveRotate.deleteAfterDays === 30,
+		{ filled, nulled },
+	);
+	const rejects: Array<[string, unknown, string]> = [
+		[
+			"deleteAfterDays below gzipAfterDays",
+			{ archiveRotate: { enabled: true, gzipAfterDays: 10, deleteAfterDays: 5 } },
+			"sessions.archiveRotate.deleteAfterDays must be >= sessions.archiveRotate.gzipAfterDays",
+		],
+		["a non-boolean enabled", { archiveRotate: { enabled: "yes" } }, "sessions.archiveRotate.enabled"],
+		["a negative gzipAfterDays", { archiveRotate: { gzipAfterDays: -1 } }, "sessions.archiveRotate.gzipAfterDays"],
+		["a fractional gzipAfterDays", { archiveRotate: { gzipAfterDays: 1.5 } }, "sessions.archiveRotate.gzipAfterDays"],
+		[
+			"an infinite deleteAfterDays",
+			{ archiveRotate: { deleteAfterDays: Number.POSITIVE_INFINITY } },
+			"sessions.archiveRotate.deleteAfterDays",
+		],
+		["a string deleteAfterDays", { archiveRotate: { deleteAfterDays: "30" } }, "sessions.archiveRotate.deleteAfterDays"],
+	];
+	for (const [label, value, expected] of rejects) {
+		let message = "";
+		try {
+			validateSessionsConfig(value);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		check(`${label} is rejected`, message.startsWith(expected), message || "accepted");
+	}
+	for (const [label, value, expected] of [
+		["a non-object sessions block", "nope", "sessions must be an object"],
+		["a non-object archiveRotate block", { archiveRotate: "nope" }, "sessions.archiveRotate must be an object"],
+	] as Array<[string, unknown, string]>) {
+		let message = "";
+		try {
+			validateSessionsConfig(value);
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		check(`${label} is rejected`, message.startsWith(expected), message || "accepted");
+	}
+	writeConfig(root, { sessions: { archiveRotate: { enabled: true, gzipAfterDays: 10, deleteAfterDays: 5 } } });
+	let loadMessage = "";
+	try {
+		load();
+	} catch (error) {
+		loadMessage = error instanceof Error ? error.message : String(error);
+	}
+	check(
+		"loadConfig rejects deleteAfterDays below gzipAfterDays",
+		loadMessage.startsWith("sessions.archiveRotate.deleteAfterDays must be >="),
+		loadMessage || "accepted",
 	);
 	fs.rmSync(root, { recursive: true, force: true });
 }

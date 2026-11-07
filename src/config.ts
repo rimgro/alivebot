@@ -16,6 +16,10 @@ import {
 	GROQ_TRANSCRIPTION_TIMEOUT_MS,
 	TELEGRAM_VOICE_MAX_BYTES,
 } from "./modules/telegram/voice-transcription.js";
+import {
+	DEFAULT_ARCHIVE_DELETE_AFTER_DAYS,
+	DEFAULT_ARCHIVE_GZIP_AFTER_DAYS,
+} from "./runtime/session-retention.js";
 import { DEFAULT_SANDBOX_CONFIG, validateSandboxConfig, type SandboxConfig } from "./sandbox/config.js";
 import { DEFAULT_SECRETS_CONFIG, validateSecretsConfig, type SecretsConfig } from "./secrets.js";
 import { DEFAULT_WORKERS_CONFIG, validateWorkersConfig, type WorkersConfig } from "./workers/config.js";
@@ -950,6 +954,70 @@ export function validateHealthConfig(value: unknown): HealthConfig {
 	return { silentMs };
 }
 
+/**
+ * Archive rotation for `alive sessions gc` (#228).
+ *
+ * `gc` only MOVES old transcripts into `<stateDir>/sessions-archive-*`; the
+ * archives then grow forever. Rotation is the second, deliberately opt-in
+ * step: compress the archives, later delete them. It only ever touches files
+ * inside `sessions-archive-*` directories — never the live `sessions/`.
+ */
+export interface SessionsArchiveRotateConfig {
+	/** Master switch. Off by default: gc behaves exactly as it did before #228. */
+	enabled: boolean;
+	/** Archive files older than this many days are gzipped (the .gz keeps the original mtime). */
+	gzipAfterDays: number;
+	/** Archive files older than this many days are deleted. Must be >= `gzipAfterDays`. */
+	deleteAfterDays: number;
+}
+
+export interface SessionsConfig {
+	/** Archive rotation for `alive sessions gc` (#228). */
+	archiveRotate: SessionsArchiveRotateConfig;
+}
+
+export const DEFAULT_SESSIONS_CONFIG: SessionsConfig = {
+	archiveRotate: {
+		// Off by default: rotation is the only code path that deletes anything.
+		enabled: false,
+		gzipAfterDays: DEFAULT_ARCHIVE_GZIP_AFTER_DAYS,
+		deleteAfterDays: DEFAULT_ARCHIVE_DELETE_AFTER_DAYS,
+	},
+};
+
+/** One whole, non-negative day count; anything else is a config error. */
+function validateArchiveDays(value: unknown, key: string): number {
+	if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+		throw new Error(`sessions.archiveRotate.${key} must be a non-negative whole number of days, got "${String(value)}"`);
+	}
+	return value;
+}
+
+/** Validate the `sessions` block; a partial or absent block is filled from the defaults. */
+export function validateSessionsConfig(value: unknown): SessionsConfig {
+	if (value === undefined || value === null) return { archiveRotate: { ...DEFAULT_SESSIONS_CONFIG.archiveRotate } };
+	if (typeof value !== "object" || Array.isArray(value)) throw new Error("sessions must be an object");
+	const raw = value as Partial<SessionsConfig>;
+	const rotate: unknown = raw.archiveRotate;
+	if (rotate === undefined || rotate === null) return { archiveRotate: { ...DEFAULT_SESSIONS_CONFIG.archiveRotate } };
+	if (typeof rotate !== "object" || Array.isArray(rotate)) throw new Error("sessions.archiveRotate must be an object");
+	const rawRotate = rotate as Partial<SessionsArchiveRotateConfig>;
+	const enabled = rawRotate.enabled ?? DEFAULT_SESSIONS_CONFIG.archiveRotate.enabled;
+	if (typeof enabled !== "boolean") throw new Error("sessions.archiveRotate.enabled must be boolean");
+	const gzipAfterDays = validateArchiveDays(
+		rawRotate.gzipAfterDays ?? DEFAULT_SESSIONS_CONFIG.archiveRotate.gzipAfterDays,
+		"gzipAfterDays",
+	);
+	const deleteAfterDays = validateArchiveDays(
+		rawRotate.deleteAfterDays ?? DEFAULT_SESSIONS_CONFIG.archiveRotate.deleteAfterDays,
+		"deleteAfterDays",
+	);
+	if (deleteAfterDays < gzipAfterDays) {
+		throw new Error("sessions.archiveRotate.deleteAfterDays must be >= sessions.archiveRotate.gzipAfterDays");
+	}
+	return { archiveRotate: { enabled, gzipAfterDays, deleteAfterDays } };
+}
+
 export interface AliveConfig {
 	name: string;
 	/** Model spec, e.g. "anthropic/claude-sonnet-4-5:high". Empty = use the default from ~/.pi/agent/settings.json. */
@@ -974,6 +1042,8 @@ export interface AliveConfig {
 	 * execution boundary (sandbox VM or host workspace).
 	 */
 	workers: WorkersConfig;
+	/** Session transcript hygiene: archive rotation for `alive sessions gc` (#228). */
+	sessions: SessionsConfig;
 	workspace: string;
 	soulFile: string;
 	/** "continue" keeps one evolving transcript across restarts; "new" starts a fresh session each start. */
@@ -1054,6 +1124,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 		grantableTools: [],
 	},
 	workers: DEFAULT_WORKERS_CONFIG,
+	sessions: DEFAULT_SESSIONS_CONFIG,
 	sandbox: DEFAULT_SANDBOX_CONFIG,
 	workspace: ".alive/workspace",
 	soulFile: "SOUL.md",
@@ -1369,6 +1440,7 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 	};
 	merged.sandbox = validateSandboxConfig(merged.sandbox);
 	merged.workers = validateWorkersConfig(merged.workers);
+	merged.sessions = validateSessionsConfig(merged.sessions);
 	merged.updates = validateUpdatesConfig(merged.updates);
 	merged.secrets = validateSecretsConfig(merged.secrets);
 	merged.dashboard = validateDashboardConfig(merged.dashboard);

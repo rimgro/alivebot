@@ -32,10 +32,14 @@ import {
 	DEFAULT_SESSION_KEEP,
 	DEFAULT_SESSION_MAX_SIZE_MB,
 	DEFAULT_SESSION_OLDER_THAN_DAYS,
+	measureSessionArchives,
 	measureSessionStats,
 	measureSessions,
+	rotateSessionArchives,
 	runSessionGc,
+	type SessionArchiveUsage,
 	type SessionGcResult,
+	type SessionRotateResult,
 	type SessionStatsResult,
 } from "./runtime/session-retention.js";
 import { readHeartbeatStatus } from "./heartbeat.js";
@@ -230,7 +234,7 @@ export async function main(argv: string[], options: CliOptions = {}): Promise<nu
 				return workersCommand(cwd, flags, positionals);
 			}
 			case "sessions": {
-				return sessionsCommand(flags, positionals);
+				return await sessionsCommand(flags, positionals);
 			}
 			case "sandbox": {
 				if (positionals.length && positionals[0] !== "status") throw new Error("usage: alive sandbox status [--config CONFIG]");
@@ -1427,20 +1431,67 @@ const SESSIONS_USAGE =
 	"usage: alive sessions gc [--dry-run] [--older-than-days N] [--max-size-mb M] [--keep N] [--json] [--config CONFIG]\n" +
 	"       alive sessions stats [--json] [--config CONFIG]\n" +
 	"\n" +
-	"  gc --dry-run            print the plan and the bytes that would be freed; move nothing\n" +
+	"  gc --dry-run            print the plan and the bytes that would be freed, including the\n" +
+	"                          archive rotation preview; gzip, delete and move nothing\n" +
 	"  gc --older-than-days N  archive transcripts older than N days (default 14)\n" +
 	"  gc --max-size-mb M      when all transcripts exceed M MB, archive the oldest until they fit\n" +
 	"                          (default 0 = no size limit, age alone decides)\n" +
 	"  gc --keep N             always leave the N newest transcripts alone (default 3)\n" +
-	"  gc --json               machine-readable plan/result\n" +
+	"  gc --json               machine-readable plan/result (gc counters + rotation)\n" +
 	"  stats                   read-only: size, age, messages, bytes by content kind,\n" +
-	"                          inline base64 payloads and image attachments\n" +
+	"                          inline base64 payloads and image attachments, archive dirs\n" +
 	"\n" +
 	"gc never deletes a transcript: files are moved to <stateDir>/sessions-archive-YYYYMMDD-HHMM/.\n" +
 	"The active transcript (runtime.json: sessionFile) and files modified in the last\n" +
-	"10 minutes are never moved.\n";
+	"10 minutes are never moved.\n" +
+	"\n" +
+	"Archive rotation (#228) is OFF by default (sessions.archiveRotate.enabled=false): gc only\n" +
+	"moves transcripts. When enabled, files inside <stateDir>/sessions-archive-*/ are gzipped\n" +
+	"after sessions.archiveRotate.gzipAfterDays (default 7) and deleted after\n" +
+	"sessions.archiveRotate.deleteAfterDays (default 30); the .gz keeps the original mtime.\n" +
+	"Rotation never touches the live <stateDir>/sessions/ directory, and a failed gzip/delete\n" +
+	"only logs a warning. --dry-run previews rotation even while it is disabled.\n";
 
-function renderSessionGc(result: SessionGcResult): string {
+function renderSessionRotation(rotation: SessionRotateResult): string[] {
+	const dry = rotation.dryRun;
+	// Disabled and not previewing: one informational line, no scan, no change.
+	if (!rotation.enabled && !dry) return ["archive rotation: disabled (sessions.archiveRotate.enabled)"];
+	const lines: string[] = [];
+	if (!rotation.enabled && dry) {
+		lines.push("archive rotation: dry run preview only — sessions.archiveRotate.enabled is off, a real run rotates nothing");
+	}
+	lines.push(
+		`archives: ${rotation.dirs} dir(s), ${rotation.files} file(s), ${formatBytes(rotation.bytesBefore)} in ${rotation.stateDir}`,
+	);
+	for (const entry of rotation.entries) {
+		const age = `${entry.ageDays.toFixed(1)}d`;
+		const where = `${entry.dir}/${entry.name}`;
+		if (entry.action === "gzipped") {
+			const after = entry.bytesAfter === null ? "size unknown until compressed" : formatBytes(entry.bytesAfter);
+			lines.push(`  ${dry ? "would gzip" : "gzipped"} ${where}  ${formatBytes(entry.bytesBefore)} -> ${after}  ${age}${dry ? "  (dry run)" : ""}`);
+			continue;
+		}
+		if (entry.action === "deleted") {
+			lines.push(`  ${dry ? "would delete" : "deleted"} ${where}  ${formatBytes(entry.bytesBefore)}  ${age}${dry ? "  (dry run)" : ""}`);
+			continue;
+		}
+		const detail = entry.detail ? ` (${oneLine(entry.detail, 160)})` : "";
+		lines.push(`  error: ${where}  ${formatBytes(entry.bytesBefore)}  ${age}${detail}`);
+	}
+	// In a dry run only deletions have a known saving: a gzip result is unknown
+	// until the file is actually compressed.
+	const freed = dry
+		? `${formatBytes(rotation.freedBytes)} freed by deletions only (gzip savings unknown until compressed)`
+		: `${formatBytes(rotation.freedBytes)} freed`;
+	lines.push(
+		`archive rotation: ${dry ? "would gzip" : "gzipped"} ${rotation.gzipped} file(s), ` +
+			`${dry ? "would delete" : "deleted"} ${rotation.deleted} file(s), ` +
+			`removed ${rotation.removedDirs.length} dir(s), ${freed}`,
+	);
+	return lines;
+}
+
+function renderSessionGc(result: SessionGcResult, rotation?: SessionRotateResult): string {
 	const lines: string[] = [
 		`sessions: ${result.sessionsDir} (${result.scanned} file(s), ${formatBytes(result.totalBytes)})`,
 		`archive:  ${result.archiveDir}${result.dryRun ? "  (dry run, nothing moved)" : ""}`,
@@ -1459,14 +1510,23 @@ function renderSessionGc(result: SessionGcResult): string {
 		`${result.dryRun ? "would archive" : "archived"}: ${result.archived} moved, ${result.skipped} skipped, ` +
 			`${formatBytes(result.freedBytes)} ${result.dryRun ? "would be freed" : "freed"}`,
 	);
+	if (rotation) lines.push(...renderSessionRotation(rotation));
 	return `${lines.join("\n")}\n`;
 }
 
-function renderSessionStats(result: SessionStatsResult): string {
+function renderSessionStats(result: SessionStatsResult, archives?: SessionArchiveUsage): string {
 	const bytes = (value: number): string => formatBytes(value);
 	const lines: string[] = [
 		`sessions: ${result.sessionsDir} (${result.files} file(s), ${bytes(result.bytes)})`,
 	];
+	if (archives) {
+		if (archives.dirs === 0) {
+			lines.push("archives: none");
+		} else {
+			const oldest = archives.oldestAgeDays === null ? "n/a" : `${archives.oldestAgeDays.toFixed(1)}d`;
+			lines.push(`archives: ${archives.dirs} dir(s), ${archives.files} file(s), ${bytes(archives.bytes)}, oldest ${oldest}`);
+		}
+	}
 	for (const entry of result.entries) {
 		lines.push(
 			`  ${entry.name}  ${bytes(entry.bytes)}  ${entry.ageDays.toFixed(1)}d  ${entry.messages} msg` +
@@ -1485,13 +1545,15 @@ function renderSessionStats(result: SessionStatsResult): string {
 }
 
 /**
- * `alive sessions`: transcript hygiene (#222).
+ * `alive sessions`: transcript hygiene (#222) and archive rotation (#228).
  *
- * `gc` archives old transcripts by age and/or total size; `stats` measures
- * where the bytes go (inline base64 frames) without changing anything. Both
- * read `paths.sessionsDir`, which is a host state directory for every profile.
+ * `gc` archives old transcripts by age and/or total size, then rotates the
+ * archive directories if the operator enabled it; `stats` measures where the
+ * bytes go (inline base64 frames) and how big the archives are, without
+ * changing anything. Both read `paths.sessionsDir`, which is a host state
+ * directory for every profile.
  */
-function sessionsCommand(flags: Record<string, string | boolean>, positionals: string[]): number {
+async function sessionsCommand(flags: Record<string, string | boolean>, positionals: string[]): Promise<number> {
 	const action = positionals[0];
 	const known = new Set([
 		"dry-run",
@@ -1523,18 +1585,29 @@ function sessionsCommand(flags: Record<string, string | boolean>, positionals: s
 		// Whatever runtime.json names is never moved, running or not: it is the
 		// transcript the next `continue` start resumes. The mtime guard inside gc
 		// additionally covers a boot that has not published its file yet.
+		const log = makeLogger(config, !flagBool(flags, "verbose"));
 		const result = runSessionGc({
 			sessionsDir: config.paths.sessionsDir,
 			stateDir: config.paths.stateDir,
-			log: makeLogger(config, !flagBool(flags, "verbose")),
+			log,
 			keep: keep ?? DEFAULT_SESSION_KEEP,
 			olderThanDays: olderThanDays ?? DEFAULT_SESSION_OLDER_THAN_DAYS,
 			maxSizeMb: maxSizeMb ?? DEFAULT_SESSION_MAX_SIZE_MB,
 			activeSessionFile: readRuntimeState(config.paths.stateDir)?.sessionFile,
 			dryRun: flagBool(flags, "dry-run"),
 		});
+		// Archive rotation only reaches `sessions-archive-*` and is off by default;
+		// `--dry-run` previews it even while it is disabled.
+		const rotation = await rotateSessionArchives({
+			stateDir: config.paths.stateDir,
+			enabled: config.config.sessions.archiveRotate.enabled,
+			gzipAfterDays: config.config.sessions.archiveRotate.gzipAfterDays,
+			deleteAfterDays: config.config.sessions.archiveRotate.deleteAfterDays,
+			dryRun: flagBool(flags, "dry-run"),
+			log,
+		});
 		process.stdout.write(
-			flagBool(flags, "json") ? `${JSON.stringify(result, null, 2)}\n` : renderSessionGc(result),
+			flagBool(flags, "json") ? `${JSON.stringify({ ...result, rotation }, null, 2)}\n` : renderSessionGc(result, rotation),
 		);
 		return 0;
 	}
@@ -1542,8 +1615,10 @@ function sessionsCommand(flags: Record<string, string | boolean>, positionals: s
 		const gcOnly = ["dry-run", "older-than-days", "max-size-mb", "keep"].filter((key) => flags[key] !== undefined);
 		if (gcOnly.length > 0) throw new Error(`--${gcOnly.join(", --")} only applies to \`alive sessions gc\``);
 		const result = measureSessionStats(config.paths.sessionsDir);
+		// Best-effort and read-only: the archive directories next to sessions/ (#228).
+		const archives = measureSessionArchives(config.paths.stateDir);
 		process.stdout.write(
-			flagBool(flags, "json") ? `${JSON.stringify(result, null, 2)}\n` : renderSessionStats(result),
+			flagBool(flags, "json") ? `${JSON.stringify({ ...result, archives }, null, 2)}\n` : renderSessionStats(result, archives),
 		);
 		return 0;
 	}
