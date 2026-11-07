@@ -32,6 +32,7 @@ import {
 	rotateSessionArchives,
 	runSessionGc,
 	sessionArchiveDirName,
+	STALE_GZIP_TEMP_AGE_MS,
 } from "../runtime/session-retention.js";
 
 let failures = 0;
@@ -661,6 +662,42 @@ try {
 	}
 
 	// -------------------------------------------------------------------------
+	section("stale gzip temp files are swept without touching a fresh one");
+	{
+		const fx = fixture("rotate-temp");
+		const dir = archiveDir(fx, "sessions-archive-20260125-0000");
+		const staleTemp = path.join(dir, "x.jsonl.gz.tmp-12345");
+		const freshTemp = path.join(dir, "y.jsonl.gz.tmp-999");
+		const aged = path.join(dir, "2026-01-25T00-00-00-000Z_ten.jsonl");
+		fs.writeFileSync(staleTemp, "half-written gzip", "utf8");
+		fs.writeFileSync(freshTemp, "half-written gzip", "utf8");
+		writeTranscript(aged);
+		age(aged, 10);
+		const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60_000);
+		fs.utimesSync(staleTemp, twoHoursAgo, twoHoursAgo);
+		check("the temp age guard is one hour", STALE_GZIP_TEMP_AGE_MS === 60 * 60_000, STALE_GZIP_TEMP_AGE_MS);
+
+		const preview = await rotateSessionArchives({ stateDir: fx.stateDir, enabled: true, dryRun: true, log: silent });
+		check("a dry run removes no temp", preview.removedTemps === 0 && exists(staleTemp) && exists(freshTemp), preview);
+		check(
+			"temps are not reported as archive files",
+			preview.files === 1 && !preview.entries.some((entry) => entry.name.includes(".gz.tmp-")),
+			preview.entries,
+		);
+
+		const result = await rotateSessionArchives({ stateDir: fx.stateDir, enabled: true, log: silent });
+		check("the stale temp is removed", result.removedTemps === 1 && !exists(staleTemp), result);
+		check("the fresh temp can belong to a live writer and stays", exists(freshTemp));
+		check("normal rotation still happens", result.gzipped === 1 && exists(`${aged}.gz`) && !exists(aged), result.entries);
+		check(
+			"temps are not counted as archive files or entries",
+			result.files === 1 && !result.entries.some((entry) => entry.name.includes(".gz.tmp-")),
+			result.entries,
+		);
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
 	section("archive usage is measured read-only");
 	{
 		const fx = fixture("rotate-measure");
@@ -714,6 +751,7 @@ try {
 				"files",
 				"gzipped",
 				"deleted",
+				"removedTemps",
 				"removedDirs",
 				"bytesBefore",
 				"bytesAfter",

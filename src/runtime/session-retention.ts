@@ -300,6 +300,17 @@ export const DEFAULT_ARCHIVE_GZIP_AFTER_DAYS = 7;
 export const DEFAULT_ARCHIVE_DELETE_AFTER_DAYS = 30;
 /** The only directories rotation may touch: `gc`'s own archive convention. */
 export const ARCHIVE_DIR_NAME_RE = /^sessions-archive-\d{8}-\d{4}$/;
+/**
+ * A gzip-in-progress temporary file (`<file>.gz.tmp-<pid>`). It is not an
+ * archive: it is never counted, gzipped or rotated as one.
+ */
+const GZIP_TEMP_NAME_RE = /\.gz\.tmp-\d+$/;
+/**
+ * A temp file younger than this may belong to a rotation running in another
+ * process, so a stale-temp sweep must not remove it mid-write. An hour is far
+ * longer than compressing one archive takes.
+ */
+export const STALE_GZIP_TEMP_AGE_MS = 60 * 60_000;
 
 export interface SessionRotateOptions {
 	/** Directory holding the `sessions-archive-*` directories (the state directory). */
@@ -347,6 +358,8 @@ export interface SessionRotateResult {
 	/** Counts are "would" counts in a dry run. */
 	gzipped: number;
 	deleted: number;
+	/** Stale `<file>.gz.tmp-<pid>` files removed from archive dirs (0 in a dry run). */
+	removedTemps: number;
 	/** Archive directories removed because rotation emptied them (empty in a dry run). */
 	removedDirs: string[];
 	/** Bytes of every archive file seen before rotation. */
@@ -432,6 +445,7 @@ export async function rotateSessionArchives(options: SessionRotateOptions): Prom
 		files: 0,
 		gzipped: 0,
 		deleted: 0,
+		removedTemps: 0,
 		removedDirs: [],
 		bytesBefore: 0,
 		bytesAfter: 0,
@@ -451,7 +465,39 @@ export async function rotateSessionArchives(options: SessionRotateOptions): Prom
 			log?.warn("cannot read session archive directory; skipping it", { dir, error: errorMessage(error) });
 			continue;
 		}
+		// A process killed mid-gzip leaves `<file>.gz.tmp-<pid>` behind. Sweep it
+		// before it is mistaken for an archive, but only when it is old enough that
+		// no other process can still be writing it. A dry run removes nothing.
+		if (!dryRun) {
+			for (const name of names) {
+				if (!GZIP_TEMP_NAME_RE.test(name)) continue;
+				const temp = path.join(dir, name);
+				let stats: fs.Stats;
+				try {
+					stats = fs.lstatSync(temp);
+				} catch {
+					continue;
+				}
+				if (!stats.isFile()) continue;
+				const ageMs = Math.max(0, now - stats.mtimeMs);
+				if (ageMs < STALE_GZIP_TEMP_AGE_MS) continue;
+				try {
+					fs.unlinkSync(temp);
+				} catch (error) {
+					log?.warn("cannot remove stale session archive gzip temp; leaving it in place", {
+						file: temp,
+						error: errorMessage(error),
+					});
+					continue;
+				}
+				log?.info("stale session archive gzip temp removed", { file: temp, ageDays: ageMs / DAY_MS, bytes: stats.size });
+				result.removedTemps += 1;
+			}
+		}
 		for (const name of names) {
+			// An in-progress or leftover gzip temp is not an archive: never count it,
+			// never gzip it into `*.gz.tmp-<pid>.gz`.
+			if (GZIP_TEMP_NAME_RE.test(name)) continue;
 			const file = path.join(dir, name);
 			let stats: fs.Stats;
 			try {
