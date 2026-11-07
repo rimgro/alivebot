@@ -298,6 +298,13 @@ export function runSessionGc(options: SessionGcOptions): SessionGcResult {
 export const DEFAULT_ARCHIVE_GZIP_AFTER_DAYS = 7;
 /** Archive files older than this many days are deleted (`sessions.archiveRotate.deleteAfterDays`). */
 export const DEFAULT_ARCHIVE_DELETE_AFTER_DAYS = 30;
+/**
+ * A file younger than this is NEVER deleted by the byte cap
+ * (`sessions.archiveRotate.maxBytes`), no matter how far over the cap the
+ * archives are: deleting yesterday's transcript to win disk space is not worth
+ * it, and the age rules still apply to it later.
+ */
+export const ARCHIVE_CAP_MIN_AGE_DAYS = 2;
 /** The only directories rotation may touch: `gc`'s own archive convention. */
 export const ARCHIVE_DIR_NAME_RE = /^sessions-archive-\d{8}-\d{4}$/;
 /**
@@ -322,6 +329,12 @@ export interface SessionRotateOptions {
 	gzipAfterDays?: number;
 	/** Age in days above which an archive file is deleted (default 30). */
 	deleteAfterDays?: number;
+	/**
+	 * Total size cap for all archive files in bytes (default 0 = off). When the
+	 * archives exceed it, the OLDEST files are deleted until the total fits; a
+	 * file younger than `ARCHIVE_CAP_MIN_AGE_DAYS` is never deleted by the cap.
+	 */
+	maxBytes?: number;
 	/** Report what would happen without gzipping, deleting, renaming or creating anything. */
 	dryRun?: boolean;
 	/** Clock seam for tests. */
@@ -342,6 +355,8 @@ export interface SessionRotateEntry {
 	bytesAfter: number | null;
 	/** Age from mtime at scan time. */
 	ageDays: number;
+	/** Why a `deleted` file went away; absent for gzip/error entries. */
+	reason?: "age" | "cap";
 	detail?: string;
 }
 
@@ -350,6 +365,8 @@ export interface SessionRotateResult {
 	dryRun: boolean;
 	gzipAfterDays: number;
 	deleteAfterDays: number;
+	/** Configured byte cap; 0 means the cap is off. */
+	capBytes: number;
 	stateDir: string;
 	/** Number of `sessions-archive-*` directories scanned. */
 	dirs: number;
@@ -357,13 +374,20 @@ export interface SessionRotateResult {
 	files: number;
 	/** Counts are "would" counts in a dry run. */
 	gzipped: number;
+	/** Total deleted files (`deletedByAge` + `deletedByCap`). Kept for compatibility. */
 	deleted: number;
+	deletedByAge: number;
+	deletedByCap: number;
 	/** Stale `<file>.gz.tmp-<pid>` files removed from archive dirs (0 in a dry run). */
 	removedTemps: number;
 	/** Archive directories removed because rotation emptied them (empty in a dry run). */
 	removedDirs: string[];
 	/** Bytes of every archive file seen before rotation. */
 	bytesBefore: number;
+	/** Bytes above the cap before rotation; 0 when the cap is off or the archives fit. */
+	overCapBefore: number;
+	/** Bytes still above the cap after the deletions projected by this run; 0 when the cap is off. */
+	overCapAfter: number;
 	/** Bytes left afterwards; `null` when a dry run cannot know the gzip result. */
 	bytesAfter: number | null;
 	freedBytes: number;
@@ -376,6 +400,10 @@ export interface SessionArchiveUsage {
 	bytes: number;
 	/** Age of the oldest archive file; `null` when there is no file. */
 	oldestAgeDays: number | null;
+	/** Configured byte cap; 0 means the cap is off. */
+	capBytes: number;
+	/** Bytes above the cap; 0 when the cap is off or the archives fit. */
+	overCapBytes: number;
 }
 
 /** Direct children of `stateDir` that are `sessions-archive-YYYYMMDD-HHMM` directories. */
@@ -410,15 +438,22 @@ function errorMessage(error: unknown): string {
 
 /**
  * Rotate `alive sessions gc`'s archive directories (#228): gzip archive files
- * older than `gzipAfterDays`, delete the ones older than `deleteAfterDays`, and
- * remove archive directories that become empty.
+ * older than `gzipAfterDays`, delete the ones older than `deleteAfterDays`,
+ * delete the oldest files until the total fits `maxBytes`, and remove archive
+ * directories that become empty.
  *
  * The decision is made PER FILE, not per directory ("the whole directory is old
  * enough, drop it"): one archive directory mixes ages, so a directory-level
  * rule would sooner or later delete a recent transcript that was moved
- * alongside old ones. Only files inside `sessions-archive-*` directories can be
- * deleted (the manager's requirement), and the live `sessions/` directory is
- * never scanned at all.
+ * alongside old ones. Only regular files directly inside `sessions-archive-*`
+ * directories can be deleted (the manager's requirement), and the live
+ * `sessions/` directory is never scanned at all.
+ *
+ * Age deletion and cap deletion walk ONE globally oldest-first list, so a file
+ * is never considered twice and the cap takes the oldest archive across every
+ * archive directory. A file younger than `ARCHIVE_CAP_MIN_AGE_DAYS` is never
+ * deleted by the cap. Gzip decisions are made only for the surviving files and
+ * a file deleted by the cap is never gzipped.
  *
  * A failed gzip/unlink is a warning, not a failure: the file is left in place
  * and the rest continues. The only throws are invalid numeric options.
@@ -433,6 +468,8 @@ export async function rotateSessionArchives(options: SessionRotateOptions): Prom
 	if (!Number.isFinite(gzipAfterDays) || gzipAfterDays < 0) throw new Error("gzipAfterDays must be a non-negative number");
 	const deleteAfterDays = options.deleteAfterDays ?? DEFAULT_ARCHIVE_DELETE_AFTER_DAYS;
 	if (!Number.isFinite(deleteAfterDays) || deleteAfterDays < 0) throw new Error("deleteAfterDays must be a non-negative number");
+	const maxBytes = options.maxBytes ?? 0;
+	if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) throw new Error("maxBytes must be a non-negative whole number of bytes");
 
 	const entries: SessionRotateEntry[] = [];
 	const result: SessionRotateResult = {
@@ -440,14 +477,19 @@ export async function rotateSessionArchives(options: SessionRotateOptions): Prom
 		dryRun,
 		gzipAfterDays,
 		deleteAfterDays,
+		capBytes: maxBytes,
 		stateDir,
 		dirs: 0,
 		files: 0,
 		gzipped: 0,
 		deleted: 0,
+		deletedByAge: 0,
+		deletedByCap: 0,
 		removedTemps: 0,
 		removedDirs: [],
 		bytesBefore: 0,
+		overCapBefore: 0,
+		overCapAfter: 0,
 		bytesAfter: 0,
 		freedBytes: 0,
 		entries,
@@ -455,7 +497,19 @@ export async function rotateSessionArchives(options: SessionRotateOptions): Prom
 	// Disabled and not previewing: report the switch, scan nothing, change nothing.
 	if (!enabled && !dryRun) return result;
 
-	for (const dir of listArchiveDirs(stateDir)) {
+	interface ArchiveFile {
+		dirName: string;
+		name: string;
+		path: string;
+		bytes: number;
+		atimeMs: number;
+		mtimeMs: number;
+		ageDays: number;
+	}
+
+	const dirs = listArchiveDirs(stateDir);
+	const archiveFiles: ArchiveFile[] = [];
+	for (const dir of dirs) {
 		result.dirs += 1;
 		const dirName = path.basename(dir);
 		let names: string[];
@@ -509,85 +563,180 @@ export async function rotateSessionArchives(options: SessionRotateOptions): Prom
 			// Only regular files directly inside the archive directory: subdirectories
 			// are never recursed into and symlinks are never followed.
 			if (!stats.isFile()) continue;
-			result.files += 1;
-			result.bytesBefore += stats.size;
-			// max(0, ...) so a clock skew cannot produce a negative age.
-			const ageDays = Math.max(0, (now - stats.mtimeMs) / DAY_MS);
+			archiveFiles.push({
+				dirName,
+				name,
+				path: file,
+				bytes: stats.size,
+				atimeMs: stats.atimeMs,
+				mtimeMs: stats.mtimeMs,
+				// max(0, ...) so a clock skew cannot produce a negative age.
+				ageDays: Math.max(0, (now - stats.mtimeMs) / DAY_MS),
+			});
+		}
+	}
 
-			if (ageDays >= deleteAfterDays) {
-				if (!dryRun) {
-					try {
-						fs.unlinkSync(file);
-					} catch (error) {
-						const detail = errorMessage(error);
-						log?.warn("cannot rotate session archive file; leaving it in place", { file, error: detail });
-						entries.push({ dir: dirName, name, path: file, action: "error", bytesBefore: stats.size, bytesAfter: stats.size, ageDays, detail });
-						continue;
-					}
-				}
-				log?.info("session archive file deleted", { file, bytes: stats.size, ageDays, dryRun });
-				entries.push({ dir: dirName, name, path: file, action: "deleted", bytesBefore: stats.size, bytesAfter: 0, ageDays });
-				result.deleted += 1;
-				result.freedBytes += stats.size;
-				continue;
-			}
+	// ONE list for the whole state directory, strictly oldest-first by mtime and
+	// with a full tie-break (name, then directory). Age deletion and the byte cap
+	// share this order, so a file can never be deleted twice and the cap always
+	// takes the oldest archive across every archive directory.
+	archiveFiles.sort((a, b) => a.mtimeMs - b.mtimeMs || a.name.localeCompare(b.name) || a.dirName.localeCompare(b.dirName));
+	result.files = archiveFiles.length;
+	result.bytesBefore = archiveFiles.reduce((sum, file) => sum + file.bytes, 0);
+	result.overCapBefore = maxBytes > 0 ? Math.max(0, result.bytesBefore - maxBytes) : 0;
+	let remaining = result.bytesBefore;
 
-			// `.gz` files are already rotated and are never compressed twice.
-			if (ageDays < gzipAfterDays || name.endsWith(".gz")) continue;
-			const gzPath = `${file}.gz`;
-			if (fs.existsSync(gzPath)) {
-				// Never overwrite an existing archive: it may be the only copy.
-				const detail = `${path.basename(gzPath)} already exists; not overwriting it`;
-				log?.warn("cannot rotate session archive file; leaving it in place", { file, error: detail });
-				entries.push({ dir: dirName, name, path: file, action: "error", bytesBefore: stats.size, bytesAfter: stats.size, ageDays, detail });
-				continue;
-			}
-			if (dryRun) {
-				// A gzip candidate's size is unknown until it is compressed, so it is
-				// reported as null and never counted as freed bytes in a preview.
-				log?.info("session archive file gzipped", { file, bytes: stats.size, ageDays, dryRun });
-				entries.push({ dir: dirName, name, path: file, action: "gzipped", bytesBefore: stats.size, bytesAfter: null, ageDays });
-				result.gzipped += 1;
-				continue;
-			}
-
-			// Streaming, never readFileSync: a single live archive can be ~886 MB.
-			const tmp = `${gzPath}.tmp-${process.pid}`;
+	// Delete one file, or report the failure and leave it where it is. In a dry
+	// run nothing is unlinked; the entry is the plan.
+	const deleteFile = (file: ArchiveFile, reason: "age" | "cap"): boolean => {
+		if (!dryRun) {
 			try {
-				await pipeline(fs.createReadStream(file), createGzip(), fs.createWriteStream(tmp));
-				const bytesAfter = fs.statSync(tmp).size;
-				fs.renameSync(tmp, gzPath);
-				// Keep the original timestamps: the rotation age must not reset by
-				// compressing, or a gzipped file would never reach deleteAfterDays.
-				fs.utimesSync(gzPath, stats.atime, stats.mtime);
-				fs.unlinkSync(file);
-				log?.info("session archive file gzipped", { file, bytes: stats.size, bytesAfter, ageDays, dryRun });
-				entries.push({ dir: dirName, name, path: file, action: "gzipped", bytesBefore: stats.size, bytesAfter, ageDays });
-				result.gzipped += 1;
-				result.freedBytes += Math.max(0, stats.size - bytesAfter);
+				fs.unlinkSync(file.path);
 			} catch (error) {
-				// A half-written temporary file must not survive a failed gzip.
-				try {
-					fs.rmSync(tmp, { force: true });
-				} catch {
-					// Nothing else to do: the source file is what matters.
-				}
 				const detail = errorMessage(error);
-				log?.warn("cannot rotate session archive file; leaving it in place", { file, error: detail });
-				entries.push({ dir: dirName, name, path: file, action: "error", bytesBefore: stats.size, bytesAfter: stats.size, ageDays, detail });
+				log?.warn("cannot rotate session archive file; leaving it in place", { file: file.path, error: detail });
+				entries.push({
+					dir: file.dirName,
+					name: file.name,
+					path: file.path,
+					action: "error",
+					bytesBefore: file.bytes,
+					bytesAfter: file.bytes,
+					ageDays: file.ageDays,
+					detail,
+				});
+				return false;
 			}
 		}
+		log?.info("session archive file deleted", { file: file.path, bytes: file.bytes, ageDays: file.ageDays, dryRun, reason });
+		entries.push({
+			dir: file.dirName,
+			name: file.name,
+			path: file.path,
+			action: "deleted",
+			bytesBefore: file.bytes,
+			bytesAfter: 0,
+			ageDays: file.ageDays,
+			reason,
+		});
+		result.deleted += 1;
+		if (reason === "age") result.deletedByAge += 1;
+		else result.deletedByCap += 1;
+		result.freedBytes += file.bytes;
+		remaining -= file.bytes;
+		return true;
+	};
 
-		// The archive DIRECTORY goes only once rotation emptied it; a directory
-		// that still holds fresh transcripts stays. A dry run removes nothing.
-		if (dryRun) continue;
+	for (const file of archiveFiles) {
+		// Rule 1 — age deletion, exactly as before.
+		if (file.ageDays >= deleteAfterDays) {
+			deleteFile(file, "age");
+			continue;
+		}
+
+		// Rule 2 — the byte cap: while the running total is over the cap, delete
+		// the oldest eligible file. A file younger than ARCHIVE_CAP_MIN_AGE_DAYS is
+		// never deleted by the cap, however far over the cap the archives are.
+		if (maxBytes > 0 && remaining > maxBytes && file.ageDays >= ARCHIVE_CAP_MIN_AGE_DAYS) {
+			deleteFile(file, "cap");
+			continue;
+		}
+
+		// Rule 3 — gzip the survivors with the same per-file rule as before.
+		// `.gz` files are already rotated and are never compressed twice.
+		if (file.ageDays < gzipAfterDays || file.name.endsWith(".gz")) continue;
+		const gzPath = `${file.path}.gz`;
+		if (fs.existsSync(gzPath)) {
+			// Never overwrite an existing archive: it may be the only copy.
+			const detail = `${path.basename(gzPath)} already exists; not overwriting it`;
+			log?.warn("cannot rotate session archive file; leaving it in place", { file: file.path, error: detail });
+			entries.push({
+				dir: file.dirName,
+				name: file.name,
+				path: file.path,
+				action: "error",
+				bytesBefore: file.bytes,
+				bytesAfter: file.bytes,
+				ageDays: file.ageDays,
+				detail,
+			});
+			continue;
+		}
+		if (dryRun) {
+			// A gzip candidate's size is unknown until it is compressed, so it is
+			// reported as null and never counted as freed bytes in a preview.
+			log?.info("session archive file gzipped", { file: file.path, bytes: file.bytes, ageDays: file.ageDays, dryRun });
+			entries.push({
+				dir: file.dirName,
+				name: file.name,
+				path: file.path,
+				action: "gzipped",
+				bytesBefore: file.bytes,
+				bytesAfter: null,
+				ageDays: file.ageDays,
+			});
+			result.gzipped += 1;
+			continue;
+		}
+
+		// Streaming, never readFileSync: a single live archive can be ~886 MB.
+		const tmp = `${gzPath}.tmp-${process.pid}`;
 		try {
-			if (fs.readdirSync(dir).length === 0) {
-				fs.rmdirSync(dir);
-				result.removedDirs.push(dir);
-			}
+			await pipeline(fs.createReadStream(file.path), createGzip(), fs.createWriteStream(tmp));
+			const bytesAfter = fs.statSync(tmp).size;
+			fs.renameSync(tmp, gzPath);
+			// Keep the original timestamps: the rotation age must not reset by
+			// compressing, or a gzipped file would never reach deleteAfterDays.
+			fs.utimesSync(gzPath, new Date(file.atimeMs), new Date(file.mtimeMs));
+			fs.unlinkSync(file.path);
+			log?.info("session archive file gzipped", { file: file.path, bytes: file.bytes, bytesAfter, ageDays: file.ageDays, dryRun });
+			entries.push({
+				dir: file.dirName,
+				name: file.name,
+				path: file.path,
+				action: "gzipped",
+				bytesBefore: file.bytes,
+				bytesAfter,
+				ageDays: file.ageDays,
+			});
+			result.gzipped += 1;
+			result.freedBytes += Math.max(0, file.bytes - bytesAfter);
 		} catch (error) {
-			log?.warn("cannot remove empty session archive directory", { dir, error: errorMessage(error) });
+			// A half-written temporary file must not survive a failed gzip.
+			try {
+				fs.rmSync(tmp, { force: true });
+			} catch {
+				// Nothing else to do: the source file is what matters.
+			}
+			const detail = errorMessage(error);
+			log?.warn("cannot rotate session archive file; leaving it in place", { file: file.path, error: detail });
+			entries.push({
+				dir: file.dirName,
+				name: file.name,
+				path: file.path,
+				action: "error",
+				bytesBefore: file.bytes,
+				bytesAfter: file.bytes,
+				ageDays: file.ageDays,
+				detail,
+			});
+		}
+	}
+
+	result.overCapAfter = maxBytes > 0 ? Math.max(0, remaining - maxBytes) : 0;
+
+	// The archive DIRECTORY goes only once rotation emptied it; a directory that
+	// still holds fresh transcripts stays. A dry run removes nothing.
+	if (!dryRun) {
+		for (const dir of dirs) {
+			try {
+				if (fs.readdirSync(dir).length === 0) {
+					fs.rmdirSync(dir);
+					result.removedDirs.push(dir);
+				}
+			} catch (error) {
+				log?.warn("cannot remove empty session archive directory", { dir, error: errorMessage(error) });
+			}
 		}
 	}
 
@@ -602,10 +751,25 @@ export async function rotateSessionArchives(options: SessionRotateOptions): Prom
  * Read-only size/age of every `sessions-archive-*` directory, for
  * `alive sessions stats`. One level deep, never follows symlinks and silently
  * skips entries it cannot read: stats is best-effort, not a verifier.
+ *
+ * `maxBytes` (default 0 = off) only ADDS `overCapBytes`: stats must show how
+ * far the archives are over the configured cap while rotation is still
+ * disabled, so the operator can see the effect before enabling it.
  */
-export function measureSessionArchives(stateDir: string, options: { now?: number } = {}): SessionArchiveUsage {
+export function measureSessionArchives(
+	stateDir: string,
+	options: { now?: number; maxBytes?: number } = {},
+): SessionArchiveUsage {
 	const now = options.now ?? Date.now();
-	const result: SessionArchiveUsage = { dirs: 0, files: 0, bytes: 0, oldestAgeDays: null };
+	const maxBytes = options.maxBytes && Number.isSafeInteger(options.maxBytes) && options.maxBytes > 0 ? options.maxBytes : 0;
+	const result: SessionArchiveUsage = {
+		dirs: 0,
+		files: 0,
+		bytes: 0,
+		oldestAgeDays: null,
+		capBytes: maxBytes,
+		overCapBytes: 0,
+	};
 	for (const dir of listArchiveDirs(stateDir)) {
 		result.dirs += 1;
 		let names: string[];
@@ -628,6 +792,7 @@ export function measureSessionArchives(stateDir: string, options: { now?: number
 			if (result.oldestAgeDays === null || ageDays > result.oldestAgeDays) result.oldestAgeDays = ageDays;
 		}
 	}
+	result.overCapBytes = maxBytes > 0 ? Math.max(0, result.bytes - maxBytes) : 0;
 	return result;
 }
 

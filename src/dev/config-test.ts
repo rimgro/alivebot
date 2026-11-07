@@ -938,11 +938,13 @@ section("loop context-sleep thresholds and profile overrides are validated (#170
 section("sessions.archiveRotate: off by default, validated, merged from defaults (#228)");
 {
 	check(
-		"the schema default is off, gzip after 7 days, delete after 30",
+		"the schema default is off, gzip after 7 days, delete after 30, no byte cap",
 		DEFAULT_CONFIG.sessions.archiveRotate.enabled === false &&
 			DEFAULT_CONFIG.sessions.archiveRotate.gzipAfterDays === 7 &&
 			DEFAULT_CONFIG.sessions.archiveRotate.deleteAfterDays === 30 &&
-			DEFAULT_SESSIONS_CONFIG.archiveRotate.enabled === false,
+			DEFAULT_CONFIG.sessions.archiveRotate.maxBytes === 0 &&
+			DEFAULT_SESSIONS_CONFIG.archiveRotate.enabled === false &&
+			DEFAULT_SESSIONS_CONFIG.archiveRotate.maxBytes === 0,
 		DEFAULT_SESSIONS_CONFIG,
 	);
 	const root = tempRoot("sessions-rotate");
@@ -953,7 +955,8 @@ section("sessions.archiveRotate: off by default, validated, merged from defaults
 		"a config without a sessions block inherits the defaults",
 		loaded.config.sessions.archiveRotate.enabled === false &&
 			loaded.config.sessions.archiveRotate.gzipAfterDays === 7 &&
-			loaded.config.sessions.archiveRotate.deleteAfterDays === 30,
+			loaded.config.sessions.archiveRotate.deleteAfterDays === 30 &&
+			loaded.config.sessions.archiveRotate.maxBytes === 0,
 		loaded.config.sessions,
 	);
 	writeConfig(root, { sessions: { archiveRotate: { enabled: true } } });
@@ -962,14 +965,26 @@ section("sessions.archiveRotate: off by default, validated, merged from defaults
 		"a partial block is filled from the defaults",
 		partial.config.sessions.archiveRotate.enabled === true &&
 			partial.config.sessions.archiveRotate.gzipAfterDays === 7 &&
-			partial.config.sessions.archiveRotate.deleteAfterDays === 30,
+			partial.config.sessions.archiveRotate.deleteAfterDays === 30 &&
+			partial.config.sessions.archiveRotate.maxBytes === 0,
 		partial.config.sessions,
 	);
-	writeConfig(root, { sessions: { archiveRotate: { enabled: true, gzipAfterDays: 3, deleteAfterDays: 10 } } });
+	const partialCap = validateSessionsConfig({ archiveRotate: { enabled: false, maxBytes: 1_500_000_000 } });
+	check(
+		"maxBytes is accepted together with enabled:false",
+		partialCap.archiveRotate.enabled === false &&
+			partialCap.archiveRotate.maxBytes === 1_500_000_000 &&
+			partialCap.archiveRotate.gzipAfterDays === 7 &&
+			partialCap.archiveRotate.deleteAfterDays === 30,
+		partialCap,
+	);
+	writeConfig(root, { sessions: { archiveRotate: { enabled: true, gzipAfterDays: 3, deleteAfterDays: 10, maxBytes: 500 } } });
 	const explicit = load();
 	check(
 		"explicit values win",
-		explicit.config.sessions.archiveRotate.gzipAfterDays === 3 && explicit.config.sessions.archiveRotate.deleteAfterDays === 10,
+		explicit.config.sessions.archiveRotate.gzipAfterDays === 3 &&
+			explicit.config.sessions.archiveRotate.deleteAfterDays === 10 &&
+			explicit.config.sessions.archiveRotate.maxBytes === 500,
 		explicit.config.sessions,
 	);
 
@@ -995,6 +1010,14 @@ section("sessions.archiveRotate: off by default, validated, merged from defaults
 			"sessions.archiveRotate.deleteAfterDays",
 		],
 		["a string deleteAfterDays", { archiveRotate: { deleteAfterDays: "30" } }, "sessions.archiveRotate.deleteAfterDays"],
+		["a negative maxBytes", { archiveRotate: { maxBytes: -1 } }, "sessions.archiveRotate.maxBytes"],
+		["a fractional maxBytes", { archiveRotate: { maxBytes: 1.5 } }, "sessions.archiveRotate.maxBytes"],
+		["a string maxBytes", { archiveRotate: { maxBytes: "1024" } }, "sessions.archiveRotate.maxBytes"],
+		[
+			"an infinite maxBytes",
+			{ archiveRotate: { maxBytes: Number.POSITIVE_INFINITY } },
+			"sessions.archiveRotate.maxBytes",
+		],
 	];
 	for (const [label, value, expected] of rejects) {
 		let message = "";
@@ -1005,6 +1028,17 @@ section("sessions.archiveRotate: off by default, validated, merged from defaults
 		}
 		check(`${label} is rejected`, message.startsWith(expected), message || "accepted");
 	}
+	let maxBytesMessage = "";
+	try {
+		validateSessionsConfig({ archiveRotate: { maxBytes: -1 } });
+	} catch (error) {
+		maxBytesMessage = error instanceof Error ? error.message : String(error);
+	}
+	check(
+		"the maxBytes error names the exact contract",
+		maxBytesMessage === "sessions.archiveRotate.maxBytes must be a non-negative whole number of bytes",
+		maxBytesMessage,
+	);
 	for (const [label, value, expected] of [
 		["a non-object sessions block", "nope", "sessions must be an object"],
 		["a non-object archiveRotate block", { archiveRotate: "nope" }, "sessions.archiveRotate must be an object"],

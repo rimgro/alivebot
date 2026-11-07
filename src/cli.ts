@@ -1440,6 +1440,7 @@ const SESSIONS_USAGE =
 	"  gc --json               machine-readable plan/result (gc counters + rotation)\n" +
 	"  stats                   read-only: size, age, messages, bytes by content kind,\n" +
 	"                          inline base64 payloads and image attachments, archive dirs\n" +
+	"                          (and how far they are over sessions.archiveRotate.maxBytes)\n" +
 	"\n" +
 	"gc never deletes a transcript: files are moved to <stateDir>/sessions-archive-YYYYMMDD-HHMM/.\n" +
 	"The active transcript (runtime.json: sessionFile) and files modified in the last\n" +
@@ -1449,6 +1450,10 @@ const SESSIONS_USAGE =
 	"moves transcripts. When enabled, files inside <stateDir>/sessions-archive-*/ are gzipped\n" +
 	"after sessions.archiveRotate.gzipAfterDays (default 7) and deleted after\n" +
 	"sessions.archiveRotate.deleteAfterDays (default 30); the .gz keeps the original mtime.\n" +
+	"sessions.archiveRotate.maxBytes (default 0 = off) caps the total archive size: when it\n" +
+	"is exceeded, the OLDEST files are deleted until the total fits, across all archive\n" +
+	"directories; a file younger than 2 days is never deleted by the cap. Age deletion and\n" +
+	"the cap share one oldest-first order, and a file deleted by the cap is never gzipped.\n" +
 	"Rotation never touches the live <stateDir>/sessions/ directory, and a failed gzip/delete\n" +
 	"only logs a warning. --dry-run previews rotation even while it is disabled.\n";
 
@@ -1463,6 +1468,21 @@ function renderSessionRotation(rotation: SessionRotateResult): string[] {
 	lines.push(
 		`archives: ${rotation.dirs} dir(s), ${rotation.files} file(s), ${formatBytes(rotation.bytesBefore)} in ${rotation.stateDir}`,
 	);
+	if (rotation.capBytes > 0 && rotation.overCapBefore > 0) {
+		// Cap deletions are known exactly even in a dry run, so the line shows the
+		// current and the projected volume (a gzip candidate's size is still unknown).
+		const deletionFreed = rotation.entries
+			.filter((entry) => entry.action === "deleted")
+			.reduce((sum, entry) => sum + entry.bytesBefore, 0);
+		const projected = rotation.bytesBefore - deletionFreed;
+		const stillOver = rotation.overCapAfter > 0 ? `, still over cap by ${formatBytes(rotation.overCapAfter)}` : "";
+		lines.push(
+			`cap: max ${formatBytes(rotation.capBytes)}, archives ${formatBytes(rotation.bytesBefore)}, ` +
+				`over cap by ${formatBytes(rotation.overCapBefore)}; ` +
+				`${dry ? "would delete" : "deleted"} ${rotation.deletedByCap} file(s) oldest first, ` +
+				`${formatBytes(rotation.bytesBefore)} -> ${formatBytes(projected)}${stillOver}`,
+		);
+	}
 	for (const entry of rotation.entries) {
 		const age = `${entry.ageDays.toFixed(1)}d`;
 		const where = `${entry.dir}/${entry.name}`;
@@ -1472,7 +1492,8 @@ function renderSessionRotation(rotation: SessionRotateResult): string[] {
 			continue;
 		}
 		if (entry.action === "deleted") {
-			lines.push(`  ${dry ? "would delete" : "deleted"} ${where}  ${formatBytes(entry.bytesBefore)}  ${age}${dry ? "  (dry run)" : ""}`);
+			const overCap = entry.reason === "cap" ? " (over cap)" : "";
+			lines.push(`  ${dry ? "would delete" : "deleted"}${overCap} ${where}  ${formatBytes(entry.bytesBefore)}  ${age}${dry ? "  (dry run)" : ""}`);
 			continue;
 		}
 		const detail = entry.detail ? ` (${oneLine(entry.detail, 160)})` : "";
@@ -1524,7 +1545,8 @@ function renderSessionStats(result: SessionStatsResult, archives?: SessionArchiv
 			lines.push("archives: none");
 		} else {
 			const oldest = archives.oldestAgeDays === null ? "n/a" : `${archives.oldestAgeDays.toFixed(1)}d`;
-			lines.push(`archives: ${archives.dirs} dir(s), ${archives.files} file(s), ${bytes(archives.bytes)}, oldest ${oldest}`);
+			const cap = archives.capBytes > 0 ? `, cap ${bytes(archives.capBytes)}, over cap by ${bytes(archives.overCapBytes)}` : "";
+			lines.push(`archives: ${archives.dirs} dir(s), ${archives.files} file(s), ${bytes(archives.bytes)}, oldest ${oldest}${cap}`);
 		}
 	}
 	for (const entry of result.entries) {
@@ -1603,6 +1625,7 @@ async function sessionsCommand(flags: Record<string, string | boolean>, position
 			enabled: config.config.sessions.archiveRotate.enabled,
 			gzipAfterDays: config.config.sessions.archiveRotate.gzipAfterDays,
 			deleteAfterDays: config.config.sessions.archiveRotate.deleteAfterDays,
+			maxBytes: config.config.sessions.archiveRotate.maxBytes,
 			dryRun: flagBool(flags, "dry-run"),
 			log,
 		});
@@ -1615,8 +1638,11 @@ async function sessionsCommand(flags: Record<string, string | boolean>, position
 		const gcOnly = ["dry-run", "older-than-days", "max-size-mb", "keep"].filter((key) => flags[key] !== undefined);
 		if (gcOnly.length > 0) throw new Error(`--${gcOnly.join(", --")} only applies to \`alive sessions gc\``);
 		const result = measureSessionStats(config.paths.sessionsDir);
-		// Best-effort and read-only: the archive directories next to sessions/ (#228).
-		const archives = measureSessionArchives(config.paths.stateDir);
+		// Best-effort and read-only: the archive directories next to sessions/ (#228),
+		// including how far they are over the configured byte cap (0 = no cap part).
+		const archives = measureSessionArchives(config.paths.stateDir, {
+			maxBytes: config.config.sessions.archiveRotate.maxBytes,
+		});
 		process.stdout.write(
 			flagBool(flags, "json") ? `${JSON.stringify({ ...result, archives }, null, 2)}\n` : renderSessionStats(result, archives),
 		);
