@@ -961,6 +961,11 @@ export function validateHealthConfig(value: unknown): HealthConfig {
  * archives then grow forever. Rotation is the second, deliberately opt-in
  * step: compress the archives, later delete them. It only ever touches files
  * inside `sessions-archive-*` directories — never the live `sessions/`.
+ *
+ * `maxBytes` is the disk-pressure rule: when all archive files together exceed
+ * it, the oldest ones are deleted until the total fits. Unlike the age rules it
+ * ignores `gzipAfterDays`/`deleteAfterDays`, but it never deletes a file younger
+ * than `ARCHIVE_CAP_MIN_AGE_DAYS` (2 days).
  */
 export interface SessionsArchiveRotateConfig {
 	/** Master switch. Off by default: gc behaves exactly as it did before #228. */
@@ -969,6 +974,12 @@ export interface SessionsArchiveRotateConfig {
 	gzipAfterDays: number;
 	/** Archive files older than this many days are deleted. Must be >= `gzipAfterDays`. */
 	deleteAfterDays: number;
+	/**
+	 * Total size cap for all archive files in bytes (0 = off). When exceeded, the
+	 * oldest files are deleted until the total fits; a file younger than 2 days is
+	 * never deleted by the cap.
+	 */
+	maxBytes: number;
 }
 
 export interface SessionsConfig {
@@ -982,6 +993,8 @@ export const DEFAULT_SESSIONS_CONFIG: SessionsConfig = {
 		enabled: false,
 		gzipAfterDays: DEFAULT_ARCHIVE_GZIP_AFTER_DAYS,
 		deleteAfterDays: DEFAULT_ARCHIVE_DELETE_AFTER_DAYS,
+		// Off by default: no byte cap unless the operator asks for one.
+		maxBytes: 0,
 	},
 };
 
@@ -1015,7 +1028,11 @@ export function validateSessionsConfig(value: unknown): SessionsConfig {
 	if (deleteAfterDays < gzipAfterDays) {
 		throw new Error("sessions.archiveRotate.deleteAfterDays must be >= sessions.archiveRotate.gzipAfterDays");
 	}
-	return { archiveRotate: { enabled, gzipAfterDays, deleteAfterDays } };
+	const maxBytes = rawRotate.maxBytes ?? DEFAULT_SESSIONS_CONFIG.archiveRotate.maxBytes;
+	if (typeof maxBytes !== "number" || !Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+		throw new Error("sessions.archiveRotate.maxBytes must be a non-negative whole number of bytes");
+	}
+	return { archiveRotate: { enabled, gzipAfterDays, deleteAfterDays, maxBytes } };
 }
 
 export interface AliveConfig {

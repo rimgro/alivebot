@@ -19,6 +19,7 @@ import { main } from "../cli.js";
 import { openSessionManager } from "../runtime/session.js";
 import {
 	ACTIVE_SESSION_MTIME_GUARD_MS,
+	ARCHIVE_CAP_MIN_AGE_DAYS,
 	DEFAULT_ARCHIVE_DELETE_AFTER_DAYS,
 	DEFAULT_ARCHIVE_GZIP_AFTER_DAYS,
 	DEFAULT_SESSION_KEEP,
@@ -125,6 +126,11 @@ function archiveDir(fx: Fixture, name: string): string {
 	return dir;
 }
 
+/** Exact bytes, so a cap test can control the archive total without transcripts. */
+function writeBytes(file: string, bytes: number): void {
+	fs.writeFileSync(file, "x".repeat(bytes), "utf8");
+}
+
 /** Names, sizes and mtimes of one directory; equal strings mean "nothing changed". */
 function snapshot(dir: string): string {
 	return fs
@@ -135,6 +141,26 @@ function snapshot(dir: string): string {
 			return `${name}:${stats.size}:${stats.mtimeMs}`;
 		})
 		.join("|");
+}
+
+/** Recursive names+sizes+mtimes of a whole tree; equal strings mean "nothing changed". */
+function treeSnapshot(root: string): string {
+	const lines: string[] = [];
+	const walk = (dir: string): void => {
+		for (const name of fs.readdirSync(dir).sort()) {
+			const full = path.join(dir, name);
+			const stats = fs.statSync(full);
+			const rel = path.relative(root, full);
+			if (stats.isDirectory()) {
+				lines.push(`${rel}/`);
+				walk(full);
+				continue;
+			}
+			lines.push(`${rel}:${stats.size}:${stats.mtimeMs}`);
+		}
+	};
+	walk(root);
+	return lines.join("|");
 }
 
 /** Run `alive ...` against the fixture root and return everything printed. */
@@ -481,12 +507,14 @@ try {
 		const fx = fixture("rotate-defaults");
 		const defaults = fx.config.config.sessions.archiveRotate;
 		check(
-			"enabled=false, gzipAfterDays=7, deleteAfterDays=30 by default",
+			"enabled=false, gzipAfterDays=7, deleteAfterDays=30, maxBytes=0 by default",
 			defaults.enabled === false &&
 				defaults.gzipAfterDays === DEFAULT_ARCHIVE_GZIP_AFTER_DAYS &&
-				defaults.deleteAfterDays === DEFAULT_ARCHIVE_DELETE_AFTER_DAYS,
+				defaults.deleteAfterDays === DEFAULT_ARCHIVE_DELETE_AFTER_DAYS &&
+				defaults.maxBytes === 0,
 			defaults,
 		);
+		check("the cap only ever skips files younger than 2 days", ARCHIVE_CAP_MIN_AGE_DAYS === 2, ARCHIVE_CAP_MIN_AGE_DAYS);
 		check(
 			"the module defaults are 7 and 30 days",
 			DEFAULT_ARCHIVE_GZIP_AFTER_DAYS === 7 && DEFAULT_ARCHIVE_DELETE_AFTER_DAYS === 30,
@@ -500,7 +528,7 @@ try {
 		const merged = loadConfig({ cwd: fx.root, migrateSecrets: false }).config.sessions.archiveRotate;
 		check(
 			"a partial block is filled from the defaults",
-			merged.enabled === true && merged.gzipAfterDays === 7 && merged.deleteAfterDays === 30,
+			merged.enabled === true && merged.gzipAfterDays === 7 && merged.deleteAfterDays === 30 && merged.maxBytes === 0,
 			merged,
 		);
 		fs.rmSync(fx.root, { recursive: true, force: true });
@@ -633,6 +661,363 @@ try {
 	}
 
 	// -------------------------------------------------------------------------
+	section("archive byte cap: everything fits, so nothing is deleted");
+	{
+		const fx = fixture("cap-under");
+		const first = archiveDir(fx, "sessions-archive-20260401-0000");
+		const second = archiveDir(fx, "sessions-archive-20260402-0000");
+		const a = path.join(first, "a.jsonl");
+		const b = path.join(second, "b.jsonl");
+		const c = path.join(first, "c.jsonl");
+		writeBytes(a, 100);
+		writeBytes(b, 100);
+		writeBytes(c, 100);
+		age(a, 20);
+		age(b, 10);
+		age(c, 5);
+		const result = await rotateSessionArchives({
+			stateDir: fx.stateDir,
+			enabled: true,
+			gzipAfterDays: 365,
+			deleteAfterDays: 365,
+			maxBytes: 1_000,
+			log: silent,
+		});
+		check("nothing is deleted by the cap", result.deletedByCap === 0 && result.deleted === 0, result);
+		check("no file is over the cap", result.overCapBefore === 0 && result.overCapAfter === 0 && result.capBytes === 1_000, result);
+		check("all files are still present", exists(a) && exists(b) && exists(c), fs.readdirSync(first).concat(fs.readdirSync(second)));
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("archive byte cap: the oldest files go until the total fits");
+	{
+		const fx = fixture("cap-over");
+		const first = archiveDir(fx, "sessions-archive-20260410-0000");
+		const second = archiveDir(fx, "sessions-archive-20260411-0000");
+		// 4 × 100 bytes = 400; a 250-byte cap must remove exactly the two oldest.
+		const oldest = path.join(first, "2026-04-01_oldest.jsonl");
+		const older = path.join(second, "2026-04-02_older.jsonl");
+		const newer = path.join(first, "2026-04-03_newer.jsonl");
+		const newest = path.join(second, "2026-04-04_newest.jsonl");
+		writeBytes(oldest, 100);
+		writeBytes(older, 100);
+		writeBytes(newer, 100);
+		writeBytes(newest, 100);
+		age(oldest, 20);
+		age(older, 15);
+		age(newer, 10);
+		age(newest, 5);
+		const result = await rotateSessionArchives({
+			stateDir: fx.stateDir,
+			enabled: true,
+			gzipAfterDays: 365,
+			deleteAfterDays: 365,
+			maxBytes: 250,
+			log: silent,
+		});
+		check("the two oldest files are deleted", !exists(oldest) && !exists(older), result.entries);
+		check("the newest files are untouched", exists(newer) && exists(newest), result.entries);
+		check(
+			"the exact cap set and counters are reported",
+			result.deletedByCap === 2 &&
+				result.deletedByAge === 0 &&
+				result.deleted === 2 &&
+				result.freedBytes === 200 &&
+				result.overCapBefore === 150 &&
+				result.overCapAfter === 0,
+			result,
+		);
+		check(
+			"every deleted entry carries reason cap",
+			result.entries.filter((entry) => entry.action === "deleted").every((entry) => entry.reason === "cap"),
+			result.entries,
+		);
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("archive byte cap: a file younger than 2 days is never deleted");
+	{
+		const fx = fixture("cap-young");
+		const dir = archiveDir(fx, "sessions-archive-20260420-0000");
+		const oldestYoung = path.join(dir, "2026-04-20_a_oldest-young.jsonl");
+		const middleYoung = path.join(dir, "2026-04-20_b_middle-young.jsonl");
+		const newestYoung = path.join(dir, "2026-04-20_c_newest-young.jsonl");
+		for (const file of [oldestYoung, middleYoung, newestYoung]) writeBytes(file, 100);
+		// All three are younger than the 2-day guard, and the oldest mtime is
+		// still younger than 2 days: the cap cannot delete any of them.
+		age(oldestYoung, 1.9);
+		age(middleYoung, 1.0);
+		age(newestYoung, 0.5);
+		const allYoung = await rotateSessionArchives({
+			stateDir: fx.stateDir,
+			enabled: true,
+			gzipAfterDays: 365,
+			deleteAfterDays: 365,
+			maxBytes: 100,
+			log: silent,
+		});
+		check(
+			"far over the cap but all files are younger than 2 days: nothing is deleted",
+			allYoung.deletedByCap === 0 && allYoung.deleted === 0,
+			allYoung,
+		);
+		check(
+			"the young files survive and the over-cap volume is reported",
+			exists(oldestYoung) && exists(middleYoung) && exists(newestYoung) && allYoung.overCapBefore === 200 && allYoung.overCapAfter === 200,
+			allYoung,
+		);
+
+		// Old files carry the over-cap part; the young file must still survive
+		// even when deleting every eligible old file leaves the archives over cap.
+		const oldA = path.join(dir, "2026-04-01_old-a.jsonl");
+		const oldB = path.join(dir, "2026-04-02_old-b.jsonl");
+		writeBytes(oldA, 100);
+		writeBytes(oldB, 100);
+		age(oldA, 10);
+		age(oldB, 9);
+		const mixed = await rotateSessionArchives({
+			stateDir: fx.stateDir,
+			enabled: true,
+			gzipAfterDays: 365,
+			deleteAfterDays: 365,
+			maxBytes: 50,
+			log: silent,
+		});
+		check("the eligible old files are deleted by the cap", !exists(oldA) && !exists(oldB) && mixed.deletedByCap === 2, mixed.entries);
+		// 500 bytes before, 200 deleted by the cap, cap 50: 250 bytes still over it.
+		check("the young file survives even though the archives stay over cap", exists(oldestYoung) && mixed.overCapAfter === 250, mixed);
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("archive byte cap: mtime ties are broken by name, then directory");
+	{
+		const fx = fixture("cap-tie");
+		const dir = archiveDir(fx, "sessions-archive-20260501-0000");
+		const a = path.join(dir, "a.jsonl");
+		const b = path.join(dir, "b.jsonl");
+		writeBytes(a, 100);
+		writeBytes(b, 100);
+		const sameMtime = new Date(Date.now() - 10 * DAY_MS);
+		fs.utimesSync(a, sameMtime, sameMtime);
+		fs.utimesSync(b, sameMtime, sameMtime);
+		const byName = await rotateSessionArchives({
+			stateDir: fx.stateDir,
+			enabled: true,
+			gzipAfterDays: 365,
+			deleteAfterDays: 365,
+			maxBytes: 100,
+			log: silent,
+		});
+		check("the name-ascending file is deleted first", !exists(a) && exists(b), byName.entries);
+
+		const firstDir = archiveDir(fx, "sessions-archive-20260502-0000");
+		const secondDir = archiveDir(fx, "sessions-archive-20260503-0000");
+		const fromFirst = path.join(firstDir, "same.jsonl");
+		const fromSecond = path.join(secondDir, "same.jsonl");
+		writeBytes(fromFirst, 100);
+		writeBytes(fromSecond, 100);
+		// Older than the previous pair, so the two `same.jsonl` files tie with
+		// each other and the directory name is the only remaining tie-breaker.
+		const dirTieMtime = new Date(Date.now() - 12 * DAY_MS);
+		fs.utimesSync(fromFirst, dirTieMtime, dirTieMtime);
+		fs.utimesSync(fromSecond, dirTieMtime, dirTieMtime);
+		const byDir = await rotateSessionArchives({
+			stateDir: fx.stateDir,
+			enabled: true,
+			gzipAfterDays: 365,
+			deleteAfterDays: 365,
+			maxBytes: 200,
+			log: silent,
+		});
+		check("the directory-ascending file is deleted first on a full tie", !exists(fromFirst) && exists(fromSecond), byDir.entries);
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("archive byte cap --dry-run changes nothing and reports the cap plan");
+	{
+		const fx = fixture("cap-dry-run");
+		const first = archiveDir(fx, "sessions-archive-20260601-0000");
+		const second = archiveDir(fx, "sessions-archive-20260602-0000");
+		const files = [
+			path.join(first, "a.jsonl"),
+			path.join(first, "b.jsonl"),
+			path.join(second, "c.jsonl"),
+			path.join(second, "d.jsonl"),
+		];
+		for (const file of files) writeBytes(file, 100);
+		age(files[0]!, 20);
+		age(files[1]!, 15);
+		age(files[2]!, 10);
+		age(files[3]!, 5);
+		// The live transcript is old enough for every rule, yet it is never scanned.
+		const live = path.join(fx.sessions, "2026-06-01T00-00-00-000Z_live.jsonl");
+		writeTranscript(live);
+		age(live, 40);
+		const liveStats = fs.statSync(live);
+		const before = treeSnapshot(fx.root);
+		const result = await rotateSessionArchives({
+			stateDir: fx.stateDir,
+			enabled: false,
+			dryRun: true,
+			gzipAfterDays: 365,
+			deleteAfterDays: 365,
+			maxBytes: 200,
+			log: silent,
+		});
+		check(
+			"the plan deletes the two oldest files by cap",
+			result.deletedByCap === 2 && result.entries.filter((entry) => entry.action === "deleted" && entry.reason === "cap").length === 2,
+			result.entries,
+		);
+		check(
+			"the cap counters project the resulting volume",
+			result.capBytes === 200 && result.overCapBefore === 200 && result.overCapAfter === 0 && result.freedBytes === 200,
+			result,
+		);
+		check("nothing changed on disk at all", treeSnapshot(fx.root) === before, treeSnapshot(fx.root));
+		check(
+			"no .gz and no temp file was created",
+			treeSnapshot(fx.root) === before && !treeSnapshot(fx.root).includes(".gz") && !treeSnapshot(fx.root).includes(".tmp-"),
+			treeSnapshot(fx.root),
+		);
+		const afterLive = fs.statSync(live);
+		check(
+			"the live sessions file keeps its size and mtime",
+			exists(live) && afterLive.size === liveStats.size && afterLive.mtimeMs === liveStats.mtimeMs,
+			{ before: liveStats.mtimeMs, after: afterLive.mtimeMs },
+		);
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("archive byte cap: the live sessions dir is untouched by a real run");
+	{
+		const fx = fixture("cap-live");
+		const dir = archiveDir(fx, "sessions-archive-20260701-0000");
+		const archived = path.join(dir, "2026-07-01_old.jsonl");
+		writeBytes(archived, 100);
+		age(archived, 40);
+		const live = path.join(fx.sessions, "2026-07-01T00-00-00-000Z_live.jsonl");
+		writeTranscript(live);
+		age(live, 40);
+		const liveStats = fs.statSync(live);
+		const result = await rotateSessionArchives({
+			stateDir: fx.stateDir,
+			enabled: true,
+			gzipAfterDays: 365,
+			deleteAfterDays: 365,
+			maxBytes: 50,
+			log: silent,
+		});
+		const afterLive = fs.statSync(live);
+		check("the archive file is deleted by the cap", !exists(archived) && result.deletedByCap === 1, result.entries);
+		check(
+			"the live transcript keeps its existence, size and mtime",
+			exists(live) && afterLive.size === liveStats.size && afterLive.mtimeMs === liveStats.mtimeMs && fs.readdirSync(fx.sessions).length === 1,
+			{ before: liveStats.mtimeMs, after: afterLive.mtimeMs, files: fs.readdirSync(fx.sessions) },
+		);
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("archive byte cap: age deletion and cap deletion never overlap");
+	{
+		const fx = fixture("cap-no-double");
+		const dir = archiveDir(fx, "sessions-archive-20260801-0000");
+		const ageOne = path.join(dir, "2026-08-01_age-40.jsonl");
+		const ageTwo = path.join(dir, "2026-08-02_age-20.jsonl");
+		const capOnly = path.join(dir, "2026-08-03_cap-10.jsonl");
+		const young = path.join(dir, "2026-08-04_young.jsonl");
+		for (const file of [ageOne, ageTwo, capOnly, young]) writeBytes(file, 100);
+		age(ageOne, 40);
+		age(ageTwo, 20);
+		age(capOnly, 10);
+		age(young, 1);
+		const result = await rotateSessionArchives({
+			stateDir: fx.stateDir,
+			enabled: true,
+			gzipAfterDays: 365,
+			deleteAfterDays: 15,
+			maxBytes: 100,
+			log: silent,
+		});
+		const deletedEntries = result.entries.filter((entry) => entry.action === "deleted");
+		const paths = deletedEntries.map((entry) => entry.path);
+		check(
+			"the two age-eligible files are deleted by age, the 10-day file by cap",
+			!exists(ageOne) &&
+				!exists(ageTwo) &&
+				!exists(capOnly) &&
+				result.deletedByAge === 2 &&
+				result.deletedByCap === 1 &&
+				result.deleted === 3,
+			result,
+		);
+		check(
+			"each file appears exactly once and never with two reasons",
+			new Set(paths).size === paths.length && deletedEntries.every((entry) => entry.reason === "age" || entry.reason === "cap"),
+			deletedEntries,
+		);
+		check(
+			"the age deletion did not leak into the cap counter",
+			deletedEntries.filter((entry) => entry.reason === "age").length === 2 &&
+				deletedEntries.filter((entry) => entry.reason === "cap").length === 1,
+			deletedEntries,
+		);
+		check("the young file survives", exists(young), result.entries);
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("archive byte cap wins over gzip for the same file");
+	{
+		const fx = fixture("cap-vs-gzip");
+		const dir = archiveDir(fx, "sessions-archive-20260901-0000");
+		const file = path.join(dir, "2026-09-01_ten-days.jsonl");
+		writeBytes(file, 100);
+		age(file, 10);
+		const result = await rotateSessionArchives({
+			stateDir: fx.stateDir,
+			enabled: true,
+			gzipAfterDays: 5,
+			deleteAfterDays: 365,
+			maxBytes: 50,
+			log: silent,
+		});
+		check(
+			"the file is deleted by the cap, not gzipped",
+			!exists(file) && !exists(`${file}.gz`) && result.gzipped === 0 && result.deletedByCap === 1,
+			{ entries: result.entries, files: fs.readdirSync(fx.stateDir) },
+		);
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("archive usage reports the byte cap without changing anything");
+	{
+		const fx = fixture("cap-stats");
+		const dir = archiveDir(fx, "sessions-archive-20261001-0000");
+		const a = path.join(dir, "a.jsonl");
+		const b = path.join(dir, "b.jsonl");
+		writeBytes(a, 100);
+		writeBytes(b, 50);
+		age(a, 10);
+		age(b, 2);
+		const noCap = measureSessionArchives(fx.stateDir);
+		check("maxBytes 0 means no cap part", noCap.capBytes === 0 && noCap.overCapBytes === 0, noCap);
+		const under = measureSessionArchives(fx.stateDir, { maxBytes: 500 });
+		check("under the cap overCapBytes is 0", under.capBytes === 500 && under.overCapBytes === 0, under);
+		const over = measureSessionArchives(fx.stateDir, { maxBytes: 100 });
+		check("over the cap the excess is reported exactly", over.capBytes === 100 && over.overCapBytes === 50, over);
+		check("measurement changed nothing", measureSessionArchives(fx.stateDir, { maxBytes: 100 }).bytes === 150 && exists(a) && exists(b));
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
 	section("a failed gzip of an archive file is a warning, not a failure");
 	{
 		const fx = fixture("rotate-error");
@@ -746,14 +1131,19 @@ try {
 				"dryRun",
 				"gzipAfterDays",
 				"deleteAfterDays",
+				"capBytes",
 				"stateDir",
 				"dirs",
 				"files",
 				"gzipped",
 				"deleted",
+				"deletedByAge",
+				"deletedByCap",
 				"removedTemps",
 				"removedDirs",
 				"bytesBefore",
+				"overCapBefore",
+				"overCapAfter",
 				"bytesAfter",
 				"freedBytes",
 				"entries",
@@ -777,10 +1167,49 @@ try {
 		const stats = JSON.parse(await runCli(fx.root, ["sessions", "stats", "--json"])) as Record<string, unknown>;
 		const archives = stats.archives as Record<string, unknown>;
 		check(
-			"stats json carries archives",
-			Boolean(archives) && archives.dirs === 1 && archives.files === 1 && typeof archives.bytes === "number" && archives.oldestAgeDays !== null,
+			"stats json carries archives and the cap fields",
+			Boolean(archives) &&
+				archives.dirs === 1 &&
+				archives.files === 1 &&
+				typeof archives.bytes === "number" &&
+				archives.oldestAgeDays !== null &&
+				archives.capBytes === 0 &&
+				archives.overCapBytes === 0,
 			archives,
 		);
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("alive sessions gc --dry-run and stats render the cap in text");
+	{
+		const fx = fixture("cap-cli-text");
+		const dir = archiveDir(fx, "sessions-archive-20261101-0000");
+		const oldest = path.join(dir, "2026-11-01_oldest.jsonl");
+		const newest = path.join(dir, "2026-11-02_newest.jsonl");
+		writeBytes(oldest, 200);
+		writeBytes(newest, 100);
+		age(oldest, 10);
+		age(newest, 5);
+		fs.writeFileSync(
+			path.join(fx.root, "alive.config.json"),
+			JSON.stringify({ sessions: { archiveRotate: { maxBytes: 150 } } }),
+			"utf8",
+		);
+		const gc = await runCli(fx.root, ["sessions", "gc", "--dry-run"]);
+		check(
+			"the dry run prints the cap volume and the projected volume",
+			gc.includes("cap: max 150 B, archives 300 B, over cap by 150 B; would delete 1 file(s) oldest first, 300 B -> 100 B"),
+			gc,
+		);
+		check("the dry run marks the over-cap deletion", gc.includes("would delete (over cap) sessions-archive-20261101-0000/2026-11-01_oldest.jsonl"), gc);
+		const stats = await runCli(fx.root, ["sessions", "stats"]);
+		check(
+			"stats prints cap and over-cap bytes",
+			stats.includes("archives: 1 dir(s), 2 file(s), 300 B, oldest 10.0d, cap 150 B, over cap by 150 B"),
+			stats,
+		);
+		check("the dry run still changed nothing", exists(oldest) && exists(newest) && !exists(`${oldest}.gz`));
 		fs.rmSync(fx.root, { recursive: true, force: true });
 	}
 
