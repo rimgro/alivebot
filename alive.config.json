@@ -40,6 +40,14 @@
   "health": {
     "silentMs": 300000
   },
+  "sessions": {
+    "archiveRotate": {
+      "enabled": true,
+      "gzipAfterDays": 7,
+      "deleteAfterDays": 3650,
+      "maxBytes": 0
+    }
+  },
   "budget": {
     "maxDailyCostUsd": 0,
     "maxWakesPerHour": 0
