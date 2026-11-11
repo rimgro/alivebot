@@ -493,6 +493,7 @@ const bot = { botId: 999, botUsername: "alive_bot", ingestEdits: true };
 	const replied = normalizeUpdate(replyToBot, bot);
 	check("a reply to the bot expects a reply", replied?.expectsReply === true);
 	check("the quoted message is included", replied?.promptText.includes("earlier") === true, replied?.promptText);
+	check("onboarding evidence keeps the current user's body separate from the quoted reply", replied?.payload.userText === "and this?", replied?.payload.userText);
 	check("requireMentionInGroups keeps replies to the bot", normalizeUpdate(replyToBot, { ...bot, requireMentionInGroups: true })?.expectsReply === true);
 
 	const command: TelegramUpdate = {

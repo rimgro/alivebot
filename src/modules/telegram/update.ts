@@ -148,6 +148,7 @@ export function normalizeUpdate(update: TelegramUpdate, options: NormalizeOption
 			: `message from ${author?.name ?? "unknown"} in ${chatLabel(chat)}`,
 		payload: {
 			module: "telegram",
+			userText: text,
 			updateId: update.update_id,
 			updateType,
 			chat: { id: chat.id, type: chat.type, title: chat.title, username: chat.username },
@@ -198,6 +199,7 @@ function normalizeCallback(update: TelegramUpdate): NormalizedInbound | undefine
 		eventTitle: `button pressed by ${displayName(query.from)} in ${chatLabel(chat)}`,
 		payload: {
 			module: "telegram",
+			userText: text,
 			updateId: update.update_id,
 			updateType: "callback_query",
 			chat: { id: chat.id, type: chat.type, title: chat.title, username: chat.username },
