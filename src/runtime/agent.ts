@@ -11,6 +11,7 @@ import type { PolicyStore } from "../store/policy.js";
 import { runTurnCount, type ContextResetReason, type RunLog, type RunProviderError, type RunRecord, type RunStoppedBy, type RunStopReason } from "../store/runs.js";
 import type { ThreadStore } from "../store/threads.js";
 import { renderAwakePrompt, renderInterruptPrompt, renderLongRunWarning, renderNudgePrompt } from "./prompt.js";
+import { onboardingContext } from "../store/onboarding.js";
 import { TurnTraceRecorder, hasUsage, residualUsage } from "./run-trace.js";
 import type { RunAnomalyEvent, RunEventSink } from "../store/run-events.js";
 import { hasWakeWorthyPending } from "./wake.js";
@@ -1131,11 +1132,17 @@ export class AgentRunner {
 	}
 
 	private async renderAwake(run: RunHandle, redeliveryRange: { fromSeq: number; toSeq: number } | undefined): Promise<string> {
-		return renderAwakePrompt(await this.promptInput(run, redeliveryRange));
+		return renderAwakePrompt(await this.promptInput(run, redeliveryRange)) + this.conversationPreferences(run.events.slice(-this.deps.config.config.loop.maxEventsPerIdle));
+	}
+
+	private conversationPreferences(events: AliveEvent[]): string {
+		return this.deps.config.config.tools.allowlist.includes("onboarding")
+			? maskSecrets(onboardingContext(this.deps.config.paths.stateDir, events), this.deps.config.config.secrets)
+			: "";
 	}
 
 	private async renderNudge(run: RunHandle, redeliveryRange: { fromSeq: number; toSeq: number } | undefined): Promise<string> {
-		return renderNudgePrompt({ ...(await this.promptInput(run, redeliveryRange)), nudge: run.nudges });
+		return renderNudgePrompt({ ...(await this.promptInput(run, redeliveryRange)), nudge: run.nudges }) + this.conversationPreferences(run.events.slice(-this.deps.config.config.loop.maxEventsPerIdle));
 	}
 
 	private async promptInput(run: RunHandle, redeliveryRange: { fromSeq: number; toSeq: number } | undefined) {
@@ -1613,7 +1620,7 @@ export class AgentRunner {
 			run.interruptDeliveries += 1;
 			this.trackEvents(run, pending);
 			this.deps.log.info(`run #${run.index} notification interrupt`, { seqs: pending.map((e) => e.seq) });
-			await this.session.steer(renderInterruptPrompt(pending, this.deps.config.config.secrets));
+			await this.session.steer(renderInterruptPrompt(pending, this.deps.config.config.secrets) + this.conversationPreferences(pending));
 		} catch (err) {
 			this.deps.log.warn("interrupt delivery failed", { error: err instanceof Error ? err.message : String(err) });
 		} finally {
