@@ -25,11 +25,13 @@ export function createOnboardingTool(input: {
 			const events = input.currentEvents().filter(event => event.thread === params.thread && isOnboardingEvent(event));
 			const event = events.at(-1);
 			if (!event) throw new Error("Onboarding is only available for a current private human conversation");
-			const payload = event.payload as { module?: string; userText?: string } | undefined;
+			const payload = event.payload as { module?: string; userText?: string; transcription?: { status?: string; text?: string } } | undefined;
 			// Telegram event.text can include somebody else's quoted reply. Legacy
 			// events without the original body need a fresh human message for writes.
-			const humanText = payload?.module === "telegram" ? payload.userText : event.text;
-			if (params.action !== "status" && (params.event_id !== event.id || !params.evidence?.trim() || !humanText?.includes(params.evidence))) {
+			const humanTexts = payload?.module === "telegram"
+				? [payload.userText, ...(payload.transcription?.status === "transcribed" ? [payload.transcription.text] : [])]
+				: [event.text];
+			if (params.action !== "status" && (params.event_id !== event.id || !params.evidence?.trim() || !humanTexts.some(text => typeof text === "string" && text.includes(params.evidence!)))) {
 				throw new Error("Use the latest human event_id and an exact quote from its text as evidence");
 			}
 			if (params.action === "status" && params.preferences) throw new Error("status cannot change preferences");

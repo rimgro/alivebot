@@ -66,6 +66,11 @@ try {
 	await assert.rejects(async () => call(tool, { action: "update", thread: "telegram:42", event_id: "event-8", evidence: "пиши коротко", preferences: { detail: "коротко" } }), /exact quote/, "a quoted reply is not the current person's preference");
 	assert(!isOnboardingEvent({ ...event(8), payload: { forward: "someone else's message" } }));
 	assert(!isOnboardingEvent({ ...event(8), payload: { author: { isBot: true } } }));
+	current = [{ ...event(8), payload: { module: "telegram", userText: "(voice)", transcription: { status: "transcribed", text: "пиши подробнее" } } }];
+	await call(tool, { action: "update", thread: "telegram:42", event_id: "event-8", evidence: "пиши подробнее", preferences: { detail: "подробнее" } });
+	assert.equal(store.get("telegram:42").preferences.detail?.value, "подробнее", "successful voice transcript is eligible evidence");
+	current = [{ ...event(8), payload: { module: "telegram", userText: "(voice)", transcription: { status: "failed", text: "пиши подробнее" } } }];
+	await assert.rejects(async () => call(tool, { action: "update", thread: "telegram:42", event_id: "event-8", evidence: "пиши подробнее", preferences: { detail: "подробнее" } }), /exact quote/, "failed transcription cannot supply evidence");
 	current = [];
 	await assert.rejects(async () => call(tool, { action: "status", thread: "telegram:42" }), /current private/);
 	assert.deepEqual(store.change("telegram:42", "reset", event(9)).preferences, {});
