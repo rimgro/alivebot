@@ -18,7 +18,7 @@ and `focus` preferences. Values are limited to 300 characters each. Each saved
 value carries an incoming event ID and sequence. Mutations require the latest
 eligible human event and an exact supporting quotation from its original body
 (not a quoted reply), or a successfully transcribed voice message. A failed
-transcription cannot supply evidence. Forwarded and bot-authored messages cannot drive intake.
+transcription cannot supply evidence. Forwarded messages, bot-authored messages, and inline button callbacks cannot drive intake.
 Legacy Telegram events without the original-body field need a fresh message for
 mutations. Whether that quotation
 actually supports the extracted preference remains an agent decision, not a

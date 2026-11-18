@@ -29,6 +29,7 @@ import type { AliveModule, ModuleContext } from "../events/api.js";
 import { Logger } from "../log.js";
 import { EventStore, type AliveEvent } from "../store/events.js";
 import { HistoryStore } from "../store/history.js";
+import { isOnboardingEvent } from "../store/onboarding.js";
 import { Outbox, type OutgoingMessage } from "../store/outbox.js";
 import type { ChatTransport } from "../transports/types.js";
 import { NullTransport } from "../transports/console.js";
@@ -3291,6 +3292,8 @@ section("telegram send_message buttons and managed-bot inline requests (#84, #85
 		const pressEvent = store.all().find((event) => (event.payload as { callbackQueryId?: string })?.callbackQueryId === "cb_yes");
 		check("the press keeps the same thread", pressEvent?.thread === "telegram:42", pressEvent?.thread);
 		check("the press event carries the callback data", (pressEvent?.payload as { data?: string })?.data === "yes", pressEvent?.payload);
+		check("нажатие кнопки не считается сообщением для онбординга", pressEvent !== undefined && !isOnboardingEvent(pressEvent));
+		check("событие кнопки не подставляет служебные данные в текст пользователя", (pressEvent?.payload as { userText?: string })?.userText === undefined);
 		check("the press keeps the author", (pressEvent?.payload as { author?: { id?: string } })?.author?.id === "7", pressEvent?.payload);
 		check(
 			"the client spinner is stopped with answerCallbackQuery",

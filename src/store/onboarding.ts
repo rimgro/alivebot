@@ -18,10 +18,10 @@ export interface OnboardingState {
 /** Only known private conversation routes; never start personal intake in a group. */
 export function isOnboardingEvent(event: AliveEvent): boolean {
 	if (event.kind !== "user_message" || !event.thread || event.expectsReply === false || event.wake === false) return false;
-	const payload = event.payload as { author?: { isBot?: boolean }; forward?: unknown } | undefined;
+	const payload = event.payload as { author?: { isBot?: boolean }; forward?: unknown; updateType?: string } | undefined;
 	if (payload?.author?.isBot || payload?.forward) return false;
 	if (event.thread.startsWith("telegram:")) {
-		return /^telegram:[1-9]\d*$/.test(event.thread) && event.meta?.chatType === "private";
+		return payload?.updateType !== "callback_query" && /^telegram:[1-9]\d*$/.test(event.thread) && event.meta?.chatType === "private";
 	}
 	return event.thread === "console" || event.thread === "local" || /^local:agent:[a-z0-9_-]+:operator$/.test(event.thread);
 }
