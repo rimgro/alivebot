@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { DEFAULT_CONFIG, DEFAULT_CONTRACT, loadConfig, resolveMemoryDatabasePath, validateProfileContextConfig, type AgentManagementPermissions, type LoadedConfig, type ProfileContextConfig } from "./config.js";
+import { DEFAULT_CONFIG, DEFAULT_CONTRACT, DEFAULT_SOUL, loadConfig, resolveMemoryDatabasePath, validateProfileContextConfig, type AgentManagementPermissions, type LoadedConfig, type ProfileContextConfig } from "./config.js";
 import { defaultTelegramTokenEnv, MASTER_TELEGRAM_TOKEN_ENV, migrateConfigSecrets, profileEnvSegment, readEnvFileValues } from "./config-secrets.js";
 import { snapshotRuntime, spawnBackground, stopRuntime, waitForRuntime, type StopInitiator } from "./runtime/daemon.js";
 import { sleep } from "./util.js";
@@ -103,7 +103,8 @@ export function createAgent(base: LoadedConfig, idInput: string, name?: string, 
 	config.modules.telegram.tokenEnv = defaultTelegramTokenEnv(id);
 	config.modules.grafana.token = "";
 	fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
-	fs.writeFileSync(soulPath, fs.readFileSync(base.paths.soulPath, "utf8"), { mode: 0o600 });
+	// A parent's identity and personal preferences are not a child-agent template.
+	fs.writeFileSync(soulPath, DEFAULT_SOUL, { mode: 0o600 });
 	// Contracts are per-agent onboarding artifacts; do not copy the creator's personal preferences.
 	fs.writeFileSync(contractPath, `# Role: ${role}\n\n${contract}\n`, { mode: 0o600 });
 	fs.mkdirSync(config.workspace, { recursive: true });

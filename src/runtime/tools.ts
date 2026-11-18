@@ -38,6 +38,9 @@ import { renderWorkerList, renderWorkerRecord, type WorkerManager } from "../wor
 import type { DashboardTool } from "../dashboard/tool.js";
 import { formatDuration, iso, parseTimeSpec, parseTimestamp, sleep, truncate } from "../util.js";
 import { renderIdleEvents, renderSleepOffer } from "./prompt.js"
+import { createOnboardingTool } from "./onboarding.js";
+import { createWritingGuideTool } from "./writing.js";
+import { onboardingContext } from "../store/onboarding.js";
 import { maskSecrets, maskValue } from "../secrets.js";
 
 /**
@@ -249,6 +252,8 @@ export const ALIVE_TOOL_NAMES = [
 	"list_reminders",
 	"cancel_reminder",
 	"note",
+	"onboarding",
+	"writing_guide",
 	"retain",
 	"memory",
 	"journal",
@@ -1034,7 +1039,8 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 							}
 						}
 						log.info("idle returned", { events: events.length, seqs: events.map((e) => e.seq) });
-						return ok(renderIdleEvents(events, deps.config.config.secrets), { events: events.length, seqs: events.map((e) => e.seq) });
+						const preferences = deps.config.config.tools.allowlist.includes("onboarding") ? onboardingContext(deps.config.paths.stateDir, events) : "";
+						return ok(renderIdleEvents(events, deps.config.config.secrets) + maskSecrets(preferences, deps.config.config.secrets), { events: events.length, seqs: events.map((e) => e.seq) });
 					}
 					const waited = Date.now() - startedAt;
 					if (until !== undefined && Date.now() >= until) {
@@ -1559,6 +1565,15 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 	});
 
 	return [
+		createOnboardingTool({
+			stateDir: deps.config.paths.stateDir,
+			currentEvents: () => {
+				const run = deps.getRun();
+				if (!run) return [];
+				return run.events.filter(event => !run.currentThreads || run.currentThreads.includes(event.thread ?? ""));
+			},
+		}),
+		createWritingGuideTool(),
 		webSearch,
 		...(deps.moduleTools.some(tool => tool.name === "browser") ? [] : [browser]),
 		sendMessage,

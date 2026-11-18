@@ -24,6 +24,7 @@ import { HistoryStore } from "../store/history.js";
 import { createAliveTools, type RunHandle, type ToolDeps } from "../runtime/tools.js";
 import { hasWakeWorthyPending } from "../runtime/wake.js";
 import { runActiveMs } from "../runtime/agent.js";
+import { OnboardingStore } from "../store/onboarding.js";
 
 let failures = 0;
 function check(name: string, condition: boolean, detail?: unknown): void {
@@ -156,11 +157,13 @@ section("idle returns pending events as tool output");
 {
 	run = makeRun(1);
 	store.beginRun(run.id);
-	event("hello from the world");
+	const incoming = event("hello from the world");
+	new OnboardingStore(config.paths.stateDir).change("console", "update", incoming, { detail: "idle-profile-sentinel" });
 	const started = Date.now();
 	const result = await call(idle, { reason: "wait for the user" });
 	check("idle returned quickly when an event was pending", Date.now() - started < 80, Date.now() - started);
 	check("idle output contains the event", result.content[0].text.includes("hello from the world"), result.content[0].text);
+	check("idle output includes the current conversation preferences", result.content[0].text.includes("idle-profile-sentinel"));
 	check("idle did not terminate the run", result.terminate !== true);
 	check("run recorded the idle return", run.idleReturns === 1);
 	check("idle is no longer blocked", run.idling === false);

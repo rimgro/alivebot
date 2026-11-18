@@ -39,6 +39,7 @@ import { hasWakeWorthyPending, WakeScheduler, wakeIntervalMs } from "../runtime/
 import { createAliveTools, type RunHandle, type ToolDeps } from "../runtime/tools.js";
 import { installCompactionGuard } from "../runtime/compaction.js";
 import { ToolAbortGate, writeToolAbortRequest } from "../runtime/tool-abort.js";
+import { OnboardingStore } from "../store/onboarding.js";
 
 let failures = 0;
 function check(name: string, condition: boolean, detail?: unknown): void {
@@ -318,6 +319,48 @@ section("policy-approved notifications are steered into a working run");
 	check("run counted the interrupt", (record?.interruptDeliveries ?? 0) === 1, record?.interruptDeliveries);
 }
 
+
+section("onboarding profiles reach awake, nudge and interrupt for their own conversation");
+{
+	drainInbox();
+	policy.reset();
+	const profiles = new OnboardingStore(config.paths.stateDir);
+	const seed = (thread: string, value: string) => {
+		const incoming = store.append({ kind: "user_message", source: "test", priority: "normal", title: "preference", text: value, thread, expectsReply: true });
+		profiles.change(thread, "update", incoming, { detail: value });
+		profiles.change(thread, "skip", incoming);
+	};
+	seed("console", "awake-profile-sentinel");
+	seed("local", "nudge-profile-sentinel");
+	seed("local:agent:reviewer:operator", "interrupt-profile-sentinel");
+	drainInbox();
+	store.append({ kind: "user_message", source: "test", priority: "normal", title: "first task", text: "do the first task", thread: "console", expectsReply: true });
+	let step = 0;
+	let checkedNudge = false;
+	let checkedInterrupt = false;
+	handler = async (session, prompt) => {
+		if (step++ === 0) {
+			check("awake includes its saved skip and preferences", prompt.includes("awake-profile-sentinel") && prompt.includes('"status":"skipped"'));
+			check("awake does not include another conversation's profile", !prompt.includes("nudge-profile-sentinel") && !prompt.includes("interrupt-profile-sentinel"));
+			store.append({ kind: "user_message", source: "test", priority: "normal", title: "next task", text: "new conversation while working", thread: "local", expectsReply: true });
+			await session.turn();
+			return;
+		}
+		checkedNudge = prompt.includes("YOU STOPPED WITHOUT IDLING") && prompt.includes("nudge-profile-sentinel");
+		check("new conversation preferences arrive through the nudge path", checkedNudge, prompt);
+		policy.add({ mode: "interrupt", thread: "local:agent:reviewer:operator" });
+		store.append({ kind: "user_message", source: "test", priority: "normal", title: "urgent", text: "interrupt task", thread: "local:agent:reviewer:operator", expectsReply: true });
+		session.emit({ type: "turn_end", toolResults: [], context: {} });
+		await new Promise(resolve => setTimeout(resolve, 30));
+		checkedInterrupt = session.steered.some(text => text.includes("interrupt-profile-sentinel"));
+		check("interrupt includes its conversation preferences", checkedInterrupt, session.steered);
+		await call(retainTool, { facts: [], scopes: [] });
+		await call(sleepTool, { summary: "profile paths checked", summary_md: "# Test summary\n" });
+	};
+	await runner.execute();
+	check("both follow-up paths were exercised", checkedNudge && checkedInterrupt);
+	policy.reset();
+}
 
 // ---------------------------------------------------------------------------
 // run health: soft warning + anomaly events instead of a wall-clock kill (#127)
