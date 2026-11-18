@@ -1556,7 +1556,10 @@ Describe who this agent is, what work it owns, and what outcomes it should produ
 Describe what this agent should not do and when it should ask the user or administrator.
 
 ## Working relationship
-At first contact, ask the user how they prefer to communicate with you (language, tone, level of detail, and when to send updates). Record only the preferences they explicitly share here or in your private memory.
+Помоги с первым запросом. Язык и подробность подстраивай по разговору. Уточняй предпочтение, если оно существенно меняет следующий шаг. Сохраняй только явно сообщённые предпочтения в контракте или приватной памяти.
+
+## Границы делегирования
+Учитывай согласованные действия, лимиты и подтверждения. Если разрешения для следующего действия не хватает, уточни его. Уже согласованные действия выполняй без повторного запроса. Молчание и наличие инструмента сами по себе не дают разрешения.
 
 ## Knowledge sharing
 Keep knowledge private unless an explicitly shared scope is configured. Never copy another agent's private memories into your own.
