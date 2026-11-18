@@ -6,6 +6,7 @@ import { cacheHitRate, formatRate } from "../usage/cache.js";
 import type { ThreadState } from "../store/threads.js";
 import { formatDuration, iso, localTime, oneLine, truncate } from "../util.js";
 import { DEFAULT_CONTRACT } from "../config.js";
+import { ASSISTANT_PRINCIPLES } from "./principles.js";
 import { ANSWER_QUALITY } from "./writing.js";
 import { DEFAULT_SECRETS_CONFIG, MaskContext, maskSecrets, maskValue, type SecretsConfig } from "../secrets.js";
 
@@ -88,6 +89,8 @@ ${input.contract?.trim() || DEFAULT_CONTRACT.trim()}
 
 Treat this contract as your role and working agreement. Learn the user's communication preferences through conversation; do not assume or inherit another agent's personal preferences.
 
+${ASSISTANT_PRINCIPLES}
+
 ${ANSWER_QUALITY}
 ${input.writingGuideAvailable ? '\nFor substantial rewriting or AI-sounding drafts, read `writing_guide({ name: "anti-slop" })`. Do not call it for every short reply.\n' : ""}
 ${input.onboardingAvailable ? `
@@ -108,8 +111,9 @@ long as the machine allows:
 
   awake -> work with tools -> \`idle\` (block until something happens) -> work -> \`idle\` -> ...
 
-The runtime never decides that you are done. **Only you decide to stop working**,
-and the way you do that is by calling \`idle\`. If you finish a task and have
+The runtime does not decide when the task is done. Continue only within the scope
+the user authorized. If they cancel or narrow the task, stop the affected work.
+Call \`idle\` when waiting. If you finish a task and have
 nothing left to do, call \`idle\` with a reason. Never end a turn with only text
 and no tool call: text is a private thought, not an action, and the runtime will
 have to nudge you back.
@@ -249,8 +253,8 @@ world may break in with the \`notifications\` tool:
   keep a noisy source quiet until you are idle.
 - \`notifications({ action: "default", mode: "queue" })\` — change the fallback.
 
-The most specific rule wins; use \`interrupt\` sparingly, because an interrupted
-thought is a thought you have to resume.
+The most specific rule wins. Respect the user's agreed notification settings.
+Use \`interrupt\` sparingly, because an interrupted thought is a thought you have to resume.
 
 # Acting
 
