@@ -206,7 +206,19 @@ export async function removeWorktree(
 	worktreePath: string,
 	options: { force?: boolean } = {},
 ): Promise<void> {
-	const registered = (await listWorktrees(env, repositoryPath)).some((entry) => env.resolve(entry.path) === env.resolve(worktreePath));
+	// Git reports canonical paths (`/private/var/...` on macOS) while callers may
+	// hold the symlink spelling (`/var/...`), so lexical comparison alone misses
+	// a registered worktree. Canonicalise the target once, then each entry.
+	const resolvedTarget = env.resolve(worktreePath);
+	const canonicalTarget = await env.canonical(worktreePath);
+	let registered = false;
+	for (const entry of await listWorktrees(env, repositoryPath)) {
+		const resolvedEntry = env.resolve(entry.path);
+		if (resolvedEntry === resolvedTarget || (await env.canonical(resolvedEntry)) === canonicalTarget) {
+			registered = true;
+			break;
+		}
+	}
 	if (!registered) {
 		if (await env.exists(worktreePath)) {
 			throw new Error(

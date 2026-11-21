@@ -24,7 +24,7 @@ import { WorkerManager, renderWorkerRecord } from "../workers/manager.js";
 import { MAX_PROVIDER_RETRY_DELAY_MS, isTransientProviderError, providerRetryDelayMs } from "../workers/retry.js";
 import type { WorkerSession, WorkerSessionFactory } from "../workers/session.js";
 import { WorkerStore } from "../workers/store.js";
-import { assertWorkerWorktreeIsSecretFree, baseBranchName, createWorktree, gitDiff, removeWorktree } from "../workers/worktree.js";
+import { assertWorkerWorktreeIsSecretFree, baseBranchName, createWorktree, gitDiff, listWorktrees, removeWorktree } from "../workers/worktree.js";
 import { createHostWorkerEnvironment } from "../workers/environment.js";
 import type { SandboxManager } from "../sandbox/manager.js";
 import { createSandboxTools } from "../sandbox/tools.js";
@@ -643,6 +643,98 @@ section("standalone worktree helpers");
 	await removeWorktree(env, helperRepo, worktree, { force: true });
 	check("helper removed worktree", !fs.existsSync(worktree));
 	fs.rmSync(helperRepo, { recursive: true, force: true });
+}
+
+section("canonical worktree paths (#235)");
+{
+	// Git reports realpath-canonical worktrees (macOS `/var` -> `/private/var`).
+	// Callers may hold the symlinked spelling, so removal must compare canonical paths.
+	const realRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-worker-canonical-"));
+	const linkRoot = `${realRoot}-link`;
+	let linked = false;
+	try {
+		fs.symlinkSync(realRoot, linkRoot, "dir");
+		linked = true;
+	} catch (error) {
+		fs.rmSync(realRoot, { recursive: true, force: true });
+		process.stdout.write(
+			`  skip  canonical worktree removal — this platform cannot create a directory symlink: ${
+				error instanceof Error ? error.message : String(error)
+			}\n`,
+		);
+	}
+	if (linked) {
+		try {
+			const repo = path.join(realRoot, "repo");
+			fs.mkdirSync(repo);
+			git(repo, ["init"]);
+			git(repo, ["config", "user.email", "worker-test@example.com"]);
+			git(repo, ["config", "user.name", "Worker Test"]);
+			fs.writeFileSync(path.join(repo, "file.txt"), "one\n");
+			git(repo, ["add", "file.txt"]);
+			git(repo, ["commit", "-m", "initial"]);
+			const linkRepo = path.join(linkRoot, "repo");
+			const linkWorktree = path.join(linkRepo, ".worktrees", "canonical");
+			const env = createHostWorkerEnvironment(repo);
+			await createWorktree(env, {
+				repositoryPath: linkRepo,
+				worktreePath: linkWorktree,
+				branch: "canonical-probe",
+				baseRef: "HEAD",
+			});
+			const registered = await listWorktrees(env, linkRepo);
+			check(
+				"git reports the canonical worktree path, not the symlink spelling",
+				registered.some((entry) => entry.path === path.join(repo, ".worktrees", "canonical")) &&
+					!registered.some((entry) => entry.path.startsWith(linkRoot)),
+				registered,
+			);
+			const failingEnv = {
+				...env,
+				canonical: async (): Promise<string> => {
+					throw new Error("canonical probe failed");
+				},
+			};
+			await expectReject(
+				"a canonicalisation failure deletes nothing",
+				() => removeWorktree(failingEnv, linkRepo, linkWorktree),
+				"canonical probe failed",
+			);
+			check("the worktree survives a canonicalisation failure", fs.existsSync(linkWorktree));
+			await removeWorktree(env, linkRepo, linkWorktree);
+			check("a registered worktree is removed through its symlinked spelling", !fs.existsSync(linkWorktree));
+			check(
+				"git no longer lists the removed worktree",
+				!(await listWorktrees(env, linkRepo)).some((entry) => entry.path.endsWith(path.join(".worktrees", "canonical"))),
+			);
+		} finally {
+			fs.rmSync(realRoot, { recursive: true, force: true });
+			fs.rmSync(linkRoot, { recursive: true, force: true });
+		}
+	}
+
+	// The guard stays strict: an existing directory that git does not know is
+	// never deleted automatically.
+	const guardRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-worker-unregistered-"));
+	try {
+		git(guardRoot, ["init"]);
+		git(guardRoot, ["config", "user.email", "worker-test@example.com"]);
+		git(guardRoot, ["config", "user.name", "Worker Test"]);
+		fs.writeFileSync(path.join(guardRoot, "file.txt"), "one\n");
+		git(guardRoot, ["add", "file.txt"]);
+		git(guardRoot, ["commit", "-m", "initial"]);
+		const stray = path.join(guardRoot, "not-a-worktree");
+		fs.mkdirSync(stray);
+		const env = createHostWorkerEnvironment(guardRoot);
+		await expectReject(
+			"an unregistered directory is still refused",
+			() => removeWorktree(env, guardRoot, stray, { force: true }),
+			"refusing to delete it automatically",
+		);
+		check("the unregistered directory is left in place", fs.existsSync(stray));
+	} finally {
+		fs.rmSync(guardRoot, { recursive: true, force: true });
+	}
 }
 
 section("provider failure classification");
