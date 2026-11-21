@@ -105,12 +105,13 @@ function sandboxEnvironment(sandbox: SandboxManager): WorkerEnvironment {
 		root: sandbox.workspaceDir,
 		resolve,
 		// Guest-side canonicalisation: `pwd -P` resolves symlinks inside the VM,
-		// where the host `fs` cannot see the path.
+		// where the host `fs` cannot see the path. Anything but an absolute result
+		// is unusable for comparisons, so it falls back like a failed command.
 		canonical: async (target) => {
 			const absolute = resolve(target);
 			const result = await execute(`cd ${shellQuote(absolute)} && pwd -P`, 30_000);
 			const canonical = result.text.trim();
-			if (result.code !== 0 || !canonical) return absolute;
+			if (result.code !== 0 || !canonical.startsWith("/")) return absolute;
 			return canonical;
 		},
 		join: (...parts) => path.posix.join(...parts),
