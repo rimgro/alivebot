@@ -28,6 +28,7 @@ import {
 	interruptedResumeDecision,
 	isRunInterruption,
 	isRunStoppedBy,
+	isUsableRunRecord,
 	resumeFileUsable,
 	RUN_STOPPED_BY_VALUES,
 	RunLog,
@@ -632,6 +633,110 @@ section("run log: interrupted stops survive a resume (#185)");
 	check("the resumed usage record carries the interruption history", usageLog.last()?.interruptedBy?.length === 1, usageLog.last()?.interruptedBy);
 	fs.rmSync(usageRoot, { recursive: true, force: true });
 	fs.rmSync(interruptedRoot, { recursive: true, force: true });
+}
+
+section("run log: zeroed records left by a hard crash are skipped on read (#242)");
+{
+	const runRecord = (id: string, index: number, startedAt: number, stopReason: RunStopReason = "slept"): RunRecord => ({
+		id,
+		index,
+		startedAt,
+		finishedAt: startedAt + 60_000,
+		durationMs: 60_000,
+		activeMs: 60_000,
+		idleMs: 0,
+		stopReason,
+		events: [],
+		outbound: [],
+		remindersCreated: [],
+		notesTouched: [],
+		journalEntries: 0,
+		idleReturns: 0,
+		interruptDeliveries: 0,
+		nudges: 0,
+		turnCount: 1,
+		promptChars: 0,
+		usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, total: 15, cost: 0.001 },
+	});
+
+	// The predicate on its own: no identity or no usable start time means the
+	// line is crash debris, not a run.
+	const good = runRecord("run_ok", 1, 1_700_000_000_000);
+	check("the predicate accepts a record with an id and a start time", isUsableRunRecord(good));
+	check("the predicate rejects an empty object", !isUsableRunRecord({}));
+	check("the predicate rejects a bare string", !isUsableRunRecord("run_ok"));
+	check("the predicate rejects null", !isUsableRunRecord(null));
+	check("the predicate rejects undefined", !isUsableRunRecord(undefined));
+	check("the predicate rejects an empty id", !isUsableRunRecord({ ...good, id: "" }));
+	check("the predicate rejects a whitespace-only id", !isUsableRunRecord({ ...good, id: "   " }));
+	check("the predicate rejects a non-string id", !isUsableRunRecord({ ...good, id: 7 }));
+	check("the predicate rejects a zeroed start time", !isUsableRunRecord({ ...good, startedAt: 0 }));
+	check("the predicate rejects a missing start time", !isUsableRunRecord({ id: "run_ok" }));
+	check("the predicate rejects a non-numeric start time", !isUsableRunRecord({ ...good, startedAt: "1700000000000" }));
+	check("the predicate rejects a non-finite start time", !isUsableRunRecord({ ...good, startedAt: Number.NaN }) && !isUsableRunRecord({ ...good, startedAt: Number.POSITIVE_INFINITY }));
+	check("the predicate rejects an id carrying NUL bytes", !isUsableRunRecord({ ...good, id: "run_\u0000\u0000" }));
+
+	// A file as a kernel panic leaves it: valid line, zeroed line, a line cut by
+	// the crash (NUL-padded), valid line, and one more zeroed line at the end.
+	const crashRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-run-zeroed-test-"));
+	const crashFile = path.join(crashRoot, "runs", "runs.jsonl");
+	fs.mkdirSync(path.dirname(crashFile), { recursive: true });
+	const now = Date.now();
+	const before = runRecord("run_before_crash", 1, now - 120_000);
+	const after = runRecord("run_after_crash", 3, now - 60_000, "interrupted");
+	const zeroed = { ...before, id: "", index: 2, startedAt: 0, finishedAt: 0 };
+	const zeroedTail = { ...after, id: "", index: 4, startedAt: 0, finishedAt: 0 };
+	const partiallyWritten = `${JSON.stringify(after).slice(0, 40)}\u0000\u0000\u0000\u0000`;
+	fs.writeFileSync(
+		crashFile,
+		[JSON.stringify(before), JSON.stringify(zeroed), partiallyWritten, JSON.stringify(after), JSON.stringify(zeroedTail)].join("\n") + "\n",
+		"utf8",
+	);
+
+	const log = new RunLog(crashRoot);
+	const listed = log.list(10);
+	check(
+		"list() returns exactly the two usable records, in order",
+		listed.length === 2 && listed[0]?.id === before.id && listed[1]?.id === after.id,
+		listed.map((record) => record.id),
+	);
+	check("last() is the last usable record, not the zeroed tail", log.last()?.id === after.id, log.last()?.id);
+	check("a partially written line with NUL bytes does not throw on read", listed.every((record) => isUsableRunRecord(record)));
+	const continuedIndex = log.nextIndex();
+	check("numbering continues from the usable records only", continuedIndex === 3, continuedIndex);
+
+	// A resume replaces the usable record; the rewrite is what finally drops the debris.
+	const resumed = { ...after, stopReason: "slept" as RunStopReason, finishedAt: after.finishedAt + 30_000 };
+	log.record(resumed);
+	const afterResume = log.list(10);
+	const linesAfterResume = fs.readFileSync(crashFile, "utf8").split("\n").filter((line) => line.trim().length > 0);
+	check(
+		"record() replaces the usable record instead of resurrecting garbage",
+		afterResume.length === 2 && afterResume[1]?.id === after.id && afterResume[1]?.stopReason === "slept",
+		afterResume.map((record) => [record.id, record.stopReason]),
+	);
+	check("the atomic rewrite leaves only usable lines behind", linesAfterResume.length === 2 && linesAfterResume.every((line) => isUsableRunRecord(JSON.parse(line))), linesAfterResume.length);
+
+	// A brand-new record is appended once, and the debris stays gone.
+	const fresh = runRecord("run_fresh", continuedIndex, now);
+	log.record(fresh);
+	const afterFresh = log.list(10);
+	check(
+		"record() appends a new run once, with the debris still skipped",
+		afterFresh.length === 3 && afterFresh[2]?.id === fresh.id && afterFresh[2]?.index === continuedIndex,
+		afterFresh.map((record) => [record.id, record.index]),
+	);
+
+	// reclassify() must work on the usable record and never find a zeroed one.
+	check("reclassify() refuses the id of a zeroed record", log.reclassify("", "aborted", "interrupted") === undefined);
+	log.record({ ...after, stopReason: "interrupted", stoppedBy: "restart" });
+	check(
+		"reclassify() closes the usable record",
+		log.reclassify(after.id, "aborted", "interrupted")?.stopReason === "aborted" && log.last()?.id === fresh.id,
+		log.list(10).map((record) => [record.id, record.stopReason]),
+	);
+	check("reclassify() leaves one line per record after the rewrite", fs.readFileSync(crashFile, "utf8").split("\n").filter((line) => line.trim().length > 0).length === 3);
+	fs.rmSync(crashRoot, { recursive: true, force: true });
 }
 
 section("startup resume refuses a missing or empty session file (#173)");
