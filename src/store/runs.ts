@@ -442,6 +442,29 @@ export function runTurnCount(record: { turnCount?: unknown; turns?: unknown }): 
 	return Array.isArray(record.turns) ? record.turns.length : 0;
 }
 
+/**
+ * True when a value read from `runs.jsonl` is a run record readers can use
+ * (#242).
+ *
+ * A hard crash (kernel panic, power loss) can leave a line behind that parses
+ * as JSON but carries zeroed fields — `id: ""`, `startedAt: 0` — or a line that
+ * is only partially written. The runtime used to count such lines as runs, so
+ * numbering and any manual/scripted accounting over the file drifted. The
+ * predicate is deliberately shallow: it only proves the record has an identity
+ * and a start time, which is what numbering, replacement and `list()` need.
+ * Everything else on a record is already read defensively by helpers above.
+ */
+export function isUsableRunRecord(value: unknown): value is RunRecord {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const candidate = value as Record<string, unknown>;
+	if (typeof candidate.id !== "string") return false;
+	// NUL bytes inside a field mean the buffer was zeroed while being written.
+	if (candidate.id.trim().length === 0 || candidate.id.includes("\u0000")) return false;
+	if (typeof candidate.startedAt !== "number") return false;
+	if (!Number.isFinite(candidate.startedAt) || candidate.startedAt <= 0) return false;
+	return true;
+}
+
 /** What startup should do with the last persisted run (#124). */
 export type InterruptedResumeDecision = "none" | "resume" | "expire";
 
@@ -534,7 +557,21 @@ export class RunLog {
 		this.file = path.join(stateDir, "runs", "runs.jsonl");
 		this.usageFile = path.join(stateDir, "usage.json");
 		ensureDir(path.dirname(this.file));
-		this.index = readJsonl<RunRecord>(this.file).length;
+		this.index = this.readRecords().length;
+	}
+
+	/**
+	 * Read every usable run record from disk (#242).
+	 *
+	 * `readJsonl` already drops lines that do not parse — including a line
+	 * truncated or NUL-padded by a crash mid-write, which can never be valid
+	 * JSON — and this method drops the lines that parse but are zeroed records.
+	 * Every read path of `RunLog` goes through here, so garbage never takes part
+	 * in numbering, replacement, `list()`/`last()` or `reclassify()`, and the
+	 * next atomic rewrite removes it from the file for good.
+	 */
+	private readRecords(): RunRecord[] {
+		return readJsonl<unknown>(this.file).filter(isUsableRunRecord);
 	}
 
 	nextIndex(): number {
@@ -549,7 +586,7 @@ export class RunLog {
 	 * accumulate instead of resetting.
 	 */
 	record(record: RunRecord): void {
-		const all = readJsonl<RunRecord>(this.file);
+		const all = this.readRecords();
 		const previousIndex = all.findIndex((candidate) => candidate.id === record.id);
 		if (previousIndex === -1) {
 			appendJsonl(this.file, record);
@@ -588,7 +625,7 @@ export class RunLog {
 	 * outcome changed instead of only that it did.
 	 */
 	reclassify(id: string, to: RunStopReason, from?: RunStopReason, reason?: string): RunRecord | undefined {
-		const all = readJsonl<RunRecord>(this.file);
+		const all = this.readRecords();
 		const index = all.findIndex((candidate) => candidate.id === id && (from === undefined || candidate.stopReason === from));
 		if (index === -1) return undefined;
 		const updated = { ...all[index]!, stopReason: to, ...(reason ? { error: reason } : {}) };
@@ -604,8 +641,7 @@ export class RunLog {
 	}
 
 	list(limit = 20): RunRecord[] {
-		const all = readJsonl<RunRecord>(this.file);
-		return all.slice(-limit);
+		return this.readRecords().slice(-limit);
 	}
 
 	last(): RunRecord | undefined {
