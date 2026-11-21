@@ -53,10 +53,19 @@ function looseObjectPath(repo: string, hash: string): string {
 	return path.join(repo, ".git", "objects", hash.slice(0, 2), hash.slice(2));
 }
 
-function truncateLooseObject(repo: string, hash: string): void {
+/**
+ * Git writes loose objects read-only (mode 0444), so truncating one as a
+ * regular user fails with EACCES (issue #236). Restore the write bit on our
+ * throwaway fixture before emptying it, and report the mode we found so the
+ * test can prove the fixture really did it.
+ */
+function truncateLooseObject(repo: string, hash: string): { file: string; modeBefore: number } {
 	const file = looseObjectPath(repo, hash);
 	if (!fs.existsSync(file)) throw new Error(`expected a loose object at ${file}`);
+	const modeBefore = fs.statSync(file).mode;
+	fs.chmodSync(file, 0o644);
 	fs.writeFileSync(file, "");
+	return { file, modeBefore };
 }
 
 function expectAssertThrows(name: string, report: Parameters<typeof assertRepositoryIntegrity>[0], includes: string[]): void {
@@ -98,7 +107,18 @@ try {
 		const repo = makeRepo(root, "empty-head-blob");
 		commitFile(repo, "hello.txt", "hello\n", "initial commit");
 		const blob = git(repo, ["rev-parse", "HEAD:hello.txt"]);
-		truncateLooseObject(repo, blob);
+		const { file: blobFile, modeBefore } = truncateLooseObject(repo, blob);
+		const truncated = fs.statSync(blobFile);
+		check("the truncated fixture is empty", truncated.size === 0, truncated.size);
+		// git writes loose objects read-only (0444), so `fs.writeFileSync` needs the
+		// chmod above; assert the mode really changed. Where git already hands out a
+		// writable object the chmod is a no-op and there is nothing to verify.
+		if ((modeBefore & 0o200) === 0) {
+			check("the truncated fixture became writable", (truncated.mode & 0o200) !== 0, {
+				before: modeBefore.toString(8),
+				after: truncated.mode.toString(8),
+			});
+		}
 		const runner = createHostWorkerEnvironment(repo);
 		// Document why the scan exists: connectivity-only does not read blobs.
 		const connectivityOnly = execFileSync("git", ["fsck", "--connectivity-only", "--no-progress"], {
