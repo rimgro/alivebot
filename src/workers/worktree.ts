@@ -214,7 +214,7 @@ export async function removeWorktree(
 	let registered = false;
 	for (const entry of await listWorktrees(env, repositoryPath)) {
 		const resolvedEntry = env.resolve(entry.path);
-		if (resolvedEntry === resolvedTarget || (await env.canonical(resolvedEntry)) === canonicalTarget) {
+		if (resolvedEntry === resolvedTarget || (await env.canonical(entry.path)) === canonicalTarget) {
 			registered = true;
 			break;
 		}
