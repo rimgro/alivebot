@@ -21,6 +21,12 @@ export interface WorkerEnvironment {
 	readonly kind: "host" | "sandbox";
 	readonly root: string;
 	resolve(value: string): string;
+	/**
+	 * Canonical absolute path with symlinks resolved, used to compare paths
+	 * that git reports (macOS turns `/var/...` into `/private/var/...`).
+	 * Falls back to `resolve()` when the target does not exist.
+	 */
+	canonical(target: string): Promise<string>;
 	join(...parts: string[]): string;
 	dirname(value: string): string;
 	run(argv: string[], cwd: string, options?: { timeoutMs?: number }): Promise<{ stdout: string; stderr: string }>;
@@ -57,10 +63,19 @@ function hostEnvironment(root: string): WorkerEnvironment {
 			throw new Error(`${argv[0]} ${argv[1] ?? ""} failed: ${detail.slice(0, 4000)}`);
 		}
 	};
+	const resolve = (value: string): string => path.resolve(root, value || ".");
 	return {
 		kind: "host",
 		root,
-		resolve: (value) => path.resolve(root, value || "."),
+		resolve,
+		canonical: async (target) => {
+			const absolute = resolve(target);
+			try {
+				return await fs.promises.realpath(absolute);
+			} catch {
+				return absolute;
+			}
+		},
 		join: (...parts) => path.join(...parts),
 		dirname: (value) => path.dirname(value),
 		run,
@@ -84,10 +99,20 @@ function sandboxEnvironment(sandbox: SandboxManager): WorkerEnvironment {
 		}
 		return { stdout: result.text, stderr: "" };
 	};
+	const resolve = (value: string): string => sandbox.path(value || ".");
 	return {
 		kind: "sandbox",
 		root: sandbox.workspaceDir,
-		resolve: (value) => sandbox.path(value || "."),
+		resolve,
+		// Guest-side canonicalisation: `pwd -P` resolves symlinks inside the VM,
+		// where the host `fs` cannot see the path.
+		canonical: async (target) => {
+			const absolute = resolve(target);
+			const result = await execute(`cd ${shellQuote(absolute)} && pwd -P`, 30_000);
+			const canonical = result.text.trim();
+			if (result.code !== 0 || !canonical) return absolute;
+			return canonical;
+		},
 		join: (...parts) => path.posix.join(...parts),
 		dirname: (value) => path.posix.dirname(value),
 		run,
