@@ -376,6 +376,12 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
  * step is a context-sleep directive and no work happens; the fix is to start an
  * empty transcript and leave the old file untouched (memory lives in
  * `summary.md`, the journal, notes and reminders, not in the transcript).
+ *
+ * Independently of the token threshold, a transcript larger than
+ * `sessions.maxActiveBytes` is never resumed (#239). That is a plain file-size
+ * check, because the failure it prevents is a provider-side request/context
+ * rejection (413 / `context_length_exceeded`), where token estimation is both
+ * expensive and unnecessary. The same check applies to an explicit resume file.
  */
 export function openSessionManager(options: {
 	config: LoadedConfig;
@@ -385,29 +391,61 @@ export function openSessionManager(options: {
 }): { sessionManager: SessionManager; resumeFailure?: string } {
 	const { log } = options;
 	const { config: cfg, paths } = options.config;
+	const createSession = (): SessionManager => SessionManager.create(paths.workspaceDir, paths.sessionsDir);
+	// The file-size guard (#239) is independent of the token threshold: a huge
+	// transcript must never be reopened, even when `sleepTokens` is 0.
+	const oversized = (file: string): boolean => {
+		const limitBytes = cfg.sessions.maxActiveBytes;
+		if (!(limitBytes > 0)) return false;
+		let bytes: number;
+		try {
+			bytes = fs.statSync(file).size;
+		} catch {
+			// A file that disappeared between discovery and the check is not "too
+			// large": let the normal open/continue path report it as before.
+			return false;
+		}
+		if (bytes <= limitBytes) return false;
+		log.warn("active session is over the size limit; starting a new transcript and keeping the old file", {
+			sessionFile: file,
+			bytes,
+			limitBytes,
+		});
+		return true;
+	};
 	// Only the configured `continue` mode is guarded. An explicit `sessionFile`
-	// (resume of an interrupted run) keeps its own resume logic below.
+	// (resume of an interrupted run) has its own guard below.
 	const continueRecent = (): SessionManager => {
 		const threshold = resolveContextPolicy(cfg).sleepTokens;
-		const recent = threshold > 0 ? mostRecentSessionFile(paths.sessionsDir, paths.workspaceDir) : undefined;
+		const recent = threshold > 0 || cfg.sessions.maxActiveBytes > 0
+			? mostRecentSessionFile(paths.sessionsDir, paths.workspaceDir)
+			: undefined;
 		if (recent) {
-			const contextTokens = measureSessionFileContext(recent);
-			if (contextTokens > 0 && contextTokens >= threshold) {
-				log.warn(
-					"recent session is at the context-sleep threshold; starting a new transcript and keeping the old file",
-					{ sessionFile: recent, contextTokens, threshold },
-				);
-				return SessionManager.create(paths.workspaceDir, paths.sessionsDir);
+			if (oversized(recent)) return createSession();
+			// Token measurement reads the transcript tail, so only pay for it when
+			// the context-sleep threshold is actually enabled.
+			if (threshold > 0) {
+				const contextTokens = measureSessionFileContext(recent);
+				if (contextTokens > 0 && contextTokens >= threshold) {
+					log.warn(
+						"recent session is at the context-sleep threshold; starting a new transcript and keeping the old file",
+						{ sessionFile: recent, contextTokens, threshold },
+					);
+					return createSession();
+				}
 			}
 		}
 		return SessionManager.continueRecent(paths.workspaceDir, paths.sessionsDir);
 	};
 	// `forceNewSession` (a sleep) ignores the configured `continue` on purpose.
 	const fresh = () =>
-		cfg.session === "continue" && !options.forceNewSession
-			? continueRecent()
-			: SessionManager.create(paths.workspaceDir, paths.sessionsDir);
+		cfg.session === "continue" && !options.forceNewSession ? continueRecent() : createSession();
 	if (options.forceNewSession || !options.sessionFile) return { sessionManager: fresh() };
+	// An oversized explicit resume target starts a NEW transcript; the old file
+	// stays on disk. This bypasses `SessionManager.open` entirely, so it must not
+	// report a `resumeFailure` (the interrupted run is closed as slept, not as an
+	// aborted/corrupt resume).
+	if (oversized(options.sessionFile)) return { sessionManager: createSession() };
 	try {
 		return { sessionManager: SessionManager.open(options.sessionFile, paths.sessionsDir, paths.workspaceDir) };
 	} catch (error) {

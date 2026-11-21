@@ -29,6 +29,7 @@ import {
 	DEFAULT_LOOP_RESUME_WINDOW_MS,
 	DEFAULT_LOOP_SHUTDOWN_GRACE_MS,
 	DEFAULT_LOOP_TOOL_LONG_MS,
+	DEFAULT_MAX_ACTIVE_BYTES,
 	DEFAULT_SESSIONS_CONFIG,
 	EMPTY_WAKE_MAX_INTERVAL_MAX_MS,
 	EMPTY_WAKE_MAX_INTERVAL_MIN_MS,
@@ -1063,6 +1064,56 @@ section("sessions.archiveRotate: off by default, validated, merged from defaults
 		loadMessage.startsWith("sessions.archiveRotate.deleteAfterDays must be >="),
 		loadMessage || "accepted",
 	);
+	fs.rmSync(root, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+section("sessions.maxActiveBytes: 32 MiB by default, 0 disables, rejects invalid values (#239)");
+{
+	check(
+		"the default is 32 MiB and is exported",
+		DEFAULT_MAX_ACTIVE_BYTES === 32 * 1024 * 1024 &&
+			DEFAULT_SESSIONS_CONFIG.maxActiveBytes === DEFAULT_MAX_ACTIVE_BYTES &&
+			DEFAULT_CONFIG.sessions.maxActiveBytes === DEFAULT_MAX_ACTIVE_BYTES,
+		{ DEFAULT_MAX_ACTIVE_BYTES, sessions: DEFAULT_CONFIG.sessions },
+	);
+	const root = tempRoot("sessions-active-bytes");
+	const load = (): ReturnType<typeof loadConfig> =>
+		loadConfig({ cwd: root, secretLog: () => undefined, secretWarn: () => undefined });
+	check(
+		"a config without a sessions block inherits 32 MiB",
+		load().config.sessions.maxActiveBytes === DEFAULT_MAX_ACTIVE_BYTES,
+		load().config.sessions,
+	);
+	writeConfig(root, { sessions: { maxActiveBytes: 0 } });
+	check(
+		"0 is accepted and means disabled",
+		load().config.sessions.maxActiveBytes === 0 && validateSessionsConfig({ maxActiveBytes: 0 }).maxActiveBytes === 0,
+		load().config.sessions,
+	);
+	writeConfig(root, { sessions: { maxActiveBytes: 1_048_576 } });
+	check(
+		"an explicit whole number is kept while archiveRotate stays defaulted",
+		load().config.sessions.maxActiveBytes === 1_048_576 &&
+			load().config.sessions.archiveRotate.deleteAfterDays === DEFAULT_SESSIONS_CONFIG.archiveRotate.deleteAfterDays,
+		load().config.sessions,
+	);
+	const rejects: Array<[string, unknown]> = [
+		["a negative maxActiveBytes", -1],
+		["a fractional maxActiveBytes", 1.5],
+		["a string maxActiveBytes", "1024"],
+		["an infinite maxActiveBytes", Number.POSITIVE_INFINITY],
+		["a NaN maxActiveBytes", Number.NaN],
+	];
+	for (const [label, value] of rejects) {
+		let message = "";
+		try {
+			validateSessionsConfig({ maxActiveBytes: value });
+		} catch (error) {
+			message = error instanceof Error ? error.message : String(error);
+		}
+		check(`${label} is rejected`, message.startsWith("sessions.maxActiveBytes must be a non-negative whole number of bytes"), message || "accepted");
+	}
 	fs.rmSync(root, { recursive: true, force: true });
 }
 

@@ -13,7 +13,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { gunzipSync } from "node:zlib";
-import { loadConfig, type AliveConfig, type LoadedConfig } from "../config.js";
+import { loadConfig, DEFAULT_SESSIONS_CONFIG, type AliveConfig, type LoadedConfig } from "../config.js";
 import { Logger } from "../log.js";
 import { main } from "../cli.js";
 import { openSessionManager } from "../runtime/session.js";
@@ -25,6 +25,8 @@ import {
 	DEFAULT_SESSION_KEEP,
 	DEFAULT_SESSION_MAX_SIZE_MB,
 	DEFAULT_SESSION_OLDER_THAN_DAYS,
+	formatActiveSessionLine,
+	measureActiveSession,
 	measureSessionArchives,
 	measureSessionFileContext,
 	measureSessionStats,
@@ -498,6 +500,125 @@ try {
 		const explicit = openSessionManager({ config, log: silent, sessionFile: recent });
 		check("an explicit resume target is opened as given", explicit.sessionManager.getSessionFile() === recent, explicit.sessionManager.getSessionFile());
 		check("the guard did not touch the file", exists(recent));
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("an oversized active transcript starts a new one and is never deleted (#239)");
+	{
+		const fx = fixture("active-bytes-over");
+		const limit = 1024 * 1024;
+		const recent = path.join(fx.sessions, "2026-10-01T00-00-00-000Z_oversized.jsonl");
+		// A valid transcript, just larger than the limit: no giant fixture needed.
+		writeTranscript(recent, { contextTokens: 1_000, text: "x".repeat(limit + 16 * 1024) });
+		const before = fs.statSync(recent).size;
+		check("the fixture is really over the limit", before > limit, { before, limit });
+		const config = makeConfig(fx.root, {
+			sessions: { ...DEFAULT_SESSIONS_CONFIG, maxActiveBytes: limit },
+			loop: { ...fx.config.config.loop, contextSleepTokens: 0 },
+		});
+		const warns: string[] = [];
+		const log = new Logger({ console: false });
+		const originalWarn = log.warn.bind(log);
+		log.warn = ((message: string, data?: unknown) => {
+			warns.push(message);
+			originalWarn(message, data);
+		}) as typeof log.warn;
+		const opened = openSessionManager({ config, log });
+		const chosen = opened.sessionManager.getSessionFile();
+		check("a new transcript is chosen", typeof chosen === "string" && path.resolve(chosen) !== recent, chosen);
+		check(
+			"the switch is logged with the file, size and limit",
+			warns.some((message) => message.includes("active session is over the size limit")),
+			warns,
+		);
+		check(
+			"the old transcript is untouched",
+			exists(recent) && fs.statSync(recent).size === before && fs.readFileSync(recent, "utf8").startsWith("{\"type\":\"session\""),
+			{ exists: exists(recent), size: exists(recent) ? fs.statSync(recent).size : null },
+		);
+		check(
+			"the old transcript is still the most recent one on disk",
+			mostRecentSessionFile(fx.sessions) === recent,
+			mostRecentSessionFile(fx.sessions),
+		);
+		// The explicit resume path (`sessionFile` of an interrupted run) is guarded too.
+		const explicit = openSessionManager({ config, log, sessionFile: recent });
+		check(
+			"an oversized explicit resume target also starts a new transcript",
+			path.resolve(explicit.sessionManager.getSessionFile() ?? "") !== recent,
+			explicit.sessionManager.getSessionFile(),
+		);
+		check("the oversized bypass is not reported as a resume failure", explicit.resumeFailure === undefined, explicit.resumeFailure);
+		check("the explicit path left the file untouched too", exists(recent) && fs.statSync(recent).size === before);
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("a transcript below maxActiveBytes keeps being resumed (#239)");
+	{
+		const fx = fixture("active-bytes-under");
+		const recent = path.join(fx.sessions, "2026-10-02T00-00-00-000Z_small.jsonl");
+		writeTranscript(recent, { contextTokens: 1_000, text: "small transcript" });
+		const config = makeConfig(fx.root, {
+			sessions: { ...DEFAULT_SESSIONS_CONFIG, maxActiveBytes: 1024 * 1024 },
+			loop: { ...fx.config.config.loop, contextSleepTokens: 0 },
+		});
+		const opened = openSessionManager({ config, log: silent });
+		check("the existing transcript is resumed", opened.sessionManager.getSessionFile() === recent, opened.sessionManager.getSessionFile());
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("maxActiveBytes 0 disables the size switch (#239)");
+	{
+		const fx = fixture("active-bytes-off");
+		const limit = 1024 * 1024;
+		const recent = path.join(fx.sessions, "2026-10-03T00-00-00-000Z_oversized.jsonl");
+		writeTranscript(recent, { contextTokens: 1_000, text: "x".repeat(limit + 16 * 1024) });
+		const config = makeConfig(fx.root, {
+			sessions: { ...DEFAULT_SESSIONS_CONFIG, maxActiveBytes: 0 },
+			loop: { ...fx.config.config.loop, contextSleepTokens: 0 },
+		});
+		const opened = openSessionManager({ config, log: silent });
+		check("the oversized transcript is resumed when the guard is off", opened.sessionManager.getSessionFile() === recent, opened.sessionManager.getSessionFile());
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("the sessions stats active line reports size, limit and over-limit (#239)");
+	{
+		const fx = fixture("stats-active");
+		const recent = path.join(fx.sessions, "2026-10-04T00-00-00-000Z_active.jsonl");
+		writeTranscript(recent, { contextTokens: 1_000, text: "active transcript" });
+		const bytes = fs.statSync(recent).size;
+		const under = measureActiveSession({
+			sessionsDir: fx.sessions,
+			workspaceDir: fx.config.paths.workspaceDir,
+			limitBytes: 32 * 1024 * 1024,
+		});
+		check(
+			"the active session is the newest transcript with its real size",
+			under?.file === recent && under.bytes === bytes && under.overLimit === false,
+			under,
+		);
+		const underLine = formatActiveSessionLine(under);
+		check("the line names the file and the limit", underLine.startsWith(`active: ${path.basename(recent)} `) && underLine.includes("(limit 32.0 MB)"), underLine);
+		check("a file below the limit has no marker", !underLine.includes("OVER LIMIT"), underLine);
+		const over = measureActiveSession({ sessionsDir: fx.sessions, workspaceDir: fx.config.paths.workspaceDir, limitBytes: 128 });
+		check(
+			"a file over the limit is flagged",
+			over?.overLimit === true && over.limitBytes === 128 && formatActiveSessionLine(over).includes("OVER LIMIT"),
+			{ over, line: formatActiveSessionLine(over) },
+		);
+		const off = measureActiveSession({ sessionsDir: fx.sessions, workspaceDir: fx.config.paths.workspaceDir, limitBytes: 0 });
+		check(
+			"limit 0 prints `limit off` and never flags",
+			off?.overLimit === false && formatActiveSessionLine(off).includes("(limit off)"),
+			{ off, line: formatActiveSessionLine(off) },
+		);
+		check("no transcript means no active session", measureActiveSession({ sessionsDir: path.join(fx.root, "nope"), limitBytes: 1 }) === undefined);
+		check("and the line says none", formatActiveSessionLine(undefined) === "active: none", formatActiveSessionLine(undefined));
 		fs.rmSync(fx.root, { recursive: true, force: true });
 	}
 
@@ -1210,6 +1331,47 @@ try {
 			stats,
 		);
 		check("the dry run still changed nothing", exists(oldest) && exists(newest) && !exists(`${oldest}.gz`));
+		fs.rmSync(fx.root, { recursive: true, force: true });
+	}
+
+	// -------------------------------------------------------------------------
+	section("alive sessions stats prints the active session line and JSON (#239)");
+	{
+		const fx = fixture("stats-active-cli");
+		const recent = path.join(fx.sessions, "2026-10-05T00-00-00-000Z_active.jsonl");
+		writeTranscript(recent, { contextTokens: 1_000, text: "active transcript" });
+		const bytes = fs.statSync(recent).size;
+		fs.writeFileSync(
+			path.join(fx.root, "alive.config.json"),
+			JSON.stringify({ sessions: { maxActiveBytes: 100 } }),
+			"utf8",
+		);
+		const text = await runCli(fx.root, ["sessions", "stats"]);
+		check(
+			"the human output has an active line with the over-limit marker",
+			text.includes(`active: ${path.basename(recent)}`) && text.includes("(limit 100 B) — OVER LIMIT"),
+			text,
+		);
+		check("existing stats lines are intact", text.includes(`sessions: ${fx.sessions}`) && text.includes("totals:"), text);
+		const stats = JSON.parse(await runCli(fx.root, ["sessions", "stats", "--json"])) as Record<string, unknown>;
+		const active = stats.activeSession as Record<string, unknown> | null;
+		check(
+			"json carries activeSession {file, bytes, limitBytes, overLimit}",
+			Boolean(active) &&
+				active!.file === recent &&
+				active!.bytes === bytes &&
+				active!.limitBytes === 100 &&
+				active!.overLimit === true,
+			active,
+		);
+		check("the existing stats fields are still there", typeof stats.files === "number" && Boolean(stats.archives), Object.keys(stats));
+		fs.writeFileSync(
+			path.join(fx.root, "alive.config.json"),
+			JSON.stringify({ sessions: { maxActiveBytes: 0 } }),
+			"utf8",
+		);
+		const off = await runCli(fx.root, ["sessions", "stats"]);
+		check("limit 0 renders `limit off` and no marker", off.includes("(limit off)") && !off.includes("OVER LIMIT"), off);
 		fs.rmSync(fx.root, { recursive: true, force: true });
 	}
 

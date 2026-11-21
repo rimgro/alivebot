@@ -32,11 +32,14 @@ import {
 	DEFAULT_SESSION_KEEP,
 	DEFAULT_SESSION_MAX_SIZE_MB,
 	DEFAULT_SESSION_OLDER_THAN_DAYS,
+	formatActiveSessionLine,
+	measureActiveSession,
 	measureSessionArchives,
 	measureSessionStats,
 	measureSessions,
 	rotateSessionArchives,
 	runSessionGc,
+	type ActiveSessionStats,
 	type SessionArchiveUsage,
 	type SessionGcResult,
 	type SessionRotateResult,
@@ -1535,11 +1538,16 @@ function renderSessionGc(result: SessionGcResult, rotation?: SessionRotateResult
 	return `${lines.join("\n")}\n`;
 }
 
-function renderSessionStats(result: SessionStatsResult, archives?: SessionArchiveUsage): string {
+function renderSessionStats(
+	result: SessionStatsResult,
+	archives?: SessionArchiveUsage,
+	active?: ActiveSessionStats,
+): string {
 	const bytes = (value: number): string => formatBytes(value);
 	const lines: string[] = [
 		`sessions: ${result.sessionsDir} (${result.files} file(s), ${bytes(result.bytes)})`,
 	];
+	lines.push(formatActiveSessionLine(active));
 	if (archives) {
 		if (archives.dirs === 0) {
 			lines.push("archives: none");
@@ -1643,8 +1651,18 @@ async function sessionsCommand(flags: Record<string, string | boolean>, position
 		const archives = measureSessionArchives(config.paths.stateDir, {
 			maxBytes: config.config.sessions.archiveRotate.maxBytes,
 		});
+		// The transcript a `continue` start would resume, checked against the same
+		// byte limit the runtime applies (#239). A separate line/field: existing
+		// `stats` output stays parseable.
+		const activeSession = measureActiveSession({
+			sessionsDir: config.paths.sessionsDir,
+			workspaceDir: config.paths.workspaceDir,
+			limitBytes: config.config.sessions.maxActiveBytes,
+		});
 		process.stdout.write(
-			flagBool(flags, "json") ? `${JSON.stringify({ ...result, archives }, null, 2)}\n` : renderSessionStats(result, archives),
+			flagBool(flags, "json")
+				? `${JSON.stringify({ ...result, archives, activeSession: activeSession ?? null }, null, 2)}\n`
+				: renderSessionStats(result, archives, activeSession),
 		);
 		return 0;
 	}

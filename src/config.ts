@@ -982,9 +982,22 @@ export interface SessionsArchiveRotateConfig {
 	maxBytes: number;
 }
 
+/**
+ * Default active-transcript byte cap (#239). A transcript larger than this is
+ * never resumed: the runtime starts a new one and keeps the old file. 32 MiB is
+ * comfortably below provider request limits while leaving room for real work.
+ */
+export const DEFAULT_MAX_ACTIVE_BYTES = 32 * 1024 * 1024;
+
 export interface SessionsConfig {
 	/** Archive rotation for `alive sessions gc` (#228). */
 	archiveRotate: SessionsArchiveRotateConfig;
+	/**
+	 * Never resume a transcript larger than this many bytes (#239); 0 = off.
+	 * The check is a plain file size, not a context-token estimate, because the
+	 * failure it prevents is a provider request-body/context rejection.
+	 */
+	maxActiveBytes: number;
 }
 
 export const DEFAULT_SESSIONS_CONFIG: SessionsConfig = {
@@ -996,6 +1009,7 @@ export const DEFAULT_SESSIONS_CONFIG: SessionsConfig = {
 		// Off by default: no byte cap unless the operator asks for one.
 		maxBytes: 0,
 	},
+	maxActiveBytes: DEFAULT_MAX_ACTIVE_BYTES,
 };
 
 /** One whole, non-negative day count; anything else is a config error. */
@@ -1006,15 +1020,20 @@ function validateArchiveDays(value: unknown, key: string): number {
 	return value;
 }
 
-/** Validate the `sessions` block; a partial or absent block is filled from the defaults. */
-export function validateSessionsConfig(value: unknown): SessionsConfig {
-	if (value === undefined || value === null) return { archiveRotate: { ...DEFAULT_SESSIONS_CONFIG.archiveRotate } };
-	if (typeof value !== "object" || Array.isArray(value)) throw new Error("sessions must be an object");
-	const raw = value as Partial<SessionsConfig>;
-	const rotate: unknown = raw.archiveRotate;
-	if (rotate === undefined || rotate === null) return { archiveRotate: { ...DEFAULT_SESSIONS_CONFIG.archiveRotate } };
-	if (typeof rotate !== "object" || Array.isArray(rotate)) throw new Error("sessions.archiveRotate must be an object");
-	const rawRotate = rotate as Partial<SessionsArchiveRotateConfig>;
+/** One whole, non-negative byte count; anything else is a config error. */
+function validateSessionBytes(value: unknown, key: string, fallback: number): number {
+	const bytes = value ?? fallback;
+	if (typeof bytes !== "number" || !Number.isFinite(bytes) || !Number.isInteger(bytes) || bytes < 0) {
+		throw new Error(`sessions.${key} must be a non-negative whole number of bytes, got "${String(bytes)}"`);
+	}
+	return bytes;
+}
+
+/** Validate the `sessions.archiveRotate` block; a partial or absent block is filled from the defaults. */
+function validateSessionsArchiveRotate(value: unknown): SessionsArchiveRotateConfig {
+	if (value === undefined || value === null) return { ...DEFAULT_SESSIONS_CONFIG.archiveRotate };
+	if (typeof value !== "object" || Array.isArray(value)) throw new Error("sessions.archiveRotate must be an object");
+	const rawRotate = value as Partial<SessionsArchiveRotateConfig>;
 	const enabled = rawRotate.enabled ?? DEFAULT_SESSIONS_CONFIG.archiveRotate.enabled;
 	if (typeof enabled !== "boolean") throw new Error("sessions.archiveRotate.enabled must be boolean");
 	const gzipAfterDays = validateArchiveDays(
@@ -1032,7 +1051,23 @@ export function validateSessionsConfig(value: unknown): SessionsConfig {
 	if (typeof maxBytes !== "number" || !Number.isSafeInteger(maxBytes) || maxBytes < 0) {
 		throw new Error("sessions.archiveRotate.maxBytes must be a non-negative whole number of bytes");
 	}
-	return { archiveRotate: { enabled, gzipAfterDays, deleteAfterDays, maxBytes } };
+	return { enabled, gzipAfterDays, deleteAfterDays, maxBytes };
+}
+
+/** Validate the `sessions` block; a partial or absent block is filled from the defaults. */
+export function validateSessionsConfig(value: unknown): SessionsConfig {
+	if (value === undefined || value === null) {
+		return {
+			archiveRotate: { ...DEFAULT_SESSIONS_CONFIG.archiveRotate },
+			maxActiveBytes: DEFAULT_SESSIONS_CONFIG.maxActiveBytes,
+		};
+	}
+	if (typeof value !== "object" || Array.isArray(value)) throw new Error("sessions must be an object");
+	const raw = value as Partial<SessionsConfig>;
+	return {
+		archiveRotate: validateSessionsArchiveRotate(raw.archiveRotate),
+		maxActiveBytes: validateSessionBytes(raw.maxActiveBytes, "maxActiveBytes", DEFAULT_SESSIONS_CONFIG.maxActiveBytes),
+	};
 }
 
 export interface AliveConfig {

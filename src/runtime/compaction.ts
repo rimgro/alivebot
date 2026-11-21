@@ -116,6 +116,44 @@ export function isSummarizationContext(context: Context | undefined): boolean {
 }
 
 /**
+ * Provider messages that mean the request itself was too large: the body-size
+ * limit (413) or the model's context window. They are matched case-insensitively
+ * because every provider phrases the rejection differently.
+ */
+const CONTEXT_OVERFLOW_PATTERNS: RegExp[] = [
+	/\b413\b/,
+	/context[_\s-]?length[_\s-]?exceeded/i,
+	/context (?:window|length) (?:is )?(?:exceeded|too (?:large|long))/i,
+	/context[_\s-]?(?:window|length)?[_\s-]?too (?:large|long)/i,
+	/maximum context (?:length|window)/i,
+	/request bod(?:y|ies)[^.;]{0,80}(?:too large|at most|exceeds?)/i,
+	/payload too large/i,
+	/prompt is too long/i,
+];
+
+/**
+ * True when a compaction failure is a provider-side context/body overflow
+ * (#239). Such a failure does not come from a bad summary: the summarization
+ * request itself carries the oversized transcript, so retrying compaction with
+ * the same transcript can never succeed. Only `provider_error` failures qualify;
+ * an HTML/JSON error page that happens to mention 413 stays what it is.
+ */
+export function isContextOverflowFailure(input: {
+	reasonClass?: CompactionFailureClass;
+	reason?: string;
+	excerpt?: string;
+	errorMessage?: string;
+	status?: number;
+}): boolean {
+	if (input.reasonClass && input.reasonClass !== "provider_error") return false;
+	if (input.status === 413) return true;
+	const text = [input.reason, input.excerpt, input.errorMessage]
+		.filter((part): part is string => typeof part === "string" && part.length > 0)
+		.join(" ");
+	return text.length > 0 && CONTEXT_OVERFLOW_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/**
  * Classify an arbitrary provider body or error text.
  *
  * HTML is checked first: an error page can contain `{` or the word "error", and

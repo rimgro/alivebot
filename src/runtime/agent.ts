@@ -18,7 +18,7 @@ import { classifyNetworkError, withRetries } from "../retry.js";
 import { maskSecrets } from "../secrets.js";
 import { cacheHitRate, isColdCacheRun } from "../usage/cache.js";
 import { privateMemoryScope } from "./memory-access.js";
-import { compactionMonitorFor } from "./compaction.js";
+import { compactionMonitorFor, isContextOverflowFailure } from "./compaction.js";
 import {
 	ProviderDiagnostics,
 	hasImageAttachments,
@@ -51,6 +51,29 @@ const AGENT_PROVIDER_RETRY_MAX_DELAY_MS = 15_000;
  * looping forever.
  */
 export const CONTEXT_SLEEP_REDELIVER_MAX = 2;
+
+/**
+ * Consecutive provider context-overflow compaction failures that force a fresh
+ * transcript (#239). The counter lives on the runner, not in the per-run watch,
+ * because the loop this breaks spans run boundaries: each run resumes the same
+ * oversized transcript, compaction's summarization request is rejected as too
+ * large, and the failing run ends without doing any work.
+ */
+export const COMPACTION_OVERFLOW_RESET_AFTER = 2;
+
+/**
+ * True when a persisted run's last compaction outcome was a provider context
+ * overflow (#239). Used to rebuild the cross-run streak after a process restart;
+ * a run without such an outcome is a clean boundary.
+ */
+function runRecordHadCompactionOverflow(record: RunRecord): boolean {
+	// Prefer the explicit marker written by this runtime; fall back to the
+	// compaction record for records written before it existed.
+	if (record.compactionOverflow === true) return true;
+	const compaction = record.compaction;
+	if (!compaction || compaction.ok) return false;
+	return isContextOverflowFailure({ reasonClass: compaction.reasonClass, reason: compaction.reason });
+}
 
 export interface ExecuteOptions {
 	redeliveryRange?: { fromSeq: number; toSeq: number };
@@ -204,6 +227,8 @@ interface RunWatch {
 	contextReset?: { reason: ContextResetReason; tokens: number; limitTokens: number };
 	/** Turn of the previous failed compaction, for the repeated-failure window. */
 	lastCompactionFailureTurn?: number;
+	/** True once a provider context-overflow compaction failure hit this run (#239). */
+	compactionOverflowFailure: boolean;
 	/** The tool currently executing in this run (#164), if any. */
 	activeTool?: { name: string; startedAt: number };
 	/** True once `tool_long` was emitted for the current tool invocation. */
@@ -239,6 +264,17 @@ export class AgentRunner {
 	private toolCallsThisRun = 0;
 	/** Per-turn usage of the current run, persisted on its record (#121). */
 	private readonly turnTrace = new TurnTraceRecorder();
+	/**
+	 * Consecutive provider context-overflow compaction failures across runs
+	 * (#239). Reset by a successful compaction or by a run without one.
+	 */
+	private compactionOverflowFailures = 0;
+	/**
+	 * True once the cross-run streak was rebuilt from persisted run records
+	 * (#239). A process restart loses the in-memory counter, but the run log
+	 * already records each run's last compaction outcome.
+	 */
+	private compactionOverflowSeeded = false;
 	/** Soft run-health state for the current run (#127); reset by every `execute`. */
 	private watch: RunWatch | undefined;
 	/**
@@ -658,6 +694,7 @@ export class AgentRunner {
 				contextSleepDirected: false,
 				contextReset: undefined,
 				lastCompactionFailureTurn: undefined,
+				compactionOverflowFailure: false,
 				activeTool: undefined,
 				toolLongFlagged: false,
 			};
@@ -925,6 +962,7 @@ export class AgentRunner {
 				usageUnsettled: usageUnsettled ? true : undefined,
 				sleep: run.sleepRequested ? { forced: run.sleepForced, summaryChars: run.sleepSummary?.length ?? 0 } : undefined,
 				compaction: compactionMonitorFor(this.session)?.record(),
+				compactionOverflow: this.watch?.compactionOverflowFailure ? true : undefined,
 				contextReset: this.watch?.contextReset,
 			};
 
@@ -932,6 +970,9 @@ export class AgentRunner {
 			this.timedOutRunId = null;
 			this.repeatAbortRunId = null;
 			this.budgetRunId = null;
+			// A run that never hit the provider context limit breaks the streak (#239);
+			// only a failure already handled above keeps the counter alive.
+			if (!this.watch?.compactionOverflowFailure) this.compactionOverflowFailures = 0;
 			this.watch = undefined;
 			this.promptRetryAbort = undefined;
 
@@ -1291,6 +1332,9 @@ export class AgentRunner {
 				monitor?.noteContextTokens(contextTokens);
 				const outcome = monitor?.last();
 				if (!event.errorMessage) {
+					// A successful compaction breaks the consecutive-overflow streak (#239).
+					this.compactionOverflowFailures = 0;
+					if (run && this.watch?.runId === run.id) this.watch.compactionOverflowFailure = false;
 					this.deps.log.info("compaction", {
 						reason: event.reason,
 						aborted: event.aborted,
@@ -1327,7 +1371,20 @@ export class AgentRunner {
 					});
 					// A stable compaction failure is the last fallback: if it repeats within
 					// the grace window, sleep resets the context instead of growing it (#170).
-					this.noteCompactionFailure(run, tokens ?? 0);
+					// A provider context-overflow is different: it is not a flaky summary but
+					// the request itself being too large, so it is counted across runs (#239).
+					if (
+						isContextOverflowFailure({
+							reasonClass,
+							reason: outcome?.reason,
+							excerpt: outcome?.excerpt,
+							errorMessage: event.errorMessage,
+						})
+					) {
+						this.noteCompactionOverflowFailure(run, tokens ?? 0);
+					} else {
+						this.noteCompactionFailure(run, tokens ?? 0);
+					}
 				} else {
 					this.deps.log.warn("compaction failed", {
 						reason: event.reason,
@@ -1543,6 +1600,66 @@ export class AgentRunner {
 			limitTokens: reset.limitTokens,
 			resetReason: reset.reason,
 		});
+	}
+
+	/**
+	 * Track a provider context-overflow compaction failure across runs (#239).
+	 *
+	 * Compaction here fails because the summarization request carries a transcript
+	 * that is already over the provider's request/context limit, so no backoff or
+	 * summary quality check can make the next attempt succeed. The counter lives
+	 * on the runner so a repeat in the next run (which resumes the same file) is
+	 * visible; after {@link COMPACTION_OVERFLOW_RESET_AFTER} consecutive failures
+	 * the run ends as slept with reason `compaction`, and `rebuildSession` starts a
+	 * genuinely new transcript.
+	 */
+	private noteCompactionOverflowFailure(run: RunHandle, tokens: number): void {
+		if (run.sleepRequested) return;
+		this.seedCompactionOverflowFailures();
+		const watch = this.watch?.runId === run.id ? this.watch : undefined;
+		if (watch) watch.compactionOverflowFailure = true;
+		this.compactionOverflowFailures += 1;
+		if (this.compactionOverflowFailures < COMPACTION_OVERFLOW_RESET_AFTER) return;
+		const policy = resolveContextPolicy(this.deps.config.config);
+		const limitTokens = policy.hardTokens > 0 ? policy.hardTokens : policy.sleepTokens;
+		this.deps.log.warn("compaction keeps hitting the provider context limit; forcing a fresh transcript", {
+			consecutive: this.compactionOverflowFailures,
+			contextTokens: tokens,
+		});
+		// The action has been taken: start a fresh streak, so a later unrelated
+		// overflow needs two new failures instead of reusing this one.
+		this.compactionOverflowFailures = 0;
+		this.forceContextReset(run, { reason: "compaction", tokens, limitTokens });
+	}
+
+	/**
+	 * Rebuild the cross-run overflow streak from the persisted run log (#239).
+	 *
+	 * A restart must not forget that the previous runs were already failing on
+	 * the provider context limit. Walk the newest records backwards, count runs
+	 * whose last compaction was a context overflow, and stop at the first clean
+	 * or successful run. The count is capped at one below the reset threshold so
+	 * a restart alone can never end the first run: the next actual overflow is
+	 * still what trips the reset. No extra state file is written.
+	 */
+	private seedCompactionOverflowFailures(): void {
+		if (this.compactionOverflowSeeded) return;
+		this.compactionOverflowSeeded = true;
+		const cap = COMPACTION_OVERFLOW_RESET_AFTER - 1;
+		if (cap <= 0) return;
+		let records: RunRecord[];
+		try {
+			records = this.deps.runs.list(cap + 1);
+		} catch {
+			// An unreadable run log is not a reason to break compaction handling.
+			return;
+		}
+		let count = 0;
+		for (let index = records.length - 1; index >= 0 && count < cap; index -= 1) {
+			if (!runRecordHadCompactionOverflow(records[index]!)) break;
+			count += 1;
+		}
+		if (count > this.compactionOverflowFailures) this.compactionOverflowFailures = count;
 	}
 
 	/**
