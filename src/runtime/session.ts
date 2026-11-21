@@ -206,6 +206,8 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 		name: cfg.name,
 		soul,
 		contract: readContract(paths.contractPath),
+		onboardingAvailable: allowedTools.includes("onboarding"),
+		writingGuideAvailable: allowedTools.includes("writing_guide"),
 		workspace,
 		stateDir: paths.stateDir,
 		runTimeoutMs: cfg.loop.runTimeoutMs,
