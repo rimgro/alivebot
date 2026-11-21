@@ -28,6 +28,7 @@ import { StringDecoder } from "node:string_decoder";
 import { pipeline } from "node:stream/promises";
 import { createGzip } from "node:zlib";
 import type { Logger } from "../log.js";
+import { formatBytes } from "../util.js";
 
 export const DEFAULT_SESSION_KEEP = 3;
 export const DEFAULT_SESSION_OLDER_THAN_DAYS = 14;
@@ -1227,6 +1228,52 @@ export function mostRecentSessionFile(sessionsDir: string, cwd?: string): string
 		if (headerCwd && path.resolve(headerCwd) === wanted) return file.path;
 	}
 	return undefined;
+}
+
+/** The transcript `continue` would resume, measured against the size guard (#239). */
+export interface ActiveSessionStats {
+	file: string;
+	/** Size in bytes; null when the file could not be stat'ed (it disappeared). */
+	bytes: number | null;
+	/** Configured `sessions.maxActiveBytes`; 0 = the guard is disabled. */
+	limitBytes: number;
+	/** True when `limitBytes > 0` and the file is larger than it. */
+	overLimit: boolean;
+}
+
+/**
+ * Describe the active transcript for `alive sessions stats` (#239). Read-only:
+ * the same `mostRecentSessionFile` lookup `openSessionManager` uses for a
+ * `continue` start, so the printed line matches what the next run would resume.
+ * Returns undefined when the workspace has no transcript at all.
+ */
+export function measureActiveSession(input: {
+	sessionsDir: string;
+	workspaceDir?: string;
+	limitBytes: number;
+}): ActiveSessionStats | undefined {
+	const file = mostRecentSessionFile(input.sessionsDir, input.workspaceDir);
+	if (!file) return undefined;
+	let bytes: number | null = null;
+	try {
+		bytes = fs.statSync(file).size;
+	} catch {
+		// Unknown size, never invented.
+	}
+	const limitBytes = Math.max(0, input.limitBytes);
+	return { file, bytes, limitBytes, overLimit: bytes !== null && limitBytes > 0 && bytes > limitBytes };
+}
+
+/**
+ * One human-readable `active:` line, e.g.
+ * `active: x.jsonl 109.2 MB (limit 32.0 MB) — OVER LIMIT`.
+ * A separate line so existing `sessions stats` lines stay unchanged.
+ */
+export function formatActiveSessionLine(active: ActiveSessionStats | undefined): string {
+	if (!active) return "active: none";
+	const size = active.bytes === null ? "size n/a" : formatBytes(active.bytes);
+	const limit = active.limitBytes > 0 ? `limit ${formatBytes(active.limitBytes)}` : "limit off";
+	return `active: ${path.basename(active.file)} ${size} (${limit})${active.overLimit ? " — OVER LIMIT" : ""}`;
 }
 
 /** `cwd` from a transcript header; undefined when the header is not a pi session. */

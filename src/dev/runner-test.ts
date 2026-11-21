@@ -239,25 +239,29 @@ const createSession = async (): Promise<AgentSession> => {
 	return session as unknown as AgentSession;
 };
 
-const runner = new AgentRunner({
-	config,
-	createSession,
-	store,
-	runs,
-	threads,
-	policy,
-	toolDeps: deps,
-	log,
-	thoughtsFile: config.paths.thoughtsFile,
-	runEvents,
-	getRun: () => currentRun,
-	setRun: (run) => {
-		currentRun = run;
-	},
-	runtimeStatus: () => ({}),
-	isStopping: () => false,
-	isBudgetExhausted: () => false,
-});
+function makeAgentRunner(): AgentRunner {
+	return new AgentRunner({
+		config,
+		createSession,
+		store,
+		runs,
+		threads,
+		policy,
+		toolDeps: deps,
+		log,
+		thoughtsFile: config.paths.thoughtsFile,
+		runEvents,
+		getRun: () => currentRun,
+		setRun: (run) => {
+			currentRun = run;
+		},
+		runtimeStatus: () => ({}),
+		isStopping: () => false,
+		isBudgetExhausted: () => false,
+	});
+}
+
+const runner = makeAgentRunner();
 await runner.init();
 
 section("idle returns an event, then sleep resets the context");
@@ -1415,6 +1419,178 @@ section("a repeated compaction failure within grace forces reason=compaction (#1
 }
 
 // ---------------------------------------------------------------------------
+// provider context-overflow compaction loop (#239)
+// ---------------------------------------------------------------------------
+
+const CONTEXT_OVERFLOW_MESSAGE =
+	"Auto-compaction failed: 413 Request bodies must be at most 64 MiB (context_length_exceeded)";
+
+/** Emit a compaction_end; `errorMessage` undefined means a successful compaction. */
+function emitCompaction(session: FakeSession, errorMessage?: string): void {
+	session.emit({
+		type: "compaction_end",
+		reason: "threshold",
+		result: undefined,
+		aborted: false,
+		willRetry: false,
+		errorMessage,
+	});
+}
+
+/** End the current run normally, unless a guard already forced the sleep. */
+async function sleepUnlessForced(): Promise<void> {
+	if (currentRun?.sleepRequested) return;
+	await call(retainTool, { facts: [], scopes: [] });
+	await call(sleepTool, { summary: "compaction overflow test", summary_md: "# Compaction overflow test\n" });
+}
+
+/**
+ * Produce a real provider 413 for the summarization request and then emit the
+ * `compaction_end` event, so the run record persists the overflow outcome
+ * (`compaction`) exactly like production. The guard is installed once per fake
+ * session; repeated nudges reuse it.
+ */
+const overflowGuarded = new WeakSet<FakeSession>();
+async function triggerOverflowCompaction(session: FakeSession): Promise<void> {
+	if (!overflowGuarded.has(session)) {
+		overflowGuarded.add(session);
+		const agent = session.agent as unknown as { streamFunction?: (model: unknown, context: unknown) => unknown };
+		agent.streamFunction = async () => {
+			throw Object.assign(new Error("Request bodies must be at most 64 MiB (context_length_exceeded)"), { status: 413 });
+		};
+		installCompactionGuard(session as unknown as AgentSession, {
+			log,
+			retry: { attempts: 1, baseDelayMs: 1, maxDelayMs: 1, jitter: "none" },
+		});
+	}
+	const agent = session.agent as unknown as { streamFunction: (model: unknown, context: unknown) => unknown };
+	const summarizationContext = {
+		systemPrompt: "You are a context summarization assistant. Only output the structured summary.",
+		messages: [{ role: "user", content: [{ type: "text", text: "<conversation>hello</conversation>" }], timestamp: Date.now() }],
+	};
+	try {
+		const stream = agent.streamFunction({ id: "fake-overflow" }, summarizationContext) as { result: () => Promise<unknown> };
+		await stream.result();
+	} catch {
+		// expected: the provider rejects the oversized summarization request
+	}
+	emitCompaction(session, CONTEXT_OVERFLOW_MESSAGE);
+}
+
+section("two context-overflow compactions across runs force exactly one compaction reset (#239)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	setContextWarn({ contextWarnTokens: 0, contextSleepTokens: 0, contextSleepGraceTurns: 0, contextHardTokens: 0 });
+	drainInbox();
+	handler = async (session) => {
+		session.setContextTokens(180_000);
+		emitCompaction(session, CONTEXT_OVERFLOW_MESSAGE);
+		await sleepUnlessForced();
+	};
+	const first = await runner.execute();
+	check("the first overflow run ends as slept without a reset", first?.stopReason === "slept" && first?.contextReset === undefined, {
+		stopReason: first?.stopReason,
+		contextReset: first?.contextReset,
+	});
+	check(
+		"one overflow failure alone does not reset",
+		anomaliesOf(first?.id ?? "", "context_reset").length === 0,
+		anomaliesOf(first?.id ?? "", "context_reset"),
+	);
+	const second = await runner.execute();
+	check(
+		"the second consecutive overflow run ends as slept with reason compaction",
+		second?.stopReason === "slept" && second?.contextReset?.reason === "compaction",
+		{ stopReason: second?.stopReason, contextReset: second?.contextReset },
+	);
+	check("the forced reset is marked as forced", second?.sleep?.forced === true, second?.sleep);
+	const resetAnomalies = anomaliesOf(second?.id ?? "", "context_reset");
+	check(
+		"the second run records exactly one context_reset with resetReason compaction",
+		resetAnomalies.length === 1 && resetAnomalies[0]?.resetReason === "compaction",
+		resetAnomalies,
+	);
+	check(
+		"compaction_failed is recorded for both failures",
+		anomaliesOf(first?.id ?? "", "compaction_failed").length === 1 &&
+			anomaliesOf(second?.id ?? "", "compaction_failed").length === 1,
+		{ first: anomaliesOf(first?.id ?? "", "compaction_failed").length, second: anomaliesOf(second?.id ?? "", "compaction_failed").length },
+	);
+	check(
+		"the reset started a new transcript",
+		created.length >= 3 && (runner.currentSession as unknown) === (created[created.length - 1] as unknown),
+		{ sessions: created.length },
+	);
+	resetContextWarn();
+}
+
+section("a successful compaction between overflow failures resets the counter (#239)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	setContextWarn({ contextWarnTokens: 0, contextSleepTokens: 0, contextSleepGraceTurns: 0, contextHardTokens: 0 });
+	drainInbox();
+	let mode: "overflow" | "success" = "overflow";
+	handler = async (session) => {
+		session.setContextTokens(180_000);
+		emitCompaction(session, mode === "overflow" ? CONTEXT_OVERFLOW_MESSAGE : undefined);
+		await sleepUnlessForced();
+	};
+	const first = await runner.execute();
+	mode = "success";
+	const second = await runner.execute();
+	mode = "overflow";
+	const third = await runner.execute();
+	check("none of the three runs is reset", first?.contextReset === undefined && second?.contextReset === undefined && third?.contextReset === undefined, {
+		first: first?.contextReset,
+		second: second?.contextReset,
+		third: third?.contextReset,
+	});
+	check(
+		"the successful compaction cleared the streak",
+		anomaliesOf(third?.id ?? "", "context_reset").length === 0,
+		anomaliesOf(third?.id ?? "", "context_reset"),
+	);
+	check(
+		"the success is not reported as a compaction failure",
+		anomaliesOf(second?.id ?? "", "compaction_failed").length === 0,
+		anomaliesOf(second?.id ?? "", "compaction_failed"),
+	);
+	resetContextWarn();
+}
+
+section("non-overflow compaction failures never trip the overflow counter (#239)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	setContextWarn({ contextWarnTokens: 0, contextSleepTokens: 0, contextSleepGraceTurns: 3, contextHardTokens: 0 });
+	drainInbox();
+	handler = async (session) => {
+		session.setContextTokens(180_000);
+		emitCompaction(session, "Auto-compaction failed: provider_html");
+		await sleepUnlessForced();
+	};
+	const first = await runner.execute();
+	const second = await runner.execute();
+	check(
+		"a provider_html failure is not a context overflow and never forces a reset",
+		first?.contextReset === undefined && second?.contextReset === undefined,
+		{ first: first?.contextReset, second: second?.contextReset },
+	);
+	check(
+		"no context_reset anomaly is written across the two runs",
+		anomaliesOf(first?.id ?? "", "context_reset").length === 0 &&
+			anomaliesOf(second?.id ?? "", "context_reset").length === 0,
+		{ first: anomaliesOf(first?.id ?? "", "context_reset"), second: anomaliesOf(second?.id ?? "", "context_reset") },
+	);
+	resetContextWarn();
+}
+
+// ---------------------------------------------------------------------------
 // per-turn usage (#121)
 // ---------------------------------------------------------------------------
 
@@ -2356,6 +2532,90 @@ section("a corrupt resume transcript falls back to a new session, never a dead b
 	const plain = openSessionManager({ config, log });
 	check("a normal start keeps the configured session mode", plain.resumeFailure === undefined && typeof plain.sessionManager.getSessionFile() === "string", plain.sessionManager.getSessionFile());
 	fs.rmSync(resumeRoot, { recursive: true, force: true });
+}
+
+section("a restart seeds the overflow streak from the persisted run records (#239)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	setContextWarn({ contextWarnTokens: 0, contextSleepTokens: 0, contextSleepGraceTurns: 0, contextHardTokens: 0 });
+	drainInbox();
+	handler = async (session) => {
+		session.setContextTokens(180_000);
+		await triggerOverflowCompaction(session);
+		await sleepUnlessForced();
+	};
+	const firstProcess = makeAgentRunner();
+	await firstProcess.init();
+	const first = await firstProcess.execute();
+	check(
+		"the first overflow run is persisted with a provider 413 compaction outcome",
+		first?.compaction?.ok === false &&
+			first.compaction.reasonClass === "provider_error" &&
+			/isContext|413/i.test(first.compaction.reason ?? ""),
+		first?.compaction,
+	);
+	check("the run record carries the durable overflow marker", first?.compactionOverflow === true, first?.compactionOverflow);
+	check("one overflow failure alone does not reset the first process", first?.contextReset === undefined, first?.contextReset);
+
+	// A brand-new runner on the same run log must not forget the streak.
+	const restarted = makeAgentRunner();
+	await restarted.init();
+	const second = await restarted.execute();
+	check(
+		"the restarted runner resets on the next overflow",
+		second?.stopReason === "slept" && second?.contextReset?.reason === "compaction",
+		{ stopReason: second?.stopReason, contextReset: second?.contextReset },
+	);
+	const resetAnomalies = anomaliesOf(second?.id ?? "", "context_reset");
+	check(
+		"exactly one context_reset with resetReason compaction is recorded",
+		resetAnomalies.length === 1 && resetAnomalies[0]?.resetReason === "compaction",
+		resetAnomalies,
+	);
+	resetContextWarn();
+}
+
+section("a clean run between overflow failures prevents the restart seed (#239)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	setContextWarn({ contextWarnTokens: 0, contextSleepTokens: 0, contextSleepGraceTurns: 0, contextHardTokens: 0 });
+	drainInbox();
+	// Newest record after this run is clean (no compaction at all), so a restart
+	// must not seed a streak from the older overflow record before it.
+	handler = async () => {
+		await sleepUnlessForced();
+	};
+	const cleanProcess = makeAgentRunner();
+	await cleanProcess.init();
+	const clean = await cleanProcess.execute();
+	check(
+		"the clean run has no compaction outcome and no reset",
+		clean?.compaction === undefined && clean?.contextReset === undefined,
+		{ compaction: clean?.compaction, contextReset: clean?.contextReset },
+	);
+	const restarted = makeAgentRunner();
+	await restarted.init();
+	handler = async (session) => {
+		session.setContextTokens(180_000);
+		await triggerOverflowCompaction(session);
+		await sleepUnlessForced();
+	};
+	const overflow = await restarted.execute();
+	check(
+		"one overflow after a clean run does not reset",
+		overflow?.contextReset === undefined,
+		overflow?.contextReset,
+	);
+	check(
+		"no context_reset anomaly is written",
+		anomaliesOf(overflow?.id ?? "", "context_reset").length === 0,
+		anomaliesOf(overflow?.id ?? "", "context_reset"),
+	);
+	resetContextWarn();
 }
 
 process.stdout.write(

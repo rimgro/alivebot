@@ -413,6 +413,12 @@ export interface RunRecord {
 	/** Last auto-compaction outcome in this run (#167). Absent when none happened. */
 	compaction?: CompactionRecord;
 	/**
+	 * True when this run hit a provider context-overflow compaction failure
+	 * (#239). Persisted so a restarted process can rebuild the consecutive
+	 * overflow streak from the run log without a separate state file.
+	 */
+	compactionOverflow?: boolean;
+	/**
 	 * Forced context reset that ended this run (#170). Absent when the agent
 	 * slept itself, or when no threshold fired.
 	 */
