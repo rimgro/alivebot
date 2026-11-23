@@ -81,6 +81,18 @@ export const TELEGRAM_DUPLICATE_POLLER_MESSAGE =
 /** Probe/delete and report a 409 at most once per five minutes for this token. */
 const TELEGRAM_CONFLICT_WINDOW_MS = 5 * 60_000;
 
+/**
+ * Background `getMe` retry backoff: 2s, 5s, 15s, 60s, then every 5 min. Tests
+ * inject a shorter list through {@link TelegramModuleOptions} instead of waiting.
+ */
+const IDENTITY_RETRY_DELAYS_MS: readonly number[] = [2_000, 5_000, 15_000, 60_000, 300_000];
+
+/** Test-only seams; production uses the defaults and passes no options. */
+export interface TelegramModuleOptions {
+	/** Override the background `getMe` retry delays (the last entry repeats). */
+	identityRetryDelaysMs?: readonly number[];
+}
+
 /** A validated attachment, loaded and ready for one Bot API upload. */
 interface PreparedUpload {
 	data: Buffer;
@@ -250,8 +262,14 @@ export class TelegramModule implements AliveModule {
 	 */
 	private readonly transcriptionCounters: TranscriptionCounters = { attempted: 0, transcribed: 0, failed: 0 };
 
-	constructor(config: TelegramConfig) {
+	private readonly identityRetryDelaysMs: readonly number[];
+
+	constructor(config: TelegramConfig, options: TelegramModuleOptions = {}) {
 		this.config = config;
+		this.identityRetryDelaysMs =
+			options.identityRetryDelaysMs && options.identityRetryDelaysMs.length > 0
+				? options.identityRetryDelaysMs
+				: IDENTITY_RETRY_DELAYS_MS;
 	}
 
 	handles(message: OutgoingMessage): boolean {
@@ -366,8 +384,8 @@ export class TelegramModule implements AliveModule {
 	 */
 	private scheduleIdentityRetry(ctx: ModuleContext): void {
 		if (this.stopped || this.identityRetry) return;
-		const delays = [2_000, 5_000, 15_000, 60_000];
-		const delay = this.identityRetryAttempt < delays.length ? delays[this.identityRetryAttempt]! : 300_000;
+		const delays = this.identityRetryDelaysMs;
+		const delay = delays[Math.min(this.identityRetryAttempt, delays.length - 1)]!;
 		this.identityRetryAttempt += 1;
 		const timer = setTimeout(() => {
 			this.identityRetry = undefined;
