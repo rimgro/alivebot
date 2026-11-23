@@ -12,6 +12,11 @@ import {
 } from "./config-secrets.js";
 import { DEFAULT_BROWSER_CONFIG, type BrowserConfig } from "./modules/browser/config.js";
 import {
+	DEFAULT_TELEGRAM_USER_CONFIG,
+	validateTelegramUserConfig,
+	type TelegramUserConfig,
+} from "./modules/telegram/user/config.js";
+import {
 	GROQ_TRANSCRIPTION_MODEL,
 	GROQ_TRANSCRIPTION_TIMEOUT_MS,
 	TELEGRAM_VOICE_MAX_BYTES,
@@ -673,6 +678,11 @@ export interface TelegramConfig {
 	 * feed and reset to that id + 1. Smaller gaps only warn. Default 1000.
 	 */
 	offsetGapReset: number;
+	/**
+	 * #248: personal Telegram account (MTProto) settings. Absent means the default
+	 * block, which is disabled; the bot above is unaffected either way.
+	 */
+	user?: TelegramUserConfig;
 }
 
 /**
@@ -741,6 +751,7 @@ export function validateTelegramConfig(value: TelegramConfig): TelegramConfig {
 			`modules.telegram.offsetGapReset must be an integer between ${MIN_TELEGRAM_OFFSET_GAP_RESET} and ${MAX_TELEGRAM_OFFSET_GAP_RESET} updates, got "${String(value.offsetGapReset)}"`,
 		);
 	}
+	if (value.user !== undefined) value.user = validateTelegramUserConfig(value.user);
 	return value;
 }
 
@@ -1297,6 +1308,9 @@ export const DEFAULT_CONFIG: AliveConfig = {
 			transcriptionRetries: DEFAULT_TRANSCRIPTION_RETRIES,
 			transcriptionRetryDelayMs: DEFAULT_TRANSCRIPTION_RETRY_DELAY_MS,
 			offsetGapReset: DEFAULT_TELEGRAM_OFFSET_GAP_RESET,
+			// #248: a user login is opt-in and keeps its own allowlist; copying the
+			// array keeps the shared default object immutable.
+			user: { ...DEFAULT_TELEGRAM_USER_CONFIG, allowedChatIds: [...(DEFAULT_TELEGRAM_USER_CONFIG.allowedChatIds ?? [])] },
 		},
 		grafana: {
 			enabled: false,

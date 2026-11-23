@@ -84,7 +84,8 @@
     "test:dashboard:tool": "tsx src/dev/dashboard-tool-test.ts",
     "test:usage": "tsx src/dev/usage-test.ts",
     "test:cache-stats": "tsx src/dev/cache-stats-test.ts",
-    "test:managed-bot": "tsx src/dev/managed-bot-test.ts"
+    "test:managed-bot": "tsx src/dev/managed-bot-test.ts",
+    "test:telegram-user": "tsx src/dev/telegram-user-test.ts"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "^0.85.1",
