@@ -86,7 +86,8 @@
     "test:usage": "tsx src/dev/usage-test.ts",
     "test:cache-stats": "tsx src/dev/cache-stats-test.ts",
     "test:managed-bot": "tsx src/dev/managed-bot-test.ts",
-    "test:telegram-user": "tsx src/dev/telegram-user-test.ts"
+    "test:telegram-user": "tsx src/dev/telegram-user-test.ts",
+    "test:telegram-cli": "tsx src/dev/telegram-cli-test.ts"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "^0.85.1",
@@ -94,17 +95,18 @@
     "@earendil-works/pi-coding-agent": "^0.85.1",
     "agent-browser": "0.27.0",
     "microsandbox": "0.7.8",
-    "tilion-fortress": "151.0.7910",
-    "typebox": "1.3.7",
     "patchright": "1.63.0",
     "pdfjs-dist": "4.10.38",
     "playwright": "1.63.0",
+    "telegram": "^2.26.22",
+    "tilion-fortress": "151.0.7910",
+    "typebox": "1.3.7",
     "ws": "8.22.0"
   },
   "devDependencies": {
     "@types/node": "^22.20.3",
+    "@types/ws": "8.18.2",
     "tsx": "^4.23.13",
-    "typescript": "^5.9.3",
-    "@types/ws": "8.18.2"
+    "typescript": "^5.9.3"
   }
 }

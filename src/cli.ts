@@ -1846,6 +1846,18 @@ async function telegramCommand(
 	const sub = positionals[0] ?? "me";
 	const moduleConfig = config.config.modules.telegram;
 
+	// Personal MTProto account (#248): local state only, no bot token involved.
+	// Imported on demand so every other command stays independent of (and does
+	// not pay the startup cost of) the MTProto library.
+	if (sub === "login" || sub === "logout" || sub === "user-status") {
+		const { telegramUserLogin, telegramUserLogout, telegramUserStatus } = await import(
+			"./modules/telegram/user/cli.js"
+		);
+		if (sub === "login") return await telegramUserLogin({ config });
+		if (sub === "logout") return await telegramUserLogout({ config });
+		return await telegramUserStatus({ config, json: flagBool(flags, "json") });
+	}
+
 	if (sub === "managed") {
 		const action = positionals[1] ?? "status";
 		const scope = managedBotScope(config);
@@ -1966,7 +1978,7 @@ async function telegramCommand(
 		process.stdout.write(`sent ${sent.length} message(s): ${sent.map((m) => m.message_id).join(", ")}\n`);
 		return 0;
 	}
-	throw new Error(`unknown telegram subcommand: ${sub} (use me, chats, chat, send, managed)`);
+	throw new Error(`unknown telegram subcommand: ${sub} (use me, chats, chat, send, managed, login, logout, user-status)`);
 }
 
 function thoughtsCommand(_cwd: string, flags: Record<string, string | boolean>): number {
@@ -2240,6 +2252,11 @@ usage:
                                               manage Telegram user access without restart
   alive telegram managed status [agent] [--json] | cancel <agent>
                                               inspect or cancel a pending Managed Bot request
+  alive telegram login                        log in as your personal account (MTProto, TTY only;
+                                              reads the code and 2FA password without echo)
+  alive telegram logout                       revoke the session locally (and on the server when possible)
+  alive telegram user-status [--json]         offline state of modules.telegram.user: readiness,
+                                              session presence and the logged-in identity
   alive browser setup [--engine chrome|fortress] [--shared-url PRIVATE_ORIGIN | --cdp-env ENV_NAME | --executable-env ENV_NAME] [--launch-mode auto|driver|native] [--public-url HTTPS_ORIGIN] [--headless true|false] [--sign-origins ORIGIN,...]
   alive browser activate | doctor [--online] | diagnose | pair | serve [--local] [--url URL]
                                               configure, diagnose and test phone handoff without an LLM
