@@ -81,6 +81,18 @@ export const TELEGRAM_DUPLICATE_POLLER_MESSAGE =
 /** Probe/delete and report a 409 at most once per five minutes for this token. */
 const TELEGRAM_CONFLICT_WINDOW_MS = 5 * 60_000;
 
+/**
+ * Background `getMe` retry backoff: 2s, 5s, 15s, 60s, then every 5 min. Tests
+ * inject a shorter list through {@link TelegramModuleOptions} instead of waiting.
+ */
+const IDENTITY_RETRY_DELAYS_MS: readonly number[] = [2_000, 5_000, 15_000, 60_000, 300_000];
+
+/** Test-only seams; production uses the defaults and passes no options. */
+export interface TelegramModuleOptions {
+	/** Override the background `getMe` retry delays (the last entry repeats). */
+	identityRetryDelaysMs?: readonly number[];
+}
+
 /** A validated attachment, loaded and ready for one Bot API upload. */
 interface PreparedUpload {
 	data: Buffer;
@@ -219,6 +231,14 @@ export class TelegramModule implements AliveModule {
 	private botName?: string;
 	private readonly typing = new Map<string, { interval: NodeJS.Timeout; deadline: NodeJS.Timeout }>();
 	private managedSweep?: NodeJS.Timeout;
+	/**
+	 * `getMe` is the only source of `botId`/`botUsername`, and group addressing
+	 * (mentions, replies to our own messages) is impossible without them. A single
+	 * network blip during startup used to leave the bot alive but unable to
+	 * recognise itself, so identity is retried in the background until it lands.
+	 */
+	private identityRetry?: NodeJS.Timeout;
+	private identityRetryAttempt = 0;
 	private typingMaxMsValue = 5 * 60_000;
 	private readonly counters = { updates: 0, inbound: 0, outbound: 0, errors: 0 };
 	/** Debounced edit bursts, keyed by `${chatId}:${messageId}`. */
@@ -242,8 +262,14 @@ export class TelegramModule implements AliveModule {
 	 */
 	private readonly transcriptionCounters: TranscriptionCounters = { attempted: 0, transcribed: 0, failed: 0 };
 
-	constructor(config: TelegramConfig) {
+	private readonly identityRetryDelaysMs: readonly number[];
+
+	constructor(config: TelegramConfig, options: TelegramModuleOptions = {}) {
 		this.config = config;
+		this.identityRetryDelaysMs =
+			options.identityRetryDelaysMs && options.identityRetryDelaysMs.length > 0
+				? options.identityRetryDelaysMs
+				: IDENTITY_RETRY_DELAYS_MS;
 	}
 
 	handles(message: OutgoingMessage): boolean {
@@ -302,16 +328,7 @@ export class TelegramModule implements AliveModule {
 		try {
 			me = await this.api.getMe();
 		} catch (err) {
-			const now = Date.now();
-			this.lastError = message(err);
-			this.lastErrorAt = now;
-			this.lastErrorKind = isNetworkError(err) ? "network" : "api";
-			this.lastFailureNetwork = isNetworkError(err);
-			// A failed getMe invalidates whatever bot was recorded by an earlier run:
-			// status must not keep presenting that identity as connected.
-			const current = this.state.load();
-			if (current.me) this.state.patch({ me: { ...current.me, stale: true, staleAt: now } });
-			ctx.log.warn("telegram getMe failed; polling anyway", { error: this.lastError });
+			this.noteIdentityFailure(ctx, err);
 		}
 
 		if (me) {
@@ -327,13 +344,81 @@ export class TelegramModule implements AliveModule {
 				await this.stop();
 				throw error;
 			}
-			this.botId = me.id;
-			this.botUsername = me.username;
-			this.botName = [me.first_name, me.last_name].filter(Boolean).join(" ") || me.username || "bot";
-			this.state.patch({
-				me: { id: me.id, username: me.username, firstName: me.first_name, verifiedAt: Date.now() },
+			this.applyIdentity(ctx, me);
+		} else {
+			// Polling is already running, but without an identity every group mention
+			// and reply-to-us reads as unaddressed. Keep asking in the background.
+			this.scheduleIdentityRetry(ctx);
+		}
+	}
+
+	/** Record a failed handshake and mark any previously known identity as stale. */
+	private noteIdentityFailure(ctx: ModuleContext, err: unknown): void {
+		const now = Date.now();
+		this.lastError = message(err);
+		this.lastErrorAt = now;
+		this.lastErrorKind = isNetworkError(err) ? "network" : "api";
+		this.lastFailureNetwork = isNetworkError(err);
+		// A failed getMe invalidates whatever bot was recorded by an earlier run:
+		// status must not keep presenting that identity as connected.
+		const current = this.state?.load();
+		if (current?.me) this.state?.patch({ me: { ...current.me, stale: true, staleAt: now } });
+		ctx.log.warn("telegram getMe failed; polling anyway", { error: this.lastError });
+	}
+
+	/** Store the bot identity once (and only once it survived the mismatch check). */
+	private applyIdentity(ctx: ModuleContext, me: NonNullable<Awaited<ReturnType<TelegramApi["getMe"]>>>): void {
+		this.botId = me.id;
+		this.botUsername = me.username;
+		this.botName = [me.first_name, me.last_name].filter(Boolean).join(" ") || me.username || "bot";
+		this.state?.patch({
+			me: { id: me.id, username: me.username, firstName: me.first_name, verifiedAt: Date.now() },
+		});
+		ctx.log.info("telegram connected", { bot: this.botName, username: this.botUsername, id: this.botId });
+	}
+
+	/**
+	 * Retry the identity handshake with backoff: 2s, 5s, 15s, 60s, then every 5 min.
+	 * Nothing else in the module can substitute for it, so giving up is not an option
+	 * while the process is alive.
+	 */
+	private scheduleIdentityRetry(ctx: ModuleContext): void {
+		if (this.stopped || this.identityRetry) return;
+		const delays = this.identityRetryDelaysMs;
+		const delay = delays[Math.min(this.identityRetryAttempt, delays.length - 1)]!;
+		this.identityRetryAttempt += 1;
+		const timer = setTimeout(() => {
+			this.identityRetry = undefined;
+			void this.retryIdentity(ctx);
+		}, delay);
+		timer.unref?.();
+		this.identityRetry = timer;
+	}
+
+	private async retryIdentity(ctx: ModuleContext): Promise<void> {
+		if (this.stopped || !this.api) return;
+		try {
+			const me = await this.api.getMe();
+			if (this.stopped) return;
+			const mismatch = this.managedBotIdentityMismatch(ctx, me.id);
+			if (mismatch) {
+				this.lastError = mismatch;
+				this.lastErrorAt = Date.now();
+				this.lastErrorKind = "api";
+				ctx.log.error("telegram bot identity mismatch; stopping identity retries", { error: mismatch, botId: me.id });
+				return;
+			}
+			this.applyIdentity(ctx, me);
+			ctx.log.info("telegram identity recovered after a failed handshake", {
+				attempts: this.identityRetryAttempt,
+				botId: me.id,
+				username: me.username,
 			});
-			ctx.log.info("telegram connected", { bot: this.botName, username: this.botUsername, id: this.botId });
+			this.identityRetryAttempt = 0;
+		} catch (err) {
+			if (this.stopped) return;
+			this.noteIdentityFailure(ctx, err);
+			this.scheduleIdentityRetry(ctx);
 		}
 	}
 
@@ -342,6 +427,8 @@ export class TelegramModule implements AliveModule {
 		this.abort.abort();
 		if (this.managedSweep) clearInterval(this.managedSweep);
 		this.managedSweep = undefined;
+		if (this.identityRetry) clearTimeout(this.identityRetry);
+		this.identityRetry = undefined;
 		for (const thread of [...this.typing.keys()]) this.stopTyping(thread);
 		// Deliver edits that were still inside their debounce window instead of
 		// silently dropping them: the event and history writes are synchronous.
