@@ -3,15 +3,27 @@
  *
  *   npx tsx src/dev/github-auth-test.ts
  *
- * Filesystem fixtures for config loading only: no network, no credentials and
- * no sandbox. The network-facing token mint is covered by its pure checks
- * (repository parsing/matching) rather than a live GitHub App.
+ * Filesystem fixtures for config loading and credential-gate checks only: no
+ * network, no real credentials and no sandbox. The network-facing token mint is
+ * covered by its pure checks (repository parsing/matching) rather than a live
+ * GitHub App.
  */
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DEFAULT_CONFIG, loadConfig, type LoadedConfig } from "../config.js";
-import { APP_FOR_PROFILE, appProfileFor, githubAppRoot, profileFromStateDir, repositoryFor } from "../github/app-auth.js";
+import {
+	APP_FOR_PROFILE,
+	appProfileFor,
+	createGitHubAuthTool,
+	githubAppRoot,
+	githubToolsEnabled,
+	hasGitHubAppCredentials,
+	profileFromStateDir,
+	repositoryFor,
+} from "../github/app-auth.js";
+import { createGitHubApiTool } from "../github/api-tool.js";
+import type { SandboxManager } from "../sandbox/manager.js";
 import {
 	DEFAULT_GITHUB_CONFIG,
 	DEFAULT_GITHUB_REPOSITORY,
@@ -64,6 +76,19 @@ function errorOf(fn: () => unknown): string {
 	} catch (error) {
 		return error instanceof Error ? error.message : String(error);
 	}
+}
+
+function writeCredentials(appRoot: string, app: string): string {
+	const directory = path.join(appRoot, app);
+	fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+	fs.chmodSync(directory, 0o700);
+	const metadata = path.join(directory, "app.json");
+	const key = path.join(directory, "private-key.pem");
+	fs.writeFileSync(metadata, JSON.stringify({ app_id: 1, installation_id: 1, slug: app, installed_repository: DEFAULT_GITHUB_REPOSITORY }), { mode: 0o600 });
+	fs.writeFileSync(key, "-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----\n", { mode: 0o600 });
+	fs.chmodSync(metadata, 0o600);
+	fs.chmodSync(key, 0o600);
+	return directory;
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +186,44 @@ section("github config validation");
 	for (const [label, value] of rejects) {
 		const message = errorOf(() => validateGitHubConfig(value));
 		check(`${label} is rejected`, message.startsWith("github"), message || "accepted");
+	}
+}
+
+// ---------------------------------------------------------------------------
+section("GitHub tools are gated on credentials unless github.app is explicit");
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-github-gate-"));
+	const appRoot = path.join(root, ".alive", "github-apps");
+	const manager = {} as unknown as SandboxManager;
+	const tools = (loaded: LoadedConfig) => ({
+		auth: createGitHubAuthTool(manager, loaded),
+		api: createGitHubApiTool(loaded),
+	});
+	try {
+		const editorState = path.join(root, ".alive", "agents", "editor", "state");
+		const noCredentials = loadedAt(editorState);
+		check("a managed profile without credentials is not available", !hasGitHubAppCredentials(editorState, "editor"));
+		check("a managed profile without credentials gets no github tools", !githubToolsEnabled(noCredentials) && tools(noCredentials).auth === undefined && tools(noCredentials).api === undefined);
+
+		const explicitWithoutDirectory = loadedAt(editorState, { app: "festival" });
+		check("an explicit github.app enables tools without a directory", githubToolsEnabled(explicitWithoutDirectory) && tools(explicitWithoutDirectory).auth !== undefined && tools(explicitWithoutDirectory).api !== undefined);
+		check("the explicit app itself still has no credentials", !hasGitHubAppCredentials(editorState, "festival"));
+
+		writeCredentials(appRoot, "festival");
+		const explicitWithDirectory = loadedAt(editorState, { app: "festival" });
+		check("an explicit github.app with credentials stays enabled", githubToolsEnabled(explicitWithDirectory) && tools(explicitWithDirectory).auth !== undefined && tools(explicitWithDirectory).api !== undefined);
+		check("the explicit App directory is now complete", hasGitHubAppCredentials(editorState, "festival"));
+
+		writeCredentials(appRoot, "editor");
+		const withCredentials = loadedAt(editorState);
+		check("a managed profile with credentials gets both tools", githubToolsEnabled(withCredentials) && tools(withCredentials).auth !== undefined && tools(withCredentials).api !== undefined);
+		check("the managed profile App directory is complete", hasGitHubAppCredentials(editorState, "editor"));
+
+		writeCredentials(appRoot, "manager");
+		const legacy = loadedAt(path.join(root, ".alive", "agents", "slava-manager", "state"));
+		check("the historical slava-manager mapping still works with its directory", githubToolsEnabled(legacy) && tools(legacy).auth !== undefined && tools(legacy).api !== undefined);
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
 	}
 }
 

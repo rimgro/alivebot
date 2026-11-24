@@ -1,7 +1,7 @@
 import { Type } from "typebox";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { LoadedConfig } from "../config.js";
-import { appProfileFor, getScopedInstallationToken, repositoryFor } from "./app-auth.js";
+import { getScopedInstallationToken, githubToolsEnabled, repositoryFor } from "./app-auth.js";
 import { withRetries, type RetryLogger } from "../retry.js";
 
 const API = "https://api.github.com";
@@ -26,7 +26,7 @@ function compactPull(value: any) {
 }
 
 export function createGitHubApiTool(loaded: LoadedConfig, log?: RetryLogger): ToolDefinition | undefined {
-	if (!appProfileFor(loaded)) return undefined;
+	if (!githubToolsEnabled(loaded)) return undefined;
 	const repository = repositoryFor(loaded);
 	return defineTool({
 		name: "github_api",

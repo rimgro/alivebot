@@ -86,6 +86,39 @@ export function githubAppRoot(stateDir: string): string {
 		: path.resolve(stateDir, "github-apps");
 }
 
+/**
+ * Cheap read-only check that the App credential directory looks complete.
+ * Missing files, permission errors or a file where a directory is expected all
+ * mean "not configured" so the tools stay out of the prompt instead of failing
+ * with ENOENT on the first call.
+ */
+export function hasGitHubAppCredentials(stateDir: string, appProfile: string): boolean {
+	if (!appProfile) return false;
+	try {
+		const appRoot = githubAppRoot(stateDir);
+		const directory = path.join(appRoot, appProfile);
+		if (!directory.startsWith(`${appRoot}${path.sep}`)) return false;
+		if (!fs.statSync(directory).isDirectory()) return false;
+		return ["app.json", "private-key.pem"].every((file) => fs.statSync(path.join(directory, file)).isFile());
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Gate for the sandbox GitHub tools.
+ *
+ * An explicit non-empty `github.app` is an operator decision: enable the tools
+ * even if the credentials are missing so the failure is loud on first use.
+ * Otherwise a profile gets the tools only when its resolved App directory
+ * actually contains credentials.
+ */
+export function githubToolsEnabled(loaded: LoadedConfig): boolean {
+	if (loaded.config.github?.app?.trim()) return true;
+	const appProfile = appProfileFor(loaded);
+	return appProfile ? hasGitHubAppCredentials(loaded.paths.stateDir, appProfile) : false;
+}
+
 function readApp(stateDir: string, appProfile: string, repository: string): { directory: string; metadata: AppMetadata; privateKey: string } {
 	const appRoot = githubAppRoot(stateDir);
 	const directory = path.join(appRoot, appProfile);
@@ -180,9 +213,9 @@ function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-/** Add a narrow token-refresh tool to profiles with a configured or derived GitHub App. */
+/** Add a narrow token-refresh tool only when this profile has a usable GitHub App. */
 export function createGitHubAuthTool(manager: SandboxManager, loaded: LoadedConfig, log?: RetryLogger): ToolDefinition | undefined {
-	if (!appProfileFor(loaded)) return undefined;
+	if (!githubToolsEnabled(loaded)) return undefined;
 	const repository = repositoryFor(loaded);
 	const repoDirectory = repositoryDirectory(repository);
 
