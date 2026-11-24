@@ -136,6 +136,16 @@ Rules:
   second request; finished or failed ones are cleared with
   `systemctl reset-failed` first. `alive update` and `alive update --auto` never
   restart anything themselves — either the watchdog does, or this command does.
+- Under a systemd unit (the recommended deployment) `alive restart --deferred`
+  does not start `alive restart` at all: it schedules
+  `systemctl [--user] restart alive.service` (or `alive-agent@<profile>`), so the
+  environment and profile come from the unit and there is exactly one restart,
+  with no race against `Restart=always`. `--user` must match the supervisor's
+  scope; an explicit `--config` is refused because the unit already determines
+  the profile, and `--force`/`--timeout`/`--model`/`--verbose` are ignored.
+  Without a supervisor it falls back to `alive restart` with an absolute
+  `--config` and a 0600 environment snapshot passed as `EnvironmentFile=`
+  (removed by the unit when it finishes). Secrets never appear in argv.
 - The command must not require interactivity and must not print secrets; its
   output is appended to the log.
 - `alive restart` from the same checkout is usually right: it stops the old

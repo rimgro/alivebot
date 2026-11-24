@@ -193,6 +193,12 @@ const SERVICE_USAGE: Record<"stop" | "restart" | "status", string> = {
 		"cleaned up with `systemctl reset-failed`, and every unit is started with\n" +
 		"--collect so systemd does not keep it around.\n" +
 		"\n" +
+		"When the profile runs under a systemd unit, the unit restarts that supervisor\n" +
+		"(systemctl [--user] restart <unit>): environment and profile come from the unit,\n" +
+		"so --config is refused and --force/--timeout/--model/--verbose are ignored.\n" +
+		"Otherwise it runs `alive restart` with an absolute --config and a 0600\n" +
+		"environment snapshot (EnvironmentFile, removed when the unit finishes).\n" +
+		"\n" +
 		"Raw equivalent (unique unit, --collect):\n" +
 		"  systemd-run --on-active=5 --collect --unit=alive-restart-$(date +%s) --working-directory=\"$PWD\" /path/to/alive restart\n" +
 		"  systemd-run --user --on-active=5 --collect --unit=alive-restart-$(date +%s) --working-directory=\"$PWD\" /path/to/alive restart\n" +
@@ -791,18 +797,38 @@ async function deferredRestartCommand(
 
 	const scope: DeferredScope = flagBool(flags, "user") ? "user" : "system";
 	const deps = options.deferred ?? { run: createExecRunner(), now: () => new Date() };
+	// The supervisor check needs the harness pid and the state dir. A broken or
+	// missing config must not stop the direct fallback, so this is best effort.
+	let stateDir: string | undefined;
+	let harnessPid: number | undefined;
+	try {
+		const config = loadForCli(flags);
+		stateDir = config.paths.stateDir;
+		harnessPid = snapshotRuntime(stateDir)?.pid;
+	} catch {
+		// No config: the direct strategy still resolves ./alive.config.json.
+	}
 	const result = await runDeferredRestart(
-		{ cwd, afterSec: after.seconds, scope, restartArgs: forwardedRestartArgs(flags) },
+		{
+			cwd,
+			afterSec: after.seconds,
+			scope,
+			restartArgs: forwardedRestartArgs(flags),
+			harnessPid,
+			stateDir,
+			env: options.env ?? process.env,
+			...(deps.cgroupText === undefined ? {} : { cgroupText: deps.cgroupText }),
+		},
 		deps,
 	);
-	const systemctl = scope === "user" ? "systemctl --user" : "systemctl";
+	const requestedSystemctl = scope === "user" ? "systemctl --user" : "systemctl";
 
 	if (result.outcome === "blocked") {
 		const lines = [`${term.red("refused:")} a deferred restart is already pending`];
 		for (const unit of result.pending) {
 			lines.push(`  ${unit.unit} is ${unit.active}/${unit.sub}`);
-			lines.push(`  inspect: ${systemctl} status ${unit.unit}`);
-			lines.push(`  stop:    ${systemctl} stop ${unit.unit}`);
+			lines.push(`  inspect: ${requestedSystemctl} status ${unit.unit}`);
+			lines.push(`  stop:    ${requestedSystemctl} stop ${unit.unit}`);
 		}
 		lines.push("Nothing new was scheduled; that unit restarts the harness when it fires.");
 		process.stderr.write(`${lines.join("\n")}\n`);
@@ -819,10 +845,18 @@ async function deferredRestartCommand(
 	for (const warning of result.warnings) {
 		process.stderr.write(`${term.yellow("warning:")} ${warning}\n`);
 	}
+	for (const note of result.notes) {
+		process.stderr.write(`${term.gray(`note: ${note}`)}\n`);
+	}
 
 	const journal = scope === "user" ? `journalctl --user -u ${result.unit}` : `journalctl -u ${result.unit}`;
+	const via =
+		result.strategy === "supervisor" && result.supervisor
+			? `via supervisor unit ${result.supervisor.unit} (${result.supervisor.scope === "user" ? "systemctl --user" : "systemctl"} restart)`
+			: "via alive restart (environment snapshot)";
 	process.stdout.write(
 		`${term.green("deferred restart scheduled:")} ${result.unit}\n` +
+			`  ${via}\n` +
 			`  restart in ${result.afterSec}s — the current run will be interrupted in ${result.afterSec}s\n` +
 			`  watch it with: ${journal}\n`,
 	);
