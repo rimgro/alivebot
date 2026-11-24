@@ -71,6 +71,14 @@ export function decideTelegramMcpCall(input: TelegramMcpPolicyInput): TelegramMc
 		const chat = extractChat(args);
 		const blacklist = blacklistReason(args);
 		if (blacklist) return { decision: "deny", ...(chat === undefined ? {} : { chat }), reason: blacklist };
+		if (profile.allowChats.length > 0 && chat === undefined) {
+			return {
+				decision: "deny",
+				reason:
+					`cannot resolve target chat: expected one of ${CHAT_KEYS.join(", ")} ` +
+					`to be a string or number; allowed chats: ${formatAllowChats(profile)}`,
+			};
+		}
 		if (profile.mode === "read") {
 			return {
 				decision: "deny",

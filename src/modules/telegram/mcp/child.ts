@@ -17,6 +17,76 @@ const HEALTHY_AFTER_MS = 30_000;
 /** How long a request waits for a restarting child to come back. */
 export const UPSTREAM_READY_TIMEOUT_MS = 10_000;
 
+/**
+ * Fixed, exact names the upstream may inherit. There are deliberately no
+ * prefix/wildcard rules: a new variable is either listed here with a reason, or
+ * the profile must add it explicitly in `env`.
+ */
+export const UPSTREAM_ENV_ALLOWLIST = [
+	// Process basics: PATH locates the `telegram` binary, HOME the session and
+	// config files, USER/LOGNAME/SHELL the normal CLI identity.
+	"PATH",
+	"HOME",
+	"USER",
+	"LOGNAME",
+	"SHELL",
+	// Terminal/locale/timezone: better-tg-cli prints and parses dates and text.
+	"TERM",
+	"LANG",
+	"LANGUAGE",
+	"LC_ALL",
+	"LC_CTYPE",
+	"LC_MESSAGES",
+	"LC_NUMERIC",
+	"LC_TIME",
+	"LC_COLLATE",
+	"LC_MONETARY",
+	"TZ",
+	// Temp directories used for downloaded/uploaded media.
+	"TMPDIR",
+	"TEMP",
+	"TMP",
+	// Standard XDG base directories: a CLI may keep config/cache/state there.
+	"XDG_CONFIG_HOME",
+	"XDG_CONFIG_DIRS",
+	"XDG_DATA_HOME",
+	"XDG_DATA_DIRS",
+	"XDG_CACHE_HOME",
+	"XDG_STATE_HOME",
+	"XDG_RUNTIME_DIR",
+	// Deliberately no Telegram credentials: `better-tg-cli` keeps its session in
+	// HOME/XDG config, and a profile that really needs TELEGRAM_* names adds them
+	// in `env` (explicit, per name) instead of inheriting them silently.
+	// Outbound proxies: better-tg-cli may need them in a restricted network.
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"NO_PROXY",
+	"ALL_PROXY",
+	"http_proxy",
+	"https_proxy",
+	"no_proxy",
+	"all_proxy",
+] as const;
+
+const CHILD_ENV_ALLOWED = new Set<string>(UPSTREAM_ENV_ALLOWLIST);
+
+/**
+ * Build the upstream environment from the allowlist plus the profile's own
+ * `env` map. `profileEnv` is the only way to add a variable: the proxy's
+ * ALIVE_* and GitHub credentials must never leak just because they are set.
+ */
+export function buildUpstreamEnv(
+	profileEnv: NodeJS.ProcessEnv | undefined,
+	source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = {};
+	for (const [key, value] of Object.entries(source)) {
+		if (value === undefined) continue;
+		if (CHILD_ENV_ALLOWED.has(key)) env[key] = value;
+	}
+	return { ...env, ...profileEnv };
+}
+
 export interface UpstreamChildOptions {
 	profile: string;
 	command: string;
@@ -126,9 +196,11 @@ export class UpstreamChild {
 		const { profile, command, args, env, cwd, log } = this.options;
 		let child: ChildProcess;
 		try {
+			const childEnv = buildUpstreamEnv(env);
+			childEnv.ALIVE_TELEGRAM_MCP_PROFILE = profile;
 			child = spawn(command, args, {
 				cwd,
-				env: { ...process.env, ...env, ALIVE_TELEGRAM_MCP_PROFILE: profile },
+				env: childEnv,
 				detached: process.platform !== "win32",
 				stdio: ["pipe", "pipe", "pipe"],
 			});

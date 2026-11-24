@@ -20,6 +20,7 @@ import {
 } from "../modules/telegram/mcp/config.js";
 import { DEFAULT_CONFIG } from "../config.js";
 import { telegramMcpAuditFile } from "../modules/telegram/mcp/audit.js";
+import { UPSTREAM_ENV_ALLOWLIST, buildUpstreamEnv } from "../modules/telegram/mcp/child.js";
 import { TelegramMcpLimitsStore, telegramMcpLimitsFile } from "../modules/telegram/mcp/limits.js";
 import { decideTelegramMcpCall } from "../modules/telegram/mcp/policy.js";
 import { parseJsonRpcMessage, parseStdioChunk } from "../modules/telegram/mcp/protocol.js";
@@ -59,6 +60,12 @@ function mode(file: string): number {
 }
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+const savedEnv = new Map<string, string | undefined>();
+
+function setTestEnv(name: string, value: string): void {
+	if (!savedEnv.has(name)) savedEnv.set(name, process.env[name]);
+	process.env[name] = value;
+}
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-mcp-test-"));
 const stateDir = path.join(root, ".alive");
@@ -69,6 +76,19 @@ const groupPidFile = path.join(root, "group-pids.jsonl");
 const groupTermFile = path.join(root, "group-terms.txt");
 const crashMarker = path.join(root, "crashed.once");
 const serverLog: string[] = [];
+
+/** The fake upstream gets its control paths through profile.env, not the proxy env. */
+function profileEnv(name: string, extra: Record<string, string> = {}): Record<string, string> {
+	return {
+		FAKE_START_LOG: startLog,
+		FAKE_WRITE_LOG: writeLog,
+		FAKE_GROUP_PID_FILE: groupPidFile,
+		FAKE_GROUP_TERM_FILE: groupTermFile,
+		FAKE_CRASH_MARKER: crashMarker,
+		FAKE_ENV_LOG: path.join(root, `env-${name}.json`),
+		...extra,
+	};
+}
 const longWriteText = `BEGIN-${"x".repeat(300)}-END-SECRET-SUFFIX`;
 
 const fakeSource = String.raw`
@@ -77,6 +97,7 @@ const { spawn } = require("node:child_process");
 const profile = process.env.ALIVE_TELEGRAM_MCP_PROFILE || "unknown";
 const startLog = process.env.FAKE_START_LOG;
 if (startLog) fs.appendFileSync(startLog, JSON.stringify({ profile, pid: process.pid, ts: Date.now() }) + "\n");
+if (process.env.FAKE_ENV_LOG) fs.writeFileSync(process.env.FAKE_ENV_LOG, JSON.stringify(process.env));
 if (process.env.FAKE_GROUP_PID_FILE) {
 	const code = "const fs=require('node:fs');process.on('SIGTERM',()=>{fs.appendFileSync(" +
 		JSON.stringify(process.env.FAKE_GROUP_TERM_FILE || "") +
@@ -158,6 +179,9 @@ let autoToken = "";
 let unopenedToken = "";
 let expiredToken = "";
 let crasherToken = "";
+let resolverToken = "";
+let burstToken = "";
+let guardedToken = "";
 let limits: TelegramMcpLimitsStore | undefined;
 let clockNow = Date.UTC(2026, 0, 1, 12, 0, 0);
 
@@ -214,11 +238,19 @@ function pidAlive(pid: number): boolean {
 
 try {
 	fs.writeFileSync(fakePath, fakeSource);
-	process.env.FAKE_START_LOG = startLog;
-	process.env.FAKE_WRITE_LOG = writeLog;
-	process.env.FAKE_GROUP_PID_FILE = groupPidFile;
-	process.env.FAKE_GROUP_TERM_FILE = groupTermFile;
-	process.env.FAKE_CRASH_MARKER = crashMarker;
+	// Parent-only markers: the proxy must not pass these to the upstream child.
+	setTestEnv("ALIVE_TEST_SECRET", "must-not-reach-the-child");
+	setTestEnv("ALIVE_TEST_GITHUB_TOKEN", "ghs_must-not-reach-the-child");
+	setTestEnv("ALIVE_TELEGRAM_MCP_TOKEN", "bearer-proxy-marker");
+	setTestEnv("TELEGRAM_MCP_TOKEN", "bearer-proxy-marker");
+	setTestEnv("TELEGRAM_FOO", "arbitrary-telegram-prefix-must-not-pass");
+	setTestEnv("LC_ALIVE_TEST", "arbitrary-lc-prefix-must-not-pass");
+	setTestEnv("XDG_ALIVE_TEST", "arbitrary-xdg-prefix-must-not-pass");
+	// Set every exact allowlist name so the child dump can prove exact matching.
+	for (const name of UPSTREAM_ENV_ALLOWLIST) {
+		if (name === "PATH") continue;
+		setTestEnv(name, name === "LANG" ? "parent-lang" : `${name}-marker`);
+	}
 
 	section("config: defaults and validation");
 	{
@@ -244,6 +276,15 @@ try {
 				);
 			})(),
 		);
+		const withEnv = validateTelegramMcpConfig({
+			enabled: true,
+			profiles: [{ name: "alice", env: { TELEGRAM_SESSION: "fixture", EMPTY: "" } }],
+		});
+		check(
+			"a flat string env map is kept",
+			withEnv.profiles[0]?.env?.TELEGRAM_SESSION === "fixture" && withEnv.profiles[0]?.env?.EMPTY === "",
+			withEnv.profiles[0]?.env,
+		);
 		const bad = [
 			["non-object", 42, "must be an object"],
 			["enabled type", { enabled: "yes", profiles: [] }, "enabled must be true or false"],
@@ -256,6 +297,10 @@ try {
 			["ttl", { enabled: true, profiles: [{ name: "a", writeTtlMs: 0 }] }, "writeTtlMs must be"],
 			["limit", { enabled: true, profiles: [{ name: "a", writeLimitPerHour: -1 }] }, "writeLimitPerHour must be"],
 			["args", { enabled: true, profiles: [{ name: "a", args: [1] }] }, "args must be an array of strings"],
+			["env type", { enabled: true, profiles: [{ name: "a", env: "X=1" }] }, "env must be an object"],
+			["env number", { enabled: true, profiles: [{ name: "a", env: { PORT: 1 } }] }, "env.PORT must be a string"],
+			["env nested", { enabled: true, profiles: [{ name: "a", env: { BAD: { nested: true } } }] }, "env.BAD must be a string"],
+			["env empty key", { enabled: true, profiles: [{ name: "a", env: { " ": "x" } }] }, "empty variable name"],
 		] as const;
 		for (const [label, value, expected] of bad) {
 			const message = thrown(() => validateTelegramMcpConfig(value));
@@ -294,12 +339,15 @@ try {
 	}
 
 	const profiles: TelegramMcpProfileConfig[] = [
-		{ name: "reader", mode: "read", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath] },
-		{ name: "asker", mode: "write:ask", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath] },
-		{ name: "autowriter", mode: "write:auto", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath] },
-		{ name: "unopened", mode: "write:auto", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath] },
-		{ name: "expired", mode: "write:auto", allowChats: ["111"], writeTtlMs: 1_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath] },
-		{ name: "crasher", mode: "read", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath] },
+		{ name: "reader", mode: "read", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath], env: profileEnv("reader", { PROFILE_ONLY: "from-profile", LANG: "profile-lang" }) },
+		{ name: "asker", mode: "write:ask", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath], env: profileEnv("asker") },
+		{ name: "autowriter", mode: "write:auto", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath], env: profileEnv("autowriter") },
+		{ name: "unopened", mode: "write:auto", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath], env: profileEnv("unopened") },
+		{ name: "expired", mode: "write:auto", allowChats: ["111"], writeTtlMs: 1_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath], env: profileEnv("expired") },
+		{ name: "crasher", mode: "read", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath], env: profileEnv("crasher") },
+		{ name: "resolver", mode: "write:auto", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 20, command: process.execPath, args: [fakePath], env: profileEnv("resolver") },
+		{ name: "burst", mode: "write:auto", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 3, command: process.execPath, args: [fakePath], env: profileEnv("burst") },
+		{ name: "guarded", mode: "write:auto", allowChats: ["123"], writeTtlMs: 60_000, writeLimitPerHour: 5, command: process.execPath, args: [fakePath], env: profileEnv("guarded") },
 	];
 	const config: TelegramMcpConfig = { enabled: true, host: "127.0.0.1", port: 8787, profiles };
 
@@ -321,6 +369,67 @@ try {
 				const decision = decideTelegramMcpCall({ profile, tool: "telegram_delete_all", args: {}, now: clockNow, limits: open });
 				return decision.decision === "deny" && decision.reason.includes("telegram_help, telegram_read, telegram_write");
 			})(),
+		);
+		const unresolved = decideTelegramMcpCall({ profile, tool: "telegram_write", args: {}, now: clockNow, limits: open });
+		check(
+			"write with allowChats and an unresolved chat is denied",
+			unresolved.decision === "deny" && unresolved.reason.includes("cannot resolve target chat") && unresolved.reason.includes('"111"'),
+			unresolved,
+		);
+		const objectChat = decideTelegramMcpCall({
+			profile,
+			tool: "telegram_write",
+			args: { chat: { id: "111" } },
+			now: clockNow,
+			limits: open,
+		});
+		check("write with a nested chat object is denied, not guessed", objectChat.decision === "deny" && objectChat.reason.includes("cannot resolve target chat"), objectChat);
+		for (const [label, args] of [
+			["numeric chat", { chat: 111 }],
+			["to string", { to: "111" }],
+			["recipient string", { recipient: "111" }],
+		] as const) {
+			const decision = decideTelegramMcpCall({ profile, tool: "telegram_write", args, now: clockNow, limits: open });
+			check(`write resolves ${label}`, decision.decision === "allow" && decision.chat === "111", decision);
+		}
+		const unrestricted = decideTelegramMcpCall({
+			profile: { ...profile, allowChats: [] },
+			tool: "telegram_write",
+			args: {},
+			now: clockNow,
+			limits: open,
+		});
+		check("an empty allowChats keeps the old write behaviour", unrestricted.decision === "allow", unrestricted);
+		const nonMatchingWrite = { ...profile, allowChats: ["123"] };
+		for (const [label, args] of [
+			["chat", { chat: "999" }],
+			["to", { to: "999" }],
+			["recipient", { recipient: "999" }],
+		] as const) {
+			const decision = decideTelegramMcpCall({
+				profile: nonMatchingWrite,
+				tool: "telegram_write",
+				args,
+				now: clockNow,
+				limits: open,
+			});
+			check(
+				`write via ${label} with a non-matching string is denied`,
+				decision.decision === "deny" && decision.reason.includes('"123"') && decision.reason.includes("allowChats"),
+				decision,
+			);
+		}
+		const nonMatchingRead = decideTelegramMcpCall({
+			profile: nonMatchingWrite,
+			tool: "telegram_read",
+			args: { chat: "999" },
+			now: clockNow,
+			limits: open,
+		});
+		check(
+			"read with a non-matching string is denied",
+			nonMatchingRead.decision === "deny" && nonMatchingRead.reason.includes('"123"') && nonMatchingRead.reason.includes("allowChats"),
+			nonMatchingRead,
 		);
 		for (const [modeName, mode] of [
 			["read", "read"],
@@ -359,10 +468,23 @@ try {
 		clockNow += 60 * 60_000;
 		check("the counter rolls over after an hour", limits.snapshot("a", clockNow).writesThisHour === 0);
 		check("limits.json is 0600", mode(telegramMcpLimitsFile(fixture)) === 0o600, mode(telegramMcpLimitsFile(fixture)));
+		const reserveStore = new TelegramMcpLimitsStore(path.join(root, "limits-reserve"), { clock: () => clockNow });
+		reserveStore.openWindow("b", 60_000, clockNow);
+		const first = reserveStore.reserveWrite("b", 2, clockNow);
+		const second = reserveStore.reserveWrite("b", 2, clockNow);
+		const third = reserveStore.reserveWrite("b", 2, clockNow);
+		check(
+			"reserveWrite checks and counts in one step",
+			first.allowed && second.allowed && !third.allowed && third.reason?.includes("write limit") === true,
+			{ first, second, third },
+		);
 		clockNow = Date.UTC(2026, 0, 1, 12, 0, 0);
 		limits = new TelegramMcpLimitsStore(stateDir, { clock: () => clockNow });
 		limits.openWindow("autowriter", 60_000, clockNow);
 		limits.openWindow("expired", 1_000, clockNow - 5_000);
+		limits.openWindow("resolver", 60_000, clockNow);
+		limits.openWindow("burst", 60_000, clockNow);
+		limits.openWindow("guarded", 60_000, clockNow);
 	}
 
 	section("server: transport, auth and policy");
@@ -374,6 +496,9 @@ try {
 		unopenedToken = tokens.issue("unopened");
 		expiredToken = tokens.issue("expired");
 		crasherToken = tokens.issue("crasher");
+		resolverToken = tokens.issue("resolver");
+		burstToken = tokens.issue("burst");
+		guardedToken = tokens.issue("guarded");
 		server = new TelegramMcpServer({
 			config,
 			stateDir,
@@ -433,6 +558,52 @@ try {
 		const askerWrites = readJsonl(writeLog).filter((entry) => entry.profile === "asker");
 		check("write:ask never reaches the upstream", askerWrites.length === 0, askerWrites);
 
+		const unresolved = await call(resolverToken, "res-0", "telegram_write", { text: "no chat" });
+		check(
+			"write:auto with an unresolved chat is denied before the upstream",
+			decisionOf(unresolved.body) === "deny" && textOf(unresolved.body).includes("cannot resolve target chat"),
+			unresolved.body,
+		);
+		const objectChat = await call(resolverToken, "res-object", "telegram_write", { chat: { id: "111" }, text: "nested" });
+		check(
+			"write:auto with a chat object is denied, not guessed",
+			decisionOf(objectChat.body) === "deny" && textOf(objectChat.body).includes("cannot resolve target chat"),
+			objectChat.body,
+		);
+		const numericChat = await call(resolverToken, "res-number", "telegram_write", { chat: 111, text: "numeric" });
+		const toChat = await call(resolverToken, "res-to", "telegram_write", { to: "111", text: "to-string" });
+		const recipientChat = await call(resolverToken, "res-recipient", "telegram_write", { recipient: "111", text: "recipient-string" });
+		check(
+			"a numeric chat, to and recipient resolve to an allowChats entry",
+			textOf(numericChat.body).startsWith("fake:telegram_write:111:numeric") &&
+				textOf(toChat.body).startsWith("fake:telegram_write:") &&
+				textOf(recipientChat.body).startsWith("fake:telegram_write:"),
+			[numericChat.body, toChat.body, recipientChat.body],
+		);
+		const resolverWrites = readJsonl(writeLog).filter((entry) => entry.profile === "resolver");
+		check("only calls with a resolved allowed chat reached the upstream", resolverWrites.length === 3, resolverWrites.length);
+
+		for (const [label, args] of [
+			["chat", { chat: "999", text: "no-match-chat" }],
+			["to", { to: "999", text: "no-match-to" }],
+			["recipient", { recipient: "999", text: "no-match-recipient" }],
+		] as const) {
+			const denied = await call(guardedToken, `guarded-${label}`, "telegram_write", args);
+			check(
+				`guarded write via ${label} with a non-matching string is denied`,
+				decisionOf(denied.body) === "deny" && textOf(denied.body).includes('"123"'),
+				denied.body,
+			);
+		}
+		const guardedRead = await call(guardedToken, "guarded-read", "telegram_read", { chat: "999" });
+		check(
+			"guarded read with a non-matching string is denied",
+			decisionOf(guardedRead.body) === "deny" && textOf(guardedRead.body).includes('"123"'),
+			guardedRead.body,
+		);
+		const guardedWrites = readJsonl(writeLog).filter((entry) => entry.profile === "guarded");
+		check("no guarded write reached the upstream", guardedWrites.length === 0, guardedWrites);
+
 		const unopened = await call(unopenedToken, "auto-0", "telegram_write", { chat: "111", text: "no window" });
 		check(
 			"write:auto without an open TTL window is denied",
@@ -457,6 +628,17 @@ try {
 		const autoWrites = readJsonl(writeLog).filter((entry) => entry.profile === "autowriter");
 		check("only the two allowed auto writes reached the upstream", autoWrites.length === 2, autoWrites.length);
 
+		const burst = await Promise.all(
+			Array.from({ length: 4 }, (_, index) =>
+				call(burstToken, `burst-${index}`, "telegram_write", { chat: "111", text: `burst-${index}` }),
+			),
+		);
+		const burstAllowed = burst.filter((response) => textOf(response.body).startsWith("fake:telegram_write:")).length;
+		const burstDenied = burst.filter((response) => decisionOf(response.body) === "deny").length;
+		check("parallel auto writes reserve exactly the free slots", burstAllowed === 3 && burstDenied === 1, { burstAllowed, burstDenied });
+		const burstWrites = readJsonl(writeLog).filter((entry) => entry.profile === "burst");
+		check("the parallel burst sent exactly three writes upstream", burstWrites.length === 3, burstWrites.length);
+
 		const expired = await call(expiredToken, "expired-1", "telegram_write", { chat: "111", text: "late" });
 		check(
 			"an expired TTL window closes write:auto",
@@ -478,6 +660,63 @@ try {
 			"an upstream sampling/elicitation request gets a JSON-RPC error and the call still completes",
 			textOf(serverRequest.body) === "srv-error:-32601",
 			serverRequest.body,
+		);
+	}
+
+	section("child env: exact allowlist plus profile.env");
+	{
+		const envFile = path.join(root, "env-reader.json");
+		check("the fake upstream wrote its environment", fs.existsSync(envFile), envFile);
+		const childEnv = JSON.parse(fs.readFileSync(envFile, "utf8")) as Record<string, string>;
+		check("ALIVE_* and GitHub marker secrets do not leak", childEnv.ALIVE_TEST_SECRET === undefined && childEnv.ALIVE_TEST_GITHUB_TOKEN === undefined, Object.keys(childEnv).filter((key) => key.startsWith("ALIVE_")));
+		check(
+			"proxy bearer markers do not leak",
+			childEnv.ALIVE_TELEGRAM_MCP_TOKEN === undefined && childEnv.TELEGRAM_MCP_TOKEN === undefined,
+			{ alive: childEnv.ALIVE_TELEGRAM_MCP_TOKEN, telegram: childEnv.TELEGRAM_MCP_TOKEN },
+		);
+		for (const name of UPSTREAM_ENV_ALLOWLIST) {
+			const expected = name === "LANG" ? "profile-lang" : process.env[name];
+			check(`allowlist ${name} reaches the child`, childEnv[name] === expected, { expected, actual: childEnv[name] });
+		}
+		check(
+			"arbitrary TELEGRAM_/LC_/XDG_ prefixes do not leak",
+			childEnv.TELEGRAM_FOO === undefined && childEnv.LC_ALIVE_TEST === undefined && childEnv.XDG_ALIVE_TEST === undefined,
+			{ TELEGRAM_FOO: childEnv.TELEGRAM_FOO, LC: childEnv.LC_ALIVE_TEST, XDG: childEnv.XDG_ALIVE_TEST },
+		);
+		check("profile.env is merged on top", childEnv.PROFILE_ONLY === "from-profile", childEnv.PROFILE_ONLY);
+		check("profile.env overrides an allowlisted name", childEnv.LANG === "profile-lang", childEnv.LANG);
+		check("the internal profile marker is present", childEnv.ALIVE_TELEGRAM_MCP_PROFILE === "reader", childEnv.ALIVE_TELEGRAM_MCP_PROFILE);
+
+		const allowlist = [...UPSTREAM_ENV_ALLOWLIST];
+		check(
+			"the allowlist is a fixed exact-name array with no wildcard or prefix entries",
+			allowlist.length > 0 && allowlist.every((name) => /^[A-Za-z0-9_]+$/.test(name) && !name.includes("*") && !name.endsWith("_")),
+			allowlist,
+		);
+		const exact = buildUpstreamEnv(
+			{},
+			{
+				LC_ALL: "listed-exactly",
+				TELEGRAM_API_HASH: "telegram-credential",
+				TELEGRAM_API_ID: "telegram-credential",
+				TELEGRAM_MCP_TOKEN: "bearer",
+				TELEGRAM_FOO: "not-listed",
+				LC_ALIVE_TEST: "not-listed",
+				XDG_ALIVE_TEST: "not-listed",
+				ALIVE_TELEGRAM_MCP_TOKEN: "bearer",
+			},
+		);
+		check(
+			"selection is exact: LC_ALL passes, Telegram credentials and prefixed names do not",
+			exact.LC_ALL === "listed-exactly" &&
+				exact.TELEGRAM_API_HASH === undefined &&
+				exact.TELEGRAM_API_ID === undefined &&
+				exact.TELEGRAM_MCP_TOKEN === undefined &&
+				exact.TELEGRAM_FOO === undefined &&
+				exact.LC_ALIVE_TEST === undefined &&
+				exact.XDG_ALIVE_TEST === undefined &&
+				exact.ALIVE_TELEGRAM_MCP_TOKEN === undefined,
+			exact,
 		);
 	}
 
@@ -530,6 +769,10 @@ try {
 		check("the audit records allow and deny decisions", audit.some((entry) => entry.decision === "allow") && audit.some((entry) => entry.decision === "deny"), audit.length);
 		const deniedRead = audit.find((entry) => entry.tool === "telegram_read" && entry.chat === "222");
 		check("the denied read has profile, reason and decision", deniedRead?.profile === "reader" && deniedRead?.decision === "deny" && (deniedRead?.reason ?? "").includes("allowChats"), deniedRead);
+		const unresolvedAudit = audit.find(
+			(entry) => entry.profile === "resolver" && entry.tool === "telegram_write" && entry.decision === "deny" && (entry.reason ?? "").includes("cannot resolve target chat"),
+		);
+		check("the audit records the unresolved-chat reason", unresolvedAudit !== undefined, unresolvedAudit);
 		const askedAudit = audit.find((entry) => entry.tool === "telegram_write" && entry.decision === "ask");
 		check("the write audit carries byte length and a 120-char preview", askedAudit?.bytes === Buffer.byteLength(longWriteText) && askedAudit?.preview?.length === 120, askedAudit);
 		const auditText = fs.readFileSync(auditFile, "utf8");
@@ -563,11 +806,10 @@ try {
 	failures += 1;
 	process.stdout.write(`\nFAIL  unexpected error: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`);
 } finally {
-	delete process.env.FAKE_START_LOG;
-	delete process.env.FAKE_WRITE_LOG;
-	delete process.env.FAKE_GROUP_PID_FILE;
-	delete process.env.FAKE_GROUP_TERM_FILE;
-	delete process.env.FAKE_CRASH_MARKER;
+	for (const [name, value] of savedEnv) {
+		if (value === undefined) delete process.env[name];
+		else process.env[name] = value;
+	}
 	if (server) await server.stop().catch(() => undefined);
 	fs.rmSync(root, { recursive: true, force: true });
 }
