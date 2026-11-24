@@ -53,7 +53,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { oneLine } from "../util.js";
 import type { CommandRunner } from "../update.js";
-import { DEFERRED_RESTART_ENV_MARKER } from "./harness-guard.js";
+import { DEFERRED_RESTART_ENV_MARKER, NON_INHERITABLE_ENV_VARIABLES } from "./harness-guard.js";
 import {
 	detectSupervisorUnit,
 	type SupervisorScope,
@@ -276,8 +276,13 @@ export function absoluteConfigArgs(
  */
 export function formatEnvironmentFile(env: NodeJS.ProcessEnv): string {
 	const lines: string[] = [];
+	const skipped = new Set<string>(NON_INHERITABLE_ENV_VARIABLES);
 	for (const key of Object.keys(env).sort()) {
 		if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
+		// Identity of the caller's unit, not of the unit this file is for: a
+		// copied `ALIVE_RUNTIME`/`SYSTEMD_EXEC_PID` makes the new unit look like
+		// the harness and `alive restart` refuses its own ExecStart (#258).
+		if (skipped.has(key)) continue;
 		const value = env[key];
 		if (value === undefined || value.includes("\0")) continue;
 		lines.push(`${key}="${escapeEnvironmentValue(value)}"`);

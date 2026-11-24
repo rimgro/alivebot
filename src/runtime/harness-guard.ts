@@ -42,6 +42,27 @@ export const SYSTEMD_ENV_VARIABLES = ["INVOCATION_ID", "SYSTEMD_EXEC_PID", "JOUR
  */
 export const DEFERRED_RESTART_ENV_MARKER = "ALIVE_DEFERRED_RESTART";
 
+/**
+ * Variables that describe *the process they were read from* — the harness, the
+ * deferred unit, or the systemd unit that started the caller. They must never
+ * be copied into a different unit's environment (the `direct` strategy of
+ * `alive restart --deferred` snapshots the caller's environment into an
+ * `EnvironmentFile=`):
+ *
+ *   - `EnvironmentFile=` is applied after the unit's own `Environment=`, so a
+ *     copied `ALIVE_RUNTIME=1` makes the restart refuse itself, and a copied
+ *     `SYSTEMD_EXEC_PID` overwrites the pid systemd set for the new unit, so
+ *     the deferred marker can no longer prove it is the unit's own ExecStart
+ *     (live red on v0.35.4);
+ *   - `INVOCATION_ID`/`JOURNAL_STREAM` point at the caller's journal stream.
+ */
+export const NON_INHERITABLE_ENV_VARIABLES = [
+	HARNESS_ENV_MARKER,
+	...LEGACY_HARNESS_ENV_MARKERS,
+	DEFERRED_RESTART_ENV_MARKER,
+	...SYSTEMD_ENV_VARIABLES,
+] as const;
+
 export type HarnessOrigin = "runtime" | "systemd" | "deferred";
 
 export interface HarnessDetection {

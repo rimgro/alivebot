@@ -639,6 +639,13 @@ async function mainTests(): Promise<void> {
 			PLAIN: 'a"b\\c\n\t',
 			"BAD-KEY": "dropped",
 			NUL: "a\0b",
+			// Identity of the caller's unit: never copied into the new unit.
+			ALIVE_RUNTIME: "1",
+			ALIVE_DAEMON: "1",
+			ALIVE_DEFERRED_RESTART: "alive-restart-1",
+			INVOCATION_ID: "deadbeef",
+			SYSTEMD_EXEC_PID: "424242",
+			JOURNAL_STREAM: "9:1",
 		};
 		const fake = fakeService();
 		const result = await runWith(fake, { stateDir: directory, envFileDir: directory, env });
@@ -651,6 +658,16 @@ async function mainTests(): Promise<void> {
 		check("a plain secret is quoted", content.includes('CLOUDFLARE_API_TOKEN="tok-secret-123"'), content);
 		check("backslash, quote, newline and tab are escaped", content.includes('PLAIN="a\\"b\\\\c\\n\\t"'), content);
 		check("invalid keys and NUL values are dropped", !content.includes("BAD-KEY") && !content.includes("NUL="), content);
+		check(
+			"caller identity variables are not copied into the new unit (#258 live red)",
+			!content.includes("ALIVE_RUNTIME=") &&
+				!content.includes("ALIVE_DAEMON=") &&
+				!content.includes("ALIVE_DEFERRED_RESTART=") &&
+				!content.includes("INVOCATION_ID=") &&
+				!content.includes("SYSTEMD_EXEC_PID=") &&
+				!content.includes("JOURNAL_STREAM="),
+			content,
+		);
 		check(
 			"the unit reads the snapshot as EnvironmentFile",
 			start?.args.includes(`--property=EnvironmentFile=${file}`) === true,
