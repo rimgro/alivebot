@@ -13,6 +13,11 @@ import {
 import { DEFAULT_GITHUB_CONFIG, validateGitHubConfig, type GitHubConfig } from "./github/config.js";
 import { DEFAULT_BROWSER_CONFIG, type BrowserConfig } from "./modules/browser/config.js";
 import {
+	DEFAULT_TELEGRAM_MCP_CONFIG,
+	validateTelegramMcpConfig,
+	type TelegramMcpConfig,
+} from "./modules/telegram/mcp/config.js";
+import {
 	DEFAULT_TELEGRAM_USER_CONFIG,
 	validateTelegramUserConfig,
 	type TelegramUserConfig,
@@ -684,6 +689,12 @@ export interface TelegramConfig {
 	 * block, which is disabled; the bot above is unaffected either way.
 	 */
 	user?: TelegramUserConfig;
+	/**
+	 * #264: MCP-aware proxy that lets a sandboxed agent use the host's Telegram
+	 * account through a narrow HTTP channel. Disabled and silent by default;
+	 * absent means the disabled default block.
+	 */
+	mcp?: TelegramMcpConfig;
 }
 
 /**
@@ -753,6 +764,7 @@ export function validateTelegramConfig(value: TelegramConfig): TelegramConfig {
 		);
 	}
 	if (value.user !== undefined) value.user = validateTelegramUserConfig(value.user);
+	value.mcp = validateTelegramMcpConfig(value.mcp ?? DEFAULT_TELEGRAM_MCP_CONFIG);
 	return value;
 }
 
@@ -1315,6 +1327,9 @@ export const DEFAULT_CONFIG: AliveConfig = {
 			// #248: a user login is opt-in and keeps its own allowlist; copying the
 			// array keeps the shared default object immutable.
 			user: { ...DEFAULT_TELEGRAM_USER_CONFIG, allowedChatIds: [...(DEFAULT_TELEGRAM_USER_CONFIG.allowedChatIds ?? [])] },
+			// #264: the MCP proxy has no default profiles: nothing listens and no
+			// upstream child exists until both `enabled` and a profile are set.
+			mcp: { ...DEFAULT_TELEGRAM_MCP_CONFIG, profiles: [...DEFAULT_TELEGRAM_MCP_CONFIG.profiles] },
 		},
 		grafana: {
 			enabled: false,

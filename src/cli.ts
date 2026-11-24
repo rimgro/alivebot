@@ -26,6 +26,9 @@ import {
 import { resolveToken } from "./modules/telegram/module.js";
 import { browserCommand } from "./modules/browser/cli.js";
 import { TelegramAllowlistStore, TelegramStateStore, telegramIdentityView } from "./modules/telegram/state.js";
+import { DEFAULT_TELEGRAM_MCP_CONFIG } from "./modules/telegram/mcp/config.js";
+import { TelegramMcpServer } from "./modules/telegram/mcp/server.js";
+import { TelegramMcpTokenStore } from "./modules/telegram/mcp/tokens.js";
 import { AliveRuntime } from "./runtime/loop.js";
 import { writeToolAbortRequest } from "./runtime/tool-abort.js";
 import {
@@ -417,6 +420,9 @@ export async function main(argv: string[], options: CliOptions = {}): Promise<nu
 			}
 			case "telegram": {
 				return await telegramCommand(cwd, flags, positionals);
+			}
+			case "telegram-mcp": {
+				return await telegramMcpCommand(flags, positionals);
 			}
 			case "browser": {
 				return await browserCommand(loadForCli(flags), positionals[0] ?? "help", flags);
@@ -2125,6 +2131,64 @@ async function telegramCommand(
 	throw new Error(`unknown telegram subcommand: ${sub} (use me, chats, chat, send, managed)`);
 }
 
+/**
+ * `alive telegram-mcp serve|token|revoke` (#264, step B).
+ *
+ * `serve` is the host-side proxy. Tokens are printed exactly once and stored
+ * only as hashes under the state directory, so they never belong in logs,
+ * config files, or a diff.
+ */
+async function telegramMcpCommand(
+	flags: Record<string, string | boolean>,
+	positionals: string[],
+): Promise<number> {
+	const config = loadForCli(flags);
+	const mcp = config.config.modules.telegram.mcp ?? DEFAULT_TELEGRAM_MCP_CONFIG;
+	const sub = positionals[0];
+	const stateDir = config.paths.stateDir;
+	if (sub === "serve") {
+		if (!mcp.enabled) {
+			throw new Error("modules.telegram.mcp.enabled is false: refusing to listen (set it to true to run the proxy)");
+		}
+		const server = new TelegramMcpServer({ config: mcp, stateDir });
+		const port = await server.start();
+		process.stdout.write(
+			`telegram-mcp listening on http://${mcp.host}:${port}/mcp (${mcp.profiles.length} profile(s))\n`,
+		);
+		await new Promise<void>((resolve) => {
+			const stop = () => {
+				process.off("SIGINT", stop);
+				process.off("SIGTERM", stop);
+				resolve();
+			};
+			process.once("SIGINT", stop);
+			process.once("SIGTERM", stop);
+		});
+		await server.stop();
+		return 0;
+	}
+	if (sub === "token" || sub === "revoke") {
+		const profile = positionals[1];
+		if (!profile) throw new Error(`usage: alive telegram-mcp ${sub} <profile> [--config CONFIG]`);
+		if (!mcp.profiles.some((entry) => entry.name === profile)) {
+			const names = mcp.profiles.map((entry) => entry.name);
+			throw new Error(
+				`unknown Telegram MCP profile "${profile}" (configured: ${names.length > 0 ? names.join(", ") : "none"})`,
+			);
+		}
+		const store = new TelegramMcpTokenStore(stateDir);
+		if (sub === "token") {
+			const token = store.issue(profile);
+			process.stdout.write(`${token}\n`);
+			return 0;
+		}
+		const removed = store.revoke(profile);
+		process.stdout.write(removed ? `revoked token for profile ${profile}\n` : `no token for profile ${profile}\n`);
+		return removed ? 0 : 1;
+	}
+	throw new Error("usage: alive telegram-mcp serve [--config CONFIG] | token <profile> | revoke <profile>");
+}
+
 function thoughtsCommand(_cwd: string, flags: Record<string, string | boolean>): number {
 	const config = loadForCli(flags);
 	const limit = Number(flagString(flags, "n") ?? 20) || 20;
@@ -2398,6 +2462,8 @@ usage:
                                               manage Telegram user access without restart
   alive telegram managed status [agent] [--json] | cancel <agent>
                                               inspect or cancel a pending Managed Bot request
+  alive telegram-mcp serve | token <profile> | revoke <profile>
+                                              host-side MCP proxy for sandboxed agents (#264)
   alive browser setup [--engine chrome|fortress] [--shared-url PRIVATE_ORIGIN | --cdp-env ENV_NAME | --executable-env ENV_NAME] [--launch-mode auto|driver|native] [--public-url HTTPS_ORIGIN] [--headless true|false] [--sign-origins ORIGIN,...]
   alive browser activate | doctor [--online] | diagnose | pair | serve [--local] [--url URL]
                                               configure, diagnose and test phone handoff without an LLM
