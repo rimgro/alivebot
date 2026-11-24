@@ -95,6 +95,14 @@ export interface DrainResult {
 /** Who asked for a deliberate shutdown (#168): `alive restart` or `alive stop`. */
 export type StopInitiator = "restart" | "stop";
 
+/**
+ * pi's `FinishTurn` decision. `{ action: "end" }` stops the run after the
+ * completed turn; `{ action: "continue" }` asks for one more provider request;
+ * `undefined` keeps pi's normal scheduling. `FinishTurn` also allows a bare
+ * `void` return, which is the same thing as `undefined` here.
+ */
+type TurnDecision = { action: "continue" } | { action: "end" };
+
 export interface AgentRunnerDeps {
 	config: LoadedConfig;
 	/** Build the pi session. `forceNew` is set after a sleep so the context is fresh. */
@@ -1226,11 +1234,25 @@ export class AgentRunner {
 	}
 
 	private installTurnGuard(): void {
-		const previous = this.session.agent.shouldStopAfterTurn;
-		this.session.agent.shouldStopAfterTurn = async (context) => {
-			if (previous && (await previous(context))) return true;
+		// pi 1.6 replaced `shouldStopAfterTurn` (boolean) with `finishTurn`, which
+		// is also called for error/aborted turns and returns a decision (#263).
+		// `{ action: "end" }` is the old `true`: end the run after the current
+		// turn without polling queues or issuing another provider request.
+		// `undefined` preserves pi's normal scheduling, i.e. the old `false`.
+		const previous = this.session.agent.finishTurn;
+		this.session.agent.finishTurn = async (
+			turn,
+			signal,
+		): Promise<TurnDecision | undefined> => {
+			const prior = (await previous?.(turn, signal)) as TurnDecision | undefined;
+			if (prior?.action === "end") return prior;
+			// pi now calls the hook on a failed or aborted response too, where the
+			// old `shouldStopAfterTurn` was never reached: the loop is already
+			// ending, so the runtime guard must stay out of it and keep its turn
+			// telemetry identical to the pre-1.6 behavior.
+			if (turn.message.stopReason === "error" || turn.message.stopReason === "aborted") return prior;
 			const run = this.deps.getRun();
-			if (!run) return false;
+			if (!run) return prior;
 			// Turns are counted for telemetry and anomaly detection only. There is
 			// deliberately no turn limit: a run may work for as long as it needs.
 			// Only the budget guard and an explicitly configured `runTimeoutMs`
@@ -1240,12 +1262,12 @@ export class AgentRunner {
 			// the session loop here instead of starting another model step (#124).
 			if (this.draining) {
 				this.deps.log.info(`run #${run.index} stopping after the current step (graceful shutdown)`);
-				return true;
+				return { action: "end" };
 			}
 			if (this.deps.isBudgetExhausted()) {
 				this.budgetRunId = run.id;
 				this.deps.log.warn(`run #${run.index} stopped: budget exhausted`);
-				return true;
+				return { action: "end" };
 			}
 			// Only hint while the run is actually continuing: no steering into a
 			// run that is already being stopped or drained.
@@ -1253,8 +1275,9 @@ export class AgentRunner {
 			// Context pressure is enforced here, at the step boundary, in runtime
 			// code (#170). It must not depend on the agent calling a tool.
 			this.maybeForceContextReset(run);
-			if (run.sleepRequested) return true;
-			return false;
+			if (run.sleepRequested) return { action: "end" };
+			// No decision from the runtime: keep whatever pi's own handler decided.
+			return prior;
 		};
 	}
 

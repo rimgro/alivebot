@@ -10,6 +10,7 @@
 import type { StreamFn } from "@earendil-works/pi-agent-core";
 import {
 	createAssistantMessageEventStream,
+	normalizeContext,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
 	type Context,
@@ -130,13 +131,40 @@ const fastRetry = { attempts: 3, baseDelayMs: 1, maxDelayMs: 2, jitter: "none" a
 // ---------------------------------------------------------------------------
 section("classification: HTML, JSON error bodies and empty responses");
 {
-	check("summarization context is detected by its system prompt", isSummarizationContext({
-		systemPrompt: "You are a context summarization assistant. Your task is to read a conversation",
+	// pi 1.6 folds systemPrompt/tools into a leading system message before the
+	// stream function sees the request, so that is the shape the guard must read.
+	const summarizationPrompt = "You are a context summarization assistant. Your task is to read a conversation";
+	const normalPrompt = "You are a long-lived agent.";
+	const summarizationTurn = {
+		role: "user" as const,
+		content: [{ type: "text" as const, text: "<conversation>hello</conversation>\n\nThe messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work." }],
+		timestamp: 1,
+	};
+	check("normalized summarization request is detected by its system message", isSummarizationContext(normalizeContext({
+		systemPrompt: summarizationPrompt,
+		messages: [summarizationTurn],
+	})));
+	check("a normalized summarization request with no turn is still detected", isSummarizationContext(normalizeContext({
+		systemPrompt: summarizationPrompt,
+		messages: [],
+	})));
+	check("legacy raw context is still detected by its systemPrompt", isSummarizationContext({
+		systemPrompt: summarizationPrompt,
 		messages: [],
 	} as Context));
-	check("normal agent context is not touched", !isSummarizationContext({
-		systemPrompt: "You are a long-lived agent.",
-		messages: [],
+	check("without any system message the summarization turn is recognized", isSummarizationContext({
+		messages: [summarizationTurn],
+	} as Context));
+	check("normal agent context is not touched", !isSummarizationContext(normalizeContext({
+		systemPrompt: normalPrompt,
+		messages: [summarizationTurn],
+	})));
+	check("a raw normal context is not touched either", !isSummarizationContext({
+		systemPrompt: normalPrompt,
+		messages: [summarizationTurn],
+	} as Context));
+	check("a plain conversation with no system message is not touched", !isSummarizationContext({
+		messages: [{ role: "user", content: [{ type: "text", text: "summarize this conversation for me" }], timestamp: 1 }],
 	} as Context));
 
 	const html = classifyCompactionText(htmlBody, 502);
