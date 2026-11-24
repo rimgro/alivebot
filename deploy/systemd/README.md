@@ -144,6 +144,10 @@ the checkout; the root config, not a profile one):
 }
 ```
 
+The unit pins `%h/Projects/alive` for the checkout and node24, like the agent
+units: if the checkout lives elsewhere, edit the template in this directory and
+reinstall instead of patching the host copy.
+
 `name` is the profile id the token is issued for; `mode` is `read`,
 `write:ask` (default) or `write:auto`; `allowChats` is the exact list of chat
 ids/@usernames `telegram_read` may read (empty means none). `command`/`args`
