@@ -8,7 +8,6 @@
  * `application/json, text/event-stream`); GET /mcp answers 405, which tells the
  * client there is no server-to-client SSE stream to open.
  */
-import { randomBytes } from "node:crypto";
 import * as http from "node:http";
 import type { Socket } from "node:net";
 import { TelegramMcpAuditLog, auditPreview } from "./audit.js";
@@ -30,6 +29,19 @@ import {
 	type TelegramMcpPolicyDecision,
 } from "./policy.js";
 import { TelegramMcpTokenStore } from "./tokens.js";
+import {
+	findPendingTicket,
+	newTelegramMcpTicketId,
+	newTelegramMcpTicketNonce,
+	parseTicketDecision,
+	patchTicket,
+	readDecision,
+	readTicket,
+	resolveTicketDir,
+	telegramMcpTicketRequestKey,
+	writeTicket,
+	type TelegramMcpTicket,
+} from "./tickets.js";
 
 const MAX_BODY_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 60_000;
@@ -61,6 +73,20 @@ export interface TelegramMcpServerOptions {
 	audit?: TelegramMcpAuditLog;
 	/** Test seam: e.g. a shorter restart delay. */
 	child?: Partial<Omit<UpstreamChildOptions, "profile" | "onMessage" | "onExit" | "command" | "args">>;
+	/** Test seam: how often a pending operator confirmation is polled. Default 100 ms. */
+	confirmationPollMs?: number;
+}
+
+type ConfirmedWriteOutcome =
+	| { kind: "result"; result: Record<string, unknown> }
+	| { kind: "forward"; response: JsonRpcMessage }
+	| { kind: "error"; message: string };
+
+interface ToolCallOutcome {
+	/** Synthetic result: deny, or ask without a confirmation directory. */
+	result?: Record<string, unknown>;
+	/** Ask that must wait for the runtime module's decision. */
+	ticket?: TelegramMcpTicket;
 }
 
 /** What an allowed but unconfirmed write answers: structured, no upstream call. */
@@ -83,6 +109,8 @@ export class TelegramMcpServer {
 	private readonly children = new Map<string, UpstreamChild>();
 	private readonly connections = new Map<string, ConnectionState>();
 	private readonly pending = new Map<string, PendingRequest>();
+	/** One in-flight promise per ticket so a repeated ask cannot double-send. */
+	private readonly confirmations = new Map<string, Promise<ConfirmedWriteOutcome>>();
 	private server: http.Server | undefined;
 	private nextUpstreamId = 1;
 	private boundPort = 0;
@@ -231,8 +259,13 @@ export class TelegramMcpServer {
 			}
 			if (message.method === "tools/call") {
 				const decision = await this.decideToolCall(profile, message);
-				if (decision) {
-					writeJson(res, 200, { jsonrpc: "2.0", id: message.id, result: decision });
+				if (decision.ticket) {
+					const response = await this.confirmAndForward(profile, connection, message, decision.ticket);
+					writeJson(res, 200, response);
+					return;
+				}
+				if (decision.result) {
+					writeJson(res, 200, { jsonrpc: "2.0", id: message.id, result: decision.result });
 					return;
 				}
 			}
@@ -268,13 +301,14 @@ export class TelegramMcpServer {
 	}
 
 	/**
-	 * Apply policy to `tools/call`. Returns the synthetic result for deny/ask and
-	 * undefined when the call may be forwarded upstream.
+	 * Apply policy to `tools/call`. Returns a synthetic result for deny/ask, a
+	 * ticket when the runtime must confirm the write, or nothing when the call
+	 * may be forwarded upstream.
 	 */
 	private async decideToolCall(
 		profile: TelegramMcpProfileConfig,
 		message: { id: JsonRpcId; params?: unknown },
-	): Promise<Record<string, unknown> | undefined> {
+	): Promise<ToolCallOutcome> {
 		const params = isRecord(message.params) ? message.params : {};
 		const tool = typeof params.name === "string" ? params.name : "";
 		const args = isRecord(params.arguments) ? params.arguments : {};
@@ -309,19 +343,200 @@ export class TelegramMcpServer {
 			bytes: text === undefined ? 0 : Buffer.byteLength(text, "utf8"),
 			...(tool === "telegram_write" && text !== undefined ? { preview: auditPreview(text) } : {}),
 		});
-		if (decision.decision === "allow") return undefined;
+		if (decision.decision === "allow") return {};
 		if (decision.decision === "ask") {
+			if (profile.confirmation) {
+				return { ticket: this.createOrReuseTicket(profile, tool, decision.chat, text ?? "", now) };
+			}
 			const ask: TelegramMcpAskResult = {
 				decision: "ask",
 				reason: decision.reason,
-				ticketId: `tgask_${randomBytes(8).toString("hex")}`,
+				ticketId: newTelegramMcpTicketId(),
 				tool,
 				profile: profile.name,
 				...(decision.chat === undefined ? {} : { chat: decision.chat }),
 			};
-			return toolResult("approval required", { ...ask }, false);
+			return { result: toolResult("approval required", { ...ask }, false) };
 		}
-		return toolResult(`denied: ${decision.reason}`, { decision: "deny", reason: decision.reason, tool, profile: profile.name }, true);
+		return {
+			result: toolResult(`denied: ${decision.reason}`, { decision: "deny", reason: decision.reason, tool, profile: profile.name }, true),
+		};
+	}
+
+	private ticketDirFor(profile: TelegramMcpProfileConfig): string {
+		const configured = profile.confirmation?.ticketDir;
+		if (!configured) throw new Error(`profile "${profile.name}" has no confirmation directory`);
+		return resolveTicketDir(this.options.stateDir, configured);
+	}
+
+	/** One pending ticket per exact (profile, tool, chat, text): a retry never spams. */
+	private createOrReuseTicket(
+		profile: TelegramMcpProfileConfig,
+		tool: string,
+		chat: string | undefined,
+		text: string,
+		now: number,
+	): TelegramMcpTicket {
+		const ticketDir = this.ticketDirFor(profile);
+		const requestKey = telegramMcpTicketRequestKey(profile.name, tool, chat ?? "", text);
+		const existing = findPendingTicket(ticketDir, requestKey, now);
+		if (existing) return existing;
+		const ttlMs = profile.confirmation?.ttlMs;
+		if (ttlMs === undefined) throw new Error(`profile "${profile.name}" has no confirmation TTL`);
+		const ticket: TelegramMcpTicket = {
+			version: 1,
+			ticketId: newTelegramMcpTicketId(),
+			profile: profile.name,
+			tool,
+			...(chat === undefined ? {} : { chat }),
+			text,
+			createdAt: now,
+			expiresAt: now + ttlMs,
+			nonce: newTelegramMcpTicketNonce(),
+			status: "pending",
+			requestKey,
+		};
+		writeTicket(ticketDir, ticket);
+		return ticket;
+	}
+
+	/**
+	 * Wait for the operator and then perform the write exactly once. Concurrent
+	 * asks that reused the same pending ticket share this promise, so an approval
+	 * cannot send the message twice.
+	 */
+	private async confirmAndForward(
+		profile: TelegramMcpProfileConfig,
+		connection: string,
+		message: { id: JsonRpcId; method: string; params?: unknown; jsonrpc: "2.0" },
+		ticket: TelegramMcpTicket,
+	): Promise<JsonRpcMessage> {
+		let execution = this.confirmations.get(ticket.ticketId);
+		if (!execution) {
+			execution = this.executeConfirmedWrite(profile, connection, message, ticket);
+			this.confirmations.set(ticket.ticketId, execution);
+			void execution
+				.catch(() => undefined)
+				.finally(() => {
+					if (this.confirmations.get(ticket.ticketId) === execution) this.confirmations.delete(ticket.ticketId);
+				});
+		}
+		const outcome = await execution;
+		if (outcome.kind === "result") return { jsonrpc: "2.0", id: message.id, result: outcome.result };
+		if (outcome.kind === "forward") return { ...outcome.response, id: message.id };
+		return {
+			jsonrpc: "2.0",
+			id: message.id,
+			error: { code: JSON_RPC_ERROR.upstreamUnavailable, message: outcome.message },
+		};
+	}
+
+	private async executeConfirmedWrite(
+		profile: TelegramMcpProfileConfig,
+		connection: string,
+		message: { id: JsonRpcId; method: string; params?: unknown; jsonrpc: "2.0" },
+		ticket: TelegramMcpTicket,
+	): Promise<ConfirmedWriteOutcome> {
+		const ticketDir = this.ticketDirFor(profile);
+		const verdict = await this.waitForDecision(ticketDir, ticket);
+		if (verdict.kind === "expired") {
+			this.finishTicket(ticketDir, ticket.ticketId, "expired", verdict.reason);
+			this.auditTerminal(profile, ticket, "deny", verdict.reason);
+			return { kind: "result", result: confirmationError(verdict.reason, ticket) };
+		}
+		if (verdict.kind === "rejected") {
+			this.finishTicket(ticketDir, ticket.ticketId, "failed", verdict.reason);
+			this.auditTerminal(profile, ticket, "deny", verdict.reason);
+			return { kind: "result", result: confirmationError(verdict.reason, ticket) };
+		}
+		if (verdict.kind === "deny") {
+			this.finishTicket(ticketDir, ticket.ticketId, "denied", "write denied by operator");
+			this.auditTerminal(profile, ticket, "deny", "write denied by operator");
+			return { kind: "result", result: confirmationError("write denied by operator: nothing was sent", ticket) };
+		}
+
+		// Approved: enforce the hourly limit and count this write once. write:ask has
+		// no persistent window of its own, so open a short one before the atomic
+		// reserve (the same check-and-count step write:auto uses).
+		const now = this.limits.now();
+		this.limits.openWindow(profile.name, profile.writeTtlMs, now);
+		const reservation = this.limits.reserveWrite(profile.name, profile.writeLimitPerHour, now);
+		if (!reservation.allowed) {
+			const reason = reservation.reason ?? `write reservation refused for profile "${profile.name}"`;
+			this.finishTicket(ticketDir, ticket.ticketId, "failed", reason);
+			this.auditTerminal(profile, ticket, "deny", reason);
+			return { kind: "result", result: toolResult(`denied: ${reason}`, { decision: "deny", reason, ticketId: ticket.ticketId, tool: ticket.tool, profile: profile.name }, true) };
+		}
+		try {
+			const response = await this.forward(profile, connection, message);
+			const failed = "error" in response || isErrorToolResponse(response);
+			const reason = failed ? "upstream returned an error" : "operator approved the write";
+			this.finishTicket(ticketDir, ticket.ticketId, failed ? "failed" : "sent", failed ? reason : undefined);
+			this.auditTerminal(profile, ticket, failed ? "deny" : "allow", reason);
+			return { kind: "forward", response };
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			this.finishTicket(ticketDir, ticket.ticketId, "failed", reason);
+			this.auditTerminal(profile, ticket, "deny", reason);
+			return { kind: "error", message: reason };
+		}
+	}
+
+	/** Poll the decision file until the operator answers, the ticket expires or the proxy stops. */
+	private async waitForDecision(
+		ticketDir: string,
+		ticket: TelegramMcpTicket,
+	): Promise<{ kind: "approve" | "deny" } | { kind: "rejected"; reason: string } | { kind: "expired"; reason: string }> {
+		const pollMs = this.options.confirmationPollMs ?? 100;
+		for (;;) {
+			const read = readDecision(ticketDir, ticket.ticketId);
+			if (read.found) {
+				const parsed = parseTicketDecision(read.raw, ticket);
+				if (!parsed.ok) return { kind: "rejected", reason: `confirmation decision rejected: ${parsed.reason}` };
+				return { kind: parsed.decision.decision };
+			}
+			const current = readTicket(ticketDir, ticket.ticketId);
+			if (current?.status === "expired") return { kind: "expired", reason: "confirmation expired: nothing was sent" };
+			if (current && (current.status === "failed" || current.status === "denied")) {
+				return { kind: "rejected", reason: `confirmation ${current.status}${current.error ? `: ${current.error}` : ""}` };
+			}
+			if (this.limits.now() >= ticket.expiresAt) {
+				return { kind: "expired", reason: "confirmation expired: nothing was sent" };
+			}
+			if (this.stopping) return { kind: "rejected", reason: "Telegram MCP proxy is shutting down" };
+			await new Promise<void>((resolve) => setTimeout(resolve, pollMs));
+		}
+	}
+
+	private finishTicket(ticketDir: string, ticketId: string, status: "sent" | "failed" | "denied" | "expired", error?: string): void {
+		try {
+			patchTicket(ticketDir, ticketId, {
+				status,
+				...(status === "sent" ? { sentAt: this.limits.now() } : {}),
+				...(error === undefined ? {} : { error }),
+			});
+		} catch {
+			// A ticket that suddenly becomes unwritable must not turn a sent message
+			// into a retry the operator would approve twice.
+		}
+	}
+
+	private auditTerminal(
+		profile: TelegramMcpProfileConfig,
+		ticket: TelegramMcpTicket,
+		decision: "allow" | "deny",
+		reason: string,
+	): void {
+		this.audit.record({
+			ts: new Date(this.limits.now()).toISOString(),
+			profile: profile.name,
+			tool: ticket.tool,
+			chat: ticket.chat ?? "",
+			decision,
+			reason,
+			bytes: Buffer.byteLength(ticket.text, "utf8"),
+			...(ticket.tool === "telegram_write" && ticket.text ? { preview: auditPreview(ticket.text) } : {}),
+		});
 	}
 
 	private async ensureChild(profile: TelegramMcpProfileConfig): Promise<UpstreamChild> {
@@ -443,6 +658,28 @@ function toolResult(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** A tool-level error result: no upstream write happened. */
+function confirmationError(reason: string, ticket: TelegramMcpTicket): Record<string, unknown> {
+	return toolResult(
+		`write not sent: ${reason}`,
+		{
+			decision: "deny",
+			reason,
+			ticketId: ticket.ticketId,
+			tool: ticket.tool,
+			profile: ticket.profile,
+			...(ticket.chat === undefined ? {} : { chat: ticket.chat }),
+		},
+		true,
+	);
+}
+
+function isErrorToolResponse(response: JsonRpcMessage): boolean {
+	if (!("result" in response)) return true;
+	const result = response.result;
+	return isRecord(result) && result.isError === true;
 }
 
 function bearerToken(header: string | string[] | undefined): string | undefined {

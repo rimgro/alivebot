@@ -14,7 +14,9 @@ import { DEFAULT_GITHUB_CONFIG, validateGitHubConfig, type GitHubConfig } from "
 import { DEFAULT_BROWSER_CONFIG, type BrowserConfig } from "./modules/browser/config.js";
 import {
 	DEFAULT_TELEGRAM_MCP_CONFIG,
+	validateTelegramMcpConfirmationRuntimeConfig,
 	validateTelegramMcpConfig,
+	type TelegramMcpConfirmationRuntimeConfig,
 	type TelegramMcpConfig,
 } from "./modules/telegram/mcp/config.js";
 import {
@@ -695,6 +697,16 @@ export interface TelegramConfig {
 	 * absent means the disabled default block.
 	 */
 	mcp?: TelegramMcpConfig;
+	/**
+	 * #264 step B2: watch the proxy's ticket directory and show the operator an
+	 * approval card for each pending `telegram_write`. Absent means disabled: no
+	 * timer is started and the directory is never read.
+	 *
+	 * Both processes run on this host, so a relative `ticketDir` is resolved
+	 * against `stateDir` in both. Set it to the same value the proxy profile uses
+	 * (`modules.telegram.mcp.profiles[].confirmation.ticketDir`).
+	 */
+	mcpConfirmation?: TelegramMcpConfirmationRuntimeConfig;
 }
 
 /**
@@ -764,6 +776,9 @@ export function validateTelegramConfig(value: TelegramConfig): TelegramConfig {
 		);
 	}
 	if (value.user !== undefined) value.user = validateTelegramUserConfig(value.user);
+	if (value.mcpConfirmation !== undefined) {
+		value.mcpConfirmation = validateTelegramMcpConfirmationRuntimeConfig(value.mcpConfirmation);
+	}
 	value.mcp = validateTelegramMcpConfig(value.mcp ?? DEFAULT_TELEGRAM_MCP_CONFIG);
 	return value;
 }
