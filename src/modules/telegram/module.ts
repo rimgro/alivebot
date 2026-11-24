@@ -963,20 +963,6 @@ export class TelegramModule implements AliveModule {
 	}
 
 	/**
-	 * Same owner/chat rule as `allowed()` for an internal MCP confirmation press.
-	 * The callback carries no normalized inbound, so apply the two configured
-	 * checks directly: an allowed chat (when configured) and an allowed human.
-	 */
-	private isMcpOperator(userId: number, chatId: number): boolean {
-		if (!Number.isSafeInteger(userId) || !Number.isSafeInteger(chatId)) return false;
-		if (this.config.allowedChatIds.length > 0 && !this.config.allowedChatIds.map(String).includes(String(chatId))) {
-			return false;
-		}
-		const allowed = new Set([...this.config.allowedUserIds.map(String), ...(this.allowlist?.list() ?? [])]);
-		return allowed.has(String(userId));
-	}
-
-	/**
 	 * `/abort_tool` from the owner: write the one-shot flag and answer in the
 	 * same thread. The runtime consumes it on its next poll and returns the tool
 	 * error to the agent; the run, its context and `stoppedBy` are untouched.

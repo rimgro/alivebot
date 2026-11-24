@@ -149,7 +149,7 @@ Proxy side, per profile:
 {
   "name": "ops",
   "mode": "write:ask",
-  "confirmation": { "ticketDir": "telegram-mcp-tickets", "ttlMs": 300000 }
+  "confirmation": { "ticketDir": "telegram-mcp-tickets", "ttlMs": 240000 }
 }
 ```
 
@@ -164,6 +164,9 @@ Behaviour worth knowing before enabling it:
   than a realistic operator answer. If the MCP client times out or aborts the
   HTTP request, the proxy closes the ticket as `denied`, a later decision is not
   accepted, and the message is **not** sent.
+  Keep `ttlMs` at least a minute below the client timeout (240000 against 300 s
+  above): if the two are equal, the client disconnects exactly when the ticket
+  expires and an approval a second before the deadline is lost as a deny.
 - **At most one send.** Before calling the upstream the proxy atomically marks
   the ticket `sending`. A proxy restarted while a ticket is `sending` turns it
   into `failed` and returns an error to the caller instead of sending again.
@@ -171,6 +174,10 @@ Behaviour worth knowing before enabling it:
   denied with a `confirmation backlog` reason and no ticket is written. Tickets
   and their decisions past their TTL are removed on proxy start and on every
   module scan.
+- **One watcher per ticket root.** Enable `modules.telegram.mcpConfirmation` in
+  a single profile per `ticketDir`. Two modules scanning the same root would send
+  two cards from two bots for one ticket, while the ticket records a single
+  `cardMessageId`: the second card keeps its buttons forever.
 - **Card failures.** If `sendMessage` for the card fails, the ticket is denied
   immediately with the reason instead of waiting for the TTL. Every press gets an
   `answerCallbackQuery`; the card is edited to its final state (sent, denied,
