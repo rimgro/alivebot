@@ -30,9 +30,10 @@ die() {
 	exit 1
 }
 
-# Repository root is two levels above this script (deploy/systemd/install.sh).
+# Repository root is two levels above this script; no package.json there = not a checkout.
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(CDPATH= cd -- "$script_dir/../.." && pwd)
+[ -f "$repo_dir/package.json" ] || die "cannot find the repository root: $repo_dir has no package.json (install.sh must live inside the checkout at deploy/systemd/)"
 
 skip_activate=0
 case "${ALIVE_SYSTEMD_SKIP_ACTIVATE:-}" in

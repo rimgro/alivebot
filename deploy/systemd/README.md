@@ -28,6 +28,9 @@ deploy/systemd/
 ./deploy/systemd/install.sh --all-profiles  # enable every profile found in the checkout
 ```
 
+Run the installer from the checkout: the repository root is resolved relative to
+the script itself and it refuses to install if that directory has no `package.json`.
+
 The installer copies the two units and both drop-ins into the user unit
 directory, runs `loginctl enable-linger "$USER"`, `systemctl --user daemon-reload`
 and `systemctl --user enable --now alive.service`.
