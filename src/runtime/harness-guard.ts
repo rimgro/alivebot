@@ -88,7 +88,9 @@ export const RESTART_REFUSED_PREFIX = "refused: alive restart would kill this ru
 
 /**
  * The refusal: says what was detected, that nothing happened, how to force it
- * and the two safe out-of-band forms.
+ * and the safe out-of-band forms. The deferred form comes first: it is the one
+ * the CLI can do itself from here, and it schedules the restart instead of
+ * betting on the operator remembering the raw systemd-run line.
  */
 export function restartRefusalText(detection: HarnessDetection): string {
 	const evidence = detection.evidence ? ` (${detection.evidence})` : "";
@@ -96,10 +98,14 @@ export function restartRefusalText(detection: HarnessDetection): string {
 		`${term.red("refused:")} alive restart would kill this run — this process is running inside the harness${evidence}.\n` +
 		"Restarting from here stops the very run that issued it: this process dies mid-work and\n" +
 		"nothing is left to start the new one. Nothing was stopped and nothing was started.\n" +
-		`Re-run as ${term.bold("alive restart --yes")} to restart anyway (the current run is lost regardless).\n` +
-		"To restart without interrupting this run, schedule it from outside:\n" +
-		"  systemd-run --on-active=5 --unit=alive-restart /path/to/alive restart\n" +
+		`Schedule the restart instead — it is allowed from here and returns immediately:\n` +
+		"  alive restart --deferred              # in 5s; --after 30 / --deferred 30 to wait longer\n" +
+		"  alive restart --deferred --user       # when the harness runs as a systemd user service\n" +
+		"The current run is interrupted when that unit fires. Raw equivalent (unique unit,\n" +
+		"--collect so systemd does not keep it around):\n" +
+		"  systemd-run --on-active=5 --collect --unit=alive-restart-$(date +%s) /path/to/alive restart\n" +
 		"  sudo systemctl restart alive.service   # from a shell outside the service\n" +
+		`Re-run as ${term.bold("alive restart --yes")} to interrupt this run right now (it is lost regardless).\n` +
 		"(/path/to/alive is the CLI binary, e.g. /opt/alive/dist/index.js)\n"
 	);
 }

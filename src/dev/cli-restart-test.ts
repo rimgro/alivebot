@@ -34,6 +34,7 @@ import {
 	restartRefusalText,
 } from "../runtime/harness-guard.js";
 import { snapshotRuntime, type StopResult } from "../runtime/daemon.js";
+import type { DeferredRestartDeps } from "../runtime/deferred-restart.js";
 import { sleep } from "../util.js";
 
 let failures = 0;
@@ -119,10 +120,35 @@ interface CliResult {
 	out: string;
 	err: string;
 	calls: Calls;
+	/** systemctl/systemd-run command lines the deferred path ran. */
+	deferred: string[];
 }
+
+/**
+ * Fake systemd for `restart --deferred`: connects nothing, records every line
+ * and answers `list-units` with the scripted output. The clock is fixed, so the
+ * unit name is deterministic.
+ */
+function fakeDeferred(calls: string[], list = ""): DeferredRestartDeps {
+	return {
+		now: () => new Date(1_700_000_000_000),
+		run: async (command, args) => {
+			calls.push(`${command} ${args.join(" ")}`);
+			if (command === "systemctl" && args.includes("list-units")) return { stdout: list, stderr: "" };
+			return { stdout: "", stderr: "" };
+		},
+	};
+}
+
 /** Run the real CLI entry with a fake service control and a fake environment. */
-async function cli(argv: string[], env: NodeJS.ProcessEnv, stopResult: Partial<StopResult> = {}): Promise<CliResult> {
+async function cli(
+	argv: string[],
+	env: NodeJS.ProcessEnv,
+	stopResult: Partial<StopResult> = {},
+	lingeringUnits = "",
+): Promise<CliResult> {
 	const calls: Calls = { names: [], stateDirs: [], initiators: [], forces: [] };
+	const deferredCalls: string[] = [];
 	const out: string[] = [];
 	const err: string[] = [];
 	const stdoutWrite = process.stdout.write;
@@ -136,8 +162,12 @@ async function cli(argv: string[], env: NodeJS.ProcessEnv, stopResult: Partial<S
 		return true;
 	}) as typeof process.stderr.write;
 	try {
-		const code = await main([...argv, "--config", configPath], { env, service: fakeService(calls, stopResult) });
-		return { code, out: out.join(""), err: err.join(""), calls };
+		const code = await main([...argv, "--config", configPath], {
+			env,
+			service: fakeService(calls, stopResult),
+			deferred: fakeDeferred(deferredCalls, lingeringUnits),
+		});
+		return { code, out: out.join(""), err: err.join(""), calls, deferred: deferredCalls };
 	} finally {
 		process.stdout.write = stdoutWrite;
 		process.stderr.write = stderrWrite;
@@ -186,7 +216,9 @@ try {
 
 		const restartHelp = await cli(["restart", "--help"], INSIDE_UNIT);
 		check("restart --help documents --yes", restartHelp.out.includes("--yes"), restartHelp.out);
-		check("restart --help shows the systemd-run form", restartHelp.out.includes("systemd-run --on-active=5 --unit=alive-restart"), restartHelp.out);
+		check("restart --help documents --deferred", restartHelp.out.includes("--deferred"), restartHelp.out);
+		check("restart --help documents --after and --user", restartHelp.out.includes("--after") && restartHelp.out.includes("--user"), restartHelp.out);
+		check("restart --help shows the --collect systemd-run form", restartHelp.out.includes("systemd-run --on-active=5 --collect --unit=alive-restart"), restartHelp.out);
 		check("restart --help shows the systemctl form", restartHelp.out.includes("systemctl restart alive.service"), restartHelp.out);
 
 		const stopHelp = await cli(["stop", "--help"], INSIDE_UNIT);
@@ -220,7 +252,8 @@ try {
 		check("shows the detected variables", refused.err.includes("INVOCATION_ID="), refused.err);
 		check("says the current run would be killed", refused.err.includes("kill this run"), refused.err);
 		check("requires an explicit --yes", refused.err.includes("alive restart --yes"), refused.err);
-		check("suggests the systemd-run form", refused.err.includes("systemd-run --on-active=5 --unit=alive-restart"), refused.err);
+		check("suggests --deferred first", refused.err.includes("alive restart --deferred"), refused.err);
+		check("suggests the raw --collect systemd-run form", refused.err.includes("systemd-run --on-active=5 --collect --unit=alive-restart-$(date +%s)"), refused.err);
 		check("suggests systemctl from outside", refused.err.includes("systemctl restart alive.service"), refused.err);
 		check("prints the interruption warning line", refused.err.includes(interruptWarningLine("restart")), refused.err);
 		check("prints nothing on stdout", refused.out.trim() === "", refused.out);
@@ -234,6 +267,49 @@ try {
 
 		const exact = restartRefusalText(detectHarnessEnvironment(INSIDE_UNIT, { harnessPid: HARNESS_PID }));
 		check("the refusal text is the one the CLI prints", refused.err.includes(exact.split("\n")[0]!), refused.err.split("\n")[0]);
+	}
+
+	// -------------------------------------------------------------------------
+	section("restart --deferred is allowed inside the harness");
+	{
+		const deferred = await cli(["restart", "--deferred"], INSIDE_UNIT);
+		check("exits 0", deferred.code === 0, [deferred.code, deferred.err]);
+		check("does not stop or start anything now", deferred.calls.names.length === 0, deferred.calls.names);
+		check(
+			"schedules a --collect unit with a unique name",
+			deferred.deferred.some((line) => line.startsWith("systemd-run") && line.includes("--collect") && /--unit=alive-restart-\d+/.test(line)),
+			deferred.deferred,
+		);
+		check("prints the unit and the delay", deferred.out.includes("deferred restart scheduled: alive-restart-1700000000") && deferred.out.includes("restart in 5s"), deferred.out);
+		check("says the current run will be interrupted", deferred.out.includes("the current run will be interrupted"), deferred.out);
+		check("prints how to watch the unit", deferred.out.includes("journalctl -u alive-restart-1700000000"), deferred.out);
+		check("forwards --config to the unit command", deferred.deferred.some((line) => line.includes(`--config ${configPath}`)), deferred.deferred);
+		check(
+			"the unit command does not re-defer",
+			deferred.deferred.filter((line) => line.startsWith("systemd-run")).every((line) => !line.includes("--deferred") && !line.includes("--after")),
+			deferred.deferred,
+		);
+
+		const longer = await cli(["restart", "--deferred", "--after", "30", "--user"], INSIDE_UNIT);
+		check("--after reaches systemd-run", longer.deferred.some((line) => line.includes("--on-active=30")), longer.deferred);
+		check("--user reaches systemctl and systemd-run", longer.deferred.some((line) => line.startsWith("systemctl --user list-units")) && longer.deferred.some((line) => line.startsWith("systemd-run --user")), longer.deferred);
+		check("--user prints the user journal command", longer.out.includes("journalctl --user -u alive-restart-1700000000"), longer.out);
+
+		const stale = await cli(["restart", "--deferred"], INSIDE_UNIT, {}, "  ● alive-restart-manual.service loaded failed failed");
+		check("a failed leftover is reset, then the restart is scheduled", stale.code === 0 && stale.deferred.some((line) => line.startsWith("systemctl reset-failed alive-restart-manual.service")), {
+			code: stale.code,
+			deferred: stale.deferred,
+		});
+		check("the cleanup is reported", stale.out.includes("reset stale unit alive-restart-manual.service"), stale.out);
+
+		const pending = await cli(["restart", "--deferred"], INSIDE_UNIT, {}, "  ● alive-restart-manual.service loaded active running");
+		check("a pending unit refuses a second request", pending.code === 1, pending);
+		check("the refusal names the unit and its state", pending.err.includes("alive-restart-manual.service is active/running"), pending.err);
+		check("the refusal gives the inspect and stop commands", pending.err.includes("systemctl status alive-restart-manual.service") && pending.err.includes("systemctl stop alive-restart-manual.service"), pending.err);
+		check("the pending refusal starts nothing", !pending.deferred.some((line) => line.startsWith("systemd-run")), pending.deferred);
+
+		const plain = await cli(["restart"], INSIDE_UNIT);
+		check("plain restart is still refused inside the harness", plain.code === 1 && plain.calls.names.length === 0, plain);
 	}
 
 	// -------------------------------------------------------------------------
@@ -305,6 +381,7 @@ try {
 	{
 		const paths = {
 			"restart refused": await cli(["restart"], INSIDE_UNIT),
+			"restart --deferred": await cli(["restart", "--deferred"], INSIDE_UNIT),
 			"restart --yes": await cli(["restart", "--yes"], INSIDE_UNIT),
 			"restart outside": await cli(["restart"], OUTSIDE),
 			stop: await cli(["stop"], OUTSIDE),

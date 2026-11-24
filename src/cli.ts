@@ -46,6 +46,12 @@ import {
 	type SessionStatsResult,
 } from "./runtime/session-retention.js";
 import { readHeartbeatStatus } from "./heartbeat.js";
+import {
+	parseDeferredAfter,
+	runDeferredRestart,
+	type DeferredRestartDeps,
+	type DeferredScope,
+} from "./runtime/deferred-restart.js";
 import { snapshotRuntime, spawnBackground, stdoutLogPath, stopRuntime, waitForRuntime, type StopInitiator, type StopResult } from "./runtime/daemon.js";
 import {
 	HARNESS_ENV_MARKER,
@@ -102,6 +108,8 @@ export interface CliOptions {
 	env?: NodeJS.ProcessEnv;
 	/** Service start/stop seam; defaults to the real background runtime control. */
 	service?: ServiceControl;
+	/** Deferred-restart (systemctl/systemd-run) seam; defaults to the real service manager. */
+	deferred?: DeferredRestartDeps;
 }
 
 export function parseArgs(argv: string[]): ParsedArgs {
@@ -157,9 +165,14 @@ const SERVICE_USAGE: Record<"stop" | "restart" | "status", string> = {
 		"states that the run in progress is interrupted; stop is never refused, so it\n" +
 		"remains the way to shut the harness down from inside.\n",
 	restart:
-		"usage: alive restart [--yes] [--timeout DURATION] [--force] [--config CONFIG] [--model MODEL] [--verbose]\n" +
+		"usage: alive restart [--yes] [--deferred [--after SECONDS] [--user]] [--timeout DURATION]\n" +
+		"                      [--force] [--config CONFIG] [--model MODEL] [--verbose]\n" +
 		"\n" +
 		"  --yes, -y           restart even from inside the harness (ends this run)\n" +
+		"  --deferred [SECONDS] schedule the restart with systemd-run instead of doing it now;\n" +
+		"                      allowed from inside the harness (default 5s, max 3600)\n" +
+		"  --after SECONDS     delay for --deferred (--deferred=SECONDS works too)\n" +
+		"  --user              use the systemd user manager (--user on systemctl and systemd-run)\n" +
 		"  --timeout DURATION  graceful SIGTERM window before SIGKILL (default loop.shutdownGraceMs + 5s)\n" +
 		"  --force, --kill     do not wait for the graceful drain; close the old run now\n" +
 		"  --config CONFIG     config file (default ./alive.config.json)\n" +
@@ -169,10 +182,19 @@ const SERVICE_USAGE: Record<"stop" | "restart" | "status", string> = {
 		"Stops the running instance, then starts a fresh one in the background. Refused\n" +
 		"when this process runs inside the harness (ALIVE_RUNTIME, or systemd's\n" +
 		"INVOCATION_ID/SYSTEMD_EXEC_PID/JOURNAL_STREAM when they belong to the harness\n" +
-		"unit), because the restart would kill the run that issued it. Safe forms from\n" +
-		"outside:\n" +
-		"  systemd-run --on-active=5 --unit=alive-restart /path/to/alive restart\n" +
-		"  sudo systemctl restart alive.service\n",
+		"unit), because the restart would kill the run that issued it.\n" +
+		"\n" +
+		"--deferred is the way out: it schedules `alive restart` as a transient systemd\n" +
+		"unit and returns immediately, so the current run is interrupted only when that\n" +
+		"unit fires. Every request gets a fresh unit name (alive-restart-<epoch>); an\n" +
+		"active alive-restart* unit refuses a second request, finished or failed ones are\n" +
+		"cleaned up with `systemctl reset-failed`, and every unit is started with\n" +
+		"--collect so systemd does not keep it around.\n" +
+		"\n" +
+		"Raw equivalent (unique unit, --collect):\n" +
+		"  systemd-run --on-active=5 --collect --unit=alive-restart-$(date +%s) /path/to/alive restart\n" +
+		"  systemd-run --user --on-active=5 --collect --unit=alive-restart-$(date +%s) …\n" +
+		"  sudo systemctl restart alive.service            # from a shell outside the service\n",
 	status:
 		"usage: alive status [--json] [--config CONFIG]\n" +
 		"\n" +
@@ -698,6 +720,10 @@ async function stopWithConfig(
 }
 
 async function restartCommand(cwd: string, flags: Record<string, string | boolean>, options: CliOptions = {}): Promise<number> {
+	// `--deferred` schedules a systemd unit and touches nothing in this process,
+	// so it is the one restart form allowed from inside the harness.
+	if (flags.deferred !== undefined) return await deferredRestartCommand(flags, options);
+
 	const config = loadForCli(flags);
 	const env = options.env ?? process.env;
 	const harnessPid = snapshotRuntime(config.paths.stateDir)?.pid;
@@ -720,6 +746,84 @@ async function restartCommand(cwd: string, flags: Record<string, string | boolea
 	const stopped = await stopWithConfig(config, flags, options, "restart");
 	if (stopped !== 0) return stopped;
 	return service.start(config, flags);
+}
+
+/**
+ * Flags the scheduled unit's own `alive restart` inherits: everything that says
+ * *which* restart to perform. `--deferred`, `--after`, `--user` and `--help` are
+ * scheduling concerns and must not leak into the unit (they would either
+ * re-defer forever or change the scope the unit already runs in).
+ */
+function forwardedRestartArgs(flags: Record<string, string | boolean>): string[] {
+	const args: string[] = [];
+	const config = flagString(flags, "config");
+	if (config !== undefined) args.push("--config", config);
+	if (flagBool(flags, "force") || flagBool(flags, "kill")) args.push("--force");
+	const timeout = flagString(flags, "timeout");
+	if (timeout !== undefined) args.push("--timeout", timeout);
+	const model = flagString(flags, "model");
+	if (model !== undefined) args.push("--model", model);
+	if (flagBool(flags, "verbose")) args.push("--verbose");
+	return args;
+}
+
+/**
+ * `alive restart --deferred [--after SECONDS] [--user]`: ask systemd to run
+ * `alive restart` a few seconds from now instead of replacing this process.
+ *
+ * All the work (lingering-unit hygiene, the `--collect` start) lives in
+ * `runtime/deferred-restart.ts`; this function only validates the flags and
+ * formats the result.
+ */
+async function deferredRestartCommand(
+	flags: Record<string, string | boolean>,
+	options: CliOptions,
+): Promise<number> {
+	const inline = typeof flags.deferred === "string" ? flags.deferred : undefined;
+	const after = parseDeferredAfter(flagString(flags, "after") ?? inline);
+	if (!after.ok) {
+		process.stderr.write(`${term.red("error:")} ${after.error}\n`);
+		return 1;
+	}
+
+	const scope: DeferredScope = flagBool(flags, "user") ? "user" : "system";
+	const deps = options.deferred ?? { run: createExecRunner(), now: () => new Date() };
+	const result = await runDeferredRestart(
+		{ afterSec: after.seconds, scope, restartArgs: forwardedRestartArgs(flags) },
+		deps,
+	);
+	const systemctl = scope === "user" ? "systemctl --user" : "systemctl";
+
+	if (result.outcome === "blocked") {
+		const lines = [`${term.red("refused:")} a deferred restart is already pending`];
+		for (const unit of result.pending) {
+			lines.push(`  ${unit.unit} is ${unit.active}/${unit.sub}`);
+			lines.push(`  inspect: ${systemctl} status ${unit.unit}`);
+			lines.push(`  stop:    ${systemctl} stop ${unit.unit}`);
+		}
+		lines.push("Nothing new was scheduled; that unit restarts the harness when it fires.");
+		process.stderr.write(`${lines.join("\n")}\n`);
+		return 1;
+	}
+	if (result.outcome === "failed" || !result.unit) {
+		process.stderr.write(`${term.red("error:")} ${result.error ?? "deferred restart failed"}\n`);
+		return 1;
+	}
+
+	for (const unit of result.reset) {
+		process.stdout.write(`${term.gray(`note: reset stale unit ${unit.unit} (was ${unit.active}/${unit.sub})`)}\n`);
+	}
+	for (const warning of result.warnings) {
+		process.stderr.write(`${term.yellow("warning:")} ${warning}\n`);
+	}
+
+	const journal = scope === "user" ? `journalctl --user -u ${result.unit}` : `journalctl -u ${result.unit}`;
+	process.stdout.write(
+		`${term.green("deferred restart scheduled:")} ${result.unit}\n` +
+			`  restart in ${result.afterSec}s — the current run will be interrupted in ${result.afterSec}s\n` +
+			`  watch it with: ${journal}\n`,
+	);
+	return 0;
 }
 
 async function logsCommand(cwd: string, flags: Record<string, string | boolean>): Promise<number> {
@@ -2203,8 +2307,10 @@ usage:
                                               (--force: do not wait for the drain, close the run now)
   alive abort-tool <agent>                    abort only the tool running right now
                                               (run/context/stoppedBy are untouched)
-  alive restart [--yes] [--verbose]           stop, then start in the background again
-                                              (refused when run inside the harness unless --yes)
+  alive restart [--yes] [--deferred [SECONDS]] [--user] [--verbose]
+                                              stop, then start in the background again
+                                              (refused when run inside the harness unless --yes;
+                                               --deferred schedules it with systemd-run instead)
   alive update [--check] [--tag vX.Y.Z] [--force]
                                               update the harness to the newest stable vX.Y.Z tag
                                               (--check: report only; --force: allow a dirty tree)
