@@ -1,10 +1,9 @@
 import { Type } from "typebox";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { LoadedConfig } from "../config.js";
-import { appProfileFor, getScopedInstallationToken } from "./app-auth.js";
+import { appProfileFor, getScopedInstallationToken, repositoryFor } from "./app-auth.js";
 import { withRetries, type RetryLogger } from "../retry.js";
 
-const REPOSITORY = "rimgro/alivebot";
 const API = "https://api.github.com";
 
 type Action = "list_issues" | "get_issue" | "create_issue" | "update_issue" | "comment_issue"
@@ -28,10 +27,11 @@ function compactPull(value: any) {
 
 export function createGitHubApiTool(loaded: LoadedConfig, log?: RetryLogger): ToolDefinition | undefined {
 	if (!appProfileFor(loaded)) return undefined;
+	const repository = repositoryFor(loaded);
 	return defineTool({
 		name: "github_api",
 		label: "GitHub issues and pull requests",
-		description: `Use this restricted GitHub API for issues and PRs in ${REPOSITORY} only. It uses your GitHub App's short-lived installation token internally; credentials are never returned. Actions: list/get/create/update/comment issues and list/get/create/update/comment PRs. Permission limits are enforced by GitHub.`,
+		description: `Use this restricted GitHub API for issues and PRs in ${repository} only. It uses your GitHub App's short-lived installation token internally; credentials are never returned. Actions: list/get/create/update/comment issues and list/get/create/update/comment PRs. Permission limits are enforced by GitHub.`,
 		parameters: Type.Object({
 			action: Type.Union([
 				Type.Literal("list_issues"), Type.Literal("get_issue"), Type.Literal("create_issue"), Type.Literal("update_issue"), Type.Literal("comment_issue"),
@@ -78,26 +78,26 @@ export function createGitHubApiTool(loaded: LoadedConfig, log?: RetryLogger): To
 					: send(endpoint, method, payload);
 			const number = params.number as number | undefined;
 			const requireNumber = () => { if (!Number.isSafeInteger(number) || number! < 1) throw new Error(`${action} requires a positive issue/PR number`); return number!; };
-			const issueEndpoint = (n: number) => `/repos/${REPOSITORY}/issues/${n}`;
-			const pullEndpoint = (n: number) => `/repos/${REPOSITORY}/pulls/${n}`;
+			const issueEndpoint = (n: number) => `/repos/${repository}/issues/${n}`;
+			const pullEndpoint = (n: number) => `/repos/${repository}/pulls/${n}`;
 
 			switch (action) {
 				case "list_issues": {
 					const state = params.state ?? "open";
-					const rows = await request(`/repos/${REPOSITORY}/issues?state=${state}&per_page=100`);
+					const rows = await request(`/repos/${repository}/issues?state=${state}&per_page=100`);
 					const issues = (rows as any[]).filter((row) => !row.pull_request).map(compactIssue);
-					return success(JSON.stringify(issues, null, 2), { repository: REPOSITORY, count: issues.length });
+					return success(JSON.stringify(issues, null, 2), { repository, count: issues.length });
 				}
 				case "get_issue": {
 					const issue = await request(issueEndpoint(requireNumber()));
 					if ((issue as any).pull_request) throw new Error(`Issue #${number} is a pull request; use get_pull_request`);
-					return success(JSON.stringify(issue, null, 2), { repository: REPOSITORY, number });
+					return success(JSON.stringify(issue, null, 2), { repository, number });
 				}
 				case "create_issue": {
 					if (!params.title?.trim()) throw new Error("create_issue requires a non-empty title");
 					const payload: Record<string, unknown> = { title: params.title.trim() };
 					for (const key of ["body", "labels", "assignees", "milestone"] as const) if (params[key] !== undefined) payload[key] = params[key];
-					const issue = await request(`/repos/${REPOSITORY}/issues`, "POST", payload);
+					const issue = await request(`/repos/${repository}/issues`, "POST", payload);
 					return success(`Created issue #${(issue as any).number}: ${(issue as any).html_url}`, compactIssue(issue));
 				}
 				case "update_issue": {
@@ -111,23 +111,23 @@ export function createGitHubApiTool(loaded: LoadedConfig, log?: RetryLogger): To
 				case "comment_pull_request": {
 					if (!params.body?.trim()) throw new Error(`${action} requires a non-empty body`);
 					const comment = await request(`${issueEndpoint(requireNumber())}/comments`, "POST", { body: params.body });
-					return success(`Comment added to #${number}: ${(comment as any).html_url}`, { repository: REPOSITORY, number, url: (comment as any).html_url });
+					return success(`Comment added to #${number}: ${(comment as any).html_url}`, { repository, number, url: (comment as any).html_url });
 				}
 				case "list_pull_requests": {
 					const state = params.state ?? "open";
-					const rows = await request(`/repos/${REPOSITORY}/pulls?state=${state}&per_page=100`);
+					const rows = await request(`/repos/${repository}/pulls?state=${state}&per_page=100`);
 					const pulls = (rows as any[]).map(compactPull);
-					return success(JSON.stringify(pulls, null, 2), { repository: REPOSITORY, count: pulls.length });
+					return success(JSON.stringify(pulls, null, 2), { repository, count: pulls.length });
 				}
 				case "get_pull_request": {
 					const pull = await request(pullEndpoint(requireNumber()));
-					return success(JSON.stringify(pull, null, 2), { repository: REPOSITORY, number });
+					return success(JSON.stringify(pull, null, 2), { repository, number });
 				}
 				case "create_pull_request": {
 					if (!params.title?.trim() || !params.head?.trim() || !params.base?.trim()) throw new Error("create_pull_request requires title, head and base");
 					const payload: Record<string, unknown> = { title: params.title.trim(), head: params.head.trim(), base: params.base.trim() };
 					for (const key of ["body", "draft"] as const) if (params[key] !== undefined) payload[key] = params[key];
-					const pull = await request(`/repos/${REPOSITORY}/pulls`, "POST", payload);
+					const pull = await request(`/repos/${repository}/pulls`, "POST", payload);
 					return success(`Created PR #${(pull as any).number}: ${(pull as any).html_url}`, compactPull(pull));
 				}
 				case "update_pull_request": {
