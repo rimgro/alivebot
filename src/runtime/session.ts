@@ -329,8 +329,12 @@ export async function buildAgent(options: BuildAgentOptions): Promise<AgentBuild
 			// Same pi execution path as a direct call: the definition owns its
 			// implementation, limits and error text. Only the extension context has
 			// to be synthesized here (the SDK does the same for agent-loop calls).
-			const context = session.extensionRunner.createContext();
-			return definition.execute(`compact_${callSeq}_${name}`, params, signal, undefined, context);
+			// pi 1.6 splits it in two: tool execution needs the tool context, which
+			// carries `tools` and `executeTool()` (the SDK's own tool wrapper builds
+			// it from the same call id and signal).
+			const toolCallId = `compact_${callSeq}_${name}`;
+			const context = session.extensionRunner.createToolContext(toolCallId, signal);
+			return definition.execute(toolCallId, params, signal, undefined, context);
 		};
 	}
 	// Wrap every active tool (built-ins, alive tools and sandbox tools) so the

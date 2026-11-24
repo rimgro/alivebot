@@ -30,11 +30,15 @@ import type { StreamFn } from "@earendil-works/pi-agent-core";
 import {
 	contentText,
 	createAssistantMessageEventStream,
+	getCurrentSystemMessage,
+	getCurrentSystemPrompt,
 	type AssistantMessage,
 	type Context,
+	type Message,
 	type Model,
 	type SimpleStreamOptions,
 	type StopReason,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { classifyNetworkError, RETRY_DEFAULTS, withRetries, type RetryLogger, type RetryOptions } from "../retry.js";
@@ -110,9 +114,46 @@ export class CompactionFailure extends Error {
 	}
 }
 
-/** True when a context is pi's one-shot conversation summarization request. */
-export function isSummarizationContext(context: Context | undefined): boolean {
-	return typeof context?.systemPrompt === "string" && context.systemPrompt.startsWith(SUMMARIZATION_SYSTEM_PREFIX);
+/**
+ * Phrases that identify pi's one-shot summarization instruction inside the user
+ * turn. Only used as a fallback when a request carries no system message at all:
+ * the primary detection is the system prompt (see below).
+ */
+const SUMMARIZATION_USER_MARKERS = [
+	"Create a structured context checkpoint summary",
+	"NEW conversation messages to incorporate into the existing summary",
+];
+
+function messageText(message: Message | undefined): string {
+	if (!message || !("content" in message)) return "";
+	return typeof message.content === "string" ? message.content : contentText(message.content);
+}
+
+/**
+ * True when a context is pi's one-shot conversation summarization request.
+ *
+ * pi 1.6 normalizes every request: `Context.systemPrompt` is folded into a
+ * leading system message (`normalizeContext`), and `StreamFn` only ever sees a
+ * `TranscriptContext`. The summarization prompt therefore lives in the
+ * transcript, so it is read from there (#263). Hand-built `Context` values
+ * (older callers, tests) may still carry it as `systemPrompt`; and if a request
+ * has no system message at all, the summarization user turn is matched instead,
+ * so the guard can never silently stop recognizing its own requests (#167).
+ */
+export function isSummarizationContext(context: Context | TranscriptContext | undefined): boolean {
+	if (!context || !Array.isArray(context.messages)) return false;
+	if (getCurrentSystemPrompt(context.messages).startsWith(SUMMARIZATION_SYSTEM_PREFIX)) return true;
+	// A raw `Context` states its prompt outside the transcript: trust it, and do
+	// not guess from user text when it is some other prompt.
+	const carried = (context as Context).systemPrompt;
+	if (typeof carried === "string" && carried.length > 0) return carried.startsWith(SUMMARIZATION_SYSTEM_PREFIX);
+	// A transcript with a system message is a real conversation: never match it
+	// by user text, only by the prompt that pi put there.
+	if (getCurrentSystemMessage(context.messages)) return false;
+	const firstUser = context.messages.find((message) => message.role === "user");
+	const text = messageText(firstUser);
+	if (!text.includes("<conversation>")) return false;
+	return SUMMARIZATION_USER_MARKERS.some((marker) => text.includes(marker));
 }
 
 /**
@@ -326,7 +367,7 @@ export class CompactionMonitor {
 	async summarize(
 		previous: StreamFn,
 		model: Model<any>,
-		context: Context,
+		context: TranscriptContext,
 		options: SimpleStreamOptions | undefined,
 	): Promise<AssistantMessage> {
 		const now = this.now();
@@ -456,7 +497,7 @@ export function installCompactionGuard(session: AgentSession, options: Compactio
 	const monitor = new CompactionMonitor(options);
 	const previous = session.agent.streamFunction;
 	if (typeof previous !== "function") return monitor;
-	session.agent.streamFunction = ((model: Model<any>, context: Context, streamOptions?: SimpleStreamOptions) => {
+	session.agent.streamFunction = ((model: Model<any>, context: TranscriptContext, streamOptions?: SimpleStreamOptions) => {
 		if (!isSummarizationContext(context)) return previous(model, context, streamOptions);
 		return guardedStream(monitor, previous, model, context, streamOptions);
 	}) as StreamFn;
@@ -479,7 +520,7 @@ function guardedStream(
 	monitor: CompactionMonitor,
 	previous: StreamFn,
 	model: Model<any>,
-	context: Context,
+	context: TranscriptContext,
 	options: SimpleStreamOptions | undefined,
 ): ReturnType<StreamFn> {
 	const stream = createAssistantMessageEventStream();

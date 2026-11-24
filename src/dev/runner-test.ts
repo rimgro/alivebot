@@ -16,7 +16,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createAssistantMessageEventStream, type AssistantMessage, type Context, type Model } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, normalizeContext, type AssistantMessage, type Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_CONFIG, loadConfig } from "../config.js";
 import { Logger } from "../log.js";
@@ -155,7 +155,8 @@ class FakeSession {
 	model = undefined;
 	sessionFile: string | undefined;
 	isStreaming = false;
-	agent: { shouldStopAfterTurn?: (context: unknown, signal?: AbortSignal) => boolean | Promise<boolean> } = {};
+	/** pi 1.6 turn hook: `finishTurn` returns a decision, not a boolean (#263). */
+	agent: { finishTurn?: (turn: unknown, signal?: AbortSignal) => unknown } = {};
 	listeners: Array<(event: unknown) => void> = [];
 	steered: string[] = [];
 	aborted = false;
@@ -227,7 +228,10 @@ class FakeSession {
 		this.disposed = true;
 	}
 	async turn(): Promise<boolean> {
-		return Boolean(await this.agent.shouldStopAfterTurn?.({}, undefined));
+		// The real agent loop passes the completed turn; `{ action: "end" }` is
+		// the only decision that stops it (pi 1.6 `finishTurn`, #263).
+		const decision = await this.agent.finishTurn?.({ message: { role: "assistant", stopReason: "stop" }, toolResults: [] }, undefined);
+		return (decision as { action?: string } | undefined)?.action === "end";
 	}
 }
 
@@ -1464,10 +1468,10 @@ async function triggerOverflowCompaction(session: FakeSession): Promise<void> {
 		});
 	}
 	const agent = session.agent as unknown as { streamFunction: (model: unknown, context: unknown) => unknown };
-	const summarizationContext = {
+	const summarizationContext = normalizeContext({
 		systemPrompt: "You are a context summarization assistant. Only output the structured summary.",
 		messages: [{ role: "user", content: [{ type: "text", text: "<conversation>hello</conversation>" }], timestamp: Date.now() }],
-	};
+	});
 	try {
 		const stream = agent.streamFunction({ id: "fake-overflow" }, summarizationContext) as { result: () => Promise<unknown> };
 		await stream.result();
@@ -2482,10 +2486,10 @@ section("a failed compaction emits compaction_failed with the reason class (#167
 	});
 	handler = async (current) => {
 		(session as unknown as { setContextTokens: (tokens: number) => void }).setContextTokens(120_000);
-		const summarizationContext = {
+		const summarizationContext = normalizeContext({
 			systemPrompt: "You are a context summarization assistant. Only output the structured summary.",
 			messages: [{ role: "user", content: [{ type: "text", text: "<conversation>hello</conversation>" }], timestamp: Date.now() }],
-		} as Context;
+		});
 		try {
 			const stream = await session.agent.streamFunction(fakeModel, summarizationContext);
 			await stream.result();
