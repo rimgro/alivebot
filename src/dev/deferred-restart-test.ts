@@ -15,6 +15,7 @@
  *
  *   npm run test:deferred-restart
  */
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -29,6 +30,7 @@ import {
 	parseUnitList,
 	runDeferredRestart,
 	unitNameFor,
+	unitPath,
 	type DeferredRestartOptions,
 } from "../runtime/deferred-restart.js";
 import { parseCgroupUnit, parseMainPid } from "../runtime/supervisor-unit.js";
@@ -68,6 +70,31 @@ function expectedDirectStart(user = false): string {
 		` --setenv=ALIVE_DEFERRED_RESTART=alive-restart-${EPOCH} ${EXEC} ${SCRIPT} restart --config ${path.resolve(CWD, "alive.config.json")}`
 	);
 }
+/**
+ * Inverse of `unitPath` for the tests: undo the unit-file quoting so a quoted
+ * value can be handed to a real command and compared with the real path.
+ */
+function decodeUnitPath(value: string): string {
+	if (!value.startsWith('"')) return value;
+	const body = value.slice(1, -1);
+	let decoded = "";
+	for (let index = 0; index < body.length; index += 1) {
+		const char = body[index]!;
+		if (char === "\\") {
+			decoded += body[index + 1] ?? "";
+			index += 1;
+			continue;
+		}
+		if ((char === "%" || char === "$") && body[index + 1] === char) {
+			decoded += char;
+			index += 1;
+			continue;
+		}
+		decoded += char;
+	}
+	return decoded;
+}
+
 /** A user-unit cgroup: the profile is supervised by `alive-agent@researcher`. */
 const SUPERVISOR_CGROUP =
 	"0::/user.slice/user-1000.slice/user@1000.service/app.slice/alive-agent@researcher.service";
@@ -662,6 +689,86 @@ async function mainTests(): Promise<void> {
 		check("a failed systemd-run is an error", result.outcome === "failed", result);
 		check("the environment snapshot is deleted again", !fs.existsSync(file), file);
 		fs.rmSync(directory, { recursive: true, force: true });
+	}
+
+	section("unitPath quotes only the paths that need it (#258)");
+	{
+		const plain = "/var/lib/alive/state/alive-restart-1700000000.env";
+		check("a plain path is returned byte-for-byte", unitPath(plain) === plain, unitPath(plain));
+		check("a plain path is untouched in Exec mode too", unitPath(plain, true) === plain, unitPath(plain, true));
+		check("a space wraps the path in double quotes", unitPath("/var/lib/my alive/state.env") === '"/var/lib/my alive/state.env"', unitPath("/var/lib/my alive/state.env"));
+		check("a backslash is doubled", unitPath("/var/lib/a\\b.env") === '"/var/lib/a\\\\b.env"', unitPath("/var/lib/a\\b.env"));
+		check("a quote is backslash-escaped", unitPath('/var/lib/a"b.env') === '"/var/lib/a\\"b.env"', unitPath('/var/lib/a"b.env'));
+		check("a percent is doubled (systemd specifier)", unitPath("/var/lib/a%b.env") === '"/var/lib/a%%b.env"', unitPath("/var/lib/a%b.env"));
+		check("a dollar stays bare outside Exec lines", unitPath("/var/lib/a$b.env") === '"/var/lib/a$b.env"', unitPath("/var/lib/a$b.env"));
+		check("a dollar is doubled in Exec lines", unitPath("/var/lib/a$b.env", true) === '"/var/lib/a$$b.env"', unitPath("/var/lib/a$b.env", true));
+		check("an apostrophe quotes the path but is not escaped", unitPath("/var/lib/a'b.env") === '"/var/lib/a\'b.env"', unitPath("/var/lib/a'b.env"));
+		check("a glob character quotes the path", unitPath("/var/lib/a*b.env") === '"/var/lib/a*b.env"', unitPath("/var/lib/a*b.env"));
+	}
+
+	section("a snapshot path with a space is quoted for the unit (#258)");
+	{
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-deferred-unit-space-"));
+		const directory = path.join(root, "state dir");
+		fs.mkdirSync(directory, { recursive: true });
+		const file = path.join(directory, `alive-restart-${EPOCH}.env`);
+		const fake = fakeService();
+		const result = await runWith(fake, { stateDir: directory, envFileDir: directory, env: { TOKEN: "x" } });
+		const start = fake.calls.find((call) => call.command === "systemd-run");
+		check("the restart is still scheduled", result.outcome === "started", result);
+		check("the snapshot really exists in the spaced directory", fs.existsSync(file), file);
+		check(
+			"EnvironmentFile= quotes the spaced path",
+			start?.args.includes(`--property=EnvironmentFile="${file}"`) === true,
+			start?.args,
+		);
+		check(
+			"ExecStopPost= quotes the spaced path",
+			start?.args.includes(`--property=ExecStopPost=/bin/rm -f "${file}"`) === true,
+			start?.args,
+		);
+		const stopPrefix = "--property=ExecStopPost=/bin/rm -f ";
+		const stopArg = start?.args.find((arg) => arg.startsWith(stopPrefix)) ?? "";
+		const stopPath = decodeUnitPath(stopArg.slice(stopPrefix.length));
+		check("the quoted path decodes back to the real snapshot", stopPath === file, stopPath);
+		try {
+			execFileSync("/bin/rm", ["-f", stopPath]);
+		} catch {
+			// Checked right below: the file must be gone.
+		}
+		check("the unit's ExecStopPost really removes the snapshot", !fs.existsSync(file), file);
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+
+	section("specifiers, dollars and quotes in the snapshot path are escaped (#258)");
+	{
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "alive-deferred-unit-spec-"));
+		const directory = path.join(root, `state %i $HOME "quoted"`);
+		fs.mkdirSync(directory, { recursive: true });
+		const file = path.join(directory, `alive-restart-${EPOCH}.env`);
+		const fake = fakeService();
+		const result = await runWith(fake, { stateDir: directory, envFileDir: directory, env: { TOKEN: "x" } });
+		const start = fake.calls.find((call) => call.command === "systemd-run");
+		// EnvironmentFile=: `%` is a specifier, `$` is not expanded.
+		const envValue = file.replace(/%/g, "%%").replace(/"/g, '\\"');
+		// Exec lines additionally expand `$VAR`.
+		const execValue = envValue.replace(/\$/g, "$$$$");
+		check("the restart is still scheduled", result.outcome === "started", result);
+		check("the snapshot really exists", fs.existsSync(file), file);
+		check(
+			"EnvironmentFile= doubles % and escapes quotes, leaving $ bare",
+			start?.args.includes(`--property=EnvironmentFile="${envValue}"`) === true,
+			start?.args,
+		);
+		check(
+			"ExecStopPost= doubles $ as well as % and quotes",
+			start?.args.includes(`--property=ExecStopPost=/bin/rm -f "${execValue}"`) === true,
+			start?.args,
+		);
+		const stopPrefix = "--property=ExecStopPost=/bin/rm -f ";
+		const stopArg = start?.args.find((arg) => arg.startsWith(stopPrefix)) ?? "";
+		check("the escaped Exec path decodes back to the real snapshot", decodeUnitPath(stopArg.slice(stopPrefix.length)) === file, stopArg);
+		fs.rmSync(root, { recursive: true, force: true });
 	}
 
 	section("CLI: supervisor strategy and its scope check (#258)");

@@ -285,6 +285,29 @@ export function formatEnvironmentFile(env: NodeJS.ProcessEnv): string {
 	return lines.length === 0 ? "" : `${lines.join("\n")}\n`;
 }
 
+/** Characters that would break a systemd unit value if left bare. */
+const UNIT_PATH_SPECIAL = /[\s"'\\%$*?]/;
+
+/**
+ * Quote a path for a `systemd-run --property=` value.
+ *
+ * A plain path is returned untouched, so the common case stays byte-for-byte
+ * as it was. Anything with whitespace or a unit special character is wrapped
+ * in double quotes and escaped the way a unit file expects: `\` becomes `\\`,
+ * `"` becomes `\"`, `%` becomes `%%`. With `exec` (Exec* lines, not
+ * `EnvironmentFile=`) `$` also becomes `$$`, because only Exec lines expand
+ * `$VAR`.
+ */
+export function unitPath(value: string, exec = false): string {
+	if (!UNIT_PATH_SPECIAL.test(value)) return value;
+	const escaped = value
+		.replace(/\\/g, () => "\\\\")
+		.replace(/"/g, () => '\\"')
+		.replace(/%/g, () => "%%")
+		.replace(/\$/g, (dollar) => (exec ? "$$" : dollar));
+	return `"${escaped}"`;
+}
+
 function escapeEnvironmentValue(value: string): string {
 	return value
 		.replace(/\\/g, "\\\\")
@@ -338,8 +361,10 @@ export function planDeferredRestart(request: DeferredRestartRequest, units: read
 			`--unit=${unit}`,
 		];
 		if (request.envFile) {
-			args.push(`--property=EnvironmentFile=${request.envFile}`);
-			args.push(`--property=ExecStopPost=/bin/rm -f ${request.envFile}`);
+			// systemd splits values on whitespace, reads `%` as a specifier and
+			// expands `$VAR` in Exec lines: quote/escape the snapshot path.
+			args.push(`--property=EnvironmentFile=${unitPath(request.envFile)}`);
+			args.push(`--property=ExecStopPost=/bin/rm -f ${unitPath(request.envFile, true)}`);
 		}
 		args.push(
 			`--setenv=${DEFERRED_RESTART_ENV_MARKER}=${unit}`,
