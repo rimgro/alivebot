@@ -23,12 +23,14 @@ import { main } from "../cli.js";
 import {
 	DEFAULT_DEFERRED_AFTER_SEC,
 	MAX_DEFERRED_AFTER_SEC,
+	SNAPSHOT_MAX_AGE_MS,
 	absoluteConfigArgs,
 	classifyLingering,
 	formatEnvironmentFile,
 	parseDeferredAfter,
 	parseUnitList,
 	runDeferredRestart,
+	sweepOrphanSnapshots,
 	unitNameFor,
 	unitPath,
 	type DeferredRestartOptions,
@@ -66,7 +68,7 @@ fs.mkdirSync(ENV_DIR, { recursive: true });
 function expectedDirectStart(user = false): string {
 	return (
 		`systemd-run ${user ? "--user " : ""}--on-active=5 --collect --working-directory=${CWD} --unit=alive-restart-${EPOCH}` +
-		` --property=EnvironmentFile=${ENV_FILE} --property=ExecStopPost=/bin/rm -f ${ENV_FILE}` +
+		` --property=KillMode=process --property=EnvironmentFile=${ENV_FILE} --property=ExecStopPost=/bin/rm -f ${ENV_FILE}` +
 		` --setenv=ALIVE_DEFERRED_RESTART=alive-restart-${EPOCH} ${EXEC} ${SCRIPT} restart --config ${path.resolve(CWD, "alive.config.json")}`
 	);
 }
@@ -99,6 +101,13 @@ function decodeUnitPath(value: string): string {
 const SUPERVISOR_CGROUP =
 	"0::/user.slice/user-1000.slice/user@1000.service/app.slice/alive-agent@researcher.service";
 const SUPERVISOR_UNIT = "alive-agent@researcher.service";
+/** The harness pid `runtime.json` reports in the #258 cgroup tests. */
+const HARNESS_PID = 4242;
+/** A system-unit cgroup: the live #258 case the harness actually runs under. */
+const HARNESS_SYSTEM_CGROUP = "0::/system.slice/alive-agent@developer.service";
+const HARNESS_SYSTEM_UNIT = "alive-agent@developer.service";
+/** The CLI's own process lives in the sandbox scope, not in the harness unit. */
+const SANDBOX_CGROUP = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/sandbox-123.scope";
 
 interface FakeCall {
 	command: string;
@@ -186,7 +195,11 @@ interface CliResult {
 }
 
 /** Run the real CLI entry with the fake service manager and the fake clock. */
-async function cli(argv: string[], fake: Fake, cgroupText = ""): Promise<CliResult> {
+async function cli(
+	argv: string[],
+	fake: Fake,
+	cgroupText: string | ((pid: number) => string | undefined) = "",
+): Promise<CliResult> {
 	const out: string[] = [];
 	const err: string[] = [];
 	const stdoutWrite = process.stdout.write;
@@ -341,6 +354,34 @@ async function mainTests(): Promise<void> {
 			"without an explicit cwd the unit inherits process.cwd()",
 			start?.args.includes(`--working-directory=${process.cwd()}`) === true,
 			start?.args,
+		);
+	}
+
+	section("direct unit keeps the detached child alive with KillMode=process (#258)");
+	{
+		const fake = fakeService();
+		const result = await runWith(fake);
+		const start = fake.calls.find((call) => call.command === "systemd-run");
+		const args = start?.args ?? [];
+		check("the restart is scheduled", result.outcome === "started", result);
+		check(
+			"KillMode=process is its own --property argument",
+			args.includes("--property=KillMode=process"),
+			args,
+		);
+		check(
+			"it is not embedded in another property value",
+			!args.some((arg) => arg !== "--property=KillMode=process" && arg.includes("KillMode")),
+			args,
+		);
+		check(
+			"it comes before EnvironmentFile= and ExecStopPost=",
+			args.indexOf("--property=KillMode=process") > args.indexOf(`--unit=alive-restart-${EPOCH}`) &&
+				args.indexOf("--property=KillMode=process") <
+					args.findIndex((arg) => arg.startsWith("--property=EnvironmentFile=")) &&
+				args.indexOf("--property=KillMode=process") <
+					args.findIndex((arg) => arg.startsWith("--property=ExecStopPost=")),
+			args,
 		);
 	}
 
@@ -552,6 +593,88 @@ async function mainTests(): Promise<void> {
 		}
 		check("MainPID is parsed from systemctl show", parseMainPid("MainPID=4242\n") === 4242, parseMainPid("MainPID=4242\n"));
 		check("missing MainPID is undefined", parseMainPid("MainPID=\n") === undefined, parseMainPid("MainPID=\n"));
+	}
+
+	section("supervisor detection reads the harness cgroup, not the caller's (#258 live regression)");
+	{
+		const seen: number[] = [];
+		const fake = fakeService({ show: `MainPID=${HARNESS_PID}\n` });
+		const result = await runWith(fake, {
+			scope: "system",
+			harnessPid: HARNESS_PID,
+			cgroupText: (pid) => {
+				seen.push(pid);
+				return pid === HARNESS_PID ? HARNESS_SYSTEM_CGROUP : SANDBOX_CGROUP;
+			},
+		});
+		check("the harness pid's cgroup is read", seen.includes(HARNESS_PID), seen);
+		check(
+			"a .service around the harness selects the supervisor strategy",
+			result.strategy === "supervisor",
+			result.strategy,
+		);
+		check(
+			"the harness unit is the supervisor",
+			result.supervisor?.unit === HARNESS_SYSTEM_UNIT && result.supervisor.scope === "system",
+			result.supervisor,
+		);
+		check(
+			"the transient unit restarts that supervisor, not `alive restart`",
+			fake.calls.some(
+				(call) =>
+					call.command === "systemd-run" &&
+					call.args.slice(call.args.indexOf("systemctl")).join(" ") ===
+						`systemctl restart ${HARNESS_SYSTEM_UNIT}`,
+			),
+			lines(fake.calls),
+		);
+		check(
+			"the unit contains no run --foreground",
+			!fake.calls.some((call) => call.command === "systemd-run" && call.args.includes("run")),
+			lines(fake.calls),
+		);
+	}
+	{
+		const fake = fakeService({ show: `MainPID=${HARNESS_PID}\n` });
+		const result = await runWith(fake, {
+			scope: "system",
+			harnessPid: HARNESS_PID,
+			// A pid inside slices/scopes but not inside any .service.
+			cgroupText: (pid) =>
+				pid === HARNESS_PID ? "0::/system.slice/alive.slice/run-17.scope" : SANDBOX_CGROUP,
+		});
+		check("a harness outside a .service falls back to direct", result.strategy === "direct", result.strategy);
+		check(
+			"the warning names the harness pid and the checked cgroup",
+			result.warnings.some(
+				(line) => line.includes(`harness pid ${HARNESS_PID}`) && line.includes(`/proc/${HARNESS_PID}/cgroup`),
+			),
+			result.warnings,
+		);
+		check("no systemctl show is run for a pid outside a unit", !fake.calls.some((call) => call.args.includes("show")), lines(fake.calls));
+	}
+	{
+		const seen: number[] = [];
+		const fake = fakeService();
+		const result = await runWith(fake, {
+			scope: "system",
+			harnessPid: HARNESS_PID,
+			cgroupText: (pid) => {
+				seen.push(pid);
+				return pid === HARNESS_PID ? undefined : SANDBOX_CGROUP;
+			},
+		});
+		check("an unreadable harness cgroup falls back to direct", result.strategy === "direct", result.strategy);
+		check(
+			"the fallback warns separately and names the harness pid",
+			result.warnings.some(
+				(line) =>
+					line.includes(`could not read the harness cgroup /proc/${HARNESS_PID}/cgroup`) &&
+					line.includes("falling back"),
+			),
+			result.warnings,
+		);
+		check("the fallback really reads this process's cgroup", seen.includes(process.pid), seen);
 	}
 
 	section("the supervisor strategy is confirmed by MainPID (#258)");
@@ -786,6 +909,97 @@ async function mainTests(): Promise<void> {
 		const stopArg = start?.args.find((arg) => arg.startsWith(stopPrefix)) ?? "";
 		check("the escaped Exec path decodes back to the real snapshot", decodeUnitPath(stopArg.slice(stopPrefix.length)) === file, stopArg);
 		fs.rmSync(root, { recursive: true, force: true });
+	}
+
+	section("orphan environment snapshots are swept at start (#258)");
+	{
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "alive-deferred-sweep-"));
+		const oldSnapshot = path.join(directory, `alive-restart-${EPOCH}.env`);
+		const freshSnapshot = path.join(directory, `alive-restart-${Number(EPOCH) + 1}.env`);
+		const foreign = path.join(directory, "alive.config.json");
+		for (const file of [oldSnapshot, freshSnapshot, foreign]) fs.writeFileSync(file, "x", "utf8");
+		const oldTime = new Date(NOW.getTime() - 3 * 60 * 60 * 1000);
+		fs.utimesSync(oldSnapshot, oldTime, oldTime);
+		const freshTime = new Date(NOW.getTime() - 60_000);
+		fs.utimesSync(freshSnapshot, freshTime, freshTime);
+		const logged: string[] = [];
+		const removed = sweepOrphanSnapshots({ stateDir: directory, now: NOW, log: (line) => logged.push(line) });
+		check("the old snapshot is removed", !fs.existsSync(oldSnapshot), removed);
+		check("a snapshot inside a legitimate delay is kept", fs.existsSync(freshSnapshot), removed);
+		check("unrelated files are untouched", fs.existsSync(foreign), removed);
+		check("the removed path is returned", removed.join(",") === oldSnapshot, removed);
+		check("the sweep reports one line", logged.length === 1 && logged[0]!.includes("1 orphan"), logged);
+		check(
+			"the default sweep age is strictly larger than the maximum deferred delay",
+			SNAPSHOT_MAX_AGE_MS > MAX_DEFERRED_AFTER_SEC * 1000,
+			{ SNAPSHOT_MAX_AGE_MS, MAX_DEFERRED_AFTER_SEC },
+		);
+		check(
+			"a snapshot younger than the default age is kept",
+			sweepOrphanSnapshots({ stateDir: directory, now: NOW.getTime() }).length === 0,
+			removed,
+		);
+		const missing = path.join(directory, "missing");
+		let missingRemoved: string[] | undefined;
+		let missingThrew = false;
+		try {
+			missingRemoved = sweepOrphanSnapshots({ stateDir: missing });
+		} catch {
+			missingThrew = true;
+		}
+		check("a missing state directory is not fatal", !missingThrew && missingRemoved?.length === 0, missingRemoved);
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+	{
+		// The harness start path must sweep: runCommand is the only caller that
+		// covers both foreground and --once. A disabled profile returns right after
+		// the sweep, so no runtime or child process is started.
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "alive-deferred-sweep-cli-"));
+		const project = path.join(directory, "profile");
+		fs.mkdirSync(project, { recursive: true });
+		fs.writeFileSync(path.join(project, "alive.config.json"), JSON.stringify({ name: "SweepCli", enabled: false }), "utf8");
+		const stateDir = path.join(project, ".alive");
+		fs.mkdirSync(stateDir, { recursive: true });
+		const oldSnapshot = path.join(stateDir, `alive-restart-${EPOCH}.env`);
+		const freshSnapshot = path.join(stateDir, `alive-restart-${Number(EPOCH) + 1}.env`);
+		const foreign = path.join(stateDir, "runtime.json");
+		for (const file of [oldSnapshot, freshSnapshot, foreign]) fs.writeFileSync(file, "x", "utf8");
+		const oldTime = new Date(Date.now() - 3 * 60 * 60 * 1000);
+		fs.utimesSync(oldSnapshot, oldTime, oldTime);
+		const previous = process.cwd();
+		const previousMarker = process.env.ALIVE_RUNTIME;
+		const out: string[] = [];
+		const err: string[] = [];
+		const stdoutWrite = process.stdout.write;
+		const stderrWrite = process.stderr.write;
+		process.stdout.write = ((chunk: unknown) => {
+			out.push(String(chunk));
+			return true;
+		}) as typeof process.stdout.write;
+		process.stderr.write = ((chunk: unknown) => {
+			err.push(String(chunk));
+			return true;
+		}) as typeof process.stderr.write;
+		try {
+			process.chdir(project);
+			const code = await main(["run"], { env: {} });
+			check("the disabled profile stops right after the sweep", code === 1, code);
+		} finally {
+			process.chdir(previous);
+			process.stdout.write = stdoutWrite;
+			process.stderr.write = stderrWrite;
+			if (previousMarker === undefined) delete process.env.ALIVE_RUNTIME;
+			else process.env.ALIVE_RUNTIME = previousMarker;
+		}
+		check("the CLI start removes the old snapshot", !fs.existsSync(oldSnapshot), oldSnapshot);
+		check("the CLI start keeps a fresh snapshot", fs.existsSync(freshSnapshot), freshSnapshot);
+		check("the CLI start leaves other state files alone", fs.existsSync(foreign), foreign);
+		check(
+			"the CLI prints one sweep line",
+			err.join("").split("\n").filter((line) => line.includes("orphan environment snapshot")).length === 1,
+			err.join(""),
+		);
+		fs.rmSync(directory, { recursive: true, force: true });
 	}
 
 	section("CLI: supervisor strategy and its scope check (#258)");

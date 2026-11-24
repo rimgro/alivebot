@@ -49,6 +49,7 @@ import { readHeartbeatStatus } from "./heartbeat.js";
 import {
 	parseDeferredAfter,
 	runDeferredRestart,
+	sweepOrphanSnapshots,
 	type DeferredRestartDeps,
 	type DeferredScope,
 } from "./runtime/deferred-restart.js";
@@ -504,6 +505,20 @@ async function runCommand(cwd: string, flags: Record<string, string | boolean>):
 	// marker, which is how `alive restart` notices it would kill its own run.
 	process.env[HARNESS_ENV_MARKER] = "1";
 	const config = loadForCli(flags);
+	// A direct deferred restart removes its 0600 environment snapshot in
+	// ExecStopPost, but that cleanup is not guaranteed: on 24.11 the unit sat in
+	// `deactivating/stop-sigterm` with the snapshot still on disk for ~50s. Sweep
+	// snapshots older than any legitimate delay at every harness start, so
+	// secrets do not depend on a transient unit ever reaching its stop phase.
+	// Best effort: a failed sweep must never stop the harness.
+	try {
+		sweepOrphanSnapshots({
+			stateDir: config.paths.stateDir,
+			log: (line) => process.stderr.write(`${term.gray(`note: ${line}`)}\n`),
+		});
+	} catch {
+		// The sweep already swallows its own I/O errors; this is the last guard.
+	}
 	if (!config.config.enabled) {
 		process.stderr.write(`${term.red("agent is disabled:")} ${config.config.name}; enable it before starting\n`);
 		return 1;
