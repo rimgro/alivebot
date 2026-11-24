@@ -25,6 +25,14 @@ interface LimitsFile {
 	profiles: Record<string, ProfileLimitRecord>;
 }
 
+export interface WriteReservation {
+	allowed: boolean;
+	/** Why the write was refused; present only when `allowed` is false. */
+	reason?: string;
+	/** Writes counted in the current hour, including this reservation when allowed. */
+	writesThisHour: number;
+}
+
 export interface LimitsStoreOptions {
 	/** Test seam: replace Date.now. */
 	clock?: () => number;
@@ -62,8 +70,50 @@ export class TelegramMcpLimitsStore {
 	}
 
 	/**
+	 * Check and count one write in a single synchronous read-modify-write. Two
+	 * parallel calls cannot both observe the last free slot: the second sees the
+	 * counter incremented by the first.
+	 */
+	reserveWrite(profile: string, limit: number, now = this.now()): WriteReservation {
+		const data = this.read();
+		const record = data.profiles[profile];
+		const expired = record?.windowExpiresAt !== undefined && record.windowExpiresAt <= now;
+		if (!record || record.windowExpiresAt === undefined || expired) {
+			return {
+				allowed: false,
+				reason:
+					`no active write window for profile "${profile}"` +
+					(expired ? ` (the previous window expired at ${new Date(record!.windowExpiresAt!).toISOString()})` : "") +
+					`; write:auto sends only inside an open TTL window`,
+				writesThisHour: record ? (isNewHour(record, now) ? 0 : record.writesThisHour) : 0,
+			};
+		}
+		if (isNewHour(record, now)) {
+			record.hourStartedAt = now;
+			record.writesThisHour = 0;
+		}
+		if (record.hourStartedAt === undefined) record.hourStartedAt = now;
+		if (record.writesThisHour >= limit) {
+			return {
+				allowed: false,
+				reason:
+					`write limit reached for profile "${profile}": ` +
+					`${record.writesThisHour}/${limit} writes this hour; retry in the next hour`,
+				writesThisHour: record.writesThisHour,
+			};
+		}
+		record.writesThisHour += 1;
+		data.profiles[profile] = record;
+		this.write(data);
+		return { allowed: true, writesThisHour: record.writesThisHour };
+	}
+
+	/**
 	 * Count one allowed write. The hour is reset lazily: a record older than an
 	 * hour starts a new hour at `now`. The TTL window is not extended by writes.
+	 *
+	 * Kept for callers that already did their own window/limit check; the server
+	 * uses `reserveWrite`, which checks and counts atomically.
 	 */
 	recordWrite(profile: string, now = this.now()): TelegramMcpLimitsSnapshot {
 		const data = this.read();

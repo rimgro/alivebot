@@ -25,6 +25,15 @@ export interface TelegramMcpProfileConfig {
 	command: string;
 	/** Upstream arguments. Default: `["mcp"]`. */
 	args: string[];
+	/**
+	 * Extra environment variables for the upstream child (#264 guards).
+	 *
+	 * This is the only way to add a variable beyond the deliberately small
+	 * allowlist in `child.ts` (PATH, HOME, USER, SHELL, LANG/LC_*, TZ, TERM,
+	 * TMPDIR/TEMP/TMP, XDG_*, TELEGRAM_*, HTTP(S)_PROXY/NO_PROXY). Values are
+	 * plain strings: no nesting and no interpolation.
+	 */
+	env?: Record<string, string>;
 }
 
 export interface TelegramMcpConfig {
@@ -118,6 +127,7 @@ function validateProfile(raw: Record<string, unknown>, path: string): TelegramMc
 		DEFAULT_TELEGRAM_MCP_WRITE_LIMIT_PER_HOUR,
 	);
 	const command = raw.command === undefined ? "telegram" : requireNonEmptyString(raw.command, `${path}.command`);
+	const env = validateProfileEnv(raw.env, `${path}.env`);
 	let args = ["mcp"];
 	if (raw.args !== undefined) {
 		if (!Array.isArray(raw.args) || !raw.args.every((arg) => typeof arg === "string")) {
@@ -133,7 +143,25 @@ function validateProfile(raw: Record<string, unknown>, path: string): TelegramMc
 		writeLimitPerHour,
 		command,
 		args,
+		...(env === undefined ? {} : { env }),
 	};
+}
+
+/** Profile env is a flat string map; values are never coerced or nested. */
+function validateProfileEnv(value: unknown, path: string): Record<string, string> | undefined {
+	if (value === undefined) return undefined;
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw new Error(`${path} must be an object mapping variable names to strings`);
+	}
+	const env: Record<string, string> = {};
+	for (const [key, entry] of Object.entries(value)) {
+		if (!key.trim()) throw new Error(`${path} must not contain an empty variable name`);
+		if (typeof entry !== "string") {
+			throw new Error(`${path}.${key} must be a string, got "${typeof entry}"`);
+		}
+		env[key] = entry;
+	}
+	return env;
 }
 
 function positiveInteger(value: unknown, path: string, fallback: number): number {

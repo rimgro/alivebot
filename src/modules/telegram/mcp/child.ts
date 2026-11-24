@@ -17,6 +17,58 @@ const HEALTHY_AFTER_MS = 30_000;
 /** How long a request waits for a restarting child to come back. */
 export const UPSTREAM_READY_TIMEOUT_MS = 10_000;
 
+/**
+ * Parent variables the upstream may see. Everything else (ALIVE_*, GitHub App
+ * credentials, unrelated API keys) stays out of the child unless the profile
+ * lists it explicitly in `env`, which is merged on top of this allowlist.
+ */
+const CHILD_ENV_EXACT = new Set([
+	// Process basics: the binary lookup and normal CLI behaviour.
+	"PATH",
+	"HOME",
+	"USER",
+	"LOGNAME",
+	"SHELL",
+	"LANG",
+	"LANGUAGE",
+	"TZ",
+	"TERM",
+	// Temp directories used by the Telegram client for downloads/uploads.
+	"TMPDIR",
+	"TEMP",
+	"TMP",
+	// Outbound proxies: better-tg-cli may need them in a restricted network.
+	"HTTP_PROXY",
+	"HTTPS_PROXY",
+	"NO_PROXY",
+	"ALL_PROXY",
+	"http_proxy",
+	"https_proxy",
+	"no_proxy",
+	"all_proxy",
+]);
+/** Prefixes that are part of the Telegram session configuration. */
+const CHILD_ENV_PREFIXES = ["LC_", "XDG_", "TELEGRAM_"];
+
+/**
+ * Build the upstream environment from the allowlist plus the profile's own
+ * `env` map. `profileEnv` is the only way to add a variable: the proxy's
+ * ALIVE_* and GitHub credentials must never leak just because they are set.
+ */
+export function buildUpstreamEnv(
+	profileEnv: NodeJS.ProcessEnv | undefined,
+	source: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+	const env: NodeJS.ProcessEnv = {};
+	for (const [key, value] of Object.entries(source)) {
+		if (value === undefined) continue;
+		if (CHILD_ENV_EXACT.has(key) || CHILD_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) {
+			env[key] = value;
+		}
+	}
+	return { ...env, ...profileEnv };
+}
+
 export interface UpstreamChildOptions {
 	profile: string;
 	command: string;
@@ -126,9 +178,11 @@ export class UpstreamChild {
 		const { profile, command, args, env, cwd, log } = this.options;
 		let child: ChildProcess;
 		try {
+			const childEnv = buildUpstreamEnv(env);
+			childEnv.ALIVE_TELEGRAM_MCP_PROFILE = profile;
 			child = spawn(command, args, {
 				cwd,
-				env: { ...process.env, ...env, ALIVE_TELEGRAM_MCP_PROFILE: profile },
+				env: childEnv,
 				detached: process.platform !== "win32",
 				stdio: ["pipe", "pipe", "pipe"],
 			});

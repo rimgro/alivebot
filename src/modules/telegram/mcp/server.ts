@@ -279,13 +279,25 @@ export class TelegramMcpServer {
 		const tool = typeof params.name === "string" ? params.name : "";
 		const args = isRecord(params.arguments) ? params.arguments : {};
 		const now = this.limits.now();
-		const decision: TelegramMcpPolicyDecision = decideTelegramMcpCall({
+		let decision: TelegramMcpPolicyDecision = decideTelegramMcpCall({
 			profile,
 			tool,
 			args,
 			now,
 			limits: this.limits.snapshot(profile.name, now),
 		});
+		// Policy used a snapshot; reserve the slot and count it in one synchronous
+		// step so parallel auto-writes cannot pass the last free slot together.
+		if (decision.decision === "allow" && tool === "telegram_write" && profile.mode === "write:auto") {
+			const reservation = this.limits.reserveWrite(profile.name, profile.writeLimitPerHour, now);
+			if (!reservation.allowed) {
+				decision = {
+					decision: "deny",
+					...(decision.chat === undefined ? {} : { chat: decision.chat }),
+					reason: reservation.reason ?? `write reservation refused for profile "${profile.name}"`,
+				};
+			}
+		}
 		const text = extractWriteText(args);
 		this.audit.record({
 			ts: new Date(now).toISOString(),
@@ -297,10 +309,7 @@ export class TelegramMcpServer {
 			bytes: text === undefined ? 0 : Buffer.byteLength(text, "utf8"),
 			...(tool === "telegram_write" && text !== undefined ? { preview: auditPreview(text) } : {}),
 		});
-		if (decision.decision === "allow") {
-			if (tool === "telegram_write" && profile.mode === "write:auto") this.limits.recordWrite(profile.name, now);
-			return undefined;
-		}
+		if (decision.decision === "allow") return undefined;
 		if (decision.decision === "ask") {
 			const ask: TelegramMcpAskResult = {
 				decision: "ask",
@@ -323,6 +332,7 @@ export class TelegramMcpServer {
 				profile: profile.name,
 				command: profile.command,
 				args: profile.args,
+				env: { ...(this.childOptions.env ?? {}), ...(profile.env ?? {}) },
 				log: this.options.log ?? ((line) => process.stderr.write(`${line}\n`)),
 				onMessage: (message) => this.onUpstreamMessage(profile.name, message),
 				onExit: (error) => this.failPending(profile.name, error),
