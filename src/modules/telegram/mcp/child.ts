@@ -54,9 +54,9 @@ export const UPSTREAM_ENV_ALLOWLIST = [
 	"XDG_CACHE_HOME",
 	"XDG_STATE_HOME",
 	"XDG_RUNTIME_DIR",
-	// The only Telegram variable this repository documents by name: the MTProto
-	// `api_hash` default is `modules.telegram.user.apiHashEnv = TELEGRAM_API_HASH`.
-	"TELEGRAM_API_HASH",
+	// Deliberately no Telegram credentials: `better-tg-cli` keeps its session in
+	// HOME/XDG config, and a profile that really needs TELEGRAM_* names adds them
+	// in `env` (explicit, per name) instead of inheriting them silently.
 	// Outbound proxies: better-tg-cli may need them in a restricted network.
 	"HTTP_PROXY",
 	"HTTPS_PROXY",

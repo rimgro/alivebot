@@ -30,7 +30,7 @@ export interface TelegramMcpProfileConfig {
 	 *
 	 * This is the only way to add a variable beyond the fixed exact-name
 	 * allowlist in `child.ts` (see `UPSTREAM_ENV_ALLOWLIST`: process, locale,
-	 * XDG, temp, `TELEGRAM_API_HASH` and proxy variables). There are no prefix
+	 * XDG, temp and proxy variables; no Telegram credentials). There are no prefix
 	 * or wildcard rules. Values are plain strings: no nesting and no
 	 * interpolation.
 	 */

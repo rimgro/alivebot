@@ -696,8 +696,10 @@ try {
 		const exact = buildUpstreamEnv(
 			{},
 			{
-				TELEGRAM_API_HASH: "documented-hash",
-				TELEGRAM_API_ID: "not-listed",
+				LC_ALL: "listed-exactly",
+				TELEGRAM_API_HASH: "telegram-credential",
+				TELEGRAM_API_ID: "telegram-credential",
+				TELEGRAM_MCP_TOKEN: "bearer",
 				TELEGRAM_FOO: "not-listed",
 				LC_ALIVE_TEST: "not-listed",
 				XDG_ALIVE_TEST: "not-listed",
@@ -705,9 +707,11 @@ try {
 			},
 		);
 		check(
-			"selection is exact: TELEGRAM_API_HASH passes, arbitrary prefixed names do not",
-			exact.TELEGRAM_API_HASH === "documented-hash" &&
+			"selection is exact: LC_ALL passes, Telegram credentials and prefixed names do not",
+			exact.LC_ALL === "listed-exactly" &&
+				exact.TELEGRAM_API_HASH === undefined &&
 				exact.TELEGRAM_API_ID === undefined &&
+				exact.TELEGRAM_MCP_TOKEN === undefined &&
 				exact.TELEGRAM_FOO === undefined &&
 				exact.LC_ALIVE_TEST === undefined &&
 				exact.XDG_ALIVE_TEST === undefined &&
