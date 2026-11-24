@@ -10,9 +10,11 @@ usage() {
 	cat <<'EOF'
 Usage: deploy/systemd/install.sh [--all-profiles] [profile ...]
 
-Install alive.service, alive-agent@.service and the restart-limit/browser-token
-drop-ins into ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user, reload the user
-manager and enable alive.service.
+Install alive.service, alive-agent@.service, alive-telegram-mcp.service and the
+restart-limit/browser-token drop-ins into ${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user,
+reload the user manager and enable alive.service. alive-telegram-mcp.service is
+copied but never enabled here: it refuses to start until modules.telegram.mcp is
+configured and enabled in alive.config.json.
 
 Without profile arguments, print the command that enables each managed profile
 found in .alive/agents/*/alive.config.json (nothing is enabled). With profile
@@ -112,13 +114,15 @@ ALIVE_SYSTEMD_ENTRY, before installing the units."
 check_runtime
 
 printf 'Installing Alive systemd user units from %s\n' "$repo_dir"
-install -d "$unit_dir/alive.service.d" "$unit_dir/alive-agent@.service.d"
+install -d "$unit_dir/alive.service.d" "$unit_dir/alive-agent@.service.d" "$unit_dir/alive-telegram-mcp.service.d"
 install -m 0644 "$script_dir/alive.service" "$unit_dir/alive.service"
 install -m 0644 "$script_dir/alive-agent@.service" "$unit_dir/alive-agent@.service"
+install -m 0644 "$script_dir/alive-telegram-mcp.service" "$unit_dir/alive-telegram-mcp.service"
 install -m 0644 "$script_dir/restart-limit.conf" "$unit_dir/alive.service.d/restart-limit.conf"
 install -m 0644 "$script_dir/restart-limit.conf" "$unit_dir/alive-agent@.service.d/restart-limit.conf"
 install -m 0644 "$script_dir/browser-token.conf" "$unit_dir/alive.service.d/browser-token.conf"
 install -m 0644 "$script_dir/browser-token.conf" "$unit_dir/alive-agent@.service.d/browser-token.conf"
+install -m 0644 "$script_dir/restart-limit.conf" "$unit_dir/alive-telegram-mcp.service.d/restart-limit.conf"
 
 # Earlier deployments hand-wrote browser-deployment.conf in the drop-in dirs (it
 # carried node24 and the browser token before the templates did). It is not part
@@ -133,6 +137,8 @@ for legacy_dir in "$unit_dir/alive.service.d" "$unit_dir/alive-agent@.service.d"
 done
 
 printf 'Installed units in %s\n' "$unit_dir"
+printf 'alive-telegram-mcp.service is installed but not enabled; enable it only after\n'
+printf 'modules.telegram.mcp is configured: systemctl --user enable --now alive-telegram-mcp.service\n'
 
 # The shared browser host reads its token from this path (see browser-token.conf).
 # The installer never creates or chmods it: not every host has a browser deployment.

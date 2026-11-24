@@ -1,0 +1,28 @@
+# Host-side MCP proxy for the Telegram account (#264, step B).
+#
+# The agent VM never talks to Telegram itself: this process owns the per-profile
+# bearer tokens, spawns `telegram mcp` (better-tg-cli, stdio) as a child and
+# answers the sandbox on 127.0.0.1. It keeps no Telegram session of its own and
+# refuses to start while modules.telegram.mcp.enabled is false, so enable the
+# unit only after the module block is configured (see README.md here).
+#
+# Child processes inherit a fixed exact-name environment allowlist (no
+# Telegram credentials): PATH locates the `telegram` binary, HOME the session
+# and config files. Keep both in mind when moving the checkout or the CLI.
+[Unit]
+Description=Alive Telegram MCP proxy (#264)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/alive
+ExecStart=%h/.local/share/node24/bin/node %h/Projects/alive/dist/index.js telegram-mcp serve --config %h/Projects/alive/alive.config.json
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=5
+Environment=HOME=%h
+Environment=PATH=%h/.pi/agent/bin:%h/.local/bin:%h/.local/share/node24/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
