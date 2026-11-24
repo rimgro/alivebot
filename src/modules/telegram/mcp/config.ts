@@ -10,11 +10,48 @@
  */
 export type TelegramMcpMode = "read" | "write:ask" | "write:auto";
 
+/**
+ * Operator-confirmation card for `write:ask` profiles (#264, step B2).
+ *
+ * The proxy and the Telegram runtime are different host processes. They share
+ * one directory of ticket files: the proxy writes a pending ticket, the module
+ * of the same profile shows the card in Telegram and writes the decision, and
+ * the proxy performs the write only after an approval.
+ */
+export interface TelegramMcpConfirmationConfig {
+	/**
+	 * Directory of ticket/decision files. A relative path is resolved against
+	 * `paths.stateDir`; an absolute path is used as-is. The runtime option
+	 * `modules.telegram.mcpConfirmation.ticketDir` must name the same directory.
+	 */
+	ticketDir: string;
+	/** How long the proxy waits for the operator. Default 5 min, maximum 1 hour. */
+	ttlMs: number;
+}
+
+/** Runtime side of the confirmation card: enabled only when this block exists. */
+export interface TelegramMcpConfirmationRuntimeConfig {
+	/** Root directory shared with the proxy profile `confirmation.ticketDir`. */
+	ticketDir: string;
+	/** The only thread a confirmation card is sent to, and the only chat a press is accepted from. */
+	chatId: number;
+	/** Non-empty list of Telegram user ids allowed to press the card's buttons. */
+	operatorUserIds: number[];
+	/** How often the module scans ticketDir for new cards. Default 2000 ms. */
+	pollMs: number;
+}
+
 export interface TelegramMcpProfileConfig {
 	/** Profile name, also the selector for `alive telegram-mcp token <profile>`. */
 	name: string;
 	/** What the profile may do. Default: `write:ask`. */
 	mode: TelegramMcpMode;
+	/**
+	 * When set on a `write:ask` profile, an ask creates a ticket and blocks until
+	 * the runtime module writes a decision (or the ticket expires). Without this
+	 * block the old ticket-id-only ask answer is kept.
+	 */
+	confirmation?: TelegramMcpConfirmationConfig;
 	/** Chats `telegram_read` may read. Empty means none. Exact string match. */
 	allowChats: string[];
 	/** How long a write window stays open after it was opened. */
@@ -50,6 +87,9 @@ export interface TelegramMcpConfig {
 
 export const DEFAULT_TELEGRAM_MCP_WRITE_TTL_MS = 15 * 60_000;
 export const DEFAULT_TELEGRAM_MCP_WRITE_LIMIT_PER_HOUR = 20;
+export const DEFAULT_TELEGRAM_MCP_CONFIRMATION_TTL_MS = 5 * 60_000;
+export const MAX_TELEGRAM_MCP_CONFIRMATION_TTL_MS = 60 * 60_000;
+export const DEFAULT_TELEGRAM_MCP_CONFIRMATION_POLL_MS = 2_000;
 
 export const DEFAULT_TELEGRAM_MCP_CONFIG: TelegramMcpConfig = {
 	enabled: false,
@@ -121,6 +161,7 @@ function validateProfile(raw: Record<string, unknown>, path: string): TelegramMc
 			allowChats.push(value);
 		}
 	}
+	const confirmation = validateConfirmation(raw.confirmation, `${path}.confirmation`);
 	const writeTtlMs = positiveInteger(raw.writeTtlMs, `${path}.writeTtlMs`, DEFAULT_TELEGRAM_MCP_WRITE_TTL_MS);
 	const writeLimitPerHour = positiveInteger(
 		raw.writeLimitPerHour,
@@ -139,6 +180,7 @@ function validateProfile(raw: Record<string, unknown>, path: string): TelegramMc
 	return {
 		name,
 		mode: mode as TelegramMcpMode,
+		...(confirmation === undefined ? {} : { confirmation }),
 		allowChats,
 		writeTtlMs,
 		writeLimitPerHour,
@@ -146,6 +188,56 @@ function validateProfile(raw: Record<string, unknown>, path: string): TelegramMc
 		args,
 		...(env === undefined ? {} : { env }),
 	};
+}
+
+function validateConfirmation(value: unknown, path: string): TelegramMcpConfirmationConfig | undefined {
+	if (value === undefined) return undefined;
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${path} must be an object`);
+	const raw = value as Record<string, unknown>;
+	const ticketDir = requireNonEmptyString(raw.ticketDir, `${path}.ticketDir`);
+	const ttlMs = raw.ttlMs === undefined ? DEFAULT_TELEGRAM_MCP_CONFIRMATION_TTL_MS : raw.ttlMs;
+	if (!Number.isSafeInteger(ttlMs) || (ttlMs as number) <= 0 || (ttlMs as number) > MAX_TELEGRAM_MCP_CONFIRMATION_TTL_MS) {
+		throw new Error(
+			`${path}.ttlMs must be an integer between 1 and ${MAX_TELEGRAM_MCP_CONFIRMATION_TTL_MS} ms (1 hour), got "${String(raw.ttlMs)}"`,
+		);
+	}
+	return { ticketDir, ttlMs: ttlMs as number };
+}
+
+/**
+ * Validate `modules.telegram.mcpConfirmation`: absent is the disabled default,
+ * and no timer or directory read happens in that case.
+ */
+export function validateTelegramMcpConfirmationRuntimeConfig(
+	value: unknown,
+	path = "modules.telegram.mcpConfirmation",
+): TelegramMcpConfirmationRuntimeConfig {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${path} must be an object`);
+	const raw = value as Record<string, unknown>;
+	const ticketDir = requireNonEmptyString(raw.ticketDir, `${path}.ticketDir`);
+	const chatId = raw.chatId;
+	if (!Number.isSafeInteger(chatId) || (chatId as number) === 0) {
+		throw new Error(`${path}.chatId must be a non-zero integer Telegram chat id, got "${String(raw.chatId)}"`);
+	}
+	if (!Array.isArray(raw.operatorUserIds) || raw.operatorUserIds.length === 0) {
+		throw new Error(`${path}.operatorUserIds must be a non-empty array of Telegram user ids`);
+	}
+	const operatorUserIds: number[] = [];
+	const seenOperators = new Set<number>();
+	for (const entry of raw.operatorUserIds) {
+		if (!Number.isSafeInteger(entry) || (entry as number) <= 0) {
+			throw new Error(`${path}.operatorUserIds must contain positive integer user ids, got "${String(entry)}"`);
+		}
+		const userId = entry as number;
+		if (seenOperators.has(userId)) throw new Error(`${path}.operatorUserIds must not contain duplicates (${userId})`);
+		seenOperators.add(userId);
+		operatorUserIds.push(userId);
+	}
+	const pollMs = raw.pollMs === undefined ? DEFAULT_TELEGRAM_MCP_CONFIRMATION_POLL_MS : raw.pollMs;
+	if (!Number.isSafeInteger(pollMs) || (pollMs as number) <= 0) {
+		throw new Error(`${path}.pollMs must be a positive integer, got "${String(raw.pollMs)}"`);
+	}
+	return { ticketDir, chatId: chatId as number, operatorUserIds, pollMs: pollMs as number };
 }
 
 /** Profile env is a flat string map; values are never coerced or nested. */

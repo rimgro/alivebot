@@ -12,19 +12,35 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	DEFAULT_TELEGRAM_MCP_CONFIG,
+	DEFAULT_TELEGRAM_MCP_CONFIRMATION_TTL_MS,
 	DEFAULT_TELEGRAM_MCP_WRITE_LIMIT_PER_HOUR,
 	DEFAULT_TELEGRAM_MCP_WRITE_TTL_MS,
+	MAX_TELEGRAM_MCP_CONFIRMATION_TTL_MS,
+	validateTelegramMcpConfirmationRuntimeConfig,
 	validateTelegramMcpConfig,
 	type TelegramMcpConfig,
 	type TelegramMcpProfileConfig,
 } from "../modules/telegram/mcp/config.js";
-import { DEFAULT_CONFIG } from "../config.js";
+import { DEFAULT_CONFIG, validateTelegramConfig } from "../config.js";
 import { telegramMcpAuditFile } from "../modules/telegram/mcp/audit.js";
 import { UPSTREAM_ENV_ALLOWLIST, buildUpstreamEnv } from "../modules/telegram/mcp/child.js";
 import { TelegramMcpLimitsStore, telegramMcpLimitsFile } from "../modules/telegram/mcp/limits.js";
 import { decideTelegramMcpCall } from "../modules/telegram/mcp/policy.js";
 import { parseJsonRpcMessage, parseStdioChunk } from "../modules/telegram/mcp/protocol.js";
 import { TelegramMcpServer } from "../modules/telegram/mcp/server.js";
+import {
+	decisionFilePath,
+	ensureTicketDir,
+	listTickets,
+	profileTicketDir,
+	readTicket,
+	telegramMcpRequestHash,
+	telegramMcpTicketRequestKey,
+	ticketFilePath,
+	writeDecision,
+	writeTicket,
+	type TelegramMcpTicket,
+} from "../modules/telegram/mcp/tickets.js";
 import {
 	TELEGRAM_MCP_TOKEN_PREFIX,
 	TelegramMcpTokenStore,
@@ -75,6 +91,8 @@ const writeLog = path.join(root, "writes.jsonl");
 const groupPidFile = path.join(root, "group-pids.jsonl");
 const groupTermFile = path.join(root, "group-terms.txt");
 const crashMarker = path.join(root, "crashed.once");
+const confirmationDir = path.join(root, "confirmation-tickets");
+const confirmerDir = profileTicketDir(confirmationDir, "confirmer");
 const serverLog: string[] = [];
 
 /** The fake upstream gets its control paths through profile.env, not the proxy env. */
@@ -182,6 +200,7 @@ let crasherToken = "";
 let resolverToken = "";
 let burstToken = "";
 let guardedToken = "";
+let confirmerToken = "";
 let limits: TelegramMcpLimitsStore | undefined;
 let clockNow = Date.UTC(2026, 0, 1, 12, 0, 0);
 
@@ -234,6 +253,32 @@ function pidAlive(pid: number): boolean {
 	} catch {
 		return false;
 	}
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 3_000): Promise<boolean> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate()) return true;
+		await delay(10);
+	}
+	return predicate();
+}
+
+function ticketsWithText(text: string): TelegramMcpTicket[] {
+	return listTickets(confirmerDir).filter((ticket) => ticket.text === text);
+}
+
+function decisionFor(ticket: TelegramMcpTicket, decision: "approve" | "deny", overrides: Partial<Record<string, unknown>> = {}) {
+	return {
+		version: 1,
+		ticketId: ticket.ticketId,
+		nonce: ticket.nonce,
+		requestHash: ticket.requestHash,
+		decision,
+		decidedAt: clockNow,
+		userId: 7,
+		...overrides,
+	};
 }
 
 try {
@@ -306,6 +351,75 @@ try {
 			const message = thrown(() => validateTelegramMcpConfig(value));
 			check(`${label} is rejected`, message.includes(expected), message || "accepted");
 		}
+
+		const defaultConfirmation = validateTelegramMcpConfig({ enabled: true, profiles: [{ name: "alice" }] }).profiles[0]?.confirmation;
+		check("confirmation is absent by default (old ask is unchanged)", defaultConfirmation === undefined, defaultConfirmation);
+		const withConfirmation = validateTelegramMcpConfig({
+			enabled: true,
+			profiles: [{ name: "alice", confirmation: { ticketDir: "telegram-mcp-tickets" } }],
+		});
+		check(
+			"confirmation keeps a relative ticketDir and defaults to a 5 minute TTL",
+			withConfirmation.profiles[0]?.confirmation?.ticketDir === "telegram-mcp-tickets" &&
+				withConfirmation.profiles[0]?.confirmation?.ttlMs === DEFAULT_TELEGRAM_MCP_CONFIRMATION_TTL_MS,
+			withConfirmation.profiles[0]?.confirmation,
+		);
+		const maxConfirmation = validateTelegramMcpConfig({
+			enabled: true,
+			profiles: [{ name: "alice", confirmation: { ticketDir: "/var/tmp/tickets", ttlMs: MAX_TELEGRAM_MCP_CONFIRMATION_TTL_MS } }],
+		});
+		check(
+			"an absolute ticketDir and the 1 hour maximum are accepted",
+			maxConfirmation.profiles[0]?.confirmation?.ticketDir === "/var/tmp/tickets" &&
+				maxConfirmation.profiles[0]?.confirmation?.ttlMs === MAX_TELEGRAM_MCP_CONFIRMATION_TTL_MS,
+			maxConfirmation.profiles[0]?.confirmation,
+		);
+		const badConfirmation = [
+			["not an object", { ticketDir: "x", confirmation: "yes" }, "confirmation must be an object"],
+			["missing ticketDir", { ticketDir: "x", confirmation: {} }, "confirmation.ticketDir must be"],
+			["empty ticketDir", { ticketDir: "x", confirmation: { ticketDir: "  " } }, "confirmation.ticketDir must be"],
+			["zero ttl", { ticketDir: "x", confirmation: { ticketDir: "x", ttlMs: 0 } }, "confirmation.ttlMs must be"],
+			["non-integer ttl", { ticketDir: "x", confirmation: { ticketDir: "x", ttlMs: 1.5 } }, "confirmation.ttlMs must be"],
+			["ttl over one hour", { ticketDir: "x", confirmation: { ticketDir: "x", ttlMs: MAX_TELEGRAM_MCP_CONFIRMATION_TTL_MS + 1 } }, "confirmation.ttlMs must be"],
+		] as const;
+		for (const [label, value, expected] of badConfirmation) {
+			const message = thrown(() => validateTelegramMcpConfig({ enabled: true, profiles: [{ name: "alice", ...(value as object) }] }));
+			check(`${label} is rejected`, message.includes(expected), message || "accepted");
+		}
+
+		const runtimeConfirmation = validateTelegramMcpConfirmationRuntimeConfig({ ticketDir: "tickets", chatId: 42, operatorUserIds: [7] });
+		check(
+			"runtime confirmation defaults to a 2 second poll",
+			runtimeConfirmation.ticketDir === "tickets" && runtimeConfirmation.pollMs === 2_000 &&
+				runtimeConfirmation.chatId === 42 && runtimeConfirmation.operatorUserIds.join(",") === "7",
+			runtimeConfirmation,
+		);
+		const noRuntimeConfirmation = validateTelegramConfig({ ...DEFAULT_CONFIG.modules.telegram, mcpConfirmation: undefined });
+		check("runtime confirmation is disabled when the option is absent", noRuntimeConfirmation.mcpConfirmation === undefined);
+		const withRuntimeConfirmation = validateTelegramConfig({
+			...DEFAULT_CONFIG.modules.telegram,
+			mcpConfirmation: { ticketDir: "tickets", chatId: 42, operatorUserIds: [7, 8], pollMs: 25 },
+		});
+		check(
+			"runtime confirmation accepts ticketDir, chatId, operatorUserIds and pollMs",
+			withRuntimeConfirmation.mcpConfirmation?.ticketDir === "tickets" &&
+				withRuntimeConfirmation.mcpConfirmation?.chatId === 42 &&
+				withRuntimeConfirmation.mcpConfirmation?.operatorUserIds.join(",") === "7,8" &&
+				withRuntimeConfirmation.mcpConfirmation?.pollMs === 25,
+			withRuntimeConfirmation.mcpConfirmation,
+		);
+		for (const [label, value, expected] of [
+			["non-object runtime confirmation", "yes", "mcpConfirmation must be an object"],
+			["missing runtime ticketDir", {}, "mcpConfirmation.ticketDir must be"],
+			["missing runtime chatId", { ticketDir: "tickets", operatorUserIds: [7] }, "mcpConfirmation.chatId must be"],
+			["empty operatorUserIds", { ticketDir: "tickets", chatId: 42, operatorUserIds: [] }, "mcpConfirmation.operatorUserIds must be"],
+			["string operator id", { ticketDir: "tickets", chatId: 42, operatorUserIds: ["7"] }, "mcpConfirmation.operatorUserIds must contain"],
+			["duplicate operator id", { ticketDir: "tickets", chatId: 42, operatorUserIds: [7, 7] }, "must not contain duplicates"],
+			["zero pollMs", { ticketDir: "tickets", chatId: 42, operatorUserIds: [7], pollMs: 0 }, "mcpConfirmation.pollMs must be"],
+		] as const) {
+			const message = thrown(() => validateTelegramConfig({ ...DEFAULT_CONFIG.modules.telegram, mcpConfirmation: value as never }));
+			check(`${label} is rejected`, message.includes(expected), message || "accepted");
+		}
 	}
 
 	section("tokens: per-profile file, permissions and revocation isolation");
@@ -348,8 +462,41 @@ try {
 		{ name: "resolver", mode: "write:auto", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 20, command: process.execPath, args: [fakePath], env: profileEnv("resolver") },
 		{ name: "burst", mode: "write:auto", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 3, command: process.execPath, args: [fakePath], env: profileEnv("burst") },
 		{ name: "guarded", mode: "write:auto", allowChats: ["123"], writeTtlMs: 60_000, writeLimitPerHour: 5, command: process.execPath, args: [fakePath], env: profileEnv("guarded") },
+		{
+			name: "confirmer",
+			mode: "write:ask",
+			allowChats: ["111"],
+			writeTtlMs: 60_000,
+			writeLimitPerHour: 5,
+			confirmation: { ticketDir: confirmationDir, ttlMs: 60_000 },
+			command: process.execPath,
+			args: [fakePath],
+			env: profileEnv("confirmer"),
+		},
 	];
 	const config: TelegramMcpConfig = { enabled: true, host: "127.0.0.1", port: 8787, profiles };
+
+	// Start-of-proxy fixtures: a stale ticket+decision and a `sending` ticket.
+	ensureTicketDir(confirmerDir);
+	const fixtureTicket = (ticketId: string, createdAt: number, expiresAt: number, status: TelegramMcpTicket["status"]): TelegramMcpTicket => ({
+		version: 1,
+		ticketId,
+		profile: "confirmer",
+		tool: "telegram_write",
+		chat: "111",
+		text: `fixture-${ticketId}`,
+		createdAt,
+		expiresAt,
+		nonce: `nonce-${ticketId}`,
+		status,
+		requestHash: telegramMcpRequestHash({ chat: "111", text: `fixture-${ticketId}` }),
+		requestKey: `key-${ticketId}`,
+	});
+	const staleFixture = fixtureTicket("tgask_1111111111111111", clockNow - 180_000, clockNow - 120_000, "expired");
+	const interruptedFixture = fixtureTicket("tgask_2222222222222222", clockNow - 1_000, clockNow + 60_000, "sending");
+	writeTicket(confirmerDir, staleFixture);
+	writeDecision(confirmerDir, decisionFor(staleFixture, "approve") as Parameters<typeof writeDecision>[1]);
+	writeTicket(confirmerDir, interruptedFixture);
 
 	section("policy: pure decisions");
 	{
@@ -499,16 +646,30 @@ try {
 		resolverToken = tokens.issue("resolver");
 		burstToken = tokens.issue("burst");
 		guardedToken = tokens.issue("guarded");
+		confirmerToken = tokens.issue("confirmer");
 		server = new TelegramMcpServer({
 			config,
 			stateDir,
 			port: 0,
 			limits,
+			confirmationPollMs: 10,
 			log: (line) => serverLog.push(line),
 			child: { initialRestartMs: 100, maxRestartMs: 400 },
 		});
 		await server.start();
 		check("the server listens on an ephemeral loopback port", server.port > 0, server.port);
+		check(
+			"start removes tickets and decisions older than their TTL",
+			!fs.existsSync(ticketFilePath(confirmerDir, staleFixture.ticketId)) &&
+				!fs.existsSync(decisionFilePath(confirmerDir, staleFixture.ticketId)),
+			fs.readdirSync(confirmerDir),
+		);
+		check(
+			"start fails a ticket interrupted in sending instead of retrying it",
+			readTicket(confirmerDir, interruptedFixture.ticketId)?.status === "failed" &&
+				String(readTicket(confirmerDir, interruptedFixture.ticketId)?.error).includes("not retried"),
+			readTicket(confirmerDir, interruptedFixture.ticketId),
+		);
 
 		const noToken = await rpc(undefined, { jsonrpc: "2.0", id: 1, method: "tools/list" });
 		check("no token gets 401", noToken.status === 401, noToken);
@@ -777,6 +938,321 @@ try {
 		check("the write audit carries byte length and a 120-char preview", askedAudit?.bytes === Buffer.byteLength(longWriteText) && askedAudit?.preview?.length === 120, askedAudit);
 		const auditText = fs.readFileSync(auditFile, "utf8");
 		check("the audit never contains the full write text", !auditText.includes(longWriteText) && !auditText.includes("-END-SECRET-SUFFIX"));
+	}
+
+	section("server: operator confirmation tickets (write:ask)");
+	{
+		const ask = (id: string, text: string, extra: Record<string, unknown> = {}) =>
+			call(confirmerToken, id, "telegram_write", { chat: "111", text, ...extra });
+		const confirmerWrites = (text?: string) =>
+			readJsonl(writeLog).filter(
+				(entry) => entry.profile === "confirmer" && (text === undefined || (entry.args as { text?: string } | undefined)?.text === text),
+			);
+		const auditFile = telegramMcpAuditFile(stateDir);
+
+		// 1. The ask becomes a private pending ticket and waits; nothing is sent.
+		const approveCall = ask("conf-approve", "confirm-approve");
+		let approveSettled = false;
+		void approveCall.then(() => {
+			approveSettled = true;
+		});
+		const ticketReady = await waitFor(() => ticketsWithText("confirm-approve").length === 1);
+		const approveTicket = ticketsWithText("confirm-approve")[0];
+		check("a confirmation ask writes one pending ticket", ticketReady && approveTicket?.status === "pending", approveTicket);
+		check(
+			"the ticket carries profile, tool, chat, exact text, nonce and TTL",
+			approveTicket?.profile === "confirmer" &&
+				approveTicket?.tool === "telegram_write" &&
+				approveTicket?.chat === "111" &&
+				approveTicket?.text === "confirm-approve" &&
+				typeof approveTicket?.nonce === "string" &&
+				approveTicket.nonce.length >= 32 &&
+				approveTicket?.expiresAt === approveTicket?.createdAt + 60_000,
+			approveTicket,
+		);
+		if (!approveTicket) throw new Error("the pending confirmation ticket is missing");
+		check(
+			"the ticket directory is 0700 and the ticket file 0600",
+			mode(confirmerDir) === 0o700 && mode(ticketFilePath(confirmerDir, approveTicket.ticketId)) === 0o600,
+			{ dir: mode(confirmerDir).toString(8), file: mode(ticketFilePath(confirmerDir, approveTicket.ticketId)).toString(8) },
+		);
+		await delay(50);
+		check(
+			"the ask blocks instead of returning while the ticket is pending",
+			!approveSettled && confirmerWrites("confirm-approve").length === 0 && !fs.existsSync(decisionFilePath(confirmerDir, approveTicket.ticketId)),
+			{ settled: approveSettled, writes: confirmerWrites("confirm-approve").length },
+		);
+
+		writeDecision(confirmerDir, decisionFor(approveTicket, "approve") as unknown as Parameters<typeof writeDecision>[1]);
+		const approved = await approveCall;
+		check(
+			"approve forwards the write to the upstream",
+			textOf(approved.body).startsWith("fake:telegram_write:111:confirm-approve"),
+			approved.body,
+		);
+		check("approve sends the upstream write exactly once", confirmerWrites("confirm-approve").length === 1, confirmerWrites("confirm-approve"));
+		check("the ticket is marked sent", readTicket(confirmerDir, approveTicket.ticketId)?.status === "sent", readTicket(confirmerDir, approveTicket.ticketId));
+		check(
+			"the hourly limit counts the approved write once",
+			limits!.snapshot("confirmer", clockNow).writesThisHour === 1,
+			limits!.snapshot("confirmer", clockNow),
+		);
+		const confirmerAudit = readJsonl(auditFile).filter((entry) => entry.profile === "confirmer");
+		check(
+			"the approval is audited once as allow",
+			confirmerAudit.filter((entry) => entry.decision === "allow").length === 1 &&
+				confirmerAudit.some((entry) => String(entry.reason).includes("operator approved")),
+			confirmerAudit,
+		);
+
+		// 2. Deny: a tool error, no upstream call, ticket closed.
+		const denyCall = ask("conf-deny", "confirm-deny");
+		await waitFor(() => ticketsWithText("confirm-deny").length === 1);
+		const denyTicket = ticketsWithText("confirm-deny")[0];
+		if (!denyTicket) throw new Error("the deny ticket is missing");
+		const writesBeforeDeny = confirmerWrites().length;
+		writeDecision(confirmerDir, decisionFor(denyTicket, "deny") as Parameters<typeof writeDecision>[1]);
+		const denied = await denyCall;
+		check(
+			"deny returns a tool error saying the operator refused",
+			(denied.body.result as { isError?: boolean } | undefined)?.isError === true && textOf(denied.body).includes("denied by operator"),
+			denied.body,
+		);
+		check("deny sends nothing upstream", confirmerWrites().length === writesBeforeDeny, confirmerWrites());
+		check("the ticket is marked denied", readTicket(confirmerDir, denyTicket.ticketId)?.status === "denied", readTicket(confirmerDir, denyTicket.ticketId));
+
+		// 3. TTL: the injected clock passes expiresAt, the ask returns an error.
+		const expireCall = ask("conf-expire", "confirm-expire");
+		await waitFor(() => ticketsWithText("confirm-expire").length === 1);
+		const expireTicket = ticketsWithText("confirm-expire")[0];
+		if (!expireTicket) throw new Error("the expiry ticket is missing");
+		const writesBeforeExpiry = confirmerWrites().length;
+		clockNow = expireTicket.expiresAt;
+		// A bounded wait: a broken TTL rule must fail the check instead of hanging the
+		// whole suite (the dangling ask settles once the server stops).
+		const expired = await Promise.race([expireCall, delay(1_000).then(() => undefined)]);
+		check(
+			"an expired ticket returns a tool error and sends nothing",
+			expired !== undefined &&
+				(expired.body.result as { isError?: boolean } | undefined)?.isError === true &&
+				textOf(expired.body).includes("expired") &&
+				confirmerWrites().length === writesBeforeExpiry,
+			expired?.body ?? "still waiting for a decision",
+		);
+		check("the ticket is marked expired", readTicket(confirmerDir, expireTicket.ticketId)?.status === "expired", readTicket(confirmerDir, expireTicket.ticketId));
+
+		// 4. A repeated identical ask reuses the pending ticket and cannot send twice.
+		const duplicateFirst = ask("conf-dup-1", "confirm-dup");
+		await waitFor(() => ticketsWithText("confirm-dup").length === 1);
+		const duplicateTicket = ticketsWithText("confirm-dup")[0];
+		if (!duplicateTicket) throw new Error("the duplicate ticket is missing");
+		const duplicateSecond = ask("conf-dup-2", "confirm-dup");
+		await delay(60);
+		check(
+			"an identical ask reuses the one pending ticket",
+			ticketsWithText("confirm-dup").length === 1 && ticketsWithText("confirm-dup")[0]?.ticketId === duplicateTicket.ticketId,
+			ticketsWithText("confirm-dup"),
+		);
+		const writesBeforeDuplicate = confirmerWrites().length;
+		writeDecision(confirmerDir, decisionFor(duplicateTicket, "approve") as Parameters<typeof writeDecision>[1]);
+		// A broken dedup would create a second ticket; answer it too so the suite
+		// fails on the write count instead of waiting for its TTL.
+		for (const extra of ticketsWithText("confirm-dup")) {
+			if (extra.ticketId !== duplicateTicket.ticketId) {
+				writeDecision(confirmerDir, decisionFor(extra, "approve") as Parameters<typeof writeDecision>[1]);
+			}
+		}
+		const [duplicateA, duplicateB] = await Promise.all([duplicateFirst, duplicateSecond]);
+		check(
+			"both waiters receive the same write result",
+			textOf(duplicateA.body).startsWith("fake:telegram_write:111:confirm-dup") &&
+				textOf(duplicateB.body).startsWith("fake:telegram_write:111:confirm-dup"),
+			[duplicateA.body, duplicateB.body],
+		);
+		check(
+			"a reused ticket still sends the write only once",
+			confirmerWrites().length === writesBeforeDuplicate + 1 && confirmerWrites("confirm-dup").length === 1,
+			confirmerWrites(),
+		);
+
+		// 5. Bad decisions are rejected without sending: corrupt, foreign, late.
+		const corruptCall = ask("conf-corrupt", "confirm-corrupt");
+		await waitFor(() => ticketsWithText("confirm-corrupt").length === 1);
+		const corruptTicket = ticketsWithText("confirm-corrupt")[0];
+		if (!corruptTicket) throw new Error("the corrupt-decision ticket is missing");
+		fs.writeFileSync(decisionFilePath(confirmerDir, corruptTicket.ticketId), "{not-json", { mode: 0o600 });
+		const corrupt = await corruptCall;
+		check(
+			"a corrupt decision is rejected and nothing is sent",
+			(corrupt.body.result as { isError?: boolean } | undefined)?.isError === true &&
+				textOf(corrupt.body).includes("decision rejected") &&
+				confirmerWrites("confirm-corrupt").length === 0,
+			corrupt.body,
+		);
+
+		const foreignCall = ask("conf-foreign", "confirm-foreign");
+		await waitFor(() => ticketsWithText("confirm-foreign").length === 1);
+		const foreignTicket = ticketsWithText("confirm-foreign")[0];
+		if (!foreignTicket) throw new Error("the foreign-decision ticket is missing");
+		const foreignDecision = { ...decisionFor(foreignTicket, "approve"), ticketId: "tgask_0000000000000000" };
+		fs.writeFileSync(decisionFilePath(confirmerDir, foreignTicket.ticketId), `${JSON.stringify(foreignDecision)}\n`, { mode: 0o600 });
+		const foreign = await foreignCall;
+		check(
+			"a decision for another ticket is rejected",
+			(foreign.body.result as { isError?: boolean } | undefined)?.isError === true &&
+				textOf(foreign.body).includes("another ticket") &&
+				confirmerWrites("confirm-foreign").length === 0,
+			foreign.body,
+		);
+
+		const nonceCall = ask("conf-nonce", "confirm-nonce");
+		await waitFor(() => ticketsWithText("confirm-nonce").length === 1);
+		const nonceTicket = ticketsWithText("confirm-nonce")[0];
+		if (!nonceTicket) throw new Error("the nonce-mismatch ticket is missing");
+		const nonceDecision = decisionFor(nonceTicket, "approve", { nonce: "wrong-nonce" });
+		fs.writeFileSync(decisionFilePath(confirmerDir, nonceTicket.ticketId), `${JSON.stringify(nonceDecision)}\n`, { mode: 0o600 });
+		const nonce = await nonceCall;
+		check(
+			"a decision with another nonce is rejected",
+			(nonce.body.result as { isError?: boolean } | undefined)?.isError === true &&
+				textOf(nonce.body).includes("nonce does not match") &&
+				confirmerWrites("confirm-nonce").length === 0,
+			nonce.body,
+		);
+
+		const lateCall = ask("conf-late", "confirm-late");
+		await waitFor(() => ticketsWithText("confirm-late").length === 1);
+		const lateTicket = ticketsWithText("confirm-late")[0];
+		if (!lateTicket) throw new Error("the late-decision ticket is missing");
+		const lateDecision = decisionFor(lateTicket, "approve", { decidedAt: lateTicket.expiresAt + 1 });
+		fs.writeFileSync(decisionFilePath(confirmerDir, lateTicket.ticketId), `${JSON.stringify(lateDecision)}\n`, { mode: 0o600 });
+		const late = await lateCall;
+		check(
+			"a decision written after the ticket expired is rejected",
+			(late.body.result as { isError?: boolean } | undefined)?.isError === true &&
+				textOf(late.body).includes("after the ticket expired") &&
+				confirmerWrites("confirm-late").length === 0,
+			late.body,
+		);
+
+		// 6. The ticket carries the sha256 of all canonical arguments.
+		const hashArgs = { chat: "111", text: "confirm-hash", nested: { b: 2, a: 1 }, list: [1, { z: 0, a: 1 }] };
+		const hashCall = call(confirmerToken, "conf-hash", "telegram_write", hashArgs);
+		await waitFor(() => ticketsWithText("confirm-hash").length === 1);
+		const hashTicket = ticketsWithText("confirm-hash")[0];
+		if (!hashTicket) throw new Error("the hash ticket is missing");
+		const reordered = { list: [1, { a: 1, z: 0 }], nested: { a: 1, b: 2 }, text: "confirm-hash", chat: "111" };
+		check(
+			"the ticket hash covers all arguments canonically (key order is irrelevant)",
+			hashTicket.requestHash === telegramMcpRequestHash(hashArgs) &&
+				hashTicket.requestHash === telegramMcpRequestHash(reordered) &&
+				hashTicket.requestHash !== telegramMcpRequestHash({ ...hashArgs, text: "another" }),
+			hashTicket.requestHash,
+		);
+		const wrongHashDecision = decisionFor(hashTicket, "approve", { requestHash: "0".repeat(64) });
+		writeDecision(confirmerDir, wrongHashDecision as Parameters<typeof writeDecision>[1]);
+		const wrongHash = await hashCall;
+		check(
+			"a decision with another request hash is rejected and nothing is sent",
+			(wrongHash.body.result as { isError?: boolean } | undefined)?.isError === true &&
+				textOf(wrongHash.body).includes("request hash") &&
+				confirmerWrites("confirm-hash").length === 0,
+			wrongHash.body,
+		);
+
+		// A ticket whose stored hash is not the hash of the request the proxy would
+		// send: the decision matches the ticket, but the outbound re-hash refuses it.
+		const tamperArgs = { chat: "111", text: "confirm-tamper" };
+		const tamperedTicket = {
+			...fixtureTicket("tgask_3333333333333333", clockNow, clockNow + 60_000, "pending"),
+			text: "confirm-tamper",
+			requestHash: "f".repeat(64),
+			requestKey: telegramMcpTicketRequestKey("confirmer", "telegram_write", telegramMcpRequestHash(tamperArgs)),
+		};
+		writeTicket(confirmerDir, tamperedTicket);
+		const tamperCall = ask("conf-tamper", "confirm-tamper");
+		// Wait until the proxy has actually picked the pre-created ticket (the
+		// audit entry is written in the same synchronous step as the lookup).
+		check(
+			"the proxy reuses the pre-created ticket",
+			await waitFor(
+				() =>
+					readJsonl(auditFile).some(
+						(entry) =>
+							entry.decision === "ask" &&
+							entry.tool === "telegram_write" &&
+							String(entry.preview ?? "").includes("confirm-tamper"),
+					) && ticketsWithText("confirm-tamper").length === 1,
+			),
+			ticketsWithText("confirm-tamper"),
+		);
+		writeDecision(confirmerDir, decisionFor(tamperedTicket, "approve") as Parameters<typeof writeDecision>[1]);
+		const tampered = await tamperCall;
+		check(
+			"approve re-hashes the request about to be sent and refuses a mismatch",
+			(tampered.body.result as { isError?: boolean } | undefined)?.isError === true &&
+				textOf(tampered.body).includes("does not match the request about to be sent") &&
+				confirmerWrites("confirm-tamper").length === 0,
+			tampered.body,
+		);
+
+		// 7. A client that closes the request before the decision denies the ticket.
+		const abortController = new AbortController();
+		const abortWritesBefore = confirmerWrites().length;
+		const abortedCall = fetch(`http://127.0.0.1:${server.port}/mcp`, {
+			method: "POST",
+			headers: { "content-type": "application/json", authorization: `Bearer ${confirmerToken}` },
+			body: JSON.stringify({ jsonrpc: "2.0", id: "conf-abort", method: "tools/call", params: { name: "telegram_write", arguments: { chat: "111", text: "confirm-abort" } } }),
+			signal: abortController.signal,
+		}).catch(() => undefined);
+		await waitFor(() => ticketsWithText("confirm-abort").length === 1);
+		const abortTicket = ticketsWithText("confirm-abort")[0];
+		if (!abortTicket) throw new Error("the abort ticket is missing");
+		abortController.abort();
+		await abortedCall;
+		const abortClosed = await waitFor(
+			() => readTicket(confirmerDir, abortTicket.ticketId)?.status === "denied",
+		);
+		check(
+			"a client close before the deadline denies the ticket",
+			abortClosed && String(readTicket(confirmerDir, abortTicket.ticketId)?.error).includes("client closed"),
+			readTicket(confirmerDir, abortTicket.ticketId),
+		);
+		// A decision written after the client went away must not revive it.
+		writeDecision(confirmerDir, decisionFor(abortTicket, "approve", { decidedAt: clockNow }) as Parameters<typeof writeDecision>[1]);
+		await delay(150);
+		check(
+			"a decision after the client close is not accepted and nothing is sent",
+			readTicket(confirmerDir, abortTicket.ticketId)?.status === "denied" &&
+				confirmerWrites().length === abortWritesBefore &&
+				confirmerWrites("confirm-abort").length === 0,
+			{ ticket: readTicket(confirmerDir, abortTicket.ticketId), writes: confirmerWrites() },
+		);
+
+		// 8. The per-profile backlog is capped; beyond it the proxy denies up front.
+		const backlogIds: string[] = [];
+		for (let index = 0; index < 8; index += 1) {
+			const ticketId = `tgask_${String(index).padStart(16, "a")}`;
+			backlogIds.push(ticketId);
+			writeTicket(confirmerDir, {
+				...fixtureTicket(ticketId, clockNow, clockNow + 60_000, "pending"),
+				text: `backlog-${index}`,
+			});
+		}
+		const backlogCall = ask("conf-backlog", "confirm-backlog");
+		const backlog = await Promise.race([backlogCall, delay(1_000).then(() => undefined)]);
+		check(
+			"the ninth pending ticket is denied with a backlog reason and not written",
+			backlog !== undefined &&
+				(backlog.body.result as { isError?: boolean } | undefined)?.isError === true &&
+				textOf(backlog.body).includes("backlog") &&
+				ticketsWithText("confirm-backlog").length === 0 &&
+				listTickets(confirmerDir).filter((ticket) => ticket.status === "pending").length === 8,
+			backlog?.body ?? "still waiting",
+		);
+		for (const ticketId of backlogIds) {
+			fs.rmSync(ticketFilePath(confirmerDir, ticketId), { force: true });
+		}
 	}
 
 	section("shutdown kills the upstream process group");

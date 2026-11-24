@@ -59,6 +59,7 @@ import {
 	type ButtonHistorySummary,
 } from "./buttons.js";
 import { formatThread, isTelegramTarget, parseThread, resolveThreadRef } from "./threads.js";
+import { TelegramMcpConfirmation, createTelegramMcpConfirmation } from "./mcp-confirmation.js";
 import type { TelegramCallbackQuery, TelegramChat, TelegramSentMessage, TelegramUpdate } from "./types.js";
 import { normalizeUpdate, type NormalizedInbound } from "./update.js";
 import { acceptBrowserPairing } from "../browser/operator.js";
@@ -240,6 +241,8 @@ export class TelegramModule implements AliveModule {
 	private identityRetry?: NodeJS.Timeout;
 	private identityRetryAttempt = 0;
 	private typingMaxMsValue = 5 * 60_000;
+	/** #264 step B2: approval cards for the MCP proxy, undefined when disabled. */
+	private mcpConfirmation?: TelegramMcpConfirmation;
 	private readonly counters = { updates: 0, inbound: 0, outbound: 0, errors: 0 };
 	/** Debounced edit bursts, keyed by `${chatId}:${messageId}`. */
 	private readonly pendingEdits = new Map<string, PendingEditBatch>();
@@ -314,6 +317,14 @@ export class TelegramModule implements AliveModule {
 		this.resetOnTokenChange(ctx, token);
 		this.resetStaleTranscriptionQuota(ctx);
 		this.api = new TelegramApi({ token, apiBase: this.config.apiBase });
+		// #264 step B2: only with an explicit option. Absent means no timer and
+		// no ticket-directory read, exactly as before the feature existed.
+		this.mcpConfirmation = createTelegramMcpConfirmation(this.config.mcpConfirmation, {
+			stateDir: ctx.paths.stateDir,
+			api: this.api,
+			log: ctx.log,
+		});
+		this.mcpConfirmation?.start();
 		this.managedSweep = setInterval(() => void this.sweepManagedRequests(), 15_000);
 		this.managedSweep.unref?.();
 		void this.sweepManagedRequests();
@@ -425,6 +436,8 @@ export class TelegramModule implements AliveModule {
 	async stop(): Promise<void> {
 		this.stopped = true;
 		this.abort.abort();
+		this.mcpConfirmation?.stop();
+		this.mcpConfirmation = undefined;
 		if (this.managedSweep) clearInterval(this.managedSweep);
 		this.managedSweep = undefined;
 		if (this.identityRetry) clearTimeout(this.identityRetry);
@@ -889,6 +902,9 @@ export class TelegramModule implements AliveModule {
 		const state = this.state;
 		if (!ctx || !api || !state) return;
 		if (update.callback_query && (await this.handleManagedBotCallback(update.callback_query))) return;
+		// #264 B2: the MCP confirmation card is internal too. Swallow every
+		// `alive_tgmcp:` press before normalizeUpdate so it never wakes the agent.
+		if (update.callback_query && (await this.mcpConfirmation?.handleCallback(update.callback_query))) return;
 		if (update.message?.text?.match(/^\/browser_pair(?:@[A-Za-z0-9_]+)?(?:\s|$)/)) {
 			const operator = acceptBrowserPairing(ctx.paths.modulesDir, update.message, this.config.allowedChatIds);
 			if (operator) this.allowlist?.add(operator.userId);

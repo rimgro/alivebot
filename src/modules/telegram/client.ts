@@ -225,6 +225,8 @@ export class TelegramApi {
 		text: string;
 		parse_mode?: string;
 		disable_web_page_preview?: boolean;
+		/** An empty inline keyboard removes the confirmation buttons. */
+		reply_markup?: unknown;
 	}): Promise<TelegramMessage | boolean> {
 		return this.call<TelegramMessage | boolean>("editMessageText", { ...params });
 	}
