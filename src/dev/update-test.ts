@@ -23,6 +23,7 @@ import {
 	type UpdateFileOps,
 	type UpdateMarker,
 	parseStableTag,
+	parsePackageVersion,
 	pickLatestStableTag,
 	runUpdate,
 } from "../update.js";
@@ -66,6 +67,10 @@ interface FakeRepoOptions {
 	failBuild?: (ref: FakeRef) => boolean;
 	/** Return true to make the `node dist/index.js --help` health gate fail. */
 	failHealth?: (ref: FakeRef) => boolean;
+	/** Tags `git merge-base --is-ancestor <tag> HEAD` reports as already contained in HEAD (exit 0). */
+	containedTags?: string[];
+	/** Fail the ancestry check with a non-1 exit, as a shallow clone or a broken git does. */
+	failMergeBase?: boolean;
 	/** Files seeded into the in-memory checkout, keyed by repository-relative path. */
 	initialFiles?: Record<string, string>;
 }
@@ -197,6 +202,16 @@ function createFakeRepo(options: FakeRepoOptions = {}): FakeRepo {
 				}
 				case "status":
 					return ok(dirty.length ? `${dirty.join("\n")}\n` : "");
+				case "merge-base": {
+					if (args[1] !== "--is-ancestor" || !args[2] || args[3] !== "HEAD") {
+						return fail("git", args, `unexpected merge-base command: ${args.join(" ")}`);
+					}
+					if (options.failMergeBase) {
+						throw new CommandFailure("git", args, 128, "", `fatal: Not a valid object name ${args[2]} (shallow clone)`);
+					}
+					if ((options.containedTags ?? []).includes(args[2])) return ok();
+					return fail("git", args, `fatal: ${args[2]} is not an ancestor of HEAD`);
+				}
 				case "diff": {
 					if (args[1] !== "--name-only" || args[2] !== "--no-renames" || args[3] !== "HEAD" || !args[4]) {
 						return fail("git", args, `unexpected diff command: ${args.join(" ")}`);
@@ -329,6 +344,10 @@ async function main(): Promise<void> {
 	check("non-vX.Y.Z refs are ignored", pickLatestStableTag(["1.2.3", "v1.2", "release", "v1.2.3+build"]) === undefined);
 	check("parseStableTag accepts v0.1.0", parseStableTag("v0.1.0")?.patch === 0);
 	check("parseStableTag rejects a prerelease", parseStableTag("v1.2.3-rc.1") === undefined);
+	check("parsePackageVersion reads a plain package version", parsePackageVersion("0.35.1")?.minor === 35);
+	check("parsePackageVersion accepts a leading v", parsePackageVersion("v0.35.1")?.patch === 1);
+	check("parsePackageVersion rejects a prerelease", parsePackageVersion("0.3.0-rc.1") === undefined);
+	check("parsePackageVersion rejects an empty version", parsePackageVersion("  ") === undefined);
 
 	section("--check is read-only and reports marker/dist");
 	{
@@ -362,6 +381,110 @@ async function main(): Promise<void> {
 			repo.calls[0]?.cwd === `${ROOT}/src` && repo.calls.slice(1).every((call) => call.cwd === ROOT),
 			repo.calls.map((call) => call.cwd),
 		);
+	}
+
+	section("update decision: version comparison plus ancestry (#253)");
+	{
+		// REGRESSION for the 23.11 incident: master carried the 0.35.1 build and the
+		// last stable tag was v0.35.1. `alive update --auto` treated "HEAD != tag"
+		// as an update, checked out v0.35.0 and restarted all seven agent units.
+		const repo = createFakeRepo({
+			start: { kind: "branch", name: "master" },
+			tags: ["v0.35.0", "v0.35.1"],
+			containedTags: ["v0.35.0", "v0.35.1"],
+		});
+		const h = harness(repo, "0.35.1");
+		const code = await runUpdate({ cwd: ROOT, check: true }, h.deps);
+		const output = lines(h.out);
+		check("master ahead of the tag: check exits 0", code === 0, code);
+		check("master ahead of the tag: no update is offered", output.includes("update available: no"), h.out);
+		check("master ahead of the tag: the reason compares the package version", output.includes("build 0.35.1 is not older than v0.35.1"), h.out);
+		check("master ahead of the tag: check only fetches", mutations(repo).join("|") === "git fetch --tags --quiet origin", mutations(repo));
+	}
+	{
+		const repo = createFakeRepo({
+			start: { kind: "branch", name: "master" },
+			tags: ["v0.35.0", "v0.35.1"],
+			containedTags: ["v0.35.0", "v0.35.1"],
+		});
+		const h = harness(repo, "0.35.1");
+		const code = await runUpdate({ cwd: ROOT }, h.deps);
+		check("master ahead of the tag: apply exits 0 without changes", code === 0, { code, err: h.err });
+		check("master ahead of the tag: apply says nothing to do", lines(h.out).includes("nothing to do") && lines(h.out).includes("build 0.35.1 is not older than v0.35.1"), h.out);
+		check("master ahead of the tag: no checkout, install, build or health gate", mutations(repo).join("|") === "git fetch --tags --quiet origin", mutations(repo));
+		check("master ahead of the tag: no marker was written (no restart request)", markerWrites(repo).length === 0, markerWrites(repo));
+		check("master ahead of the tag: the checkout stays on master", refName(repo.ref()) === "branch:master", refName(repo.ref()));
+	}
+	{
+		// The same numbers do not make a tag an update when HEAD already contains it.
+		const repo = createFakeRepo({
+			start: { kind: "branch", name: "main" },
+			tags: ["v0.1.0", "v0.2.0"],
+			containedTags: ["v0.1.0", "v0.2.0"],
+		});
+		const h = harness(repo, "0.2.0");
+		const code = await runUpdate({ cwd: ROOT, check: true }, h.deps);
+		check("target equal to the package version is not an update", code === 0 && lines(h.out).includes("update available: no"), h.out);
+		check("equal-version reason names the build", lines(h.out).includes("build 0.2.0 is not older than v0.2.0"), h.out);
+	}
+	{
+		// Version comparison says "newer" (0.2.0 < 0.3.0), but the branch already
+		// contains v0.3.0: applying it would move the build backwards.
+		const repo = createFakeRepo({
+			start: { kind: "branch", name: "master" },
+			tags: ["v0.2.0", "v0.3.0"],
+			containedTags: ["v0.3.0"],
+		});
+		const h = harness(repo, "0.2.0");
+		const code = await runUpdate({ cwd: ROOT, check: true }, h.deps);
+		const output = lines(h.out);
+		check("a tag HEAD contains is not an update even when it looks newer", code === 0 && output.includes("update available: no"), h.out);
+		check("the ancestry reason names the branch and the tag", output.includes("branch master @ sha-branch-m already contains v0.3.0"), h.out);
+		check("the ancestry reason contains the canonical phrase", output.includes("master ahead of the last stable tag"), h.out);
+		check(
+			"the ancestry check runs in the repository root",
+			repo.calls.some((call) => call.command === "git" && call.args.join(" ") === "merge-base --is-ancestor v0.3.0 HEAD" && call.cwd === ROOT),
+			repo.calls,
+		);
+	}
+	{
+		const repo = createFakeRepo({ start: { kind: "branch", name: "master" }, tags: ["v0.2.0", "v0.3.0"] });
+		const h = harness(repo, "0.2.0");
+		const code = await runUpdate({ cwd: ROOT, check: true }, h.deps);
+		check("a genuinely newer tag not in HEAD is still an update", code === 0 && lines(h.out).includes("update available: yes"), h.out);
+		check("the newer tag is the target", lines(h.out).includes("latest stable: v0.3.0"), h.out);
+	}
+	{
+		const repo = createFakeRepo({ start: { kind: "tag", name: "v0.2.0" }, tags: ["v0.2.0", "v0.3.0"] });
+		const h = harness(repo, "0.2.0");
+		const code = await runUpdate({ cwd: ROOT, check: true }, h.deps);
+		check("HEAD on an older tag offers the newer tag", code === 0 && lines(h.out).includes("update available: yes"), h.out);
+		check("the tag-to-tag move keeps the old output wording", lines(h.out).includes("update available: yes (v0.2.0 -> v0.3.0)"), h.out);
+	}
+	{
+		// A manual downgrade stays possible: --tag is the operator's explicit wish.
+		const repo = createFakeRepo({ tags: ["v0.1.0", "v0.2.0", "v0.3.0"] });
+		const h = harness(repo, "0.3.0");
+		const checkCode = await runUpdate({ cwd: ROOT, check: true, tag: "v0.1.0" }, h.deps);
+		check("an explicit older tag is still offered", checkCode === 0 && lines(h.out).includes("update available: yes"), h.out);
+		check("the ancestry check is skipped for an explicit tag", !repo.calls.some((call) => call.args[0] === "merge-base"), repo.calls);
+	}
+	{
+		const repo = createFakeRepo({ tags: ["v0.1.0", "v0.2.0", "v0.3.0"] });
+		const h = harness(repo, "0.3.0");
+		const code = await runUpdate({ cwd: ROOT, tag: "v0.1.0" }, h.deps);
+		check("an explicit manual downgrade is applied", code === 0, { code, err: h.err });
+		check("the manual downgrade checks out the requested tag", refName(repo.ref()) === "tag:v0.1.0", refName(repo.ref()));
+		check("manual downgrade skips the ancestry check", !repo.calls.some((call) => call.args[0] === "merge-base"), repo.calls);
+	}
+	{
+		// A shallow clone or a broken git must not block a real update.
+		const repo = createFakeRepo({ tags: TAGS, failMergeBase: true });
+		const h = harness(repo, "0.1.0");
+		const code = await runUpdate({ cwd: ROOT, check: true }, h.deps);
+		const output = lines(h.out);
+		check("an unanswerable ancestry check still offers the newer tag", code === 0 && output.includes("update available: yes"), h.out);
+		check("an unanswerable ancestry check is reported as a note", output.includes("could not check whether HEAD already contains v0.2.0") && output.includes("comparing versions only"), h.out);
 	}
 
 	section("dirty tree");

@@ -58,6 +58,10 @@ interface FakeRepoOptions {
 	dirty?: string[];
 	/** Paths `git diff --name-only --no-renames HEAD <ref>` reports; a map keys them by ref. */
 	changedPaths?: string[] | Record<string, string[]>;
+	/** Tags `git merge-base --is-ancestor <tag> HEAD` reports as already contained in HEAD (exit 0). */
+	containedTags?: string[];
+	/** Fail the ancestry check with a non-1 exit, as a shallow clone or a broken git does. */
+	failMergeBase?: boolean;
 	failBuild?: (ref: FakeRef) => boolean;
 	initialFiles?: Record<string, string>;
 }
@@ -163,6 +167,16 @@ function createFakeRepo(options: FakeRepoOptions = {}): FakeRepo {
 					return ok(`${ref.name}\n`);
 				case "status":
 					return ok(dirty.length ? `${dirty.join("\n")}\n` : "");
+				case "merge-base": {
+					if (args[1] !== "--is-ancestor" || !args[2] || args[3] !== "HEAD") {
+						return fail("git", args, `unexpected merge-base command: ${args.join(" ")}`);
+					}
+					if (options.failMergeBase) {
+						throw new CommandFailure("git", args, 128, "", `fatal: Not a valid object name ${args[2]} (shallow clone)`);
+					}
+					if ((options.containedTags ?? []).includes(args[2])) return ok();
+					return fail("git", args, `fatal: ${args[2]} is not an ancestor of HEAD`);
+				}
 				case "diff": {
 					if (args[1] !== "--name-only" || args[2] !== "--no-renames" || args[3] !== "HEAD" || !args[4]) {
 						return fail("git", args, `unexpected diff command: ${args.join(" ")}`);
@@ -211,6 +225,8 @@ interface AutoOptions {
 	runtimeStatus?: string | null;
 	runtimeRunId?: string;
 	now?: Date;
+	/** Version read from the checkout's package.json; defaults to "0.1.0". */
+	packageVersion?: string;
 }
 
 interface Harness {
@@ -230,7 +246,7 @@ function harness(repo: FakeRepo, options: AutoOptions = {}): Harness {
 			fs: repo.fs,
 			out: (line) => out.push(line),
 			err: (line) => err.push(line),
-			readPackageVersion: async () => "0.1.0",
+			readPackageVersion: async () => options.packageVersion ?? "0.1.0",
 			now: () => "2024-03-01T12:00:00.000Z",
 			auto: {
 				updates: { auto: options.auto ?? true, window: options.window ?? "" },
@@ -413,6 +429,60 @@ async function typescriptTests(): Promise<void> {
 		const h = harness(repo);
 		const code = await runUpdate({ cwd: ROOT, auto: true }, h.deps);
 		check("an interrupted update blocks auto mode", code === 0 && h.out.join("\n").includes("update is in progress"), h.out);
+	}
+
+	section("REGRESSION #253: auto-update never rolls master back to a contained tag");
+	{
+		// 23.11, 19:02 MSK: master carried package 0.35.1, the last stable tag was
+		// v0.35.1, and the auto path checked out v0.35.0 and restarted every unit.
+		const repo = createFakeRepo({
+			start: { kind: "branch", name: "master" },
+			tags: ["v0.35.0", "v0.35.1"],
+			containedTags: ["v0.35.0", "v0.35.1"],
+			initialFiles: EXISTING_MARKER,
+		});
+		const h = harness(repo, { heartbeatAgeMs: 600_000, packageVersion: "0.35.1" });
+		const code = await runUpdate({ cwd: ROOT, auto: true }, h.deps);
+		const out = h.out.join("\n");
+		check("exits 0, never the restart code", code === 0, code);
+		check("logs that master is ahead of the last stable tag", out.includes("master ahead of the last stable tag") && out.includes("v0.35.1"), h.out);
+		check("logs nothing to do", out.includes("nothing to do"), h.out);
+		check("never checks anything out", !commandLines(repo).some((line) => line.startsWith("git checkout")), commandLines(repo));
+		check("never installs, builds or health-checks", !commandLines(repo).some((line) => line.startsWith("npm ") || line.startsWith("node ")), commandLines(repo));
+		check("leaves the marker untouched (no restart request)", repo.fs.files.get(MARKER_FILE) === EXISTING_MARKER[UPDATE_MARKER_FILE], repo.fs.files.get(MARKER_FILE));
+		check("the checkout stays on master", repo.ref().kind === "branch" && repo.ref().name === "master", repo.ref());
+	}
+	{
+		// The package version looks older than the tag, yet HEAD already contains it:
+		// the ancestry guard alone has to refuse the downgrade.
+		const repo = createFakeRepo({
+			start: { kind: "branch", name: "master" },
+			tags: ["v0.35.0", "v0.35.1"],
+			containedTags: ["v0.35.1"],
+			initialFiles: EXISTING_MARKER,
+		});
+		const h = harness(repo, { heartbeatAgeMs: 600_000, packageVersion: "0.35.0" });
+		const code = await runUpdate({ cwd: ROOT, auto: true }, h.deps);
+		check("a contained tag is refused even when the version looks newer", code === 0, code);
+		check("the ancestry refusal names the tag and the phrase", h.out.join("\n").includes("already contains v0.35.1") && h.out.join("\n").includes("master ahead of the last stable tag"), h.out);
+		check("the ancestry refusal applies nothing", !commandLines(repo).some((line) => line.startsWith("git checkout") || line.startsWith("npm ")), commandLines(repo));
+	}
+	{
+		// A tag that HEAD does not contain is still a real update.
+		const repo = createFakeRepo({
+			start: { kind: "branch", name: "master" },
+			tags: ["v0.35.0", "v0.35.1"],
+			initialFiles: EXISTING_MARKER,
+		});
+		const h = harness(repo, { heartbeatAgeMs: 600_000, packageVersion: "0.35.0" });
+		const code = await runUpdate({ cwd: ROOT, auto: true }, h.deps);
+		check("a genuinely newer tag still applies", code === 10, { code, out: h.out, err: h.err });
+		check("the newer tag is checked out", repo.ref().kind === "tag" && repo.ref().name === "v0.35.1", repo.ref());
+		check(
+			"the ancestry check runs once for the whole auto decision",
+			commandLines(repo).filter((line) => line.startsWith("git merge-base")).length === 1,
+			commandLines(repo),
+		);
 	}
 
 	section("--auto applies, exits 10 and requests a restart");

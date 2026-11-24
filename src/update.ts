@@ -5,7 +5,10 @@
  * tree):
  *
  *   - check: fetch tags and report the current ref, the newest stable `vX.Y.Z`
- *     tag, the update marker and the presence of `dist/`/`dist.prev/`.
+ *     tag, the update marker and the presence of `dist/`/`dist.prev/`. A tag is
+ *     offered only when it is numerically newer than the current build (the tag
+ *     HEAD is on, otherwise the `package.json` version) and HEAD does not
+ *     already contain it (#253).
  *   - apply: check out the target tag, preserve the old build in `dist.prev/`,
  *     run `npm ci --prefer-offline` + `npm run build`, then a short health gate.
  *   - rollback: restore `previousRef` from the marker and either restore
@@ -22,6 +25,10 @@
  *   - never touch `.alive/`, `alive.config.json`, `SOUL.md`, `.env` or any path
  *     outside the checkout;
  *   - never `git push`, never `git checkout --force`, never delete a ref;
+ *   - never move the build backwards: a stable tag HEAD already contains is not
+ *     an update, even when the checkout is only a few commits ahead of it. Only
+ *     an explicit `alive update --tag vX.Y.Z` may point the build at an older
+ *     tag, and that is a deliberate manual action;
  *   - a dirty tree is refused unless `--force`, but only when the dirty paths
  *     differ between HEAD and the target: local edits the update does not touch
  *     are kept and recorded as `dirtyKept` in the marker. Even with a conflict
@@ -87,6 +94,17 @@ export function parseStableTag(tag: string): StableVersion | undefined {
 	const version: StableVersion = { major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3]) };
 	if (![version.major, version.minor, version.patch].every((part) => Number.isSafeInteger(part))) return undefined;
 	return version;
+}
+
+/**
+ * Parse the `version` from `package.json` (`0.35.1`, optionally `v0.35.1`) into
+ * the same shape as a stable tag. Prereleases and anything else yield undefined.
+ */
+export function parsePackageVersion(version: string): StableVersion | undefined {
+	const value = version.trim();
+	if (!value) return undefined;
+	// `parseStableTag` owns the numeric pattern: reuse it instead of forking it.
+	return parseStableTag(`v${value.replace(/^[vV]/, "")}`);
 }
 
 export function compareStableVersions(a: StableVersion, b: StableVersion): number {
@@ -414,15 +432,16 @@ export async function autoUpdate(options: UpdateOptions, deps: UpdateDeps): Prom
 			d.out("auto-update: no stable vX.Y.Z tags found on origin; nothing to do");
 			return 0;
 		}
-		const verdict = updateVerdict(snapshot, target, false);
+		const verdict = await evaluateUpdate(d, snapshot, target, false);
 		if (!verdict.available) {
 			d.out(`auto-update: no newer stable tag (${verdict.reason}); nothing to do`);
 			return 0;
 		}
+		if (verdict.note) d.out(`auto-update: note: ${verdict.note}`);
 		d.out(`auto-update: guard has a newer stable tag: ${target}`);
 
 		d.out(`auto-update: applying ${target} (current: ${currentLabel(snapshot.current)})...`);
-		await applyAndReport(options, d, { snapshot, target });
+		await applyAndReport(options, d, { snapshot, target, verdict });
 		return AUTO_UPDATE_RESTART_EXIT_CODE;
 	} catch (error) {
 		d.err(`error: ${errorMessage(error)}`);
@@ -523,6 +542,8 @@ interface RepositorySnapshot {
 interface UpdateVerdict {
 	available: boolean;
 	reason: string;
+	/** Set when the verdict stands but a supporting check could not run (never blocks an update). */
+	note?: string;
 }
 
 interface RollbackOutcome {
@@ -549,12 +570,13 @@ async function inspectAndReport(options: UpdateOptions, d: ResolvedDeps): Promis
 	}
 
 	d.out(`${targetLabel(options)}: ${target}`);
-	const verdict = updateVerdict(snapshot, target, options.tag !== undefined);
+	const verdict = await evaluateUpdate(d, snapshot, target, options.tag !== undefined);
 	if (!verdict.available) {
 		d.out(`update available: no (${verdict.reason})`);
 		await reportUpdateArtifacts(d, snapshot.root);
 		return;
 	}
+	if (verdict.note) d.out(`note: ${verdict.note}`);
 
 	d.out(`update available: yes (${shortLabel(snapshot.current)} -> ${target})`);
 	if (!snapshot.current.tag && !snapshot.current.branch) {
@@ -583,6 +605,8 @@ async function inspectAndReport(options: UpdateOptions, d: ResolvedDeps): Promis
 interface PreparedApply {
 	snapshot: RepositorySnapshot;
 	target: string;
+	/** Verdict already computed by `autoUpdate`; avoids a second ancestry check. */
+	verdict?: UpdateVerdict;
 }
 
 async function applyAndReport(options: UpdateOptions, d: ResolvedDeps, prepared?: PreparedApply): Promise<void> {
@@ -595,11 +619,12 @@ async function applyAndReport(options: UpdateOptions, d: ResolvedDeps, prepared?
 	if (!target) throw new UpdateError("no stable vX.Y.Z tags found on origin; cannot update");
 
 	d.out(`${targetLabel(options)}: ${target}`);
-	const verdict = updateVerdict(snapshot, target, options.tag !== undefined);
+	const verdict = prepared?.verdict ?? (await evaluateUpdate(d, snapshot, target, options.tag !== undefined));
 	if (!verdict.available) {
-		d.out(`already on ${target}; nothing to do`);
+		d.out(`nothing to do: ${verdict.reason}`);
 		return;
 	}
+	if (verdict.note) d.err(`note: ${verdict.note}`);
 
 	if (!snapshot.current.tag && !snapshot.current.branch) {
 		const short = snapshot.current.commit ? snapshot.current.commit.slice(0, 12) : "unknown";
@@ -952,12 +977,83 @@ function selectTarget(options: UpdateOptions, snapshot: RepositorySnapshot): str
 function updateVerdict(snapshot: RepositorySnapshot, target: string, explicit: boolean): UpdateVerdict {
 	const currentTag = snapshot.current.tag;
 	if (currentTag === target) return { available: false, reason: `already on ${target}` };
-	const currentVersion = currentTag ? parseStableTag(currentTag) : undefined;
+	if (explicit) return { available: true, reason: "" };
+
+	// A branch tip normally sits *after* the last stable tag, so the tag HEAD is
+	// on says nothing about the build: compare real version numbers, using the
+	// package version whenever HEAD is not exactly on a stable tag (#253).
+	const currentVersion = currentTag ? parseStableTag(currentTag) : parsePackageVersion(snapshot.packageVersion ?? "");
 	const targetVersion = parseStableTag(target);
-	if (!explicit && currentVersion && targetVersion && compareStableVersions(currentVersion, targetVersion) >= 0) {
-		return { available: false, reason: `${currentTag} is not older than the latest stable tag` };
+	if (currentVersion && targetVersion && compareStableVersions(currentVersion, targetVersion) >= 0) {
+		const buildLabel = currentTag ?? `build ${snapshot.packageVersion}`;
+		return { available: false, reason: `${buildLabel} is not older than ${target}` };
 	}
 	return { available: true, reason: "" };
+}
+
+/**
+ * Result of `git merge-base --is-ancestor <tag> HEAD`. `unknown` means the check
+ * itself could not answer (shallow clone, missing objects, no git): it must
+ * never turn a real update into a failure.
+ */
+type Ancestry = { status: "contained" } | { status: "missing" } | { status: "unknown"; detail: string };
+
+async function targetInHead(d: ResolvedDeps, snapshot: RepositorySnapshot, target: string): Promise<Ancestry> {
+	try {
+		await d.run("git", ["merge-base", "--is-ancestor", target, "HEAD"], {
+			cwd: snapshot.root,
+			timeoutMs: GIT_TIMEOUT_MS,
+		});
+		return { status: "contained" };
+	} catch (error) {
+		// Exit 1 is the documented "not an ancestor" answer; everything else is
+		// an inability to answer and falls back to the version comparison.
+		if (error instanceof CommandFailure && error.exitCode === 1) return { status: "missing" };
+		return { status: "unknown", detail: oneLine(errorMessage(error)) };
+	}
+}
+
+/**
+ * The full update decision: the pure version verdict first, then the ancestry
+ * guard.
+ *
+ * The guard is what fixed #253: a branch a few commits ahead of the last stable
+ * tag must never be "updated" down to a tag it already contains. It runs when
+ * the version verdict offers the target, and also when it refuses on a branch
+ * (`build 0.35.1 is not older than v0.35.1`) so the log can still say the branch
+ * is ahead of the tag; it can only ever turn "available" into "unavailable".
+ * An unanswerable `merge-base` (shallow clone, broken git) never blocks an
+ * update: the version verdict stands and a note explains why.
+ *
+ * `explicit` (`alive update --tag vX.Y.Z`) skips everything: an operator may
+ * deliberately point the build at an older tag.
+ */
+async function evaluateUpdate(
+	d: ResolvedDeps,
+	snapshot: RepositorySnapshot,
+	target: string,
+	explicit: boolean,
+): Promise<UpdateVerdict> {
+	const verdict = updateVerdict(snapshot, target, explicit);
+	if (explicit) return verdict;
+	// HEAD exactly on the target tag is "already on", not "ahead of it".
+	if (!verdict.available && (snapshot.current.tag === target || !snapshot.current.branch)) return verdict;
+
+	const ancestry = await targetInHead(d, snapshot, target);
+	if (ancestry.status === "contained") {
+		const head = snapshot.current.branch
+			? `branch ${snapshot.current.branch} @ ${shortCommit(snapshot.current)}`
+			: `HEAD @ ${shortCommit(snapshot.current)}`;
+		const ahead = `${head} already contains ${target} (master ahead of the last stable tag)`;
+		return { available: false, reason: verdict.available ? ahead : `${verdict.reason}; ${ahead}` };
+	}
+	if (ancestry.status === "unknown" && verdict.available) {
+		return {
+			...verdict,
+			note: `could not check whether HEAD already contains ${target} (git merge-base --is-ancestor failed: ${ancestry.detail}); comparing versions only`,
+		};
+	}
+	return verdict;
 }
 
 function targetLabel(options: UpdateOptions): string {
@@ -969,10 +1065,15 @@ function shortLabel(current: CurrentRef): string {
 }
 
 function currentLabel(current: CurrentRef): string {
-	const short = current.commit ? current.commit.slice(0, 12) : "unknown";
+	const short = shortCommit(current);
 	if (current.branch) return `branch ${current.branch} @ ${short}${current.tag ? ` (tag ${current.tag})` : ""}`;
 	if (current.tag) return `${current.tag} (tag)`;
 	return `detached @ ${short}`;
+}
+
+/** Abbreviated commit used in report and reason lines. */
+function shortCommit(current: CurrentRef): string {
+	return current.commit ? current.commit.slice(0, 12) : "unknown";
 }
 
 function describeWorktree(snapshot: RepositorySnapshot): string {
