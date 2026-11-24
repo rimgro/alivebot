@@ -10,6 +10,7 @@ import {
 	migrateConfigSecrets,
 	readEnvFileValues,
 } from "./config-secrets.js";
+import { DEFAULT_GITHUB_CONFIG, validateGitHubConfig, type GitHubConfig } from "./github/config.js";
 import { DEFAULT_BROWSER_CONFIG, type BrowserConfig } from "./modules/browser/config.js";
 import {
 	DEFAULT_TELEGRAM_USER_CONFIG,
@@ -1114,6 +1115,8 @@ export interface AliveConfig {
 	tools: ToolsConfig;
 	/** Hardware isolation of agent shell/files. Host integrations remain trusted runtime services. */
 	sandbox: SandboxConfig;
+	/** GitHub App tools: credential directory and the single repository they may touch. */
+	github: GitHubConfig;
 	memory: MemoryConfig;
 	loop: LoopConfig;
 	/** Dead-agent observability thresholds (#175). */
@@ -1189,6 +1192,7 @@ export const DEFAULT_CONFIG: AliveConfig = {
 	workers: DEFAULT_WORKERS_CONFIG,
 	sessions: DEFAULT_SESSIONS_CONFIG,
 	sandbox: DEFAULT_SANDBOX_CONFIG,
+	github: DEFAULT_GITHUB_CONFIG,
 	workspace: ".alive/workspace",
 	soulFile: "SOUL.md",
 	session: "continue",
@@ -1505,6 +1509,7 @@ export function loadConfig(options: LoadConfigOptions): LoadedConfig {
 		allowlist: ensureCompactCatalogTools(merged.tools.allowlist, merged.tools.compactCatalog === true),
 	};
 	merged.sandbox = validateSandboxConfig(merged.sandbox);
+	merged.github = validateGitHubConfig(merged.github);
 	merged.workers = validateWorkersConfig(merged.workers);
 	merged.sessions = validateSessionsConfig(merged.sessions);
 	merged.updates = validateUpdatesConfig(merged.updates);

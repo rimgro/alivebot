@@ -6,13 +6,19 @@ import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { LoadedConfig } from "../config.js";
 import type { SandboxManager } from "../sandbox/manager.js";
 import { withRetries, type RetryLogger } from "../retry.js";
+import {
+	DEFAULT_GITHUB_REPOSITORY,
+	parseGitHubRepository,
+	repositoryDirectory,
+	repositoryMatches,
+} from "./config.js";
 
-const APP_FOR_PROFILE: Record<string, string> = {
+/** Historical profiles keep their existing App directories; any other profile uses its own id. */
+export const APP_FOR_PROFILE: Record<string, string> = {
 	"slava-manager": "manager",
 	developer: "developer",
 	sre_devops: "sre",
 };
-const REPOSITORY = "rimgro/alivebot";
 const API = "https://api.github.com";
 const USER_AGENT = "alive-github-app-auth";
 const tokenCache = new Map<string, { token: string; expiresAt: string; metadata: AppMetadata }>();
@@ -69,8 +75,52 @@ async function githubJson<T>(url: string, token: string, method = "GET", body?: 
 	return withRetries(request, { attempts: 3, baseDelayMs: 500, maxDelayMs: 5_000, label: "github app", log, signal });
 }
 
-function readApp(stateDir: string, appProfile: string): { directory: string; metadata: AppMetadata; privateKey: string } {
-	const appRoot = path.resolve(stateDir, "../../../github-apps");
+/**
+ * Shared credential root. Managed profiles live at `<root>/.alive/agents/<id>/state`,
+ * so the historical `../../../github-apps` lands on `<root>/.alive/github-apps`.
+ * A root profile (stateDir itself is `.alive`) keeps its credentials next to state.
+ */
+export function githubAppRoot(stateDir: string): string {
+	return profileFromStateDir(stateDir)
+		? path.resolve(stateDir, "../../../github-apps")
+		: path.resolve(stateDir, "github-apps");
+}
+
+/**
+ * Cheap read-only check that the App credential directory looks complete.
+ * Missing files, permission errors or a file where a directory is expected all
+ * mean "not configured" so the tools stay out of the prompt instead of failing
+ * with ENOENT on the first call.
+ */
+export function hasGitHubAppCredentials(stateDir: string, appProfile: string): boolean {
+	if (!appProfile) return false;
+	try {
+		const appRoot = githubAppRoot(stateDir);
+		const directory = path.join(appRoot, appProfile);
+		if (!directory.startsWith(`${appRoot}${path.sep}`)) return false;
+		if (!fs.statSync(directory).isDirectory()) return false;
+		return ["app.json", "private-key.pem"].every((file) => fs.statSync(path.join(directory, file)).isFile());
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Gate for the sandbox GitHub tools.
+ *
+ * An explicit non-empty `github.app` is an operator decision: enable the tools
+ * even if the credentials are missing so the failure is loud on first use.
+ * Otherwise a profile gets the tools only when its resolved App directory
+ * actually contains credentials.
+ */
+export function githubToolsEnabled(loaded: LoadedConfig): boolean {
+	if (loaded.config.github?.app?.trim()) return true;
+	const appProfile = appProfileFor(loaded);
+	return appProfile ? hasGitHubAppCredentials(loaded.paths.stateDir, appProfile) : false;
+}
+
+function readApp(stateDir: string, appProfile: string, repository: string): { directory: string; metadata: AppMetadata; privateKey: string } {
+	const appRoot = githubAppRoot(stateDir);
 	const directory = path.join(appRoot, appProfile);
 	if (!directory.startsWith(`${appRoot}${path.sep}`)) throw new Error("Invalid GitHub App profile path");
 	const directoryMode = fs.statSync(directory).mode & 0o777;
@@ -84,13 +134,14 @@ function readApp(stateDir: string, appProfile: string): { directory: string; met
 	const metadata = JSON.parse(fs.readFileSync(metadataPath, "utf8")) as AppMetadata;
 	if (!Number.isSafeInteger(metadata.app_id) || !Number.isSafeInteger(metadata.installation_id)
 		|| typeof metadata.slug !== "string" || !/^[a-z0-9-]+$/.test(metadata.slug)
-		|| metadata.installed_repository?.toLowerCase() !== REPOSITORY) {
-		throw new Error("GitHub App is not fully installed on the expected repository");
+		|| !repositoryMatches(metadata.installed_repository, repository)) {
+		throw new Error(`GitHub App is not fully installed on ${repository}`);
 	}
 	return { directory, metadata, privateKey: fs.readFileSync(keyPath, "utf8") };
 }
 
-async function mintRepositoryToken(metadata: AppMetadata, privateKey: string, signal?: AbortSignal, log?: RetryLogger): Promise<{ token: string; expiresAt: string }> {
+async function mintRepositoryToken(metadata: AppMetadata, privateKey: string, repository: string, signal?: AbortSignal, log?: RetryLogger): Promise<{ token: string; expiresAt: string }> {
+	const { owner, name, fullName } = parseGitHubRepository(repository);
 	const jwt = createAppJwt(metadata.app_id, privateKey);
 	const app = await githubJson<{ id: number; slug: string }>(`${API}/app`, jwt, "GET", undefined, signal, log);
 	if (app.id !== metadata.app_id || app.slug !== metadata.slug) throw new Error("GitHub App identity changed; refusing token mint");
@@ -98,63 +149,89 @@ async function mintRepositoryToken(metadata: AppMetadata, privateKey: string, si
 		`${API}/app/installations/${metadata.installation_id}`, jwt, "GET", undefined, signal, log,
 	);
 	if (installation.id !== metadata.installation_id || installation.repository_selection !== "selected"
-		|| installation.account?.login?.toLowerCase() !== "rimgro") {
-		throw new Error("GitHub App installation is no longer restricted to selected repositories for rimgro");
+		|| !repositoryMatches(installation.account?.login, owner)) {
+		throw new Error(`GitHub App installation is no longer restricted to selected repositories for ${owner}`);
 	}
 	for (const [permission, level] of Object.entries(metadata.permissions)) {
 		if (installation.permissions?.[permission] !== level) throw new Error(`GitHub App permission changed: ${permission}`);
 	}
 	const created = await githubJson<{ token: string; expires_at: string }>(
-		`${API}/app/installations/${metadata.installation_id}/access_tokens`, jwt, "POST", { repository_names: ["alivebot"] }, signal, log,
+		`${API}/app/installations/${metadata.installation_id}/access_tokens`, jwt, "POST", { repository_names: [name] }, signal, log,
 	);
 	if (typeof created.token !== "string" || typeof created.expires_at !== "string") throw new Error("GitHub did not return a valid installation token");
 	const visible = await githubJson<{ repositories?: Array<{ full_name?: string }> }>(
 		`${API}/installation/repositories`, created.token, "GET", undefined, signal, log,
 	);
-	const names = (visible.repositories ?? []).map((repo) => repo.full_name?.toLowerCase());
-	if (names.length !== 1 || names[0] !== REPOSITORY) throw new Error("Installation token is not restricted to rimgro/alivebot");
+	const names = (visible.repositories ?? []).map((repo) => repo.full_name);
+	if (names.length !== 1 || !repositoryMatches(names[0], fullName)) throw new Error(`Installation token is not restricted to ${fullName}`);
 	return { token: created.token, expiresAt: created.expires_at };
 }
 
-export function appProfileFor(loaded: LoadedConfig): string | undefined {
-	const segments = loaded.paths.stateDir.split(path.sep).filter(Boolean);
+/** Managed profile id encoded in `<stateDir>/agents/<id>/state`, if any. */
+export function profileFromStateDir(stateDir: string): string | undefined {
+	const segments = stateDir.split(path.sep).filter(Boolean);
 	const agentsIndex = segments.lastIndexOf("agents");
-	const profile = agentsIndex >= 0 ? segments[agentsIndex + 1] : undefined;
-	return profile ? APP_FOR_PROFILE[profile] : undefined;
+	return agentsIndex >= 0 ? segments[agentsIndex + 1] : undefined;
 }
 
-export async function getScopedInstallationToken(loaded: LoadedConfig, signal?: AbortSignal, log?: RetryLogger): Promise<{ token: string; expiresAt: string; metadata: AppMetadata }> {
+/**
+ * Resolve the GitHub App credential directory for this profile.
+ *
+ * Precedence: explicit `github.app`, the historical profile mapping, then the
+ * managed profile id itself (so `festival` uses `.alive/github-apps/festival`).
+ * A root profile without `github.app` still has no App, as before.
+ */
+export function appProfileFor(loaded: LoadedConfig): string | undefined {
+	const configured = loaded.config.github?.app?.trim();
+	if (configured) return configured;
+	const profile = profileFromStateDir(loaded.paths.stateDir);
+	if (!profile) return undefined;
+	return APP_FOR_PROFILE[profile] ?? profile;
+}
+
+/** The single repository this profile's GitHub tools may touch. */
+export function repositoryFor(loaded: LoadedConfig): string {
+	const configured = loaded.config.github?.repository?.trim();
+	return configured ? parseGitHubRepository(configured).fullName : DEFAULT_GITHUB_REPOSITORY;
+}
+
+export async function getScopedInstallationToken(loaded: LoadedConfig, signal?: AbortSignal, log?: RetryLogger): Promise<{ token: string; expiresAt: string; metadata: AppMetadata; repository: string }> {
 	const profile = appProfileFor(loaded);
 	if (!profile) throw new Error("This Alive profile has no GitHub App configured");
-	const { metadata, privateKey } = readApp(loaded.paths.stateDir, profile);
-	const cached = tokenCache.get(profile);
-	if (cached && Date.parse(cached.expiresAt) > Date.now() + 120_000) return cached;
-	const minted = await mintRepositoryToken(metadata, privateKey, signal, log);
+	const repository = repositoryFor(loaded);
+	const { metadata, privateKey } = readApp(loaded.paths.stateDir, profile, repository);
+	const cacheKey = `${profile}\0${repository.toLowerCase()}`;
+	const cached = tokenCache.get(cacheKey);
+	if (cached && Date.parse(cached.expiresAt) > Date.now() + 120_000) return { ...cached, repository };
+	const minted = await mintRepositoryToken(metadata, privateKey, repository, signal, log);
 	const result = { ...minted, metadata };
-	tokenCache.set(profile, result);
-	return result;
+	tokenCache.set(cacheKey, result);
+	return { ...result, repository };
 }
 
 function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-/** Add a narrow token-refresh tool only to the three profiles with dedicated GitHub Apps. */
+/** Add a narrow token-refresh tool only when this profile has a usable GitHub App. */
 export function createGitHubAuthTool(manager: SandboxManager, loaded: LoadedConfig, log?: RetryLogger): ToolDefinition | undefined {
-	if (!appProfileFor(loaded)) return undefined;
+	if (!githubToolsEnabled(loaded)) return undefined;
+	const repository = repositoryFor(loaded);
+	const repoDirectory = repositoryDirectory(repository);
 
 	return {
 		name: "github_auth",
 		label: "Refresh GitHub App auth",
-		description: "Mint a short-lived GitHub App installation token restricted to rimgro/alivebot, store it privately in your sandbox Git credential file, set your git commit author to your App bot identity, and clone/update the fixed repository at ./alivebot. The token is never returned in tool output. Call before GitHub work if the previous token expired. Manager has read-only code access; Developer and SRE can push only with explicit operator authorization.",
+		description: `Mint a short-lived GitHub App installation token restricted to ${repository}, store it privately in your sandbox Git credential file, set your git commit author to your App bot identity, and clone/update the fixed repository at ./${repoDirectory}. The token is never returned in tool output. Call before GitHub work if the previous token expired. Manager has read-only code access; Developer and SRE can push only with explicit operator authorization.`,
 		promptSnippet: "Refresh scoped GitHub App auth and configure this agent's bot commit identity",
 		parameters: Type.Object({ action: Type.Optional(Type.Literal("refresh")) }),
 		async execute(_toolCallId, _params, signal) {
 			return manager.exclusive(async () => {
 				signal?.throwIfAborted();
-				const { metadata, token, expiresAt } = await getScopedInstallationToken(loaded, signal, log);
+				const { metadata, token, expiresAt, repository } = await getScopedInstallationToken(loaded, signal, log);
+				const repoDirectory = repositoryDirectory(repository);
 				const credentialPath = path.posix.join(manager.workspaceDir, ".github-credentials-alive");
-				const credential = `https://x-access-token:${token}@github.com/rimgro/alivebot.git\n`;
+				const credential = `https://x-access-token:${token}@github.com/${repository}.git\n`;
 				const files = await manager.files();
 				await files.write(manager.path(".github-credentials-alive"), credential);
 				const username = `${metadata.slug}[bot]`;
@@ -166,12 +243,12 @@ export function createGitHubAuthTool(manager: SandboxManager, loaded: LoadedConf
 					`git config --global user.email ${shellQuote(email)}`,
 					`git config --global credential.helper ${shellQuote(`store --file=${credentialPath}`)}`,
 					"git config --global credential.useHttpPath true",
-					"if [ -L alivebot ]; then echo 'refusing symlink at ./alivebot' >&2; exit 44; fi",
-					`if [ -d alivebot/.git ]; then git -C alivebot remote set-url origin https://github.com/${REPOSITORY}.git; else git clone -- https://github.com/${REPOSITORY}.git alivebot; fi`,
-					`git -C alivebot config --local user.name ${shellQuote(username)}`,
-					`git -C alivebot config --local user.email ${shellQuote(email)}`,
-					`git -C alivebot config --local credential.helper ${shellQuote(`store --file=${credentialPath}`)}`,
-					"git -C alivebot config --local credential.useHttpPath true",
+					`if [ -L ${shellQuote(repoDirectory)} ]; then echo ${shellQuote(`refusing symlink at ./${repoDirectory}`)} >&2; exit 44; fi`,
+					`if [ -d ${shellQuote(`${repoDirectory}/.git`)} ]; then git -C ${shellQuote(repoDirectory)} remote set-url origin https://github.com/${repository}.git; else git clone -- https://github.com/${repository}.git ${shellQuote(repoDirectory)}; fi`,
+					`git -C ${shellQuote(repoDirectory)} config --local user.name ${shellQuote(username)}`,
+					`git -C ${shellQuote(repoDirectory)} config --local user.email ${shellQuote(email)}`,
+					`git -C ${shellQuote(repoDirectory)} config --local credential.helper ${shellQuote(`store --file=${credentialPath}`)}`,
+					`git -C ${shellQuote(repoDirectory)} config --local credential.useHttpPath true`,
 				].join(" && ");
 				try {
 					const result = await manager.execute(command, 300_000, signal);
@@ -181,8 +258,8 @@ export function createGitHubAuthTool(manager: SandboxManager, loaded: LoadedConf
 					throw error;
 				}
 				return {
-					content: [{ type: "text", text: `GitHub auth refreshed for ${username}. Repository is ./alivebot; token expires at ${expiresAt}. Token was not included in this response.` }],
-					details: { app: metadata.slug, repository: REPOSITORY, tokenExpiresAt: expiresAt, tokenReturned: false },
+					content: [{ type: "text", text: `GitHub auth refreshed for ${username}. Repository is ./${repoDirectory}; token expires at ${expiresAt}. Token was not included in this response.` }],
+					details: { app: metadata.slug, repository, tokenExpiresAt: expiresAt, tokenReturned: false },
 				};
 			});
 		},
