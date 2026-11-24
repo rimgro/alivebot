@@ -9,6 +9,9 @@
  * output, the pending/stale split, the refusal on a lingering active unit, the
  * `reset-failed` cleanup (including a failing reset), `--collect` on the start,
  * the `--user` scope, flag forwarding and the delay validation in the CLI.
+ * Plus the two #258 strategies: supervisor detection from cgroup + MainPID,
+ * the exact `systemctl restart` unit, and the direct fallback with its 0600
+ * environment snapshot.
  *
  *   npm run test:deferred-restart
  */
@@ -19,13 +22,17 @@ import { main } from "../cli.js";
 import {
 	DEFAULT_DEFERRED_AFTER_SEC,
 	MAX_DEFERRED_AFTER_SEC,
+	absoluteConfigArgs,
 	classifyLingering,
+	formatEnvironmentFile,
 	parseDeferredAfter,
 	parseUnitList,
 	runDeferredRestart,
 	unitNameFor,
 	type DeferredRestartOptions,
 } from "../runtime/deferred-restart.js";
+import { parseCgroupUnit, parseMainPid } from "../runtime/supervisor-unit.js";
+import { writeRuntimeState } from "../store/runs.js";
 import { CommandFailure, type CommandRunner } from "../update.js";
 
 let failures = 0;
@@ -48,6 +55,23 @@ const EXEC = "/usr/bin/node";
 const SCRIPT = "/opt/alive/dist/index.js";
 /** Caller directory the unit must inherit (`--working-directory`). */
 const CWD = "/opt/alive/project";
+/** Deterministic home of the direct-mode environment snapshots in these tests. */
+const ENV_DIR = path.join(os.tmpdir(), "alive-deferred-restart-test-env");
+const ENV_FILE = path.join(ENV_DIR, `alive-restart-${EPOCH}.env`);
+fs.mkdirSync(ENV_DIR, { recursive: true });
+
+/** The exact direct-mode systemd-run line for the fixed clock and CWD. */
+function expectedDirectStart(user = false): string {
+	return (
+		`systemd-run ${user ? "--user " : ""}--on-active=5 --collect --working-directory=${CWD} --unit=alive-restart-${EPOCH}` +
+		` --property=EnvironmentFile=${ENV_FILE} --property=ExecStopPost=/bin/rm -f ${ENV_FILE}` +
+		` --setenv=ALIVE_DEFERRED_RESTART=alive-restart-${EPOCH} ${EXEC} ${SCRIPT} restart --config ${path.resolve(CWD, "alive.config.json")}`
+	);
+}
+/** A user-unit cgroup: the profile is supervised by `alive-agent@researcher`. */
+const SUPERVISOR_CGROUP =
+	"0::/user.slice/user-1000.slice/user@1000.service/app.slice/alive-agent@researcher.service";
+const SUPERVISOR_UNIT = "alive-agent@researcher.service";
 
 interface FakeCall {
 	command: string;
@@ -63,6 +87,10 @@ interface FakeOptions {
 	failReset?: string[];
 	/** Make `systemd-run` fail. */
 	failStart?: string;
+	/** stdout of `systemctl show -p MainPID …`. */
+	show?: string;
+	/** Make `systemctl show` fail, e.g. no bus. */
+	failShow?: string;
 }
 
 interface Fake {
@@ -77,6 +105,10 @@ function fakeService(options: FakeOptions = {}): Fake {
 		const fail = (detail: string): never => {
 			throw new CommandFailure(command, args, 1, "", detail);
 		};
+		if (command === "systemctl" && args.includes("show")) {
+			if (options.failShow) return fail(options.failShow);
+			return { stdout: options.show ?? "", stderr: "" };
+		}
 		if (command === "systemctl" && args.includes("list-units")) {
 			if (options.failList) return fail(options.failList);
 			return { stdout: options.list ?? "", stderr: "" };
@@ -101,7 +133,20 @@ function lines(calls: FakeCall[]): string[] {
 
 async function runWith(fake: Fake, overrides: Partial<DeferredRestartOptions> = {}) {
 	return await runDeferredRestart(
-		{ afterSec: 5, scope: "system", cwd: CWD, execPath: EXEC, scriptPath: SCRIPT, execArgv: [], restartArgs: [], ...overrides },
+		{
+			afterSec: 5,
+			scope: "system",
+			cwd: CWD,
+			execPath: EXEC,
+			scriptPath: SCRIPT,
+			execArgv: [],
+			restartArgs: [],
+			// No real /proc: these tests must not depend on the host's unit.
+			cgroupText: "",
+			env: {},
+			envFileDir: ENV_DIR,
+			...overrides,
+		},
 		{ run: fake.run, now: () => NOW },
 	);
 }
@@ -114,7 +159,7 @@ interface CliResult {
 }
 
 /** Run the real CLI entry with the fake service manager and the fake clock. */
-async function cli(argv: string[], fake: Fake): Promise<CliResult> {
+async function cli(argv: string[], fake: Fake, cgroupText = ""): Promise<CliResult> {
 	const out: string[] = [];
 	const err: string[] = [];
 	const stdoutWrite = process.stdout.write;
@@ -128,7 +173,10 @@ async function cli(argv: string[], fake: Fake): Promise<CliResult> {
 		return true;
 	}) as typeof process.stderr.write;
 	try {
-		const code = await main(argv, { env: {}, deferred: { run: fake.run, now: () => NOW } });
+		const code = await main(argv, {
+			env: {},
+			deferred: { run: fake.run, now: () => NOW, ...(cgroupText ? { cgroupText } : {}) },
+		});
 		return { code, out: out.join(""), err: err.join(""), calls: fake.calls };
 	} finally {
 		process.stdout.write = stdoutWrite;
@@ -233,8 +281,7 @@ async function mainTests(): Promise<void> {
 		);
 		check(
 			"the unit is transient, --collect and uniquely named",
-			lines(fake.calls)[1] ===
-				`systemd-run --on-active=5 --collect --working-directory=${CWD} --unit=alive-restart-${EPOCH} --setenv=ALIVE_DEFERRED_RESTART=alive-restart-${EPOCH} ${EXEC} ${SCRIPT} restart`,
+			lines(fake.calls)[1] === expectedDirectStart(),
 			lines(fake.calls)[1],
 		);
 		check("nothing was reset and nothing warned", result.reset.length === 0 && result.warnings.length === 0, result);
@@ -326,7 +373,7 @@ async function mainTests(): Promise<void> {
 				[
 					"systemctl list-units --all --no-legend --plain --type=service alive-restart*",
 					"systemctl reset-failed alive-restart-manual.service",
-					`systemd-run --on-active=5 --collect --working-directory=${CWD} --unit=alive-restart-${EPOCH} --setenv=ALIVE_DEFERRED_RESTART=alive-restart-${EPOCH} ${EXEC} ${SCRIPT} restart`,
+					expectedDirectStart(),
 				].join(" | "),
 			lines(fake.calls),
 		);
@@ -358,7 +405,7 @@ async function mainTests(): Promise<void> {
 		check("the reset uses --user", lines(fake.calls)[1] === "systemctl --user reset-failed alive-restart-old.service", lines(fake.calls)[1]);
 		check(
 			"systemd-run uses --user",
-			lines(fake.calls)[2] === `systemd-run --user --on-active=5 --collect --working-directory=${CWD} --unit=alive-restart-${EPOCH} --setenv=ALIVE_DEFERRED_RESTART=alive-restart-${EPOCH} ${EXEC} ${SCRIPT} restart`,
+			lines(fake.calls)[2] === expectedDirectStart(true),
 			lines(fake.calls)[2],
 		);
 	}
@@ -420,6 +467,7 @@ async function mainTests(): Promise<void> {
 		check("the delay is printed", result.out.includes("restart in 120s"), result.out);
 		check("the interruption is stated plainly", result.out.includes("the current run will be interrupted in 120s"), result.out);
 		check("the journal command uses --user", result.out.includes(`journalctl --user -u alive-restart-${EPOCH}`), result.out);
+		check("the direct strategy is named in the output", result.out.includes("via alive restart (environment snapshot)"), result.out);
 		check("the stale unit cleanup is printed", result.out.includes("reset stale unit alive-restart-manual.service"), result.out);
 		check(
 			"the unit runs in the CLI's cwd and carries the deferred marker",
@@ -455,6 +503,217 @@ async function mainTests(): Promise<void> {
 		check("the refusal gives the stop command", result.err.includes("systemctl stop alive-restart-manual.service"), result.err);
 		check("nothing is started", !fake.calls.some((call) => call.command === "systemd-run"), lines(fake.calls));
 	}
+
+	section("parseCgroupUnit finds the deepest service unit (#258)");
+	{
+		const user = parseCgroupUnit(
+			"0::/user.slice/user-1000.slice/user@1000.service/app.slice/alive-agent@researcher.service",
+		);
+		check("a user unit is returned with scope user", user?.unit === "alive-agent@researcher.service" && user.scope === "user", user);
+		const system = parseCgroupUnit("0::/system.slice/alive.service");
+		check("a system unit is returned with scope system", system?.unit === "alive.service" && system.scope === "system", system);
+		const deeper = parseCgroupUnit("0::/system.slice/alive.service/app.slice/run-1.scope");
+		check("a deeper scope does not hide the service", deeper?.unit === "alive.service" && deeper.scope === "system", deeper);
+		const manager = parseCgroupUnit("0::/user.slice/user-1000.slice/user@1000.service/init.scope");
+		check("the user manager itself is not a supervisor", manager === undefined, manager);
+		const v1 = parseCgroupUnit("12:cpuset:/\n1:name=systemd:/system.slice/alive.service/app.slice/run-1.scope");
+		check("a v1 controller line with the systemd hierarchy is parsed", v1?.unit === "alive.service" && v1.scope === "system", v1);
+		const escaped = parseCgroupUnit("0::/system.slice/alive\\x2dagent.service");
+		check("\\x2d is unescaped to a dash", escaped?.unit === "alive-agent.service", escaped);
+		for (const garbage of ["", "   \n", "garbage", "0::/", "0::/system.slice/"]) {
+			check(`no unit in ${JSON.stringify(garbage)}`, parseCgroupUnit(garbage) === undefined, parseCgroupUnit(garbage));
+		}
+		check("MainPID is parsed from systemctl show", parseMainPid("MainPID=4242\n") === 4242, parseMainPid("MainPID=4242\n"));
+		check("missing MainPID is undefined", parseMainPid("MainPID=\n") === undefined, parseMainPid("MainPID=\n"));
+	}
+
+	section("the supervisor strategy is confirmed by MainPID (#258)");
+	{
+		const fake = fakeService({ show: "MainPID=4242\n" });
+		const result = await runWith(fake, {
+			scope: "user",
+			cgroupText: SUPERVISOR_CGROUP,
+			harnessPid: 4242,
+		});
+		check("the strategy is supervisor", result.strategy === "supervisor", result.strategy);
+		check("the supervisor unit and scope are reported", result.supervisor?.unit === SUPERVISOR_UNIT && result.supervisor.scope === "user", result.supervisor);
+		check(
+			"systemctl show was asked for the candidate's MainPID",
+			fake.calls.some((call) => call.command === "systemctl" && call.args.join(" ") === `--user show -p MainPID ${SUPERVISOR_UNIT}`),
+			lines(fake.calls),
+		);
+		check("no environment warning is produced", result.warnings.length === 0, result.warnings);
+	}
+	{
+		const fake = fakeService({ show: "MainPID=999\n" });
+		const result = await runWith(fake, { scope: "user", cgroupText: SUPERVISOR_CGROUP, harnessPid: 4242 });
+		check("a different MainPID falls back to direct", result.strategy === "direct" && result.supervisor === undefined, result);
+		check("the mismatch is a warning, not a failure", result.outcome === "started" && result.warnings.some((line) => line.includes("not the harness supervisor")), result);
+	}
+	{
+		const fake = fakeService({ failShow: "Failed to connect to bus" });
+		const result = await runWith(fake, { scope: "user", cgroupText: SUPERVISOR_CGROUP, harnessPid: 4242 });
+		check("a failed systemctl show falls back to direct", result.strategy === "direct" && result.warnings.some((line) => line.includes("could not verify")), result);
+	}
+	{
+		const fake = fakeService({ show: "MainPID=4242\n" });
+		const result = await runWith(fake, { scope: "user", cgroupText: SUPERVISOR_CGROUP, harnessPid: undefined });
+		check("an unknown harness pid falls back to direct", result.strategy === "direct", result);
+		check("no systemctl show is run without a pid to compare", !fake.calls.some((call) => call.args.includes("show")), lines(fake.calls));
+	}
+
+	section("the supervisor unit only runs systemctl restart (#258)");
+	{
+		const fake = fakeService({ show: "MainPID=4242\n" });
+		const result = await runWith(fake, {
+			scope: "user",
+			cgroupText: SUPERVISOR_CGROUP,
+			harnessPid: 4242,
+			restartArgs: ["--force", "--timeout", "45s", "--model", "m1", "--verbose"],
+		});
+		const start = fake.calls.find((call) => call.command === "systemd-run");
+		check(
+			"the unit is exactly systemd-run --user --on-active --collect --unit systemctl --user restart",
+			start?.args.join(" ") ===
+				`--user --on-active=5 --collect --unit=alive-restart-${EPOCH} systemctl --user restart ${SUPERVISOR_UNIT}`,
+			start?.args,
+		);
+		check("no --working-directory in supervisor mode", !start?.args.some((arg) => arg.startsWith("--working-directory")), start?.args);
+		check("no --setenv in supervisor mode", !start?.args.some((arg) => arg.startsWith("--setenv")), start?.args);
+		check("no --property in supervisor mode", !start?.args.some((arg) => arg.startsWith("--property")), start?.args);
+		check("ignored flags become a note", result.notes.length === 1 && result.notes[0]!.includes("--force") && result.notes[0]!.includes("--timeout"), result.notes);
+	}
+	{
+		const fake = fakeService({ show: "MainPID=4242\n" });
+		const result = await runWith(fake, { scope: "system", cgroupText: SUPERVISOR_CGROUP, harnessPid: 4242 });
+		check("a user supervisor with a system request fails", result.outcome === "failed", result);
+		check("the error says to rerun with --user", (result.error ?? "").includes("user unit") && (result.error ?? "").includes("--user"), result.error);
+		check("no restart command is started", !fake.calls.some((call) => call.command === "systemd-run"), lines(fake.calls));
+		check("the unit listing is not even run", !fake.calls.some((call) => call.args.includes("list-units")), lines(fake.calls));
+	}
+	{
+		const fake = fakeService({ show: "MainPID=4242\n" });
+		const result = await runWith(fake, {
+			scope: "user",
+			cgroupText: SUPERVISOR_CGROUP,
+			harnessPid: 4242,
+			restartArgs: ["--config", "/opt/other/alive.config.json"],
+		});
+		check("an explicit --config cannot be combined with a supervisor", result.outcome === "failed", result);
+		check("the error explains the supervisor owns the profile", (result.error ?? "").includes("--config") && (result.error ?? "").includes("supervised"), result.error);
+		check("nothing is started", !fake.calls.some((call) => call.command === "systemd-run"), lines(fake.calls));
+	}
+
+	section("the direct strategy snapshots the caller's environment (#258)");
+	{
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "alive-deferred-env-"));
+		const env: NodeJS.ProcessEnv = {
+			CLOUDFLARE_API_TOKEN: "tok-secret-123",
+			PLAIN: 'a"b\\c\n\t',
+			"BAD-KEY": "dropped",
+			NUL: "a\0b",
+		};
+		const fake = fakeService();
+		const result = await runWith(fake, { stateDir: directory, envFileDir: directory, env });
+		const file = path.join(directory, `alive-restart-${EPOCH}.env`);
+		const start = fake.calls.find((call) => call.command === "systemd-run");
+		check("the direct strategy is reported", result.strategy === "direct", result.strategy);
+		check("the environment snapshot exists", fs.existsSync(file), file);
+		check("the environment snapshot is 0600", fs.existsSync(file) && (fs.statSync(file).mode & 0o777) === 0o600, fs.existsSync(file) ? (fs.statSync(file).mode & 0o777).toString(8) : "missing");
+		const content = fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+		check("a plain secret is quoted", content.includes('CLOUDFLARE_API_TOKEN="tok-secret-123"'), content);
+		check("backslash, quote, newline and tab are escaped", content.includes('PLAIN="a\\"b\\\\c\\n\\t"'), content);
+		check("invalid keys and NUL values are dropped", !content.includes("BAD-KEY") && !content.includes("NUL="), content);
+		check(
+			"the unit reads the snapshot as EnvironmentFile",
+			start?.args.includes(`--property=EnvironmentFile=${file}`) === true,
+			start?.args,
+		);
+		check(
+			"the unit removes the snapshot when it finishes",
+			start?.args.includes(`--property=ExecStopPost=/bin/rm -f ${file}`) === true,
+			start?.args,
+		);
+		check(
+			"the direct unit still carries cwd, marker and absolute --config",
+			start?.args.includes(`--working-directory=${CWD}`) === true &&
+				start?.args.includes(`--setenv=ALIVE_DEFERRED_RESTART=alive-restart-${EPOCH}`) === true &&
+				start?.args.includes("--config") === true &&
+				start?.args.includes(path.resolve(CWD, "alive.config.json")) === true,
+			start?.args,
+		);
+		check(
+			"no secret value is written to argv",
+			!fake.calls.some((call) => call.args.some((arg) => arg.includes("tok-secret-123"))),
+			lines(fake.calls),
+		);
+		check(
+			"without --config the planner still forwards ./alive.config.json absolute",
+			absoluteConfigArgs([], CWD).join(" ") === `--config ${path.resolve(CWD, "alive.config.json")}`,
+			absoluteConfigArgs([], CWD),
+		);
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+	{
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "alive-deferred-env-fail-"));
+		const fake = fakeService({ failStart: "Failed to start transient service unit" });
+		const result = await runWith(fake, { stateDir: directory, envFileDir: directory, env: { TOKEN: "x" } });
+		const file = path.join(directory, `alive-restart-${EPOCH}.env`);
+		check("a failed systemd-run is an error", result.outcome === "failed", result);
+		check("the environment snapshot is deleted again", !fs.existsSync(file), file);
+		fs.rmSync(directory, { recursive: true, force: true });
+	}
+
+	section("CLI: supervisor strategy and its scope check (#258)");
+	{
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), "alive-deferred-supervisor-cli-"));
+		const project = path.join(directory, "profile");
+		fs.mkdirSync(project, { recursive: true });
+		fs.writeFileSync(path.join(project, "alive.config.json"), JSON.stringify({ name: "DeferredSupervisor" }), "utf8");
+		const stateDir = path.join(project, ".alive");
+		writeRuntimeState(stateDir, {
+			pid: 4242,
+			startedAt: Date.now() - 60_000,
+			lastTickAt: Date.now(),
+			status: "idle",
+			runIndex: 1,
+			pending: 0,
+			openThreads: 0,
+			sleeps: 0,
+			mode: "background",
+		});
+		const previous = process.cwd();
+		try {
+			process.chdir(project);
+			const fake = fakeService({ show: "MainPID=4242\n" });
+			const result = await cli(["restart", "--deferred", "--user"], fake, SUPERVISOR_CGROUP);
+			check("the CLI exits 0", result.code === 0, [result.code, result.err]);
+			check(
+				"the output names the supervisor and the systemctl command",
+				result.out.includes(`via supervisor unit ${SUPERVISOR_UNIT} (systemctl --user restart)`),
+				result.out,
+			);
+			check(
+				"the scheduled unit restarts the supervisor",
+				result.calls.some(
+					(call) =>
+						call.command === "systemd-run" &&
+						call.args.join(" ") ===
+							`--user --on-active=5 --collect --unit=alive-restart-${EPOCH} systemctl --user restart ${SUPERVISOR_UNIT}`,
+				),
+				lines(result.calls),
+			);
+
+			const mismatch = fakeService({ show: "MainPID=4242\n" });
+			const refused = await cli(["restart", "--deferred"], mismatch, SUPERVISOR_CGROUP);
+			check("a scope mismatch exits 1", refused.code === 1, refused);
+			check("the error mentions --user", refused.err.includes("--user"), refused.err);
+			check("no restart unit is created", !mismatch.calls.some((call) => call.command === "systemd-run"), lines(mismatch.calls));
+		} finally {
+			process.chdir(previous);
+			fs.rmSync(directory, { recursive: true, force: true });
+		}
+	}
 }
 
 try {
@@ -462,6 +721,8 @@ try {
 } catch (error) {
 	failures += 1;
 	process.stderr.write(`\nUNEXPECTED ERROR: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`);
+} finally {
+	fs.rmSync(ENV_DIR, { recursive: true, force: true });
 }
 
 process.stdout.write(failures === 0 ? "\nALL DEFERRED RESTART TESTS PASSED\n" : `\n${failures} DEFERRED RESTART TEST(S) FAILED\n`);
