@@ -128,8 +128,11 @@ Rules:
   `alive restart --deferred` (5s; `--after N` and `--user` change the delay and the
   systemd manager). It starts `systemd-run --on-active=N --collect
   --unit=alive-restart-<epoch>`: every request gets its own unit name, so requests
-  cannot collide, and `--collect` stops systemd from keeping the unit around. An
-  active `alive-restart*` unit means a restart is already on its way and refuses a
+  cannot collide, and `--collect` stops systemd from keeping the unit around. The
+  unit runs in the caller's directory (`--working-directory`) and is marked
+  `ALIVE_DEFERRED_RESTART=<unit>`, so the guard lets its own `ExecStart` restart
+  the harness instead of refusing it. An active `alive-restart*` unit means a
+  restart is already on its way and refuses a
   second request; finished or failed ones are cleared with
   `systemctl reset-failed` first. `alive update` and `alive update --auto` never
   restart anything themselves — either the watchdog does, or this command does.

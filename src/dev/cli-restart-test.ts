@@ -90,6 +90,18 @@ const INSIDE_UNIT: NodeJS.ProcessEnv = {
 const OTHER_UNIT: NodeJS.ProcessEnv = { ...INSIDE_UNIT, SYSTEMD_EXEC_PID: "1", INVOCATION_ID: "ffffffffffffffffffffffffffffffff" };
 /** A plain interactive shell: no service manager, no harness marker. */
 const OUTSIDE: NodeJS.ProcessEnv = { PATH: "/usr/local/bin:/usr/bin:/bin" };
+/**
+ * The transient unit `alive restart --deferred` starts: systemd gives it the
+ * unit variables, and it inherits ALIVE_RUNTIME and the marker from the caller.
+ */
+const DEFERRED_PID = 4242;
+const DEFERRED_UNIT: NodeJS.ProcessEnv = {
+	INVOCATION_ID: "x",
+	SYSTEMD_EXEC_PID: String(DEFERRED_PID),
+	JOURNAL_STREAM: "1:2",
+	ALIVE_RUNTIME: "1",
+	ALIVE_DEFERRED_RESTART: "alive-restart-1795514972",
+};
 
 interface Calls {
 	names: string[];
@@ -146,6 +158,7 @@ async function cli(
 	env: NodeJS.ProcessEnv,
 	stopResult: Partial<StopResult> = {},
 	lingeringUnits = "",
+	selfPid?: number,
 ): Promise<CliResult> {
 	const calls: Calls = { names: [], stateDirs: [], initiators: [], forces: [] };
 	const deferredCalls: string[] = [];
@@ -164,6 +177,7 @@ async function cli(
 	try {
 		const code = await main([...argv, "--config", configPath], {
 			env,
+			selfPid,
 			service: fakeService(calls, stopResult),
 			deferred: fakeDeferred(deferredCalls, lingeringUnits),
 		});
@@ -201,6 +215,25 @@ try {
 
 		const noHarness = detectHarnessEnvironment(INSIDE_UNIT, {});
 		check("without a harness pid the unit variables still count as inside", noHarness.inside, noHarness);
+
+		const deferredUnit = detectHarnessEnvironment(DEFERRED_UNIT, { harnessPid: HARNESS_PID, selfPid: DEFERRED_PID });
+		check(
+			"the deferred unit's own ExecStart is outside (origin deferred)",
+			!deferredUnit.inside && deferredUnit.origin === "deferred",
+			deferredUnit,
+		);
+		check(
+			"the deferred exemption names the unit and the evidence",
+			deferredUnit.evidence === "ALIVE_DEFERRED_RESTART=alive-restart-1795514972 SYSTEMD_EXEC_PID=4242" &&
+				deferredUnit.outsideReason?.includes("alive-restart-1795514972") === true,
+			deferredUnit,
+		);
+		const inheritedMarker = detectHarnessEnvironment(DEFERRED_UNIT, { harnessPid: HARNESS_PID, selfPid: 9999 });
+		check(
+			"the marker inherited by a descendant does not bypass the guard",
+			inheritedMarker.inside && inheritedMarker.origin === "runtime",
+			inheritedMarker,
+		);
 	}
 
 	// -------------------------------------------------------------------------
@@ -219,6 +252,11 @@ try {
 		check("restart --help documents --deferred", restartHelp.out.includes("--deferred"), restartHelp.out);
 		check("restart --help documents --after and --user", restartHelp.out.includes("--after") && restartHelp.out.includes("--user"), restartHelp.out);
 		check("restart --help shows the --collect systemd-run form", restartHelp.out.includes("systemd-run --on-active=5 --collect --unit=alive-restart"), restartHelp.out);
+		check(
+			"restart --help shows a raw form that keeps the caller's directory",
+			restartHelp.out.includes(`--working-directory="$PWD"`),
+			restartHelp.out,
+		);
 		check("restart --help shows the systemctl form", restartHelp.out.includes("systemctl restart alive.service"), restartHelp.out);
 
 		const stopHelp = await cli(["stop", "--help"], INSIDE_UNIT);
@@ -254,6 +292,11 @@ try {
 		check("requires an explicit --yes", refused.err.includes("alive restart --yes"), refused.err);
 		check("suggests --deferred first", refused.err.includes("alive restart --deferred"), refused.err);
 		check("suggests the raw --collect systemd-run form", refused.err.includes("systemd-run --on-active=5 --collect --unit=alive-restart-$(date +%s)"), refused.err);
+		check(
+			"the raw form works from the harness unit (keeps $PWD)",
+			refused.err.includes(`--working-directory="$PWD"`),
+			refused.err,
+		);
 		check("suggests systemctl from outside", refused.err.includes("systemctl restart alive.service"), refused.err);
 		check("prints the interruption warning line", refused.err.includes(interruptWarningLine("restart")), refused.err);
 		check("prints nothing on stdout", refused.out.trim() === "", refused.out);
@@ -301,6 +344,16 @@ try {
 			deferred: stale.deferred,
 		});
 		check("the cleanup is reported", stale.out.includes("reset stale unit alive-restart-manual.service"), stale.out);
+		check(
+			"the unit runs in the caller's directory and is marked as deferred",
+			deferred.deferred.some(
+				(line) =>
+					line.startsWith("systemd-run") &&
+					line.includes(`--working-directory=${process.cwd()}`) &&
+					line.includes("--setenv=ALIVE_DEFERRED_RESTART=alive-restart-1700000000"),
+			),
+			deferred.deferred,
+		);
 
 		const pending = await cli(["restart", "--deferred"], INSIDE_UNIT, {}, "  ● alive-restart-manual.service loaded active running");
 		check("a pending unit refuses a second request", pending.code === 1, pending);
@@ -342,6 +395,22 @@ try {
 		check("a different unit is allowed (update watchdog / systemd-run)", otherUnit.code === 0, otherUnit.err);
 		check("the different unit still stops and starts", otherUnit.calls.names.join(",") === "stop,start", otherUnit.calls.names);
 		check("the different unit is explained", otherUnit.err.includes("separate unit"), otherUnit.err);
+
+		const deferredUnit = await cli(["restart"], DEFERRED_UNIT, {}, "", DEFERRED_PID);
+		check("the deferred unit's own ExecStart may restart", deferredUnit.code === 0, [deferredUnit.code, deferredUnit.err]);
+		check("the deferred unit stops, then starts", deferredUnit.calls.names.join(",") === "stop,start", deferredUnit.calls.names);
+		check("the deferred unit is not refused", !deferredUnit.err.includes("refused"), deferredUnit.err);
+		check("the deferred unit is explained", deferredUnit.err.includes("scheduled unit alive-restart-1795514972"), deferredUnit.err);
+
+		const inheritedMarker = await cli(["restart"], DEFERRED_UNIT, {}, "", 9999);
+		check("a descendant that inherited the marker is still refused", inheritedMarker.code === 1, [inheritedMarker.code, inheritedMarker.err]);
+		check(
+			"the descendant gets the harness-guard refusal",
+			inheritedMarker.err.includes("refused: alive restart would kill this run") && inheritedMarker.err.includes("running inside the harness"),
+			inheritedMarker.err,
+		);
+		check("the descendant calls neither stop nor start", !inheritedMarker.calls.names.includes("stop") && !inheritedMarker.calls.names.includes("start"), inheritedMarker.calls.names);
+		check("the descendant stops and starts nothing", inheritedMarker.calls.names.length === 0, inheritedMarker.calls.names);
 
 		const already = await cli(["restart"], OUTSIDE, { alreadyStopped: true, stopped: true });
 		check("restart with nothing running still starts", already.code === 0 && already.calls.names.join(",") === "stop,start", already.calls.names);
