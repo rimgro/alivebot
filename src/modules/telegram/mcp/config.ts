@@ -31,8 +31,12 @@ export interface TelegramMcpConfirmationConfig {
 
 /** Runtime side of the confirmation card: enabled only when this block exists. */
 export interface TelegramMcpConfirmationRuntimeConfig {
-	/** Same directory as the proxy profile `confirmation.ticketDir`. */
+	/** Root directory shared with the proxy profile `confirmation.ticketDir`. */
 	ticketDir: string;
+	/** The only thread a confirmation card is sent to, and the only chat a press is accepted from. */
+	chatId: number;
+	/** Non-empty list of Telegram user ids allowed to press the card's buttons. */
+	operatorUserIds: number[];
 	/** How often the module scans ticketDir for new cards. Default 2000 ms. */
 	pollMs: number;
 }
@@ -211,11 +215,29 @@ export function validateTelegramMcpConfirmationRuntimeConfig(
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${path} must be an object`);
 	const raw = value as Record<string, unknown>;
 	const ticketDir = requireNonEmptyString(raw.ticketDir, `${path}.ticketDir`);
+	const chatId = raw.chatId;
+	if (!Number.isSafeInteger(chatId) || (chatId as number) === 0) {
+		throw new Error(`${path}.chatId must be a non-zero integer Telegram chat id, got "${String(raw.chatId)}"`);
+	}
+	if (!Array.isArray(raw.operatorUserIds) || raw.operatorUserIds.length === 0) {
+		throw new Error(`${path}.operatorUserIds must be a non-empty array of Telegram user ids`);
+	}
+	const operatorUserIds: number[] = [];
+	const seenOperators = new Set<number>();
+	for (const entry of raw.operatorUserIds) {
+		if (!Number.isSafeInteger(entry) || (entry as number) <= 0) {
+			throw new Error(`${path}.operatorUserIds must contain positive integer user ids, got "${String(entry)}"`);
+		}
+		const userId = entry as number;
+		if (seenOperators.has(userId)) throw new Error(`${path}.operatorUserIds must not contain duplicates (${userId})`);
+		seenOperators.add(userId);
+		operatorUserIds.push(userId);
+	}
 	const pollMs = raw.pollMs === undefined ? DEFAULT_TELEGRAM_MCP_CONFIRMATION_POLL_MS : raw.pollMs;
 	if (!Number.isSafeInteger(pollMs) || (pollMs as number) <= 0) {
 		throw new Error(`${path}.pollMs must be a positive integer, got "${String(raw.pollMs)}"`);
 	}
-	return { ticketDir, pollMs: pollMs as number };
+	return { ticketDir, chatId: chatId as number, operatorUserIds, pollMs: pollMs as number };
 }
 
 /** Profile env is a flat string map; values are never coerced or nested. */

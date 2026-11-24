@@ -2,9 +2,13 @@
  * Operator approval card for Telegram MCP writes (#264, step B2).
  *
  * The proxy writes a pending ticket file; this module-side watcher scans the
- * shared directory, sends one inline card per ticket into the target thread and
- * turns an owner press into `<ticketId>.decision.json`. The proxy is the only
- * process that sends the actual write, and only after reading that decision.
+ * shared directory, sends one inline card per ticket into the configured thread
+ * and turns an allowed operator press into `<ticketId>.decision.json`. The proxy
+ * is the only process that sends the actual write, and only after reading that
+ * decision.
+ *
+ * Tickets live in `<ticketDir>/<profile>/`; this module scans every profile
+ * subdirectory but accepts a press only from `chatId` and `operatorUserIds`.
  *
  * Nothing here is model-facing: the callback is intercepted in
  * `TelegramModule.handleUpdate` before `normalizeUpdate`, exactly like the
@@ -13,9 +17,11 @@
 import type { TelegramApi } from "./client.js";
 import type { TelegramMcpConfirmationRuntimeConfig } from "./mcp/config.js";
 import {
+	listProfileTicketDirs,
 	listTickets,
 	readTicket,
 	resolveTicketDir,
+	sweepExpiredTickets,
 	writeDecision,
 	writeTicket,
 	type TelegramMcpTicket,
@@ -46,10 +52,6 @@ export interface TelegramMcpConfirmationContext {
 	/** Host state directory; a relative ticketDir is resolved against it. */
 	stateDir: string;
 	api: Pick<TelegramApi, "sendMessage" | "editMessageText" | "answerCallbackQuery">;
-	/** Same owner/allowlist check the module applies to inbound updates. */
-	isOperator: (userId: number, chatId: number) => boolean;
-	/** Used when a ticket carries no chat (an allowChats-free profile). */
-	fallbackChatId?: string | number;
 	now?: () => number;
 	log?: { warn: (message: string, meta?: Record<string, unknown>) => void };
 }
@@ -57,7 +59,16 @@ export interface TelegramMcpConfirmationContext {
 export interface TelegramMcpConfirmationOptions extends TelegramMcpConfirmationContext {
 	ticketDir: string;
 	pollMs: number;
+	/** The only thread cards are sent to and presses are accepted from. */
+	chatId: number;
+	/** Non-empty allowlist of Telegram user ids allowed to press the buttons. */
+	operatorUserIds: number[];
 }
+
+/** A press that is not from the configured chat and operator list. */
+export const MCP_CONFIRMATION_FOREIGN_PRESS = "это не ваш запрос";
+/** A second press on an already processed ticket. */
+export const MCP_CONFIRMATION_ALREADY_HANDLED = "уже обработано";
 
 /**
  * Return a watcher only when `modules.telegram.mcpConfirmation` is configured:
@@ -72,11 +83,23 @@ export function createTelegramMcpConfirmation(
 		...context,
 		ticketDir: resolveTicketDir(context.stateDir, config.ticketDir),
 		pollMs: config.pollMs,
+		chatId: config.chatId,
+		operatorUserIds: [...config.operatorUserIds],
 	});
 }
 
 /** How much of the write text a Telegram card shows; the ticket keeps it whole. */
 export const MCP_CONFIRMATION_CARD_TEXT_MAX = 2_800;
+
+/** Final card suffix per terminal ticket status. */
+const FINAL_SUFFIX: Record<string, string> = {
+	approve: "\n\n✅ Подтверждено оператором. Запись выполняется.",
+	sent: "\n\n✅ Отправлено.",
+	denied: "\n\n⛔ Отказ. Запись не отправлена.",
+	failed: "\n\n⚠️ Ошибка. Запись не отправлена.",
+	expired: "\n\n⌛ Подтверждение истекло. Запись не отправлена.",
+	processed: "\n\nЗаявка уже обработана.",
+};
 
 export class TelegramMcpConfirmation {
 	private readonly options: TelegramMcpConfirmationOptions;
@@ -101,20 +124,34 @@ export class TelegramMcpConfirmation {
 		this.timer = undefined;
 	}
 
-	/** Send cards for new pending tickets and retire overdue ones. */
+	/** Send cards for new pending tickets, finalize terminal ones and clean up. */
 	async sweep(): Promise<void> {
 		if (this.sweeping || this.stopped) return;
 		this.sweeping = true;
 		try {
-			for (const ticket of listTickets(this.options.ticketDir)) {
-				if (ticket.status !== "pending") continue;
-				const now = this.now();
-				if (ticket.expiresAt <= now) {
-					await this.expire(ticket);
-					continue;
+			for (const dir of listProfileTicketDirs(this.options.ticketDir)) {
+				for (const ticket of listTickets(dir)) {
+					const now = this.now();
+					if (ticket.status === "pending") {
+						if (ticket.expiresAt <= now) {
+							await this.expire(dir, ticket);
+							continue;
+						}
+						if (ticket.cardChatId !== undefined && ticket.cardMessageId !== undefined) continue;
+						await this.announce(dir, ticket);
+						continue;
+					}
+					// A terminal ticket whose card still has buttons gets its final edit.
+					if (
+						FINAL_SUFFIX[ticket.status] !== undefined &&
+						ticket.cardChatId !== undefined &&
+						ticket.cardMessageId !== undefined &&
+						ticket.cardClosedAt === undefined
+					) {
+						await this.finishCard(dir, ticket, ticket.status);
+					}
 				}
-				if (ticket.cardChatId !== undefined && ticket.cardMessageId !== undefined) continue;
-				await this.announce(ticket);
+				sweepExpiredTickets(dir, this.now());
 			}
 		} finally {
 			this.sweeping = false;
@@ -128,72 +165,82 @@ export class TelegramMcpConfirmation {
 	async handleCallback(query: TelegramCallbackQuery): Promise<boolean> {
 		const parsed = parseMcpConfirmationCallbackData(query.data);
 		if (!parsed) return false;
+		try {
+			await this.handleParsedCallback(query, parsed);
+		} catch (error) {
+			this.options.log?.warn("telegram mcp confirmation callback failed", {
+				error: error instanceof Error ? error.message : String(error),
+			});
+			// The operator must always get an answer, including on an internal error.
+			await this.answer(query, "Не удалось обработать подтверждение", true);
+		}
+		return true;
+	}
+
+	private async handleParsedCallback(query: TelegramCallbackQuery, parsed: McpConfirmationCallback): Promise<void> {
 		const chatId = query.message?.chat.id;
 		const userId = query.from.id;
-		if (chatId === undefined) {
-			await this.answer(query, "Не удалось определить чат карточки", true);
-			return true;
+		// Authorization is explicit and independent of the module allowlist: only
+		// the configured thread and the configured operator ids may decide.
+		if (chatId !== this.options.chatId || !this.options.operatorUserIds.includes(userId)) {
+			await this.answer(query, MCP_CONFIRMATION_FOREIGN_PRESS, true);
+			return;
 		}
-		const ticket = readTicket(this.options.ticketDir, parsed.ticketId);
-		if (!ticket) {
+		const found = this.findTicket(parsed.ticketId);
+		if (!found) {
 			await this.answer(query, "Заявка не найдена", true);
-			return true;
+			return;
 		}
-		// The card is sent into the target thread; a callback from anywhere else
-		// is not an operator confirmation for this ticket.
-		if (ticket.cardChatId !== undefined && chatId !== ticket.cardChatId) {
-			await this.answer(query, "Карточка принадлежит другому чату", true);
-			return true;
-		}
-		// Same rule as every inbound update: the presser must be an allowed human
-		// in an allowed chat. A group member who is not the owner cannot approve.
-		if (!this.options.isOperator(userId, chatId)) {
-			await this.answer(query, "Подтвердить запись может только владелец в разрешённом чате", true);
-			return true;
-		}
+		const { dir, ticket } = found;
 		if (ticket.status !== "pending") {
-			await this.answer(query, ticket.status === "expired" ? "Подтверждение истекло" : "Заявка уже обработана", true);
-			await this.finishCard(ticket, ticket.status === "expired" ? "expired" : "processed");
-			return true;
+			await this.answer(query, MCP_CONFIRMATION_ALREADY_HANDLED);
+			if (FINAL_SUFFIX[ticket.status] !== undefined && ticket.cardClosedAt === undefined) {
+				await this.finishCard(dir, ticket, ticket.status);
+			}
+			return;
 		}
 		const now = this.now();
 		if (ticket.expiresAt <= now) {
-			await this.expire(ticket);
+			await this.expire(dir, ticket);
 			await this.answer(query, "Подтверждение истекло", true);
-			return true;
+			return;
 		}
-		writeDecision(this.options.ticketDir, {
+		writeDecision(dir, {
 			version: 1,
 			ticketId: ticket.ticketId,
 			nonce: ticket.nonce,
+			requestHash: ticket.requestHash,
 			decision: parsed.decision,
 			decidedAt: now,
 			userId,
 		});
-		markTicketDecided(this.options.ticketDir, ticket.ticketId, userId, now);
+		if (parsed.decision === "approve") {
+			markTicketDecided(dir, ticket.ticketId, userId, now);
+		} else {
+			markTicketDenied(dir, ticket.ticketId, userId, now);
+		}
 		await this.answer(query, parsed.decision === "approve" ? "Подтверждено, запись выполняется" : "Запись отклонена");
-		await this.finishCard(ticket, parsed.decision);
-		return true;
+		// "approve" is not final: the proxy will mark sent/failed and the sweep
+		// edits the card then. Deny/expiry are final immediately.
+		await this.finishCard(dir, ticket, parsed.decision === "approve" ? "approve" : "denied");
 	}
 
 	private now(): number {
 		return (this.options.now ?? (() => Date.now()))();
 	}
 
-	/** The card goes into the thread the write targets; fallback is the owner DM. */
-	private cardChat(ticket: TelegramMcpTicket): string | number | undefined {
-		return ticket.chat ?? this.options.fallbackChatId;
+	private findTicket(ticketId: string): { dir: string; ticket: TelegramMcpTicket } | undefined {
+		for (const dir of listProfileTicketDirs(this.options.ticketDir)) {
+			const ticket = readTicket(dir, ticketId);
+			if (ticket) return { dir, ticket };
+		}
+		return undefined;
 	}
 
-	private async announce(ticket: TelegramMcpTicket): Promise<void> {
-		const chat = this.cardChat(ticket);
-		if (chat === undefined) {
-			this.options.log?.warn("telegram mcp confirmation: no chat for the card", { ticketId: ticket.ticketId, profile: ticket.profile });
-			return;
-		}
+	private async announce(dir: string, ticket: TelegramMcpTicket): Promise<void> {
 		try {
 			const sent = await this.options.api.sendMessage({
-				chat_id: chat,
+				chat_id: this.options.chatId,
 				text: this.cardText(ticket),
 				reply_markup: {
 					inline_keyboard: [
@@ -205,9 +252,9 @@ export class TelegramMcpConfirmation {
 				},
 			});
 			// Only bookkeeping fields: never overwrite a status the proxy just set.
-			const current = readTicket(this.options.ticketDir, ticket.ticketId);
+			const current = readTicket(dir, ticket.ticketId);
 			if (current && current.status === "pending") {
-				writeTicket(this.options.ticketDir, {
+				writeTicket(dir, {
 					...current,
 					cardChatId: sent.chat.id,
 					cardMessageId: sent.message_id,
@@ -215,10 +262,13 @@ export class TelegramMcpConfirmation {
 				});
 			}
 		} catch (error) {
-			this.options.log?.warn("telegram mcp confirmation card failed", {
-				ticketId: ticket.ticketId,
-				error: error instanceof Error ? error.message : String(error),
-			});
+			const reason = `confirmation card could not be sent: ${error instanceof Error ? error.message : String(error)}`;
+			this.options.log?.warn("telegram mcp confirmation card failed", { ticketId: ticket.ticketId, error: reason });
+			// No card means no way to approve: deny now instead of waiting for the TTL.
+			const current = readTicket(dir, ticket.ticketId);
+			if (current && current.status === "pending") {
+				writeTicket(dir, { ...current, status: "denied", error: reason });
+			}
 		}
 	}
 
@@ -233,31 +283,26 @@ export class TelegramMcpConfirmation {
 			`Профиль: ${ticket.profile}\n` +
 			`Чат: ${ticket.chat ?? "не указан"}\n` +
 			`Действие: ${ticket.tool}\n` +
-			`Действует до: ${expires}\n\n` +
+			`Действует до: ${expires}\n` +
+			`Хэш запроса: ${ticket.requestHash}\n\n` +
 			`Текст записи:\n${text}\n\n` +
 			`Без подтверждения ничего не отправляется.`
 		);
 	}
 
-	private async expire(ticket: TelegramMcpTicket): Promise<void> {
-		const current = readTicket(this.options.ticketDir, ticket.ticketId);
+	private async expire(dir: string, ticket: TelegramMcpTicket): Promise<void> {
+		const current = readTicket(dir, ticket.ticketId);
 		if (!current || current.status !== "pending") return;
-		writeTicket(this.options.ticketDir, { ...current, status: "expired" });
-		await this.finishCard(current, "expired");
+		writeTicket(dir, { ...current, status: "expired" });
+		await this.finishCard(dir, { ...current, status: "expired" }, "expired");
 	}
 
-	/** Update the card in place; a short reply is the fallback when editing fails. */
-	private async finishCard(ticket: TelegramMcpTicket, outcome: "approve" | "deny" | "expired" | "processed"): Promise<void> {
+	/** Update the card in place without buttons; a short reply is the last resort. */
+	private async finishCard(dir: string, ticket: TelegramMcpTicket, outcome: string): Promise<void> {
 		if (ticket.cardChatId === undefined || ticket.cardMessageId === undefined) return;
-		const suffix =
-			outcome === "approve"
-				? "\n\n✅ Подтверждено оператором. Запись выполняется."
-				: outcome === "deny"
-					? "\n\n⛔ Отклонено оператором. Запись не отправлена."
-					: outcome === "expired"
-						? "\n\n⌛ Подтверждение истекло. Запись не отправлена."
-						: "\n\nЗаявка уже обработана.";
+		const suffix = FINAL_SUFFIX[outcome] ?? FINAL_SUFFIX.processed;
 		const text = `${this.cardText(ticket)}${suffix}`;
+		let edited = false;
 		try {
 			await this.options.api.editMessageText({
 				chat_id: ticket.cardChatId,
@@ -265,12 +310,21 @@ export class TelegramMcpConfirmation {
 				text,
 				reply_markup: { inline_keyboard: [] },
 			});
+			edited = true;
 		} catch {
 			try {
 				await this.options.api.sendMessage({ chat_id: ticket.cardChatId, text: `Заявка ${ticket.ticketId}: ${suffix.trim()}` });
+				edited = true;
 			} catch {
 				// the callback answer already told the operator; never fail the press on cosmetics
 			}
+		}
+		// "approve" is only a transient marker: the proxy will produce sent/failed
+		// and the card must be editable one more time.
+		if (!edited || outcome === "approve") return;
+		const current = readTicket(dir, ticket.ticketId);
+		if (current && current.cardClosedAt === undefined) {
+			writeTicket(dir, { ...current, cardClosedAt: this.now() });
 		}
 	}
 
@@ -287,4 +341,16 @@ function markTicketDecided(ticketDir: string, ticketId: string, userId: number, 
 	const ticket = readTicket(ticketDir, ticketId);
 	if (!ticket || ticket.status !== "pending") return;
 	writeTicket(ticketDir, { ...ticket, status: "decided", decidedAt: at, decidedBy: userId });
+}
+
+function markTicketDenied(ticketDir: string, ticketId: string, userId: number, at: number): void {
+	const ticket = readTicket(ticketDir, ticketId);
+	if (!ticket || ticket.status !== "pending") return;
+	writeTicket(ticketDir, {
+		...ticket,
+		status: "denied",
+		decidedAt: at,
+		decidedBy: userId,
+		error: "write denied by operator",
+	});
 }

@@ -109,6 +109,73 @@ systemctl --user list-units 'alive-agent@*'
 journalctl --user -u alive.service -n 100 --no-pager
 ```
 
+## Telegram MCP proxy
+
+`write:ask` profiles of the Telegram MCP proxy (`modules.telegram.mcp`) do not
+send a write directly. The proxy writes a ticket file, the Telegram module of the
+same profile shows an inline confirmation card, and the proxy performs the write
+only after the operator presses **Отправить** (or refuses with **Отказ**).
+
+The two processes share one directory: the proxy option
+`profiles[].confirmation.ticketDir` and the runtime option
+`modules.telegram.mcpConfirmation.ticketDir` must name the **same** directory
+(a relative path is resolved against `paths.stateDir`). Tickets and decisions
+live in `ticketDir/<profile>/`; do not point two profiles at the same subdirectory.
+
+Confirmation card configuration (`modules.telegram.mcpConfirmation`):
+
+```json
+{
+  "mcpConfirmation": {
+    "ticketDir": "telegram-mcp-tickets",
+    "chatId": 123456789,
+    "operatorUserIds": [123456789],
+    "pollMs": 2000
+  }
+}
+```
+
+- `chatId` — the only thread cards are sent to and the only chat a press is
+  accepted from. A press from another chat or from a user id outside
+  `operatorUserIds` is answered with «это не ваш запрос»; no decision is written.
+- `operatorUserIds` — a non-empty list of numeric Telegram user ids allowed to
+  approve or refuse a write.
+- `ticketDir` — shared ticket root (see above).
+- `pollMs` — scan interval, default 2000 ms.
+
+Proxy side, per profile:
+
+```json
+{
+  "name": "ops",
+  "mode": "write:ask",
+  "confirmation": { "ticketDir": "telegram-mcp-tickets", "ttlMs": 300000 }
+}
+```
+
+Behaviour worth knowing before enabling it:
+
+- **The profile module must be running.** If `modules.telegram.enabled` is off,
+  the bot has no token or `mcpConfirmation` is absent, nobody sends the card:
+  tickets stay pending until `ttlMs` and then the proxy denies the write. No
+  automatic retry happens.
+- **Step C / pi client timeout.** In the profile's `mcp.json` set
+  `"timeout": 300` for this MCP server. pi's default is 30 s, which is shorter
+  than a realistic operator answer. If the MCP client times out or aborts the
+  HTTP request, the proxy closes the ticket as `denied`, a later decision is not
+  accepted, and the message is **not** sent.
+- **At most one send.** Before calling the upstream the proxy atomically marks
+  the ticket `sending`. A proxy restarted while a ticket is `sending` turns it
+  into `failed` and returns an error to the caller instead of sending again.
+- **Backlog and cleanup.** At most 8 pending tickets per profile; a ninth ask is
+  denied with a `confirmation backlog` reason and no ticket is written. Tickets
+  and their decisions past their TTL are removed on proxy start and on every
+  module scan.
+- **Card failures.** If `sendMessage` for the card fails, the ticket is denied
+  immediately with the reason instead of waiting for the TTL. Every press gets an
+  `answerCallbackQuery`; the card is edited to its final state (sent, denied,
+  expired, failed) without inline buttons, and a repeated press is a no-op.
+
 ## Out of scope
 
 **System-scope units** are out of scope here and are not installed by this

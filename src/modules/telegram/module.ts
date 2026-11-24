@@ -322,8 +322,6 @@ export class TelegramModule implements AliveModule {
 		this.mcpConfirmation = createTelegramMcpConfirmation(this.config.mcpConfirmation, {
 			stateDir: ctx.paths.stateDir,
 			api: this.api,
-			isOperator: (userId, chatId) => this.isMcpOperator(userId, chatId),
-			fallbackChatId: this.config.allowedUserIds[0],
 			log: ctx.log,
 		});
 		this.mcpConfirmation?.start();

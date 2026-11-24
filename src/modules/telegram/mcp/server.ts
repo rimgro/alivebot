@@ -30,14 +30,21 @@ import {
 } from "./policy.js";
 import { TelegramMcpTokenStore } from "./tokens.js";
 import {
+	MAX_PENDING_TICKETS_PER_PROFILE,
+	countPendingTickets,
+	failInterruptedSendingTickets,
 	findPendingTicket,
 	newTelegramMcpTicketId,
 	newTelegramMcpTicketNonce,
 	parseTicketDecision,
 	patchTicket,
+	prepareProfileTicketDir,
+	profileTicketDir,
 	readDecision,
 	readTicket,
 	resolveTicketDir,
+	sweepExpiredTickets,
+	telegramMcpRequestHash,
 	telegramMcpTicketRequestKey,
 	writeTicket,
 	type TelegramMcpTicket,
@@ -89,6 +96,8 @@ interface ToolCallOutcome {
 	ticket?: TelegramMcpTicket;
 }
 
+type TicketCreation = { ticket: TelegramMcpTicket } | { result: Record<string, unknown> };
+
 /** What an allowed but unconfirmed write answers: structured, no upstream call. */
 export interface TelegramMcpAskResult {
 	decision: "ask";
@@ -137,6 +146,19 @@ export class TelegramMcpServer {
 	start(): Promise<number> {
 		if (this.server) throw new Error("Telegram MCP proxy is already started");
 		this.stopping = false;
+		// Restart hygiene: drop tickets past their TTL and never retry a write
+		// interrupted in `sending` (at-most-once across a proxy restart).
+		const now = this.limits.now();
+		for (const profile of this.profiles.values()) {
+			if (!profile.confirmation) continue;
+			try {
+				prepareProfileTicketDir(resolveTicketDir(this.options.stateDir, profile.confirmation.ticketDir), profile.name, now);
+			} catch (error) {
+				this.options.log?.(
+					`telegram-mcp: cannot prepare ticket directory for "${profile.name}": ${error instanceof Error ? error.message : String(error)}`,
+				);
+			}
+		}
 		const server = http.createServer((req, res) => {
 			void this.handle(req, res);
 		});
@@ -260,8 +282,22 @@ export class TelegramMcpServer {
 			if (message.method === "tools/call") {
 				const decision = await this.decideToolCall(profile, message);
 				if (decision.ticket) {
-					const response = await this.confirmAndForward(profile, connection, message, decision.ticket);
-					writeJson(res, 200, response);
+					const ticket = decision.ticket;
+					let clientClosed = false;
+					const onClientGone = () => {
+						if (clientClosed || res.writableEnded) return;
+						clientClosed = true;
+						this.closeTicketForClient(ticketDirOf(this.options.stateDir, profile), ticket.ticketId);
+					};
+					res.on("close", onClientGone);
+					req.on("aborted", onClientGone);
+					try {
+						const response = await this.confirmAndForward(profile, connection, message, ticket, () => clientClosed);
+						writeJson(res, 200, response);
+					} finally {
+						res.off("close", onClientGone);
+						req.off("aborted", onClientGone);
+					}
 					return;
 				}
 				if (decision.result) {
@@ -346,7 +382,9 @@ export class TelegramMcpServer {
 		if (decision.decision === "allow") return {};
 		if (decision.decision === "ask") {
 			if (profile.confirmation) {
-				return { ticket: this.createOrReuseTicket(profile, tool, decision.chat, text ?? "", now) };
+				const created = this.createOrReuseTicket(profile, args, tool, decision.chat, text ?? "", now);
+				if ("result" in created) return created;
+				return { ticket: created.ticket };
 			}
 			const ask: TelegramMcpAskResult = {
 				decision: "ask",
@@ -363,24 +401,42 @@ export class TelegramMcpServer {
 		};
 	}
 
-	private ticketDirFor(profile: TelegramMcpProfileConfig): string {
+	private ticketRootFor(profile: TelegramMcpProfileConfig): string {
 		const configured = profile.confirmation?.ticketDir;
 		if (!configured) throw new Error(`profile "${profile.name}" has no confirmation directory`);
 		return resolveTicketDir(this.options.stateDir, configured);
 	}
 
-	/** One pending ticket per exact (profile, tool, chat, text): a retry never spams. */
+	private ticketDirFor(profile: TelegramMcpProfileConfig): string {
+		return profileTicketDir(this.ticketRootFor(profile), profile.name);
+	}
+
+	/**
+	 * One pending ticket per exact (profile, tool, canonical arguments): a retry
+	 * never spams. The per-profile backlog is capped; beyond it nothing is written.
+	 */
 	private createOrReuseTicket(
 		profile: TelegramMcpProfileConfig,
+		args: Record<string, unknown>,
 		tool: string,
 		chat: string | undefined,
 		text: string,
 		now: number,
-	): TelegramMcpTicket {
-		const ticketDir = this.ticketDirFor(profile);
-		const requestKey = telegramMcpTicketRequestKey(profile.name, tool, chat ?? "", text);
+	): TicketCreation {
+		// First access after a restart also does the start-of-proxy hygiene.
+		const ticketDir = prepareProfileTicketDir(this.ticketRootFor(profile), profile.name, now);
+		const requestHash = telegramMcpRequestHash(args);
+		const requestKey = telegramMcpTicketRequestKey(profile.name, tool, requestHash);
 		const existing = findPendingTicket(ticketDir, requestKey, now);
-		if (existing) return existing;
+		if (existing) return { ticket: existing };
+		const pending = countPendingTickets(ticketDir, now);
+		if (pending >= MAX_PENDING_TICKETS_PER_PROFILE) {
+			const reason = `confirmation backlog: ${pending} pending tickets for profile "${profile.name}" (max ${MAX_PENDING_TICKETS_PER_PROFILE}); nothing was written`;
+			this.auditTerminal(profile, { ticketId: "", profile: profile.name, tool, chat, text } as TelegramMcpTicket, "deny", reason);
+			return {
+				result: toolResult(`denied: ${reason}`, { decision: "deny", reason, tool, profile: profile.name }, true),
+			};
+		}
 		const ttlMs = profile.confirmation?.ttlMs;
 		if (ttlMs === undefined) throw new Error(`profile "${profile.name}" has no confirmation TTL`);
 		const ticket: TelegramMcpTicket = {
@@ -394,10 +450,11 @@ export class TelegramMcpServer {
 			expiresAt: now + ttlMs,
 			nonce: newTelegramMcpTicketNonce(),
 			status: "pending",
+			requestHash,
 			requestKey,
 		};
 		writeTicket(ticketDir, ticket);
-		return ticket;
+		return { ticket };
 	}
 
 	/**
@@ -410,10 +467,11 @@ export class TelegramMcpServer {
 		connection: string,
 		message: { id: JsonRpcId; method: string; params?: unknown; jsonrpc: "2.0" },
 		ticket: TelegramMcpTicket,
+		isClientClosed: () => boolean,
 	): Promise<JsonRpcMessage> {
 		let execution = this.confirmations.get(ticket.ticketId);
 		if (!execution) {
-			execution = this.executeConfirmedWrite(profile, connection, message, ticket);
+			execution = this.executeConfirmedWrite(profile, connection, message, ticket, isClientClosed);
 			this.confirmations.set(ticket.ticketId, execution);
 			void execution
 				.catch(() => undefined)
@@ -436,9 +494,10 @@ export class TelegramMcpServer {
 		connection: string,
 		message: { id: JsonRpcId; method: string; params?: unknown; jsonrpc: "2.0" },
 		ticket: TelegramMcpTicket,
+		isClientClosed: () => boolean,
 	): Promise<ConfirmedWriteOutcome> {
 		const ticketDir = this.ticketDirFor(profile);
-		const verdict = await this.waitForDecision(ticketDir, ticket);
+		const verdict = await this.waitForDecision(ticketDir, ticket, isClientClosed);
 		if (verdict.kind === "expired") {
 			this.finishTicket(ticketDir, ticket.ticketId, "expired", verdict.reason);
 			this.auditTerminal(profile, ticket, "deny", verdict.reason);
@@ -455,6 +514,23 @@ export class TelegramMcpServer {
 			return { kind: "result", result: confirmationError("write denied by operator: nothing was sent", ticket) };
 		}
 
+		// Approved: the ticket hash, the operator's decision hash (already checked by
+		// parseTicketDecision) and the request about to be sent must all agree.
+		const params = isRecord(message.params) ? message.params : {};
+		const requestHash = telegramMcpRequestHash(params.arguments);
+		if (requestHash !== ticket.requestHash) {
+			const reason = "confirmation request hash does not match the request about to be sent";
+			this.finishTicket(ticketDir, ticket.ticketId, "denied", reason);
+			this.auditTerminal(profile, ticket, "deny", reason);
+			return { kind: "result", result: confirmationError(reason, ticket) };
+		}
+		if (isClientClosed()) {
+			const reason = "client closed the request before the decision";
+			this.finishTicket(ticketDir, ticket.ticketId, "denied", reason);
+			this.auditTerminal(profile, ticket, "deny", reason);
+			return { kind: "result", result: confirmationError(reason, ticket) };
+		}
+
 		// Approved: enforce the hourly limit and count this write once. write:ask has
 		// no persistent window of its own, so open a short one before the atomic
 		// reserve (the same check-and-count step write:auto uses).
@@ -466,6 +542,17 @@ export class TelegramMcpServer {
 			this.finishTicket(ticketDir, ticket.ticketId, "failed", reason);
 			this.auditTerminal(profile, ticket, "deny", reason);
 			return { kind: "result", result: toolResult(`denied: ${reason}`, { decision: "deny", reason, ticketId: ticket.ticketId, tool: ticket.tool, profile: profile.name }, true) };
+		}
+		// At-most-once: persist `sending` atomically before the upstream call. A
+		// restart that finds it will fail the ticket instead of retrying.
+		const sending = patchTicket(ticketDir, ticket.ticketId, { status: "sending" }, { onlyStatus: ["pending", "decided"] });
+		if (!sending || sending.status !== "sending") {
+			const reason = isClientClosed()
+				? "client closed the request before the decision"
+				: "confirmation was closed before sending";
+			this.finishTicket(ticketDir, ticket.ticketId, "denied", reason);
+			this.auditTerminal(profile, ticket, "deny", reason);
+			return { kind: "result", result: confirmationError(reason, ticket) };
 		}
 		try {
 			const response = await this.forward(profile, connection, message);
@@ -486,19 +573,23 @@ export class TelegramMcpServer {
 	private async waitForDecision(
 		ticketDir: string,
 		ticket: TelegramMcpTicket,
+		isClientClosed: () => boolean,
 	): Promise<{ kind: "approve" | "deny" } | { kind: "rejected"; reason: string } | { kind: "expired"; reason: string }> {
 		const pollMs = this.options.confirmationPollMs ?? 100;
 		for (;;) {
+			// A ticket closed by the client, a restart or the module wins over a
+			// decision file: once it is not pending a press is not accepted.
+			const current = readTicket(ticketDir, ticket.ticketId);
+			if (isClientClosed()) return { kind: "rejected", reason: "client closed the request before the decision" };
+			if (current?.status === "expired") return { kind: "expired", reason: "confirmation expired: nothing was sent" };
+			if (current && (current.status === "failed" || current.status === "denied")) {
+				return { kind: "rejected", reason: `confirmation ${current.status}${current.error ? `: ${current.error}` : ""}` };
+			}
 			const read = readDecision(ticketDir, ticket.ticketId);
 			if (read.found) {
 				const parsed = parseTicketDecision(read.raw, ticket);
 				if (!parsed.ok) return { kind: "rejected", reason: `confirmation decision rejected: ${parsed.reason}` };
 				return { kind: parsed.decision.decision };
-			}
-			const current = readTicket(ticketDir, ticket.ticketId);
-			if (current?.status === "expired") return { kind: "expired", reason: "confirmation expired: nothing was sent" };
-			if (current && (current.status === "failed" || current.status === "denied")) {
-				return { kind: "rejected", reason: `confirmation ${current.status}${current.error ? `: ${current.error}` : ""}` };
 			}
 			if (this.limits.now() >= ticket.expiresAt) {
 				return { kind: "expired", reason: "confirmation expired: nothing was sent" };
@@ -508,8 +599,27 @@ export class TelegramMcpServer {
 		}
 	}
 
+	/** Client disconnect before the answer: the ticket is denied, never sent. */
+	private closeTicketForClient(ticketDir: string, ticketId: string): void {
+		try {
+			const current = readTicket(ticketDir, ticketId);
+			if (!current || (current.status !== "pending" && current.status !== "decided")) return;
+			writeTicket(ticketDir, {
+				...current,
+				status: "denied",
+				error: "client closed the request before the decision",
+			});
+		} catch {
+			// an unwritable ticket must not crash the HTTP handler
+		}
+	}
+
 	private finishTicket(ticketDir: string, ticketId: string, status: "sent" | "failed" | "denied" | "expired", error?: string): void {
 		try {
+			// Never downgrade a terminal status set by the client-close path or the
+			// module: `denied`/`expired`/`failed` are final for the proxy.
+			const current = readTicket(ticketDir, ticketId);
+			if (!current || current.status === "sent" || current.status === "failed" || current.status === "denied" || current.status === "expired") return;
 			patchTicket(ticketDir, ticketId, {
 				status,
 				...(status === "sent" ? { sentAt: this.limits.now() } : {}),
@@ -642,6 +752,12 @@ export class TelegramMcpServer {
 		this.connections.get(pending.connection)?.pending.delete(key);
 		pending.resolve({ ...message, id: pending.clientId } as JsonRpcMessage);
 	}
+}
+
+function ticketDirOf(stateDir: string, profile: TelegramMcpProfileConfig): string {
+	const configured = profile.confirmation?.ticketDir;
+	if (!configured) throw new Error(`profile "${profile.name}" has no confirmation directory`);
+	return profileTicketDir(resolveTicketDir(stateDir, configured), profile.name);
 }
 
 function toolResult(
