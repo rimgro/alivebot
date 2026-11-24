@@ -28,10 +28,11 @@ export interface TelegramMcpProfileConfig {
 	/**
 	 * Extra environment variables for the upstream child (#264 guards).
 	 *
-	 * This is the only way to add a variable beyond the deliberately small
-	 * allowlist in `child.ts` (PATH, HOME, USER, SHELL, LANG/LC_*, TZ, TERM,
-	 * TMPDIR/TEMP/TMP, XDG_*, TELEGRAM_*, HTTP(S)_PROXY/NO_PROXY). Values are
-	 * plain strings: no nesting and no interpolation.
+	 * This is the only way to add a variable beyond the fixed exact-name
+	 * allowlist in `child.ts` (see `UPSTREAM_ENV_ALLOWLIST`: process, locale,
+	 * XDG, temp, `TELEGRAM_API_HASH` and proxy variables). There are no prefix
+	 * or wildcard rules. Values are plain strings: no nesting and no
+	 * interpolation.
 	 */
 	env?: Record<string, string>;
 }

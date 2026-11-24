@@ -18,25 +18,45 @@ const HEALTHY_AFTER_MS = 30_000;
 export const UPSTREAM_READY_TIMEOUT_MS = 10_000;
 
 /**
- * Parent variables the upstream may see. Everything else (ALIVE_*, GitHub App
- * credentials, unrelated API keys) stays out of the child unless the profile
- * lists it explicitly in `env`, which is merged on top of this allowlist.
+ * Fixed, exact names the upstream may inherit. There are deliberately no
+ * prefix/wildcard rules: a new variable is either listed here with a reason, or
+ * the profile must add it explicitly in `env`.
  */
-const CHILD_ENV_EXACT = new Set([
-	// Process basics: the binary lookup and normal CLI behaviour.
+export const UPSTREAM_ENV_ALLOWLIST = [
+	// Process basics: PATH locates the `telegram` binary, HOME the session and
+	// config files, USER/LOGNAME/SHELL the normal CLI identity.
 	"PATH",
 	"HOME",
 	"USER",
 	"LOGNAME",
 	"SHELL",
+	// Terminal/locale/timezone: better-tg-cli prints and parses dates and text.
+	"TERM",
 	"LANG",
 	"LANGUAGE",
+	"LC_ALL",
+	"LC_CTYPE",
+	"LC_MESSAGES",
+	"LC_NUMERIC",
+	"LC_TIME",
+	"LC_COLLATE",
+	"LC_MONETARY",
 	"TZ",
-	"TERM",
-	// Temp directories used by the Telegram client for downloads/uploads.
+	// Temp directories used for downloaded/uploaded media.
 	"TMPDIR",
 	"TEMP",
 	"TMP",
+	// Standard XDG base directories: a CLI may keep config/cache/state there.
+	"XDG_CONFIG_HOME",
+	"XDG_CONFIG_DIRS",
+	"XDG_DATA_HOME",
+	"XDG_DATA_DIRS",
+	"XDG_CACHE_HOME",
+	"XDG_STATE_HOME",
+	"XDG_RUNTIME_DIR",
+	// The only Telegram variable this repository documents by name: the MTProto
+	// `api_hash` default is `modules.telegram.user.apiHashEnv = TELEGRAM_API_HASH`.
+	"TELEGRAM_API_HASH",
 	// Outbound proxies: better-tg-cli may need them in a restricted network.
 	"HTTP_PROXY",
 	"HTTPS_PROXY",
@@ -46,9 +66,9 @@ const CHILD_ENV_EXACT = new Set([
 	"https_proxy",
 	"no_proxy",
 	"all_proxy",
-]);
-/** Prefixes that are part of the Telegram session configuration. */
-const CHILD_ENV_PREFIXES = ["LC_", "XDG_", "TELEGRAM_"];
+] as const;
+
+const CHILD_ENV_ALLOWED = new Set<string>(UPSTREAM_ENV_ALLOWLIST);
 
 /**
  * Build the upstream environment from the allowlist plus the profile's own
@@ -62,9 +82,7 @@ export function buildUpstreamEnv(
 	const env: NodeJS.ProcessEnv = {};
 	for (const [key, value] of Object.entries(source)) {
 		if (value === undefined) continue;
-		if (CHILD_ENV_EXACT.has(key) || CHILD_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) {
-			env[key] = value;
-		}
+		if (CHILD_ENV_ALLOWED.has(key)) env[key] = value;
 	}
 	return { ...env, ...profileEnv };
 }
