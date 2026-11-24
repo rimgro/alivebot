@@ -12,6 +12,9 @@
  *
  *   npm run test:deferred-restart
  */
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { main } from "../cli.js";
 import {
 	DEFAULT_DEFERRED_AFTER_SEC,
@@ -43,6 +46,8 @@ const NOW = new Date(1_700_000_000_000);
 const EPOCH = "1700000000";
 const EXEC = "/usr/bin/node";
 const SCRIPT = "/opt/alive/dist/index.js";
+/** Caller directory the unit must inherit (`--working-directory`). */
+const CWD = "/opt/alive/project";
 
 interface FakeCall {
 	command: string;
@@ -96,7 +101,7 @@ function lines(calls: FakeCall[]): string[] {
 
 async function runWith(fake: Fake, overrides: Partial<DeferredRestartOptions> = {}) {
 	return await runDeferredRestart(
-		{ afterSec: 5, scope: "system", execPath: EXEC, scriptPath: SCRIPT, execArgv: [], restartArgs: [], ...overrides },
+		{ afterSec: 5, scope: "system", cwd: CWD, execPath: EXEC, scriptPath: SCRIPT, execArgv: [], restartArgs: [], ...overrides },
 		{ run: fake.run, now: () => NOW },
 	);
 }
@@ -229,10 +234,74 @@ async function mainTests(): Promise<void> {
 		check(
 			"the unit is transient, --collect and uniquely named",
 			lines(fake.calls)[1] ===
-				`systemd-run --on-active=5 --collect --unit=alive-restart-${EPOCH} ${EXEC} ${SCRIPT} restart`,
+				`systemd-run --on-active=5 --collect --working-directory=${CWD} --unit=alive-restart-${EPOCH} --setenv=ALIVE_DEFERRED_RESTART=alive-restart-${EPOCH} ${EXEC} ${SCRIPT} restart`,
 			lines(fake.calls)[1],
 		);
 		check("nothing was reset and nothing warned", result.reset.length === 0 && result.warnings.length === 0, result);
+	}
+
+	section("the unit runs in the caller's directory and carries the deferred marker");
+	{
+		const fake = fakeService();
+		await runWith(fake, { cwd: "/srv/other-profile" });
+		const start = fake.calls.find((call) => call.command === "systemd-run");
+		const args = start?.args ?? [];
+		check("a custom cwd reaches --working-directory", args.includes("--working-directory=/srv/other-profile"), args);
+		check(
+			"--working-directory comes right after --collect, before --unit",
+			args.indexOf("--working-directory=/srv/other-profile") === args.indexOf("--collect") + 1 &&
+				args.indexOf("--working-directory=/srv/other-profile") < args.indexOf(`--unit=alive-restart-${EPOCH}`),
+			args,
+		);
+		check(
+			"the unit is tagged with ALIVE_DEFERRED_RESTART=<its own unit>",
+			args.includes(`--setenv=ALIVE_DEFERRED_RESTART=alive-restart-${EPOCH}`),
+			args,
+		);
+	}
+	{
+		const fake = fakeService();
+		await runWith(fake, { cwd: undefined });
+		const start = fake.calls.find((call) => call.command === "systemd-run");
+		check(
+			"without an explicit cwd the unit inherits process.cwd()",
+			start?.args.includes(`--working-directory=${process.cwd()}`) === true,
+			start?.args,
+		);
+	}
+
+	section("a real directory outside $HOME reaches the planner and the CLI");
+	{
+		const requested = path.join(os.tmpdir(), `alive-deferred-smoke-${process.pid}`);
+		fs.mkdirSync(requested, { recursive: true });
+		const smokeCwd = fs.realpathSync(requested);
+		const previous = process.cwd();
+		try {
+			const fake = fakeService();
+			const result = await runWith(fake, { cwd: smokeCwd });
+			check("planning from a real directory still schedules the restart", result.outcome === "started", result);
+			const start = fake.calls.find((call) => call.command === "systemd-run");
+			check(
+				"runDeferredRestart passes the real cwd to systemd-run",
+				start?.args.includes(`--working-directory=${smokeCwd}`) === true,
+				start?.args,
+			);
+
+			process.chdir(smokeCwd);
+			const cliFake = fakeService();
+			const cliResult = await cli(["restart", "--deferred"], cliFake);
+			check("the CLI exits 0 when run from the real directory", cliResult.code === 0, [cliResult.code, cliResult.err]);
+			const cliStart = cliFake.calls.find((call) => call.command === "systemd-run");
+			check(
+				"the CLI's systemd-run uses that same real directory",
+				cliStart?.args.includes(`--working-directory=${smokeCwd}`) === true,
+				cliStart?.args,
+			);
+		} finally {
+			process.chdir(previous);
+			fs.rmSync(smokeCwd, { recursive: true, force: true });
+			check("the smoke directory is cleaned up", !fs.existsSync(smokeCwd), smokeCwd);
+		}
 	}
 
 	section("a pending unit blocks a second request");
@@ -257,7 +326,7 @@ async function mainTests(): Promise<void> {
 				[
 					"systemctl list-units --all --no-legend --plain --type=service alive-restart*",
 					"systemctl reset-failed alive-restart-manual.service",
-					`systemd-run --on-active=5 --collect --unit=alive-restart-${EPOCH} ${EXEC} ${SCRIPT} restart`,
+					`systemd-run --on-active=5 --collect --working-directory=${CWD} --unit=alive-restart-${EPOCH} --setenv=ALIVE_DEFERRED_RESTART=alive-restart-${EPOCH} ${EXEC} ${SCRIPT} restart`,
 				].join(" | "),
 			lines(fake.calls),
 		);
@@ -289,7 +358,7 @@ async function mainTests(): Promise<void> {
 		check("the reset uses --user", lines(fake.calls)[1] === "systemctl --user reset-failed alive-restart-old.service", lines(fake.calls)[1]);
 		check(
 			"systemd-run uses --user",
-			lines(fake.calls)[2] === `systemd-run --user --on-active=5 --collect --unit=alive-restart-${EPOCH} ${EXEC} ${SCRIPT} restart`,
+			lines(fake.calls)[2] === `systemd-run --user --on-active=5 --collect --working-directory=${CWD} --unit=alive-restart-${EPOCH} --setenv=ALIVE_DEFERRED_RESTART=alive-restart-${EPOCH} ${EXEC} ${SCRIPT} restart`,
 			lines(fake.calls)[2],
 		);
 	}
@@ -352,6 +421,16 @@ async function mainTests(): Promise<void> {
 		check("the interruption is stated plainly", result.out.includes("the current run will be interrupted in 120s"), result.out);
 		check("the journal command uses --user", result.out.includes(`journalctl --user -u alive-restart-${EPOCH}`), result.out);
 		check("the stale unit cleanup is printed", result.out.includes("reset stale unit alive-restart-manual.service"), result.out);
+		check(
+			"the unit runs in the CLI's cwd and carries the deferred marker",
+			result.calls.some(
+				(call) =>
+					call.command === "systemd-run" &&
+					call.args.includes(`--working-directory=${process.cwd()}`) &&
+					call.args.includes(`--setenv=ALIVE_DEFERRED_RESTART=alive-restart-${EPOCH}`),
+			),
+			lines(result.calls),
+		);
 		check(
 			"the unit command keeps the config and --force, drops --deferred/--after/--user",
 			result.calls.some(

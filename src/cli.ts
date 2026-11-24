@@ -106,6 +106,8 @@ export interface ServiceControl {
 export interface CliOptions {
 	/** Environment the harness guard inspects; defaults to `process.env`. */
 	env?: NodeJS.ProcessEnv;
+	/** Pid of this process for the harness guard; defaults to `process.pid`. */
+	selfPid?: number;
 	/** Service start/stop seam; defaults to the real background runtime control. */
 	service?: ServiceControl;
 	/** Deferred-restart (systemctl/systemd-run) seam; defaults to the real service manager. */
@@ -192,8 +194,8 @@ const SERVICE_USAGE: Record<"stop" | "restart" | "status", string> = {
 		"--collect so systemd does not keep it around.\n" +
 		"\n" +
 		"Raw equivalent (unique unit, --collect):\n" +
-		"  systemd-run --on-active=5 --collect --unit=alive-restart-$(date +%s) /path/to/alive restart\n" +
-		"  systemd-run --user --on-active=5 --collect --unit=alive-restart-$(date +%s) …\n" +
+		"  systemd-run --on-active=5 --collect --unit=alive-restart-$(date +%s) --working-directory=\"$PWD\" /path/to/alive restart\n" +
+		"  systemd-run --user --on-active=5 --collect --unit=alive-restart-$(date +%s) --working-directory=\"$PWD\" /path/to/alive restart\n" +
 		"  sudo systemctl restart alive.service            # from a shell outside the service\n",
 	status:
 		"usage: alive status [--json] [--config CONFIG]\n" +
@@ -722,12 +724,12 @@ async function stopWithConfig(
 async function restartCommand(cwd: string, flags: Record<string, string | boolean>, options: CliOptions = {}): Promise<number> {
 	// `--deferred` schedules a systemd unit and touches nothing in this process,
 	// so it is the one restart form allowed from inside the harness.
-	if (flags.deferred !== undefined) return await deferredRestartCommand(flags, options);
+	if (flags.deferred !== undefined) return await deferredRestartCommand(cwd, flags, options);
 
 	const config = loadForCli(flags);
 	const env = options.env ?? process.env;
 	const harnessPid = snapshotRuntime(config.paths.stateDir)?.pid;
-	const detection = detectHarnessEnvironment(env, { harnessPid });
+	const detection = detectHarnessEnvironment(env, { harnessPid, selfPid: options.selfPid });
 
 	if (detection.inside) {
 		if (!flagBool(flags, "yes") && !flagBool(flags, "y")) {
@@ -776,6 +778,7 @@ function forwardedRestartArgs(flags: Record<string, string | boolean>): string[]
  * formats the result.
  */
 async function deferredRestartCommand(
+	cwd: string,
 	flags: Record<string, string | boolean>,
 	options: CliOptions,
 ): Promise<number> {
@@ -789,7 +792,7 @@ async function deferredRestartCommand(
 	const scope: DeferredScope = flagBool(flags, "user") ? "user" : "system";
 	const deps = options.deferred ?? { run: createExecRunner(), now: () => new Date() };
 	const result = await runDeferredRestart(
-		{ afterSec: after.seconds, scope, restartArgs: forwardedRestartArgs(flags) },
+		{ cwd, afterSec: after.seconds, scope, restartArgs: forwardedRestartArgs(flags) },
 		deps,
 	);
 	const systemctl = scope === "user" ? "systemctl --user" : "systemctl";

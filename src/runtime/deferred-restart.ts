@@ -20,6 +20,18 @@
  *   - the flow is planning plus an injected command runner, so tests never
  *     touch a real service manager.
  *
+ * The unit must also look like the restart it was asked for:
+ *   - `--working-directory=<cwd>` pins the unit to the directory the operator
+ *     ran `alive restart --deferred` from. Without it the unit starts in
+ *     `$HOME`, `loadForCli` reads another (or an empty) profile there, and the
+ *     restart would target the wrong instance — or refuse, because the harness
+ *     pid from that profile's `runtime.json` is not found;
+ *   - `--setenv=ALIVE_DEFERRED_RESTART=<unit>` marks the unit explicitly.
+ *     systemd-run passes the caller's environment to the transient unit, so it
+ *     inherits `ALIVE_RUNTIME=1` from the harness and the guard would refuse to
+ *     restart from inside the unit. The marker lets the guard recognise the
+ *     unit's own ExecStart (see `harness-guard.ts`).
+ *
  * Scope: the default is the system manager, the same scope the printed advice
  * has always used. `--user` switches both `systemctl` and `systemd-run` to the
  * user manager for setups where the harness runs as a user service.
@@ -27,6 +39,7 @@
 import * as path from "node:path";
 import { oneLine } from "../util.js";
 import type { CommandRunner } from "../update.js";
+import { DEFERRED_RESTART_ENV_MARKER } from "./harness-guard.js";
 
 /** Transient units this feature owns; the glob systemd matches them by. */
 export const DEFERRED_UNIT_PREFIX = "alive-restart-";
@@ -155,6 +168,8 @@ export interface DeferredRestartRequest {
 	scriptPath: string;
 	/** Loader args the entry script needs, e.g. `--import tsx` (process.execArgv). */
 	execArgv?: string[];
+	/** Directory the unit runs in (`--working-directory`), the caller's cwd. */
+	cwd: string;
 	/** Flags forwarded to the unit's own `alive restart`. */
 	restartArgs?: string[];
 }
@@ -194,7 +209,9 @@ export function planDeferredRestart(request: DeferredRestartRequest, units: read
 				...scopeArgs(request.scope),
 				`--on-active=${request.afterSec}`,
 				"--collect",
+				`--working-directory=${request.cwd}`,
 				`--unit=${unitNameFor(request.now)}`,
+				`--setenv=${DEFERRED_RESTART_ENV_MARKER}=${unitNameFor(request.now)}`,
 				request.execPath,
 				...(request.execArgv ?? []),
 				request.scriptPath,
@@ -209,6 +226,8 @@ export interface DeferredRestartOptions {
 	afterSec: number;
 	scope: DeferredScope;
 	restartArgs?: string[];
+	/** Defaults to `process.cwd()`. */
+	cwd?: string;
 	/** Defaults: `process.execPath`, `process.argv[1]`, `process.execArgv`. */
 	execPath?: string;
 	scriptPath?: string;
@@ -299,6 +318,7 @@ export async function runDeferredRestart(
 			execPath: options.execPath ?? process.execPath,
 			scriptPath,
 			execArgv: options.execArgv ?? process.execArgv,
+			cwd: options.cwd ?? process.cwd(),
 			restartArgs: options.restartArgs ?? [],
 		},
 		parseUnitList(listing),

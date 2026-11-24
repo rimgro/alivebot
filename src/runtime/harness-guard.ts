@@ -15,6 +15,14 @@
  * `SYSTEMD_EXEC_PID` is the pid systemd started for that unit, and when it is
  * not the pid recorded in `runtime.json` the command belongs to a different
  * unit and is allowed.
+ *
+ * The transient unit started by `alive restart --deferred` is one of those
+ * other units, not "inside the harness": it inherits `ALIVE_RUNTIME=1` from the
+ * process that scheduled it, but it is the ExecStart systemd started to perform
+ * the restart. It marks itself with `ALIVE_DEFERRED_RESTART=<unit>`, and that
+ * marker is honoured only when `SYSTEMD_EXEC_PID` is this very process — a
+ * descendant (the new harness, runs) inherits the marker but not a matching
+ * pid, so the guard keeps working there.
  */
 import { term } from "../term.js";
 
@@ -27,7 +35,14 @@ export const LEGACY_HARNESS_ENV_MARKERS = ["ALIVE_DAEMON"] as const;
 /** Variables systemd sets for every service and passes on to its children. */
 export const SYSTEMD_ENV_VARIABLES = ["INVOCATION_ID", "SYSTEMD_EXEC_PID", "JOURNAL_STREAM"] as const;
 
-export type HarnessOrigin = "runtime" | "systemd";
+/**
+ * Marker `alive restart --deferred` puts on its transient unit
+ * (`--setenv=ALIVE_DEFERRED_RESTART=<unit>`), so the unit's own `alive restart`
+ * is recognised as the restart it was asked to perform.
+ */
+export const DEFERRED_RESTART_ENV_MARKER = "ALIVE_DEFERRED_RESTART";
+
+export type HarnessOrigin = "runtime" | "systemd" | "deferred";
 
 export interface HarnessDetection {
 	/** The command runs inside the harness, so restarting it would kill this run. */
@@ -43,6 +58,8 @@ export interface HarnessDetection {
 export interface HarnessDetectionOptions {
 	/** Pid of the running harness from `runtime.json`, when it is known. */
 	harnessPid?: number;
+	/** Pid of the process being inspected; defaults to `process.pid`. */
+	selfPid?: number;
 }
 
 /**
@@ -53,6 +70,21 @@ export function detectHarnessEnvironment(
 	env: NodeJS.ProcessEnv = process.env,
 	options: HarnessDetectionOptions = {},
 ): HarnessDetection {
+	const execPid = Number(env.SYSTEMD_EXEC_PID);
+	const selfPid = options.selfPid ?? process.pid;
+	const deferredUnit = env[DEFERRED_RESTART_ENV_MARKER];
+	// The deferred unit is ExecStart itself: it inherited ALIVE_RUNTIME from the
+	// process that scheduled it, so the marker may only exempt the process whose
+	// own pid is the one systemd started for that unit.
+	if ((deferredUnit ?? "") !== "" && Number.isInteger(execPid) && execPid > 0 && execPid === selfPid) {
+		return {
+			inside: false,
+			origin: "deferred",
+			evidence: `${DEFERRED_RESTART_ENV_MARKER}=${deferredUnit} SYSTEMD_EXEC_PID=${execPid}`,
+			outsideReason: `this process is the ExecStart of the scheduled unit ${deferredUnit} — it performs the restart that was asked for`,
+		};
+	}
+
 	for (const variable of [HARNESS_ENV_MARKER, ...LEGACY_HARNESS_ENV_MARKERS]) {
 		const value = env[variable];
 		if (value === "1" || value === "true") {
@@ -64,7 +96,6 @@ export function detectHarnessEnvironment(
 	if (present.length === 0) return { inside: false };
 	const evidence = present.map((variable) => `${variable}=${env[variable]}`).join(" ");
 
-	const execPid = Number(env.SYSTEMD_EXEC_PID);
 	if (options.harnessPid !== undefined && Number.isInteger(execPid) && execPid > 0 && execPid !== options.harnessPid) {
 		return {
 			inside: false,
@@ -103,7 +134,7 @@ export function restartRefusalText(detection: HarnessDetection): string {
 		"  alive restart --deferred --user       # when the harness runs as a systemd user service\n" +
 		"The current run is interrupted when that unit fires. Raw equivalent (unique unit,\n" +
 		"--collect so systemd does not keep it around):\n" +
-		"  systemd-run --on-active=5 --collect --unit=alive-restart-$(date +%s) /path/to/alive restart\n" +
+		"  systemd-run --on-active=5 --collect --unit=alive-restart-$(date +%s) --working-directory=\"$PWD\" /path/to/alive restart\n" +
 		"  sudo systemctl restart alive.service   # from a shell outside the service\n" +
 		`Re-run as ${term.bold("alive restart --yes")} to interrupt this run right now (it is lost regardless).\n` +
 		"(/path/to/alive is the CLI binary, e.g. /opt/alive/dist/index.js)\n"
