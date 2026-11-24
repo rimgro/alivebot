@@ -27,7 +27,12 @@ Every guard is logged, and a refused guard is a successful no-op (exit 0):
    progress) or `"starting"`. A fresh heartbeat with an unreadable
    `runtime.json` is treated as busy, because idleness cannot be proven. A stale
    heartbeat means the runtime is down, so updating is safe;
-5. origin has a stable `vX.Y.Z` tag newer than the current one.
+5. origin has a stable `vX.Y.Z` tag that is newer than the current build (the
+   tag HEAD is on, otherwise the `package.json` version) and that HEAD does not
+   already contain. When `master` is ahead of the last stable tag the command
+   logs `master ahead of the last stable tag` and exits 0: nothing is checked
+   out, installed, rebuilt or restarted. Pointing the build at an older tag is a
+   manual action only: `alive update --tag vX.Y.Z`.
 
 Exit codes:
 
@@ -119,6 +124,15 @@ Rules:
   older than 232 (no `SYSTEMD_EXEC_PID`) the guard cannot prove that and refuses;
   then either add `--yes` to the restart command (`"alive restart --yes"`) or use
   `"systemctl restart alive.service"` here.
+- From inside the harness, schedule the restart instead of forcing it:
+  `alive restart --deferred` (5s; `--after N` and `--user` change the delay and the
+  systemd manager). It starts `systemd-run --on-active=N --collect
+  --unit=alive-restart-<epoch>`: every request gets its own unit name, so requests
+  cannot collide, and `--collect` stops systemd from keeping the unit around. An
+  active `alive-restart*` unit means a restart is already on its way and refuses a
+  second request; finished or failed ones are cleared with
+  `systemctl reset-failed` first. `alive update` and `alive update --auto` never
+  restart anything themselves — either the watchdog does, or this command does.
 - The command must not require interactivity and must not print secrets; its
   output is appended to the log.
 - `alive restart` from the same checkout is usually right: it stops the old
