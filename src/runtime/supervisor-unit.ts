@@ -10,13 +10,18 @@
  * itself (`systemctl restart <unit>`) takes the environment from the unit file
  * and performs exactly one restart.
  *
- * The supervisor is found from `/proc/self/cgroup`: the deepest `.service`
- * component is the unit systemd started this process under. That alone is not
- * proof — the process may live under a login session's `tmux.service` rather
- * than under the Alive unit — so the candidate is confirmed with
- * `systemctl show -p MainPID`: only a unit whose MainPID is the harness pid from
- * `runtime.json` is the supervisor. Anything else falls back to the direct
- * strategy.
+ * The supervisor is found from the harness pid's cgroup: the deepest
+ * `.service` component in `/proc/<harnessPid>/cgroup` is the unit systemd
+ * started the harness under (#258). Looking at `/proc/self/cgroup` is wrong in
+ * practice — the CLI usually runs from the agent/sandbox process, whose cgroup
+ * is a sandbox scope, not the harness unit — so the caller's own cgroup is only
+ * a fallback when the harness cgroup is unreadable or empty, and that fallback
+ * is reported as a warning. The candidate alone is not proof — the harness may
+ * live under a login session's `tmux.service` rather than under the Alive unit
+ * — so it is confirmed with `systemctl show -p MainPID`: only a unit whose
+ * MainPID is the harness pid from `runtime.json` is the supervisor. Anything
+ * else falls back to the direct strategy with a warning that names the pid whose
+ * cgroup was inspected.
  *
  * Everything here is pure or injected (`run`, `readCgroup`, `harnessPid`), so
  * tests never need a real service manager.
@@ -38,14 +43,20 @@ export interface SupervisorDetection {
 	strategy: SupervisorStrategy;
 	/** Set only when `strategy === "supervisor"`. */
 	supervisor?: SupervisorUnit;
-	/** Why the detection fell back to `direct`; one line, never fatal. */
-	warning?: string;
+	/**
+	 * Why the detection fell back to `direct`, or which assumptions it had to
+	 * make. One line per doubt, never fatal.
+	 */
+	warnings: string[];
 }
 
 export interface DetectSupervisorOptions {
 	run: CommandRunner;
-	/** Test seam; defaults to reading `/proc/<process.pid>/cgroup`. */
-	readCgroup?: () => string | undefined;
+	/**
+	 * Test seam; defaults to reading `/proc/<pid>/cgroup`. It takes the pid so
+	 * a test can return different cgroups for the harness and for this process.
+	 */
+	readCgroup?: (pid: number) => string | undefined;
 	/** Pid of the running harness from `runtime.json`. */
 	harnessPid?: number;
 	timeoutMs?: number;
@@ -128,16 +139,40 @@ export function parseMainPid(stdout: string): number | undefined {
  * deferred restart still happens, just through its old, self-contained path.
  */
 export async function detectSupervisorUnit(options: DetectSupervisorOptions): Promise<SupervisorDetection> {
-	const cgroupText = (options.readCgroup ?? (() => readSelfCgroup()))() ?? "";
-	const candidate = parseCgroupUnit(cgroupText);
-	if (!candidate) return { strategy: "direct" };
-
+	const warnings: string[] = [];
 	const harnessPid = options.harnessPid;
-	if (harnessPid === undefined || !Number.isInteger(harnessPid) || harnessPid <= 0) {
-		return {
-			strategy: "direct",
-			warning: `the process runs under ${candidate.unit}, but the harness pid is unknown (no runtime.json); scheduling a direct restart`,
-		};
+	const validHarnessPid = harnessPid !== undefined && Number.isInteger(harnessPid) && harnessPid > 0;
+	const readCgroup = options.readCgroup ?? ((pid: number) => readSelfCgroup(pid));
+
+	// The CLI usually runs from the agent/sandbox process, whose cgroup is the
+	// sandbox scope — not the unit that runs the harness. Ask about the harness
+	// pid from runtime.json first; `/proc/self/cgroup` is only a fallback, and a
+	// fallback answer is worth a warning of its own.
+	let inspectedPid = validHarnessPid ? harnessPid! : process.pid;
+	let cgroupText = readCgroup(inspectedPid) ?? "";
+	if (validHarnessPid && cgroupText.trim() === "") {
+		warnings.push(
+			`could not read the harness cgroup /proc/${harnessPid}/cgroup (missing, unreadable or empty); falling back to this process's cgroup /proc/${process.pid}/cgroup, which may not be the harness unit`,
+		);
+		inspectedPid = process.pid;
+		cgroupText = readCgroup(inspectedPid) ?? "";
+	}
+
+	const candidate = parseCgroupUnit(cgroupText);
+	if (!candidate) {
+		if (validHarnessPid && inspectedPid === harnessPid) {
+			warnings.push(
+				`the harness pid ${harnessPid} is not inside a systemd .service unit (checked /proc/${harnessPid}/cgroup); scheduling a direct restart`,
+			);
+		}
+		return { strategy: "direct", warnings };
+	}
+
+	if (!validHarnessPid) {
+		warnings.push(
+			`the process runs under ${candidate.unit} (checked /proc/${inspectedPid}/cgroup), but the harness pid is unknown (no runtime.json); scheduling a direct restart`,
+		);
+		return { strategy: "direct", warnings };
 	}
 
 	const args = [...scopeArgs(candidate.scope), "show", "-p", "MainPID", candidate.unit];
@@ -145,26 +180,26 @@ export async function detectSupervisorUnit(options: DetectSupervisorOptions): Pr
 	try {
 		stdout = (await options.run("systemctl", args, { timeoutMs: options.timeoutMs ?? COMMAND_TIMEOUT_MS })).stdout;
 	} catch (error) {
-		return {
-			strategy: "direct",
-			warning: `could not verify that ${candidate.unit} supervises the harness (systemctl ${args.join(" ")}: ${oneLine(errorMessage(error))}); scheduling a direct restart`,
-		};
+		warnings.push(
+			`could not verify that ${candidate.unit} supervises the harness (systemctl ${args.join(" ")}: ${oneLine(errorMessage(error))}; checked /proc/${inspectedPid}/cgroup); scheduling a direct restart`,
+		);
+		return { strategy: "direct", warnings };
 	}
 
 	const mainPid = parseMainPid(stdout);
 	if (mainPid === undefined) {
-		return {
-			strategy: "direct",
-			warning: `could not verify that ${candidate.unit} supervises the harness (systemctl ${args.join(" ")} did not report MainPID); scheduling a direct restart`,
-		};
+		warnings.push(
+			`could not verify that ${candidate.unit} supervises the harness (systemctl ${args.join(" ")} did not report MainPID; checked /proc/${inspectedPid}/cgroup); scheduling a direct restart`,
+		);
+		return { strategy: "direct", warnings };
 	}
 	if (mainPid !== harnessPid) {
-		return {
-			strategy: "direct",
-			warning: `${candidate.unit} is not the harness supervisor (MainPID ${mainPid}, harness pid ${harnessPid}); scheduling a direct restart`,
-		};
+		warnings.push(
+			`${candidate.unit} is not the harness supervisor (MainPID ${mainPid}, harness pid ${harnessPid}; checked /proc/${inspectedPid}/cgroup); scheduling a direct restart`,
+		);
+		return { strategy: "direct", warnings };
 	}
-	return { strategy: "supervisor", supervisor: candidate };
+	return { strategy: "supervisor", supervisor: candidate, warnings };
 }
 
 function errorMessage(error: unknown): string {

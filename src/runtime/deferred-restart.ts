@@ -41,7 +41,10 @@
  *     the caller's directory. `systemd-run` drops the caller's environment, so
  *     it is snapshotted into a 0600 file passed as `EnvironmentFile=`, and the
  *     absolute `--config` is always forwarded (the unit's cwd alone does not
- *     identify the root profile's `.env`).
+ *     identify the root profile's `.env`). `KillMode=process` lets the detached
+ *     `run --foreground` child outlive the one-shot unit instead of holding it
+ *     in `deactivating/stop-sigterm`; a snapshot sweep at harness start is the
+ *     guaranteed cleanup when ExecStopPost is delayed.
  *
  * Scope: the default is the system manager, the same scope the printed advice
  * has always used. `--user` switches both `systemctl` and `systemd-run` to the
@@ -69,6 +72,74 @@ export const DEFERRED_UNIT_PATTERN = "alive-restart*";
 /** Default and maximum delay, in seconds. */
 export const DEFAULT_DEFERRED_AFTER_SEC = 5;
 export const MAX_DEFERRED_AFTER_SEC = 3600;
+
+/**
+ * Age after which a direct-mode environment snapshot is considered orphaned.
+ *
+ * It must be strictly larger than MAX_DEFERRED_AFTER_SEC, or a restart that is
+ * legitimately waiting out its delay would lose the snapshot it is about to
+ * read. Two hours leaves an order of magnitude of headroom over the one-hour
+ * maximum delay and still bounds how long a leaked secret sits on disk.
+ */
+export const SNAPSHOT_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+
+export interface SweepOrphanSnapshotsOptions {
+	/** Profile state directory that holds `alive-restart-<epoch>.env` files. */
+	stateDir: string;
+	/** Clock for the age comparison; defaults to `Date.now()`. */
+	now?: Date | number;
+	/** Defaults to SNAPSHOT_MAX_AGE_MS (2 hours). */
+	maxAgeMs?: number;
+	/** Optional single-line reporter, called only when something was removed. */
+	log?: (line: string) => void;
+}
+
+/**
+ * Remove environment snapshots left behind by the direct strategy.
+ *
+ * ExecStopPost is the intended cleanup, but it is not a guarantee: on 24.11 a
+ * direct unit sat in `deactivating/stop-sigterm` with its 0600 snapshot still
+ * on disk for ~50 seconds, because the detached child kept the cgroup alive.
+ * The guaranteed cleanup is a sweep at harness start, so secrets do not depend
+ * on a transient unit ever reaching its stop phase.
+ *
+ * Only regular files matching `alive-restart-*.env` are considered; everything
+ * else in the directory belongs to the profile and is untouched. All errors
+ * (unreadable directory, vanished or unreadable file) are swallowed: a sweep
+ * is best effort and must never block a boot.
+ */
+export function sweepOrphanSnapshots(options: SweepOrphanSnapshotsOptions): string[] {
+	const removed: string[] = [];
+	const maxAgeMs = options.maxAgeMs ?? SNAPSHOT_MAX_AGE_MS;
+	const nowMs =
+		options.now === undefined ? Date.now() : options.now instanceof Date ? options.now.getTime() : options.now;
+
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(options.stateDir, { withFileTypes: true });
+	} catch {
+		return removed;
+	}
+
+	for (const entry of entries) {
+		if (!entry.isFile()) continue;
+		const name = entry.name;
+		if (!name.startsWith(DEFERRED_UNIT_PREFIX) || !name.endsWith(".env")) continue;
+		const file = path.join(options.stateDir, name);
+		try {
+			const stat = fs.statSync(file);
+			if (nowMs - stat.mtimeMs <= maxAgeMs) continue;
+			fs.rmSync(file, { force: true });
+			removed.push(file);
+		} catch {
+			// The file vanished or cannot be read/removed: next boot tries again.
+		}
+	}
+	if (removed.length > 0) {
+		options.log?.(`removed ${removed.length} orphan environment snapshot(s): ${removed.join(", ")}`);
+	}
+	return removed;
+}
 
 /**
  * systemctl/systemd-run answer immediately; a wedged service manager must never
@@ -365,6 +436,15 @@ export function planDeferredRestart(request: DeferredRestartRequest, units: read
 			`--working-directory=${request.cwd}`,
 			`--unit=${unit}`,
 		];
+		// KillMode=process (#258, live incident 24.11): the default
+		// `control-group` mode SIGTERMs every process still in the unit's cgroup
+		// and waits for them. `alive restart` leaves a detached
+		// `run --foreground`, so the one-shot unit hung in
+		// `deactivating/stop-sigterm` for ~50s and ExecStopPost (snapshot
+		// removal) only ran after a manual `systemctl stop`. With `process` only
+		// the unit's main process is signalled: the detached child survives its
+		// own transient unit and the cleanup runs immediately.
+		args.push("--property=KillMode=process");
 		if (request.envFile) {
 			// systemd splits values on whitespace, reads `%` as a specifier and
 			// expands `$VAR` in Exec lines: quote/escape the snapshot path.
@@ -415,8 +495,11 @@ export interface DeferredRestartOptions {
 	stateDir?: string;
 	/** Environment to snapshot in direct mode; defaults to `process.env`. */
 	env?: NodeJS.ProcessEnv;
-	/** Test seam replacing `/proc/<pid>/cgroup`. */
-	cgroupText?: string;
+	/**
+	 * Test seam replacing `/proc/<pid>/cgroup`. A plain string answers for every
+	 * pid; a function lets a test distinguish the harness pid from this process.
+	 */
+	cgroupText?: string | ((pid: number) => string | undefined);
 	/** Override the directory of the direct-mode environment snapshot. */
 	envFileDir?: string;
 }
@@ -424,8 +507,11 @@ export interface DeferredRestartOptions {
 export interface DeferredRestartDeps {
 	run: CommandRunner;
 	now?: () => Date;
-	/** Test seam for supervisor detection through the CLI. */
-	cgroupText?: string;
+	/**
+	 * Test seam for supervisor detection through the CLI. A plain string answers
+	 * for every pid; a function can answer differently for the harness pid.
+	 */
+	cgroupText?: string | ((pid: number) => string | undefined);
 }
 
 export type DeferredRestartOutcome = "started" | "blocked" | "failed";
@@ -498,14 +584,20 @@ export async function runDeferredRestart(
 
 	// 0. Detection: a confirmed supervisor unit decides the whole strategy.
 	//    It runs before any restart command; a fallback only adds a warning.
+	const cgroupText = options.cgroupText;
 	const detection = await detectSupervisorUnit({
 		run: deps.run,
-		readCgroup: options.cgroupText === undefined ? undefined : () => options.cgroupText,
+		readCgroup:
+			cgroupText === undefined
+				? undefined
+				: typeof cgroupText === "function"
+					? cgroupText
+					: () => cgroupText,
 		harnessPid: options.harnessPid,
 	});
 	result.strategy = detection.strategy;
 	if (detection.supervisor) result.supervisor = detection.supervisor;
-	if (detection.warning) result.warnings.push(detection.warning);
+	result.warnings.push(...detection.warnings);
 
 	const restartArgs = options.restartArgs ?? [];
 	if (detection.strategy === "supervisor" && detection.supervisor) {
