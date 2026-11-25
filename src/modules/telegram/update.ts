@@ -55,6 +55,15 @@ export interface NormalizeOptions {
 	 * the bot (mention, text_mention or a reply to one of its messages).
 	 */
 	editExpectsReply?: boolean;
+	/**
+	 * Is this text an exact label of a live reply keyboard in this chat/thread?
+	 *
+	 * Telegram sends a reply-keyboard press as an ordinary text message with no
+	 * mention, so `requireMentionInGroups` would drop it before the module can
+	 * turn it back into a choice event (#279). The callback is consulted only by
+	 * that group mention filter and never for any other rule.
+	 */
+	isReplyKeyboardPress?: (input: { chatId: string; thread: string; text: string | undefined }) => boolean;
 }
 
 /**
@@ -99,7 +108,13 @@ export function normalizeUpdate(update: TelegramUpdate, options: NormalizeOption
 	const expectsReplyToMessage = expectsReply(message, isChannel, options);
 	// Group filtering keeps the "was this message addressed to us" rule even for
 	// edits: an edit is ingested only when the original update would have been.
-	if (options.requireMentionInGroups && (chat.type === "group" || chat.type === "supergroup") && !expectsReplyToMessage) return undefined;
+	// A reply-keyboard press is the one exception: it is addressed to the bot by
+	// construction (the keyboard is ours), but Telegram sends it as plain text.
+	const isGroup = chat.type === "group" || chat.type === "supergroup";
+	if (options.requireMentionInGroups && isGroup && !expectsReplyToMessage) {
+		const keyboardPress = options.isReplyKeyboardPress?.({ chatId, thread, text: message.text });
+		if (!keyboardPress) return undefined;
+	}
 	const addressedToBot = isAddressedToBot(message, options);
 	// Edits are corrections, not new requests: by default they do not oblige the
 	// agent to answer unless the new version explicitly addresses the bot again.

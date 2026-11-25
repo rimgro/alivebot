@@ -441,8 +441,11 @@ export class ChoiceStore {
 	 * unanswered reply set. Only an exact label of that set matches; once it is
 	 * answered the keyboard is gone, so a repeat press is an ordinary message
 	 * even if an older set in the same chat happens to carry the same label.
+	 *
+	 * `thread` narrows the lookup to one forum topic: keyboards are per message,
+	 * so a press in another topic is not a press on this set (#279).
 	 */
-	findReplySet(chatId: string, text: string): ChoiceSet | undefined {
+	findReplySet(chatId: string, text: string, thread?: string): ChoiceSet | undefined {
 		const wanted = String(chatId);
 		const active = this.readEntries()
 			.flatMap((entry) => (entry.set ? [entry.set] : []))
@@ -450,6 +453,7 @@ export class ChoiceStore {
 				(set) =>
 					set.source === "reply_keyboard" &&
 					set.chatId === wanted &&
+					(thread === undefined || set.thread === thread) &&
 					this.now() - set.createdAt <= TELEGRAM_CHOICE_SET_TTL_MS,
 			)
 			.sort((a, b) => b.createdAt - a.createdAt)[0];

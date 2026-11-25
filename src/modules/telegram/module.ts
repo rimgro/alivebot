@@ -1030,7 +1030,7 @@ export class TelegramModule implements AliveModule {
 		const api = this.api;
 		const ctx = this.ctx;
 		if (!store || !api || !ctx || rawText === undefined) return false;
-		const set = store.findReplySet(inbound.chatId, rawText);
+		const set = store.findReplySet(inbound.chatId, rawText, inbound.thread);
 		const option = set?.options.find((entry) => entry.label === rawText);
 		if (!set || !option) return false;
 		const press: ChoicePress = {
@@ -1122,6 +1122,21 @@ export class TelegramModule implements AliveModule {
 			requireMentionInGroups: this.config.requireMentionInGroups,
 			ingestEdits: this.config.ingestEdits,
 			editExpectsReply: this.config.editExpectsReply,
+			// #279: a reply-keyboard press arrives as plain text without a mention,
+			// so the group mention filter must let an exact label of a live keyboard
+			// through to `applyReplyKeyboardChoice` below.
+			isReplyKeyboardPress: ({ chatId, thread, text }) => {
+				if (text === undefined) return false;
+				const found = this.choiceStore?.findReplySet(chatId, text, thread);
+				if (!found) return false;
+				return (
+					found.source === "reply_keyboard" &&
+					found.chosen === null &&
+					found.chatId === chatId &&
+					found.thread === thread &&
+					found.options.some((option) => option.label === text)
+				);
+			},
 		});
 		if (!inbound) return;
 		if (update.callback_query) {

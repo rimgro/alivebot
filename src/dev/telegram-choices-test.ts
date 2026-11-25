@@ -47,7 +47,7 @@ import {
 	type ChoiceSet,
 } from "../modules/telegram/choices.js";
 import { TELEGRAM_CALLBACK_DATA_MAX_BYTES } from "../modules/telegram/buttons.js";
-import { normalizeChoicePress } from "../modules/telegram/update.js";
+import { normalizeChoicePress, normalizeUpdate } from "../modules/telegram/update.js";
 import { splitMessage } from "../modules/telegram/text.js";
 import { htmlToPlainText } from "../modules/telegram/markdown.js";
 import type { TelegramChat, TelegramUpdate } from "../modules/telegram/types.js";
@@ -340,6 +340,29 @@ section("choice store: disk shape, modes, TTL and limit");
 		"only the newest reply keyboard in the chat is active",
 		store.findReplySet("42", "New")?.setId === newReply.setId && store.findReplySet("42", "Old") === undefined,
 	);
+
+	// #279: a reply keyboard belongs to one thread, and expiry is decided by the
+	// store clock, not by the caller.
+	const threadRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-choices-thread-"));
+	let clock = Date.now();
+	const threadStore = new ChoiceStore(threadRoot, () => clock);
+	const topicReply = threadStore.create({
+		chatId: "42",
+		thread: "telegram:42/7",
+		text: "Topic menu",
+		options: [option("yes", "Yes")],
+		source: "reply_keyboard",
+	});
+	check(
+		"a reply set matches only in its own thread",
+		threadStore.findReplySet("42", "Yes", "telegram:42/7")?.setId === topicReply.setId &&
+			threadStore.findReplySet("42", "Yes", "telegram:42") === undefined &&
+			threadStore.findReplySet("42", "Yes", "telegram:42/8") === undefined,
+	);
+	check("omitting the thread keeps the chat-wide lookup", threadStore.findReplySet("42", "Yes")?.setId === topicReply.setId);
+	check("a near-miss label stays unmatched in a thread", threadStore.findReplySet("42", "Yess", "telegram:42/7") === undefined);
+	clock += TELEGRAM_CHOICE_SET_TTL_MS + 1;
+	check("an expired reply set is not found in its thread", threadStore.findReplySet("42", "Yes", "telegram:42/7") === undefined);
 
 	const limitRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-choices-limit-"));
 	const limitStore = new ChoiceStore(limitRoot);
@@ -923,6 +946,335 @@ section("module: inline choices, presses and stale sets");
 			"after a restart a repeat press does not edit or emit an event",
 			edits().length === 0 && choiceEvents().length === eventsBeforeRestart && storedSet(repeatSetId).chosen?.id === "yes",
 			{ edits: edits().length, events: choiceEvents().length },
+		);
+	} finally {
+		await host?.stop().catch(() => undefined);
+		globalThis.fetch = realFetch;
+	}
+}
+
+// ---------------------------------------------------------------------------
+section("module: reply keyboard presses in groups with requireMentionInGroups (#279)");
+{
+	const moduleRoot = fs.mkdtempSync(path.join(os.tmpdir(), "alive-telegram-group-choices-test-"));
+	fs.writeFileSync(path.join(moduleRoot, "SOUL.md"), "group choices test soul\n");
+	fs.writeFileSync(path.join(moduleRoot, "CONTRACT.md"), "group choices test contract\n");
+	const logFile = path.join(moduleRoot, "test-log.jsonl");
+	const log = new Logger({ console: false, level: "warn", file: logFile, scope: "telegram-group-choices-test" });
+	const store = EventStore.open(moduleRoot);
+	const history = HistoryStore.open(moduleRoot);
+	const outbox = new Outbox(moduleRoot);
+	const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+	let nextMessageId = 700;
+
+	const jsonResponse = (body: unknown, status = 200): Response =>
+		new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+	const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+		const url = String(input);
+		const method = url.slice(url.lastIndexOf("/") + 1);
+		const params = init?.body && !(init.body instanceof FormData) ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+		calls.push({ method, params });
+		if (method === "getMe") return jsonResponse({ ok: true, result: { id: 999, is_bot: true, first_name: "Alive", username: "alive_bot" } });
+		if (method === "deleteWebhook") return jsonResponse({ ok: true, result: true });
+		if (method === "getUpdates") {
+			return new Promise<Response>((resolve) => {
+				const timer = setTimeout(() => resolve(jsonResponse({ ok: true, result: [] })), 10);
+				init?.signal?.addEventListener(
+					"abort",
+					() => {
+						clearTimeout(timer);
+						resolve(jsonResponse({ ok: true, result: [] }));
+					},
+					{ once: true },
+				);
+			});
+		}
+		if (method === "sendMessage") {
+			nextMessageId += 1;
+			return jsonResponse({
+				ok: true,
+				result: { message_id: nextMessageId, date: 1, chat: { id: Number(params.chat_id), type: "supergroup" } },
+			});
+		}
+		return jsonResponse({ ok: true, result: true });
+	}) as unknown as typeof fetch;
+
+	const config = loadConfig({
+		cwd: moduleRoot,
+		overrides: {
+			chat: { console: false, http: { enabled: false, host: "127.0.0.1", port: 0, token: "" } },
+			modules: {
+				telegram: {
+					...DEFAULT_CONFIG.modules.telegram,
+					enabled: true,
+					token: "choices-group-test-token",
+					tokenEnv: "ALIVE_CHOICES_GROUP_TEST_TOKEN_UNSET",
+					apiBase: "https://telegram.invalid",
+					allowedChatIds: ["-1001"],
+					allowedUserIds: ["7"],
+					pollTimeoutSec: 0,
+					parseMode: "",
+					requireMentionInGroups: true,
+				},
+				grafana: { ...DEFAULT_CONFIG.modules.grafana, enabled: false },
+				external: [],
+			},
+		},
+	});
+	const stateDir = config.paths.stateDir;
+	const choiceStore = new ChoiceStore(stateDir);
+	const groupChat: TelegramChat = { id: -1001, type: "supergroup", title: "Alive team" };
+
+	const realFetch = globalThis.fetch;
+	globalThis.fetch = fetchImpl;
+	let host: ModuleHost | undefined;
+	let telegram: TelegramModule | undefined;
+	const boot = async (requireMentionInGroups: boolean): Promise<void> => {
+		telegram = new TelegramModule({ ...config.config.modules.telegram, requireMentionInGroups });
+		host = new ModuleHost({
+			config,
+			log,
+			transports: [],
+			modules: [telegram],
+			ingest: (event) => store.append(event),
+			outbox: (limit) => outbox.list(limit),
+			history,
+			runtimeStatus: () => ({}),
+		});
+		await host.init();
+		await new Promise((resolve) => setTimeout(resolve, 30));
+	};
+	const dispatch = (update: TelegramUpdate) =>
+		(telegram as unknown as { handleUpdate(update: TelegramUpdate): Promise<void> }).handleUpdate(update);
+
+	let nextUpdateId = 1;
+	let nextGroupMessageId = 900;
+	const groupUpdate = (text: string, topicId?: number): TelegramUpdate => ({
+		update_id: nextUpdateId++,
+		message: {
+			message_id: nextGroupMessageId++,
+			date: 1,
+			chat: groupChat,
+			from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
+			text,
+			...(topicId !== undefined ? { message_thread_id: topicId } : {}),
+		},
+	});
+	const userEvents = () => store.all().filter((item) => item.kind === "user_message");
+	const choiceEvents = () => userEvents().filter((item) => item.text.startsWith("[choice] "));
+	const removals = () =>
+		calls.filter(
+			(call) =>
+				call.method === "sendMessage" &&
+				(call.params.reply_markup as { remove_keyboard?: boolean } | undefined)?.remove_keyboard === true,
+		);
+	const storedSet = (setId: string): ChoiceSet =>
+		JSON.parse(fs.readFileSync(path.join(stateDir, "telegram-choices", `${setId}.json`), "utf8")) as ChoiceSet;
+	// Mirrors the module's own `isReplyKeyboardPress`: only a live, exact label of
+	// this chat and thread lets an unaddressed group message through.
+	const groupOptions = () => ({
+		botId: 999,
+		botUsername: "alive_bot",
+		ingestEdits: true,
+		requireMentionInGroups: true,
+		isReplyKeyboardPress: ({ chatId, thread, text }: { chatId: string; thread: string; text: string | undefined }) =>
+			text !== undefined && choiceStore.findReplySet(chatId, text, thread) !== undefined,
+	});
+	const parsedChoice = (text: string): Record<string, unknown> =>
+		JSON.parse(text.split("\n")[0]!.slice("[choice] ".length)) as Record<string, unknown>;
+
+	try {
+		await boot(true);
+		calls.length = 0;
+
+		const primary = choiceStore.create({
+			chatId: "-1001",
+			thread: "telegram:-1001",
+			text: "Choose a day",
+			options: replyKeyboardOptions({ rows: [["Yes", "No"]] }),
+			source: "reply_keyboard",
+		});
+
+		// Exact label only: a prefix or a longer text with the label in front is
+		// not a press, so the group filter must still drop it.
+		const beforeNearMiss = userEvents().length;
+		const removalsBeforeNearMiss = removals().length;
+		await dispatch(groupUpdate("Y"));
+		await dispatch(groupUpdate("Yes, please"));
+		check(
+			"near-miss labels are not keyboard presses in a group",
+			userEvents().length === beforeNearMiss && removals().length === removalsBeforeNearMiss,
+			{ events: userEvents().length - beforeNearMiss, removals: removals().length - removalsBeforeNearMiss },
+		);
+		check(
+			"normalizeUpdate does not accept a prefix or a longer text as a keyboard press",
+			normalizeUpdate(groupUpdate("Y"), groupOptions()) === undefined &&
+				normalizeUpdate(groupUpdate("Yes, please"), groupOptions()) === undefined &&
+				normalizeUpdate(groupUpdate("Yes"), groupOptions()) !== undefined,
+			{
+				prefix: normalizeUpdate(groupUpdate("Y"), groupOptions())?.text,
+				longer: normalizeUpdate(groupUpdate("Yes, please"), groupOptions())?.text,
+				exact: normalizeUpdate(groupUpdate("Yes"), groupOptions())?.text,
+			},
+		);
+
+		const pressMessageId = nextGroupMessageId;
+		const beforePress = userEvents().length;
+		await dispatch(groupUpdate("Yes"));
+		const pressEvent = choiceEvents().at(-1);
+		check(
+			"a reply keyboard press in a group with requireMentionInGroups is not dropped",
+			userEvents().length === beforePress + 1 && choiceEvents().length === 1,
+			userEvents().slice(beforePress).map((item) => item.text),
+		);
+		const pressJson = pressEvent ? parsedChoice(pressEvent.text) : {};
+		check(
+			"the group press is a [choice] event with source=reply_keyboard in this thread",
+			pressEvent !== undefined &&
+				pressJson.set === primary.setId &&
+				pressJson.option_id === primary.options[0]!.id &&
+				pressJson.label === "Yes" &&
+				pressJson.message_id === pressMessageId &&
+				pressJson.thread === "telegram:-1001" &&
+				pressJson.source === "reply_keyboard",
+			pressJson,
+		);
+		check(
+			"the group press removes the keyboard exactly once",
+			removals().length === 1 &&
+				removals()[0]?.params.text === CHOICE_REPLY_KEYBOARD_REMOVED_TEXT &&
+				removals()[0]?.params.chat_id === "-1001",
+			removals().map((call) => call.params),
+		);
+		check("the group press marks the set chosen", storedSet(primary.setId).chosen?.label === "Yes", storedSet(primary.setId).chosen);
+
+		// No live set: the same text must fall back to the ordinary filter and stay invisible.
+		const afterChosen = userEvents().length;
+		const removalsAfterChosen = removals().length;
+		await dispatch(groupUpdate("Yes"));
+		check(
+			"the same label without an active set stays invisible in the group",
+			userEvents().length === afterChosen && removals().length === removalsAfterChosen,
+			{ events: userEvents().length - afterChosen, removals: removals().length - removalsAfterChosen },
+		);
+		check(
+			"normalizeUpdate returns undefined for an unaddressed group text without a live set",
+			normalizeUpdate(groupUpdate("Yes"), groupOptions()) === undefined,
+		);
+
+		// Expired set: a press is not recognized, so the ordinary filter drops it.
+		const expired = choiceStore.create({
+			chatId: "-1001",
+			thread: "telegram:-1001",
+			text: "Expired menu",
+			options: replyKeyboardOptions({ rows: [["Sure"]] }),
+			source: "reply_keyboard",
+		});
+		const expiredFile = choiceStore.file(expired.setId);
+		const expiredRaw = JSON.parse(fs.readFileSync(expiredFile, "utf8")) as ChoiceSet;
+		expiredRaw.createdAt = Date.now() - TELEGRAM_CHOICE_SET_TTL_MS - 1;
+		fs.writeFileSync(expiredFile, JSON.stringify(expiredRaw));
+		check(
+			"a clock-shifted store does not resolve the aged reply set",
+			new ChoiceStore(stateDir, () => Date.now() + TELEGRAM_CHOICE_SET_TTL_MS + 1).findReplySet("-1001", "Sure", "telegram:-1001") ===
+				undefined,
+		);
+		const beforeExpired = userEvents().length;
+		const removalsBeforeExpired = removals().length;
+		await dispatch(groupUpdate("Sure"));
+		check(
+			"an expired reply set emits no event and no keyboard removal in a group",
+			userEvents().length === beforeExpired && removals().length === removalsBeforeExpired,
+			{ events: userEvents().length - beforeExpired, removals: removals().length - removalsBeforeExpired },
+		);
+		check("normalizeUpdate drops an expired reply set", normalizeUpdate(groupUpdate("Sure"), groupOptions()) === undefined);
+
+		// Another thread (forum topic): its keyboard is not this thread's keyboard.
+		const topicSet = choiceStore.create({
+			chatId: "-1001",
+			thread: "telegram:-1001/7",
+			text: "Topic menu",
+			options: replyKeyboardOptions({ rows: [["Yes", "No"]] }),
+			source: "reply_keyboard",
+		});
+		const beforeWrongThread = userEvents().length;
+		const removalsBeforeWrongThread = removals().length;
+		await dispatch(groupUpdate("Yes"));
+		check(
+			"a set in another topic does not turn a main-thread press into an event",
+			userEvents().length === beforeWrongThread && removals().length === removalsBeforeWrongThread,
+			{ events: userEvents().length - beforeWrongThread, removals: removals().length - removalsBeforeWrongThread },
+		);
+		check(
+			"normalizeUpdate drops a main-thread text that only matches another topic's set",
+			normalizeUpdate(groupUpdate("Yes"), groupOptions()) === undefined,
+		);
+		const beforeTopicPress = userEvents().length;
+		const choicesBeforeTopic = choiceEvents().length;
+		await dispatch(groupUpdate("Yes", 7));
+		const topicEvent = choiceEvents().at(-1);
+		const topicJson = topicEvent ? parsedChoice(topicEvent.text) : {};
+		check(
+			"a press in its own topic is a reply_keyboard choice event",
+			topicEvent !== undefined &&
+				choiceEvents().length === choicesBeforeTopic + 1 &&
+				userEvents().length === beforeTopicPress + 1 &&
+				topicJson.set === topicSet.setId &&
+				topicJson.thread === "telegram:-1001/7" &&
+				topicJson.source === "reply_keyboard",
+			topicJson,
+		);
+		check(
+			"the topic press removes the keyboard in that topic only",
+			removals().length === removalsBeforeWrongThread + 1 && removals().at(-1)?.params.message_thread_id === 7,
+			removals().at(-1)?.params,
+		);
+		check("the topic set is chosen", storedSet(topicSet.setId).chosen?.label === "Yes", storedSet(topicSet.setId).chosen);
+
+		// Regression: with the default `requireMentionInGroups: false` the same
+		// group press works exactly as before.
+		await host?.stop();
+		host = undefined;
+		await boot(false);
+		calls.length = 0;
+		const relaxed = choiceStore.create({
+			chatId: "-1001",
+			thread: "telegram:-1001",
+			text: "Relaxed menu",
+			options: replyKeyboardOptions({ rows: [["Yes", "No"]] }),
+			source: "reply_keyboard",
+		});
+		const beforeRelaxed = userEvents().length;
+		const choicesBeforeRelaxed = choiceEvents().length;
+		await dispatch(groupUpdate("Yes"));
+		const relaxedChoice = choiceEvents().at(-1);
+		const relaxedJson = relaxedChoice ? parsedChoice(relaxedChoice.text) : {};
+		check(
+			"without requireMentionInGroups a group keyboard press still works as before",
+			relaxedChoice !== undefined &&
+				choiceEvents().length === choicesBeforeRelaxed + 1 &&
+				userEvents().length === beforeRelaxed + 1 &&
+				relaxedJson.set === relaxed.setId &&
+				relaxedJson.source === "reply_keyboard",
+			choiceEvents().map((item) => item.text),
+		);
+		check("the relaxed press still removes the keyboard", removals().length === 1);
+		check("the relaxed set is chosen", storedSet(relaxed.setId).chosen?.label === "Yes", storedSet(relaxed.setId).chosen);
+
+		// And plain group chatter is still an ordinary (non-choice) event there.
+		const beforeChatter = userEvents().length;
+		await dispatch(groupUpdate("just talking"));
+		const chatter = userEvents().slice(beforeChatter);
+		check(
+			"ordinary group chatter without a keyboard is still a normal event",
+			chatter.length === 1 && chatter[0]?.text === "just talking" && chatter[0]?.expectsReply === false,
+			chatter.map((item) => ({ text: item.text, expectsReply: item.expectsReply })),
+		);
+		const defaults = normalizeUpdate(groupUpdate("hello"), { botId: 999, botUsername: "alive_bot", ingestEdits: true });
+		check(
+			"the default normalizeUpdate (no keyboard, no requireMentionInGroups) is unchanged",
+			defaults?.text === "hello" && defaults.expectsReply === false && defaults.addressedToBot === false,
+			defaults && { text: defaults.text, expectsReply: defaults.expectsReply, addressedToBot: defaults.addressedToBot },
 		);
 	} finally {
 		await host?.stop().catch(() => undefined);
