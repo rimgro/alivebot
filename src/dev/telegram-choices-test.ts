@@ -1015,6 +1015,9 @@ section("module: reply keyboard presses in groups with requireMentionInGroups (#
 					pollTimeoutSec: 0,
 					parseMode: "",
 					requireMentionInGroups: true,
+					// An edit event must land immediately, so a wrongly admitted
+					// edit is visible to the assertions below without waiting 3s.
+					editDebounceMs: 0,
 				},
 				grafana: { ...DEFAULT_CONFIG.modules.grafana, enabled: false },
 				external: [],
@@ -1049,36 +1052,66 @@ section("module: reply keyboard presses in groups with requireMentionInGroups (#
 
 	let nextUpdateId = 1;
 	let nextGroupMessageId = 900;
-	const groupUpdate = (text: string, topicId?: number): TelegramUpdate => ({
+	let nextPrivateMessageId = 300;
+	const groupUpdate = (text: string, topicId?: number, userId = 7): TelegramUpdate => ({
 		update_id: nextUpdateId++,
 		message: {
 			message_id: nextGroupMessageId++,
 			date: 1,
 			chat: groupChat,
-			from: { id: 7, is_bot: false, first_name: "Alice", username: "alice" },
+			from: { id: userId, is_bot: false, first_name: userId === 7 ? "Alice" : "Stranger", username: userId === 7 ? "alice" : undefined },
 			text,
 			...(topicId !== undefined ? { message_thread_id: topicId } : {}),
 		},
 	});
+	const groupEditUpdate = (text: string, userId = 7): TelegramUpdate => ({
+		update_id: nextUpdateId++,
+		edited_message: {
+			message_id: nextGroupMessageId++,
+			date: 1,
+			edit_date: 2,
+			chat: groupChat,
+			from: { id: userId, is_bot: false, first_name: userId === 7 ? "Alice" : "Stranger", username: userId === 7 ? "alice" : undefined },
+			text,
+		},
+	});
+	const privateUpdate = (text: string, userId: number): TelegramUpdate => ({
+		update_id: nextUpdateId++,
+		message: {
+			message_id: nextPrivateMessageId++,
+			date: 1,
+			chat: { id: userId, type: "private", first_name: "Stranger" },
+			from: { id: userId, is_bot: false, first_name: "Stranger" },
+			text,
+		},
+	});
 	const userEvents = () => store.all().filter((item) => item.kind === "user_message");
 	const choiceEvents = () => userEvents().filter((item) => item.text.startsWith("[choice] "));
+	const sendMessages = () => calls.filter((call) => call.method === "sendMessage");
 	const removals = () =>
-		calls.filter(
-			(call) =>
-				call.method === "sendMessage" &&
-				(call.params.reply_markup as { remove_keyboard?: boolean } | undefined)?.remove_keyboard === true,
+		sendMessages().filter(
+			(call) => (call.params.reply_markup as { remove_keyboard?: boolean } | undefined)?.remove_keyboard === true,
 		);
 	const storedSet = (setId: string): ChoiceSet =>
 		JSON.parse(fs.readFileSync(path.join(stateDir, "telegram-choices", `${setId}.json`), "utf8")) as ChoiceSet;
 	// Mirrors the module's own `isReplyKeyboardPress`: only a live, exact label of
-	// this chat and thread lets an unaddressed group message through.
+	// this chat and thread lets a new (not edited) group message through.
 	const groupOptions = () => ({
 		botId: 999,
 		botUsername: "alive_bot",
 		ingestEdits: true,
 		requireMentionInGroups: true,
-		isReplyKeyboardPress: ({ chatId, thread, text }: { chatId: string; thread: string; text: string | undefined }) =>
-			text !== undefined && choiceStore.findReplySet(chatId, text, thread) !== undefined,
+		isReplyKeyboardPress: ({
+			chatId,
+			thread,
+			text,
+			isEdit,
+		}: {
+			chatId: string;
+			thread: string;
+			text: string | undefined;
+			isEdit: boolean;
+		}) => !isEdit && text !== undefined && choiceStore.findReplySet(chatId, text, thread) !== undefined,
 	});
 	const parsedChoice = (text: string): Record<string, unknown> =>
 		JSON.parse(text.split("\n")[0]!.slice("[choice] ".length)) as Record<string, unknown>;
@@ -1161,6 +1194,72 @@ section("module: reply keyboard presses in groups with requireMentionInGroups (#
 			"normalizeUpdate returns undefined for an unaddressed group text without a live set",
 			normalizeUpdate(groupUpdate("Yes"), groupOptions()) === undefined,
 		);
+
+		// #280 (1): a reply-keyboard label lets an unaddressed group message past
+		// the mention filter, but it must not turn the allowlist deny text into a
+		// megaphone: a stranger's press stays silent.
+		const strangerSet = choiceStore.create({
+			chatId: "-1001",
+			thread: "telegram:-1001",
+			text: "Stranger menu",
+			options: replyKeyboardOptions({ rows: [["Apply", "Cancel"]] }),
+			source: "reply_keyboard",
+		});
+		const beforeStranger = userEvents().length;
+		const sendsBeforeStranger = sendMessages().length;
+		await dispatch(groupUpdate("Apply", undefined, 8));
+		check(
+			"a non-allowlisted user pressing a live label in a group stays silent",
+			userEvents().length === beforeStranger && sendMessages().length === sendsBeforeStranger,
+			{
+				events: userEvents().length - beforeStranger,
+				sends: sendMessages().slice(sendsBeforeStranger).map((call) => call.params),
+			},
+		);
+		check(
+			"the stranger press does not mark the set chosen",
+			storedSet(strangerSet.setId).chosen === null,
+			storedSet(strangerSet.setId).chosen,
+		);
+
+		// Regression: the deny text must still reach a stranger in a private chat,
+		// where the message is addressed to the bot by definition.
+		const sendsBeforePrivateDeny = sendMessages().length;
+		await dispatch(privateUpdate("Apply", 8));
+		const denyCalls = sendMessages().slice(sendsBeforePrivateDeny);
+		check(
+			"a non-allowlisted user in a private chat still gets the deny message",
+			denyCalls.length === 1 &&
+				denyCalls[0]?.params.chat_id === "8" &&
+				String(denyCalls[0]?.params.text).includes("Доступ не разрешён"),
+			denyCalls.map((call) => call.params),
+		);
+
+		// #280 (2): an edit is a correction, never a key press.
+		const editSet = choiceStore.create({
+			chatId: "-1001",
+			thread: "telegram:-1001",
+			text: "Edit menu",
+			options: replyKeyboardOptions({ rows: [["Edit me"]] }),
+			source: "reply_keyboard",
+		});
+		check(
+			"normalizeUpdate drops an edited group message that matches a live label",
+			normalizeUpdate(groupEditUpdate("Edit me"), groupOptions()) === undefined,
+		);
+		const beforeEdit = userEvents().length;
+		const sendsBeforeEdit = sendMessages().length;
+		await dispatch(groupEditUpdate("Edit me"));
+		await new Promise((resolve) => setTimeout(resolve, 40));
+		check(
+			"an edited label in a group emits no event and no message",
+			userEvents().length === beforeEdit && sendMessages().length === sendsBeforeEdit,
+			{
+				events: userEvents().length - beforeEdit,
+				sends: sendMessages().slice(sendsBeforeEdit).map((call) => call.params),
+			},
+		);
+		check("the edited label does not mark the set chosen", storedSet(editSet.setId).chosen === null, storedSet(editSet.setId).chosen);
 
 		// Expired set: a press is not recognized, so the ordinary filter drops it.
 		const expired = choiceStore.create({

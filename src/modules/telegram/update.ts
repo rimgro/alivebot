@@ -56,14 +56,16 @@ export interface NormalizeOptions {
 	 */
 	editExpectsReply?: boolean;
 	/**
-	 * Is this text an exact label of a live reply keyboard in this chat/thread?
+	 * Is this new (not edited) text an exact label of a live reply keyboard in
+	 * this chat/thread?
 	 *
 	 * Telegram sends a reply-keyboard press as an ordinary text message with no
 	 * mention, so `requireMentionInGroups` would drop it before the module can
 	 * turn it back into a choice event (#279). The callback is consulted only by
-	 * that group mention filter and never for any other rule.
+	 * that group mention filter and never for any other rule. The exception is
+	 * for new messages only: an edit is a correction, never a key press.
 	 */
-	isReplyKeyboardPress?: (input: { chatId: string; thread: string; text: string | undefined }) => boolean;
+	isReplyKeyboardPress?: (input: { chatId: string; thread: string; text: string | undefined; isEdit: boolean }) => boolean;
 }
 
 /**
@@ -112,7 +114,8 @@ export function normalizeUpdate(update: TelegramUpdate, options: NormalizeOption
 	// construction (the keyboard is ours), but Telegram sends it as plain text.
 	const isGroup = chat.type === "group" || chat.type === "supergroup";
 	if (options.requireMentionInGroups && isGroup && !expectsReplyToMessage) {
-		const keyboardPress = options.isReplyKeyboardPress?.({ chatId, thread, text: message.text });
+		// An edit is a correction, not a key press, so it gets no exception.
+		const keyboardPress = !isEdit && options.isReplyKeyboardPress?.({ chatId, thread, text: message.text, isEdit });
 		if (!keyboardPress) return undefined;
 	}
 	const addressedToBot = isAddressedToBot(message, options);
