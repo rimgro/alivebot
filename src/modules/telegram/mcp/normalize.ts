@@ -334,6 +334,14 @@ function normalizeFlatCall(tool: string, args: Record<string, unknown>): Telegra
 		const flatText = resolveFlatText(args);
 		if (!flatText.ok) return deny(flatText.reason);
 		text = flatText.text;
+		// The flat shape must satisfy the same requirement as the argv shape:
+		// the upstream stores the text on stdin and rejects a write without it,
+		// so an empty send would burn a write slot for nothing.
+		if (spec.textRequired && (text === undefined || text.trim().length === 0)) {
+			return deny(
+				`telegram command "${command}" requires non-empty text; got ${text === undefined ? "none" : "an empty string"}`,
+			);
+		}
 	}
 
 	// The flat shape has no original argv. Build the command that will be shown

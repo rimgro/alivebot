@@ -556,7 +556,7 @@ try {
 				return decision.decision === "deny" && decision.reason.includes("telegram_help, telegram_read, telegram_write");
 			})(),
 		);
-		const unresolved = decideTelegramMcpCall({ profile, tool: "telegram_write", args: {}, now: clockNow, limits: open });
+		const unresolved = decideTelegramMcpCall({ profile, tool: "telegram_write", args: { text: "hi" }, now: clockNow, limits: open });
 		check(
 			"write with allowChats and an unresolved chat is denied",
 			unresolved.decision === "deny" && unresolved.reason.includes("cannot resolve target chat") && unresolved.reason.includes('"111"'),
@@ -565,15 +565,15 @@ try {
 		const objectChat = decideTelegramMcpCall({
 			profile,
 			tool: "telegram_write",
-			args: { chat: { id: "111" } },
+			args: { chat: { id: "111" }, text: "hi" },
 			now: clockNow,
 			limits: open,
 		});
 		check("write with a nested chat object is denied, not guessed", objectChat.decision === "deny" && objectChat.reason.includes("cannot resolve target chat"), objectChat);
 		for (const [label, args] of [
-			["numeric chat", { chat: 111 }],
-			["to string", { to: "111" }],
-			["recipient string", { recipient: "111" }],
+			["numeric chat", { chat: 111, text: "hi" }],
+			["to string", { to: "111", text: "hi" }],
+			["recipient string", { recipient: "111", text: "hi" }],
 		] as const) {
 			const decision = decideTelegramMcpCall({ profile, tool: "telegram_write", args, now: clockNow, limits: open });
 			check(`write resolves ${label}`, decision.decision === "allow" && decision.chat === "111", decision);
@@ -581,16 +581,16 @@ try {
 		const unrestricted = decideTelegramMcpCall({
 			profile: { ...profile, allowChats: [] },
 			tool: "telegram_write",
-			args: {},
+			args: { text: "hi" },
 			now: clockNow,
 			limits: open,
 		});
 		check("an empty allowChats keeps the old write behaviour", unrestricted.decision === "allow", unrestricted);
 		const nonMatchingWrite = { ...profile, allowChats: ["123"] };
 		for (const [label, args] of [
-			["chat", { chat: "999" }],
-			["to", { to: "999" }],
-			["recipient", { recipient: "999" }],
+			["chat", { chat: "999", text: "hi" }],
+			["to", { to: "999", text: "hi" }],
+			["recipient", { recipient: "999", text: "hi" }],
 		] as const) {
 			const decision = decideTelegramMcpCall({
 				profile: nonMatchingWrite,
@@ -862,6 +862,17 @@ try {
 		);
 		const flatRead = view("telegram_read", { chat: "111" });
 		check("the flat read still maps to read", flatRead?.command === "read" && flatRead.chat === "111" && flatRead.write === false, flatRead);
+		// A flat write without text would reach the upstream as `send <chat>` and
+		// fail there after the write slot was already reserved.
+		const flatNoText = reason("telegram_write", { chat: "@test" });
+		check("a flat write without text is denied", flatNoText.includes("requires non-empty text"), flatNoText);
+		const flatEmptyText = reason("telegram_write", { chat: "@test", text: "   " });
+		check("a flat write with blank text is denied", flatEmptyText.includes("requires non-empty text"), flatEmptyText);
+		check(
+			"a flat write without text is never forwarded as a bare argv",
+			JSON.stringify(upstreamToolArguments("telegram_write", { chat: "@test" })) === JSON.stringify({ chat: "@test" }),
+			upstreamToolArguments("telegram_write", { chat: "@test" }),
+		);
 		check("a flat action is honoured", view("telegram_write", { action: "mark-read", chat: "111" })?.command === "mark-read");
 		check("flat delete_chat is denied", reason("telegram_write", { action: "delete_chat", chat: "111" }).includes("deleting"));
 		check("flat recipient lists are mass-send denied", reason("telegram_write", { recipients: ["1", "2"] }).includes("mass send"));
