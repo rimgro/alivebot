@@ -976,20 +976,43 @@ export class TelegramModule implements AliveModule {
 		} catch (err) {
 			ctx.log.warn("telegram choice state could not be saved", { setId: set.setId, error: message(err) });
 		}
+		const editedText = `${set.text}\n\n✅ ${option.label}`;
+		const editParams = {
+			chat_id: set.chatId,
+			message_id: messageId,
+			text: editedText,
+			...(set.parseMode ? { parse_mode: set.parseMode } : {}),
+			// Removing the keyboard is part of the contract, not a cosmetic detail.
+			reply_markup: { inline_keyboard: [] },
+		};
 		try {
-			await api.editMessageText({
-				chat_id: set.chatId,
-				message_id: messageId,
-				text: `${set.text}\n\n✅ ${option.label}`,
-				// Removing the keyboard is part of the contract, not a cosmetic detail.
-				reply_markup: { inline_keyboard: [] },
-			});
+			await api.editMessageText(editParams);
 		} catch (err) {
-			ctx.log.warn("telegram choice message edit failed", {
-				setId: set.setId,
-				messageId,
-				error: message(err),
-			});
+			if (set.parseMode && isParseModeError(err)) {
+				// The chunk was rendered for a parse mode; an edited line can make the
+				// markup invalid. Mirror the normal send path: one plain-text retry.
+				const plainText = set.parseMode === "HTML" ? htmlToPlainText(editedText) : editedText;
+				ctx.log.warn("telegram rejected the choice markup; editing as plain text", {
+					setId: set.setId,
+					messageId,
+					parseMode: set.parseMode,
+				});
+				try {
+					await api.editMessageText({ ...editParams, text: plainText, parse_mode: undefined });
+				} catch (retryErr) {
+					ctx.log.warn("telegram choice message edit failed", {
+						setId: set.setId,
+						messageId,
+						error: message(retryErr),
+					});
+				}
+			} else {
+				ctx.log.warn("telegram choice message edit failed", {
+					setId: set.setId,
+					messageId,
+					error: message(err),
+				});
+			}
 		}
 		await this.processInbound(inbound);
 		return true;
@@ -2003,6 +2026,29 @@ export class TelegramModule implements AliveModule {
 				? replyKeyboardToReplyMarkup(message.keyboard)
 				: buttonsToReplyMarkup(message.buttons);
 		const buttonSummary = buttonHistorySummary(message.buttons);
+		// Attachments are read and limit-checked before the first API call: an
+		// unreadable or oversize file must not leave half a message in the chat.
+		const uploads = await this.prepareAttachments(ctx, message.attachments);
+		// Split before persisting the set: the keyboard rides on the last chunk, and
+		// the stored text must be that chunk, not the whole (possibly long) message.
+		const htmlFormat = format === "markdown" || format === "html";
+		const textChunks = htmlFormat
+			? splitHtml(rendered, this.config.maxMessageChars)
+			: splitMessage(text, this.config.maxMessageChars);
+		const captions = uploads.length > 0
+			? htmlFormat
+				? splitHtml(rendered, TELEGRAM_CAPTION_MAX_CHARS)
+				: splitMessage(text, TELEGRAM_CAPTION_MAX_CHARS)
+			: [];
+		const followUps = captions.slice(1);
+		// The keyboard is attached to the last follow-up chunk, else the last (only)
+		// upload caption, else the last text chunk.
+		const lastUploadCaption = uploads.length === 1 ? (captions[0] ?? "") : "";
+		const keyboardText = uploads.length > 0
+			? followUps.length > 0
+				? (followUps[followUps.length - 1] ?? "")
+				: lastUploadCaption
+			: (textChunks[textChunks.length - 1] ?? "");
 		// Persist the set before the send so a press that lands immediately after
 		// the API accepted the message can still be resolved. `messageId` is filled
 		// in once Telegram returns it.
@@ -2012,14 +2058,12 @@ export class TelegramModule implements AliveModule {
 				setId: choiceSetId,
 				chatId: ref.chatId,
 				thread: message.thread,
-				text,
+				text: keyboardText,
+				...(parseMode ? { parseMode } : {}),
 				options: choiceOptions,
 				source: choiceSource,
 			});
 		}
-		// Attachments are read and limit-checked before the first API call: an
-		// unreadable or oversize file must not leave half a message in the chat.
-		const uploads = await this.prepareAttachments(ctx, message.attachments);
 		const sent: Array<{
 			result: TelegramSentMessage;
 			text: string;
@@ -2037,11 +2081,6 @@ export class TelegramModule implements AliveModule {
 			// Telegram captions are limited to 1024 characters; the remainder becomes
 			// ordinary text messages so no part of the reply is lost. Only the first
 			// attachment carries the caption (one file per `send_message` today).
-			const htmlFormat = format === "markdown" || format === "html";
-			const captions = htmlFormat
-				? splitHtml(rendered, TELEGRAM_CAPTION_MAX_CHARS)
-				: splitMessage(text, TELEGRAM_CAPTION_MAX_CHARS);
-			const followUps = captions.slice(1);
 			for (const [index, upload] of uploads.entries()) {
 				const caption = index === 0 ? captions[0] ?? "" : "";
 				const carriesButtons = index === uploads.length - 1 && followUps.length === 0 && replyMarkup !== undefined;
@@ -2088,11 +2127,8 @@ export class TelegramModule implements AliveModule {
 				if (result) sent.push({ result, text: chunk, ...(carriesButtons && buttonSummary ? { buttons: buttonSummary } : {}) });
 			}
 		} else {
-			const chunks = format === "markdown" || format === "html"
-				? splitHtml(rendered, this.config.maxMessageChars)
-				: splitMessage(text, this.config.maxMessageChars);
-			for (const [index, chunk] of chunks.entries()) {
-				const carriesButtons = index === chunks.length - 1 && replyMarkup !== undefined;
+			for (const [index, chunk] of textChunks.entries()) {
+				const carriesButtons = index === textChunks.length - 1 && replyMarkup !== undefined;
 				const result = await this.sendPart(partKey(index), ref.chatId, message.thread, () =>
 					this.sendTextChunk(ctx, api, ref.chatId, threadId, chunk, nextReplyTo(), carriesButtons ? replyMarkup : undefined, parseMode, text, format),
 					"telegram sendMessage",

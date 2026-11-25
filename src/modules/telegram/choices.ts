@@ -65,8 +65,10 @@ export interface ChoiceSet {
 	thread: string;
 	/** Appears after the message is accepted by Telegram. */
 	messageId?: number;
-	/** Original message text the keyboard belongs to. */
+	/** Text of the exact message chunk the keyboard is attached to. */
 	text: string;
+	/** Parse mode that chunk was sent with; omitted/old files mean plain text. */
+	parseMode?: string;
 	options: OutgoingChoiceOption[];
 	chosen: ChoiceChosen | null;
 	createdAt: number;
@@ -366,6 +368,7 @@ export class ChoiceStore {
 		chatId: string;
 		thread: string;
 		text: string;
+		parseMode?: string;
 		options: OutgoingChoiceOption[];
 		source: ChoiceSource;
 		messageId?: number;
@@ -388,6 +391,7 @@ export class ChoiceStore {
 			thread: input.thread,
 			...(input.messageId !== undefined ? { messageId: input.messageId } : {}),
 			text: input.text,
+			...(input.parseMode ? { parseMode: input.parseMode } : {}),
 			options: input.options.map((option) => ({ id: option.id, label: option.label })),
 			chosen: null,
 			createdAt: this.now(),
@@ -505,6 +509,7 @@ function isChoiceSet(value: unknown): value is ChoiceSet {
 	const set = value as Partial<ChoiceSet>;
 	if (typeof set.setId !== "string" || !TELEGRAM_CHOICE_SET_ID_PATTERN.test(set.setId)) return false;
 	if (typeof set.chatId !== "string" || typeof set.thread !== "string" || typeof set.text !== "string") return false;
+	if (set.parseMode !== undefined && typeof set.parseMode !== "string") return false;
 	if (typeof set.createdAt !== "number" || !Number.isFinite(set.createdAt)) return false;
 	if (set.source !== "inline" && set.source !== "reply_keyboard") return false;
 	if (!Array.isArray(set.options) || set.options.length === 0) return false;

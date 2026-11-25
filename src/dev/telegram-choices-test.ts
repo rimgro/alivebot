@@ -48,6 +48,8 @@ import {
 } from "../modules/telegram/choices.js";
 import { TELEGRAM_CALLBACK_DATA_MAX_BYTES } from "../modules/telegram/buttons.js";
 import { normalizeChoicePress } from "../modules/telegram/update.js";
+import { splitMessage } from "../modules/telegram/text.js";
+import { htmlToPlainText } from "../modules/telegram/markdown.js";
 import type { TelegramChat, TelegramUpdate } from "../modules/telegram/types.js";
 import { readJsonl } from "../util.js";
 
@@ -278,6 +280,11 @@ section("choice store: disk shape, modes, TTL and limit");
 			raw.messageId === undefined,
 		raw,
 	);
+	check(
+		"a plain set omits parseMode, so old JSON without it still loads",
+		raw.parseMode === undefined && store.get(created.setId) !== undefined,
+		raw.parseMode,
+	);
 	const known = store.setMessageId(created.setId, 77);
 	check("messageId is filled after the send", known?.messageId === 77);
 	const chosen = store.choose(created.setId, option("yes", "Yes"), "7");
@@ -365,6 +372,7 @@ section("module: inline choices, presses and stale sets");
 	let nextMessageId = 500;
 	let lastMessageId = 0;
 	let failEditFor: number | undefined;
+	let failEditParseModeFor: number | undefined;
 
 	const jsonResponse = (body: unknown, status = 200): Response =>
 		new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
@@ -394,6 +402,16 @@ section("module: inline choices, presses and stale sets");
 			return jsonResponse({ ok: true, result: { message_id: nextMessageId, date: 1, chat: { id: Number(params.chat_id), type: "private" } } });
 		}
 		if (method === "editMessageText") {
+			if (
+				failEditParseModeFor !== undefined &&
+				Number(params.message_id) === failEditParseModeFor &&
+				params.parse_mode === "HTML"
+			) {
+				return jsonResponse(
+					{ ok: false, error_code: 400, description: "Bad Request: can't parse entities: unexpected end tag" },
+					400,
+				);
+			}
 			if (failEditFor !== undefined && Number(params.message_id) === failEditFor) {
 				return jsonResponse({ ok: false, error_code: 400, description: "Bad Request: message to edit not found" }, 400);
 			}
@@ -632,6 +650,28 @@ section("module: inline choices, presses and stale sets");
 		await dispatch(callbackUpdate("cb-foreign", firstData, choiceMessageId, 99));
 		check("a press from another chat answers stale", staleAnswers() === staleBefore + 1);
 
+		// A user outside the allowlist is different from a foreign chat: no event,
+		// no edit and the set stays unanswered.
+		await send({ thread: "telegram:42", text: "Allowlist guard", choices: [option("yes", "Yes")] });
+		const allowData = ((lastSent()?.params.reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> }).inline_keyboard[0]![0]!
+			.callback_data);
+		const allowId = parseChoiceCallbackData(allowData)!.setId;
+		const allowMessageId = lastMessageId;
+		staleBefore = staleAnswers();
+		const editsBeforeAllow = edits().length;
+		const eventsBeforeAllow = choiceEvents().length;
+		await dispatch(callbackUpdate("cb-not-allowed", allowData, allowMessageId, 42, 8));
+		check(
+			"a press by a non-allowlisted user answers stale",
+			staleAnswers() === staleBefore + 1,
+			answers().at(-1),
+		);
+		check(
+			"a press by a non-allowlisted user emits no event and leaves chosen null",
+			choiceEvents().length === eventsBeforeAllow && edits().length === editsBeforeAllow && storedSet(allowId).chosen === null,
+			{ events: choiceEvents().length - eventsBeforeAllow, edits: edits().length - editsBeforeAllow, chosen: storedSet(allowId).chosen },
+		);
+
 		await send({ thread: "telegram:42", text: "Corrupt me", choices: [option("a", "A")] });
 		const corruptData = ((lastSent()?.params.reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> }).inline_keyboard[0]![0]!
 			.callback_data);
@@ -677,6 +717,80 @@ section("module: inline choices, presses and stale sets");
 			(record) => record.level === "warn" && String(record.msg ?? "").includes("choice message edit failed"),
 		);
 		check("an edit failure is logged as a warn", warnings.some((record) => record.data?.setId === failId), warnings.at(-1));
+
+		// Long messages: the keyboard is on the last chunk, so the set must store
+		// that chunk (and the edit must use it), never the whole original text.
+		const longText = "word ".repeat(1_000).trim();
+		const longChunks = splitMessage(longText, config.config.modules.telegram.maxMessageChars);
+		check("the long fixture really produces several chunks", longChunks.length > 1, longChunks.map((chunk) => chunk.length));
+		await send({ thread: "telegram:42", text: longText, choices: [option("yes", "Yes")] });
+		const longData = ((lastSent()?.params.reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> }).inline_keyboard[0]![0]!
+			.callback_data);
+		const longId = parseChoiceCallbackData(longData)!.setId;
+		const longMessageId = lastMessageId;
+		const lastChunk = longChunks.at(-1)!;
+		check(
+			"choices on a long message store the keyboard-carrying last chunk",
+			storedSet(longId).text === lastChunk && storedSet(longId).text !== longText,
+			{ stored: storedSet(longId).text.length, lastChunk: lastChunk.length, whole: longText.length },
+		);
+		const eventsBeforeLong = choiceEvents().length;
+		const editsBeforeLong = edits().length;
+		await dispatch(callbackUpdate("cb-long", longData, longMessageId));
+		const longEdit = edits().slice(editsBeforeLong).at(-1) as { text?: string } | undefined;
+		check(
+			"a press edits the last chunk plus the check line, not the whole message",
+			longEdit?.text === `${lastChunk}\n\n✅ Yes`,
+			{ editLength: longEdit?.text?.length, expectedLength: lastChunk.length + 6 },
+		);
+		check("the long-message press still emits one event", choiceEvents().length === eventsBeforeLong + 1);
+
+		// Markdown/HTML: the edit must keep the parse mode, and a rejected markup
+		// must get one plain-text retry without losing the event.
+		await send({ thread: "telegram:42", text: "**Pick** one", format: "markdown", choices: [option("yes", "Yes")] });
+		const markdownData = ((lastSent()?.params.reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> }).inline_keyboard[0]![0]!
+			.callback_data);
+		const markdownId = parseChoiceCallbackData(markdownData)!.setId;
+		const markdownMessageId = lastMessageId;
+		check(
+			"a markdown choice set stores the rendered chunk and its parse mode",
+			storedSet(markdownId).text === "<b>Pick</b> one" && storedSet(markdownId).parseMode === "HTML",
+			{ text: storedSet(markdownId).text, parseMode: storedSet(markdownId).parseMode },
+		);
+		const editsBeforeMarkdown = edits().length;
+		await dispatch(callbackUpdate("cb-markdown", markdownData, markdownMessageId));
+		const markdownEdit = edits().slice(editsBeforeMarkdown).at(-1) as { text?: string; parse_mode?: string } | undefined;
+		check(
+			"a markdown press edits with the same parse mode",
+			markdownEdit?.parse_mode === "HTML" && markdownEdit?.text === "<b>Pick</b> one\n\n✅ Yes",
+			markdownEdit,
+		);
+
+		await send({ thread: "telegram:42", text: "<b>Pick</b> two", format: "html", choices: [option("yes", "Yes")] });
+		const htmlData = ((lastSent()?.params.reply_markup as { inline_keyboard: Array<Array<{ callback_data: string }>> }).inline_keyboard[0]![0]!
+			.callback_data);
+		const htmlId = parseChoiceCallbackData(htmlData)!.setId;
+		const htmlMessageId = lastMessageId;
+		failEditParseModeFor = htmlMessageId;
+		const editsBeforeHtml = edits().length;
+		const eventsBeforeHtml = choiceEvents().length;
+		await dispatch(callbackUpdate("cb-html-fallback", htmlData, htmlMessageId));
+		failEditParseModeFor = undefined;
+		const htmlEdits = edits().slice(editsBeforeHtml) as Array<{ text?: string; parse_mode?: string }>;
+		check(
+			"a rejected choice markup is retried exactly once as plain text",
+			htmlEdits.length === 2 &&
+				htmlEdits[0]?.parse_mode === "HTML" &&
+				htmlEdits[0]?.text === "<b>Pick</b> two\n\n✅ Yes" &&
+				htmlEdits[1]?.parse_mode === undefined &&
+				htmlEdits[1]?.text === htmlToPlainText("<b>Pick</b> two\n\n✅ Yes"),
+			htmlEdits,
+		);
+		check(
+			"the plain-text fallback still marks the choice and delivers the event",
+			storedSet(htmlId).chosen?.id === "yes" && choiceEvents().length === eventsBeforeHtml + 1,
+			{ chosen: storedSet(htmlId).chosen, events: choiceEvents().length - eventsBeforeHtml },
+		);
 
 		// Plain buttons keep the old callback path and old event text.
 		await send({ thread: "telegram:42", text: "Old style", buttons: [[{ text: "Legacy", data: "legacy:action" }]] });
