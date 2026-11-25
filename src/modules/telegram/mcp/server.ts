@@ -14,6 +14,7 @@ import { TelegramMcpAuditLog, auditPreview } from "./audit.js";
 import type { TelegramMcpConfig, TelegramMcpProfileConfig } from "./config.js";
 import { UpstreamChild, type UpstreamChildOptions } from "./child.js";
 import { TelegramMcpLimitsStore } from "./limits.js";
+import { upstreamToolArguments } from "./normalize.js";
 import {
 	JSON_RPC_ERROR,
 	isJsonRpcNotification,
@@ -25,7 +26,7 @@ import {
 } from "./protocol.js";
 import {
 	decideTelegramMcpCall,
-	extractWriteText,
+	TELEGRAM_MCP_TOOLS,
 	type TelegramMcpPolicyDecision,
 } from "./policy.js";
 import { TelegramMcpTokenStore } from "./tokens.js";
@@ -105,6 +106,7 @@ export interface TelegramMcpAskResult {
 	ticketId: string;
 	tool: string;
 	profile: string;
+	command?: string;
 	chat?: string;
 }
 
@@ -319,6 +321,7 @@ export class TelegramMcpServer {
 				});
 				return;
 			}
+			if (message.method === "tools/list") response = filterToolsListResponse(response);
 			writeJson(res, 200, response);
 		} catch (error) {
 			if (!res.headersSent) {
@@ -368,11 +371,17 @@ export class TelegramMcpServer {
 				};
 			}
 		}
-		const text = extractWriteText(args);
+		const text = decision.view === undefined ? undefined : decision.view.text;
+		// Audit keeps the command name only: the full argv may contain the write
+		// text, and the audit deliberately stores at most a 120-char preview.
+		const auditCommand = decision.view === undefined ? rawCommand(args) : decision.view.command;
+		// A ticket shows what will really run, so it carries the whole argv (#274).
+		const ticketCommand = decision.view === undefined ? rawCommand(args) : decision.view.argv.join(" ");
 		this.audit.record({
 			ts: new Date(now).toISOString(),
 			profile: profile.name,
 			tool,
+			...(auditCommand === undefined ? {} : { command: auditCommand }),
 			chat: decision.chat ?? "",
 			decision: decision.decision,
 			reason: decision.reason,
@@ -382,7 +391,15 @@ export class TelegramMcpServer {
 		if (decision.decision === "allow") return {};
 		if (decision.decision === "ask") {
 			if (profile.confirmation) {
-				const created = this.createOrReuseTicket(profile, args, tool, decision.chat, text ?? "", now);
+				const created = this.createOrReuseTicket(
+					profile,
+					args,
+					tool,
+					decision.chat,
+					ticketCommand ?? "",
+					text ?? "",
+					now,
+				);
 				if ("result" in created) return created;
 				return { ticket: created.ticket };
 			}
@@ -392,6 +409,7 @@ export class TelegramMcpServer {
 				ticketId: newTelegramMcpTicketId(),
 				tool,
 				profile: profile.name,
+				...(ticketCommand === undefined ? {} : { command: ticketCommand }),
 				...(decision.chat === undefined ? {} : { chat: decision.chat }),
 			};
 			return { result: toolResult("approval required", { ...ask }, false) };
@@ -420,6 +438,7 @@ export class TelegramMcpServer {
 		args: Record<string, unknown>,
 		tool: string,
 		chat: string | undefined,
+		command: string,
 		text: string,
 		now: number,
 	): TicketCreation {
@@ -432,7 +451,7 @@ export class TelegramMcpServer {
 		const pending = countPendingTickets(ticketDir, now);
 		if (pending >= MAX_PENDING_TICKETS_PER_PROFILE) {
 			const reason = `confirmation backlog: ${pending} pending tickets for profile "${profile.name}" (max ${MAX_PENDING_TICKETS_PER_PROFILE}); nothing was written`;
-			this.auditTerminal(profile, { ticketId: "", profile: profile.name, tool, chat, text } as TelegramMcpTicket, "deny", reason);
+			this.auditTerminal(profile, { ticketId: "", profile: profile.name, tool, command, chat, text } as TelegramMcpTicket, "deny", reason);
 			return {
 				result: toolResult(`denied: ${reason}`, { decision: "deny", reason, tool, profile: profile.name }, true),
 			};
@@ -444,6 +463,7 @@ export class TelegramMcpServer {
 			ticketId: newTelegramMcpTicketId(),
 			profile: profile.name,
 			tool,
+			...(command === "" ? {} : { command }),
 			...(chat === undefined ? {} : { chat }),
 			text,
 			createdAt: now,
@@ -641,6 +661,7 @@ export class TelegramMcpServer {
 			ts: new Date(this.limits.now()).toISOString(),
 			profile: profile.name,
 			tool: ticket.tool,
+			...(ticket.command === undefined ? {} : { command: ticket.command.split(" ")[0] }),
 			chat: ticket.chat ?? "",
 			decision,
 			reason,
@@ -695,7 +716,8 @@ export class TelegramMcpServer {
 				timer,
 			});
 		});
-		const sent = child.send({ jsonrpc: "2.0", id: upstreamId, method: message.method, ...(message.params === undefined ? {} : { params: message.params }) });
+		const params = upstreamParams(message.params);
+		const sent = child.send({ jsonrpc: "2.0", id: upstreamId, method: message.method, ...(params === undefined ? {} : { params }) });
 		if (!sent) {
 			this.settle(key, new Error("telegram mcp upstream is not running"));
 		}
@@ -774,6 +796,44 @@ function toolResult(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A legacy flat call is rewritten into the real `{args, stdin}` shape before it
+ * reaches the upstream; every other request passes through unchanged (#274).
+ */
+function upstreamParams(params: unknown): unknown {
+	if (!isRecord(params) || typeof params.name !== "string") return params;
+	const tool = params.name;
+	if (tool !== "telegram_read" && tool !== "telegram_write") return params;
+	const args = isRecord(params.arguments) ? params.arguments : undefined;
+	if (args === undefined) return params;
+	const rewritten = upstreamToolArguments(tool, args);
+	return rewritten === args ? params : { ...params, arguments: rewritten };
+}
+
+/** The raw command name from an argv-shaped call, for audit entries of a deny. */
+function rawCommand(args: Record<string, unknown>): string | undefined {
+	if (!Array.isArray(args.args)) return undefined;
+	const first = args.args[0];
+	return typeof first === "string" && first.length > 0 ? first : undefined;
+}
+
+/** Tools the proxy exposes; the upstream may also advertise hidden ones. */
+const EXPOSED_TOOL_NAMES = new Set<string>(TELEGRAM_MCP_TOOLS);
+
+/**
+ * Hide `telegram_setup` and anything else the policy would refuse, so the
+ * model never sees a tool it cannot call (#274).
+ */
+function filterToolsListResponse(response: JsonRpcMessage): JsonRpcMessage {
+	if (!("result" in response) || !isRecord(response.result)) return response;
+	const result = response.result;
+	if (!Array.isArray(result.tools)) return response;
+	const tools = result.tools.filter(
+		(tool) => isRecord(tool) && typeof tool.name === "string" && EXPOSED_TOOL_NAMES.has(tool.name),
+	);
+	return { ...response, result: { ...result, tools } };
 }
 
 /** A tool-level error result: no upstream write happened. */

@@ -24,7 +24,7 @@ NoNewPrivileges=yes
 Restart=on-failure
 RestartSec=5
 Environment=HOME=%h
-Environment=PATH=%h/.pi/agent/bin:%h/.local/bin:%h/.local/share/node24/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.pi/agent/bin:%h/.local/bin:%h/opt/better-tg-cli/node_modules/.bin:%h/.local/share/node24/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target

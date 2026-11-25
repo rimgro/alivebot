@@ -15,6 +15,8 @@ export interface TelegramMcpAuditEntry {
 	ts: string;
 	profile: string;
 	tool: string;
+	/** Canonical command name the call would run, e.g. "send" (#274). */
+	command?: string;
 	chat?: string;
 	decision: "allow" | "deny" | "ask";
 	reason: string;

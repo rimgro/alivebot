@@ -26,6 +26,8 @@ export interface TelegramMcpTicket {
 	ticketId: string;
 	profile: string;
 	tool: string;
+	/** Exact command the upstream would run, `argv.join(" ")` (#274). */
+	command?: string;
 	/** Chat as the agent sent it; absent when the profile has no allowChats. */
 	chat?: string;
 	/** Exact text the upstream would receive; never truncated in the ticket. */
@@ -383,6 +385,7 @@ function normalizeTicket(value: unknown): TelegramMcpTicket | undefined {
 		requestHash: raw.requestHash,
 		requestKey: raw.requestKey,
 	};
+	if (typeof raw.command === "string") ticket.command = raw.command;
 	if (typeof raw.chat === "string") ticket.chat = raw.chat;
 	if (Number.isSafeInteger(raw.cardChatId)) ticket.cardChatId = raw.cardChatId as number;
 	if (Number.isSafeInteger(raw.cardMessageId)) ticket.cardMessageId = raw.cardMessageId as number;
