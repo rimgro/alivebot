@@ -46,52 +46,53 @@ interface CommandSpec {
 	textIndex?: number;
 	/** send/reply/edit cannot run without text. */
 	textRequired?: boolean;
+	/** edit takes its text on stdin only; its text positional must be `-`. */
+	stdinOnly?: boolean;
 	/** The chat comes only from this value flag (`search --chat`). */
 	chatFlag?: string;
 	/** 1-based positional index that is a query, never a chat (`search`). */
 	queryIndex?: number;
-	/** The command takes no positionals at all (`write-access`). */
-	noPositionals?: boolean;
+	/** Exact positional count the command accepts (flags are not counted). */
+	positionals: { min: number; max: number };
 }
 
 /**
- * Read commands: the chat argument, where the text starts (never), and the
- * commands that need no chat.
+ * Read commands: the chat argument and the exact number of positionals
+ * (flags are removed by the parser before counting).
  */
 const READ_COMMANDS: Record<string, CommandSpec> = {
-	read: { write: false, chatIndex: 1 },
-	get: { write: false, chatIndex: 1 },
-	topics: { write: false, chatIndex: 1 },
-	buttons: { write: false, chatIndex: 1 },
-	info: { write: false, chatIndex: 1 },
-	members: { write: false, chatIndex: 1 },
-	permissions: { write: false, chatIndex: 1 },
-	stats: { write: false, chatIndex: 1 },
-	scheduled: { write: false, chatIndex: 1 },
-	"profile-photos": { write: false, chatIndex: 1 },
-	"admin-log": { write: false, chatIndex: 1 },
-	invites: { write: false, chatIndex: 1 },
-	whoami: { write: false, chatIndex: 0 },
-	check: { write: false, chatIndex: 0 },
-	help: { write: false, chatIndex: 0 },
-	"help-all": { write: false, chatIndex: 0 },
-	"write-access": { write: false, chatIndex: 0, noPositionals: true },
-	// Search only takes its chat from `--chat`; the positional is the query.
-	search: { write: false, chatIndex: 0, chatFlag: "--chat", queryIndex: 1 },
+	read: { write: false, chatIndex: 1, positionals: { min: 1, max: 1 } },
+	get: { write: false, chatIndex: 1, positionals: { min: 2, max: Number.POSITIVE_INFINITY } },
+	topics: { write: false, chatIndex: 1, positionals: { min: 1, max: 1 } },
+	buttons: { write: false, chatIndex: 1, positionals: { min: 1, max: 1 } },
+	info: { write: false, chatIndex: 1, positionals: { min: 1, max: 1 } },
+	members: { write: false, chatIndex: 1, positionals: { min: 1, max: 1 } },
+	permissions: { write: false, chatIndex: 1, positionals: { min: 1, max: 1 } },
+	stats: { write: false, chatIndex: 1, positionals: { min: 1, max: 1 } },
+	scheduled: { write: false, chatIndex: 1, positionals: { min: 1, max: 1 } },
+	"profile-photos": { write: false, chatIndex: 1, positionals: { min: 1, max: 1 } },
+	"admin-log": { write: false, chatIndex: 1, positionals: { min: 1, max: 1 } },
+	invites: { write: false, chatIndex: 1, positionals: { min: 1, max: 1 } },
+	whoami: { write: false, chatIndex: 0, positionals: { min: 0, max: 0 } },
+	check: { write: false, chatIndex: 0, positionals: { min: 0, max: 0 } },
+	help: { write: false, chatIndex: 0, positionals: { min: 0, max: 0 } },
+	"help-all": { write: false, chatIndex: 0, positionals: { min: 0, max: 0 } },
+	"write-access": { write: false, chatIndex: 0, positionals: { min: 0, max: 0 } },
+	// Search only takes its chat from `--chat`; the one positional is the query.
+	search: { write: false, chatIndex: 0, chatFlag: "--chat", queryIndex: 1, positionals: { min: 1, max: 1 } },
 };
 
-/** Write commands: chat index and where the text starts. */
+/** Write commands: chat index, text start and the exact positional count. */
 const WRITE_COMMANDS: Record<string, CommandSpec> = {
-	send: { write: true, chatIndex: 1, textIndex: 2, textRequired: true },
-	reply: { write: true, chatIndex: 1, textIndex: 3, textRequired: true },
-	edit: { write: true, chatIndex: 1, textIndex: 3, textRequired: true },
-	"mark-read": { write: true, chatIndex: 1 },
-	"mark-unread": { write: true, chatIndex: 1 },
-	click: { write: true, chatIndex: 1 },
-	react: { write: true, chatIndex: 1 },
-	pin: { write: true, chatIndex: 1 },
-	unpin: { write: true, chatIndex: 1 },
-	vote: { write: true, chatIndex: 1 },
+	send: { write: true, chatIndex: 1, textIndex: 2, textRequired: true, positionals: { min: 2, max: 2 } },
+	reply: { write: true, chatIndex: 1, textIndex: 3, textRequired: true, positionals: { min: 3, max: 3 } },
+	edit: { write: true, chatIndex: 1, textIndex: 3, textRequired: true, stdinOnly: true, positionals: { min: 3, max: 3 } },
+	"mark-read": { write: true, chatIndex: 1, positionals: { min: 1, max: 1 } },
+	"mark-unread": { write: true, chatIndex: 1, positionals: { min: 1, max: 1 } },
+	react: { write: true, chatIndex: 1, positionals: { min: 3, max: 3 } },
+	pin: { write: true, chatIndex: 1, positionals: { min: 2, max: 2 } },
+	unpin: { write: true, chatIndex: 1, positionals: { min: 1, max: 2 } },
+	vote: { write: true, chatIndex: 1, positionals: { min: 3, max: 3 } },
 };
 
 /**
@@ -104,6 +105,7 @@ const DENIED_COMMANDS: Record<string, string> = {
 	"delete-dialog": "deleting or leaving a dialog is not allowed",
 	forward: "forwarding messages is not allowed",
 	"send-file": "sending files is not allowed",
+	click: "pressing buttons is not allowed: the button was written by the bot owner",
 	poll: "creating polls is not allowed",
 	kick: "kicking members is not allowed",
 	ban: "banning members is not allowed",
@@ -246,11 +248,16 @@ function normalizeArgvCall(tool: string, args: Record<string, unknown>): Telegra
 	if (!parsed.ok) return deny(parsed.reason);
 	const { positionals, flags } = parsed.parsed;
 
-	if (spec.noPositionals && positionals.length > 0) {
-		return deny(`telegram command "${command}" is read-only here: changing the write mode is not allowed`);
-	}
+	const positionalCount = checkPositionalCount(command, spec, positionals);
+	if (positionalCount) return deny(positionalCount);
 	if (command === "write-access" && flags.has("--for")) {
 		return deny('telegram command "write-access" is read-only here: changing the write mode is not allowed');
+	}
+	if (spec.stdinOnly) {
+		const textToken = positionals[spec.textIndex! - 1];
+		if (textToken !== "-") {
+			return deny(`telegram command "${command}" takes its text on stdin: the text argument must be "-"`);
+		}
 	}
 
 	const chatResult = resolveArgvChat(positionals, flags, spec);
@@ -328,6 +335,34 @@ function checkToolMatchesCommand(tool: string, command: string, spec: CommandSpe
 		return `command "${command}" is not a write; call it through telegram_read`;
 	}
 	return undefined;
+}
+
+/**
+ * Strict positional count: flags are already removed, so a leftover token is
+ * either an argument the command does not take or a multi-word text that the
+ * caller should have passed on stdin. Guessing would shift the chat/text.
+ */
+function checkPositionalCount(command: string, spec: CommandSpec, positionals: string[]): string | undefined {
+	const got = positionals.length;
+	const { min, max } = spec.positionals;
+	if (got >= min && got <= max) return undefined;
+	if (command === "write-access") {
+		return 'telegram command "write-access" is read-only here: changing the write mode is not allowed';
+	}
+	const expected =
+		min === max ? `exactly ${min}` : max === Number.POSITIVE_INFINITY ? `at least ${min}` : `${min} to ${max}`;
+	let hint = "";
+	if (got < min && spec.chatIndex > 0 && got < spec.chatIndex) {
+		hint = " (the chat argument is missing)";
+	} else if (got < min && spec.textIndex !== undefined && got < spec.textIndex) {
+		hint = " (the text argument is missing)";
+	} else if (got > max) {
+		hint =
+			spec.textIndex !== undefined
+				? ' (multi-word text must go on stdin with "-")'
+				: " (unexpected extra positional arguments)";
+	}
+	return `telegram command "${command}" expects ${expected} positional argument(s), got ${got}${hint}`;
 }
 
 function defaultFlatCommand(tool: string): string | undefined {
