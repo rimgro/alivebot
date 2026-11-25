@@ -35,6 +35,20 @@ export interface OutgoingButton {
 /** Rows of inline buttons, 1–3 buttons per row. */
 export type OutgoingButtonRows = OutgoingButton[][];
 
+/** One structured choice option (#266): a stable short id and a visible label. */
+export interface OutgoingChoiceOption {
+	id: string;
+	label: string;
+}
+
+/** A flat list of choices rendered as an inline keyboard by the sink. */
+export type OutgoingChoiceList = OutgoingChoiceOption[];
+
+/** A reply keyboard under the composer: rows of button labels. */
+export interface OutgoingKeyboard {
+	rows: string[][];
+}
+
 /**
  * How the body of an outgoing message should be interpreted.
  *
@@ -62,6 +76,10 @@ export interface OutgoingMessage {
 	attachments?: OutgoingAttachment[];
 	/** Inline quick-reply buttons attached to the message. */
 	buttons?: OutgoingButtonRows;
+	/** Structured choices; mutually exclusive with `buttons` and `keyboard`. */
+	choices?: OutgoingChoiceList;
+	/** Reply keyboard labels; mutually exclusive with `buttons` and `choices`. */
+	keyboard?: OutgoingKeyboard;
 	/** Optional explicit body format; omitted keeps the sink's configured parse mode. */
 	format?: MessageFormat;
 	/** Explicit recipient for local managed-agent routing; thread remains a conversation id. */
@@ -158,6 +176,8 @@ export class Outbox {
 			senderName?: string;
 			attachments?: OutgoingAttachment[];
 			buttons?: OutgoingButtonRows;
+			choices?: OutgoingChoiceList;
+			keyboard?: OutgoingKeyboard;
 			format?: MessageFormat;
 		},
 		deliver: (message: OutgoingMessage) => Promise<void>,
@@ -171,6 +191,8 @@ export class Outbox {
 			text: input.text,
 			...(input.attachments && input.attachments.length > 0 ? { attachments: input.attachments } : {}),
 			...(input.buttons && input.buttons.length > 0 ? { buttons: input.buttons } : {}),
+			...(input.choices && input.choices.length > 0 ? { choices: input.choices } : {}),
+			...(input.keyboard ? { keyboard: input.keyboard } : {}),
 			...(input.format ? { format: input.format } : {}),
 			recipientAgentId: input.recipientAgentId,
 			senderId: input.senderId,

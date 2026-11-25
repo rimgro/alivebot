@@ -23,7 +23,7 @@ import type { Journal } from "../store/journal.js";
 import type { HistoryQuery, HistoryRecord, HistoryStore } from "../store/history.js";
 import type { NoteStore } from "../store/notes.js";
 import type { MemoryService } from "../store/memory.js";
-import type { MessageFormat, Outbox, OutgoingButtonRows, OutgoingMessage } from "../store/outbox.js";
+import type { MessageFormat, Outbox, OutgoingButtonRows, OutgoingChoiceList, OutgoingKeyboard, OutgoingMessage } from "../store/outbox.js";
 import type { NotifyMode, PolicyStore } from "../store/policy.js";
 import type { ReminderStore } from "../store/reminders.js";
 import type { ThreadStore } from "../store/threads.js";
@@ -34,6 +34,7 @@ import { resolveOutgoingAttachment, toOutgoingAttachment } from "./attachments.j
 import { snapshotRuntime } from "./daemon.js";
 import { requestAgentTelegram } from "../modules/telegram/managed-request.js";
 import { buttonHistorySummary, validateOutgoingButtons } from "../modules/telegram/buttons.js";
+import { validateChoiceInputs } from "../modules/telegram/choices.js";
 import { renderWorkerList, renderWorkerRecord, type WorkerManager } from "../workers/manager.js";
 import type { DashboardTool } from "../dashboard/tool.js";
 import { formatDuration, iso, parseTimeSpec, parseTimestamp, sleep, truncate } from "../util.js";
@@ -826,7 +827,9 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 			"Use the thread id from the incoming event. Returns a message id when delivered. " +
 			"Set attachment to a workspace-relative file to deliver it with the text (Telegram sends images as photos, other files as documents). " +
 			"Set buttons to rows of 1–3 inline quick-reply buttons: {text,data} sends a callback action and {text,url} opens a link. " +
-			"callback data is limited to 64 UTF-8 bytes; url buttons are refused in groups unless explicitly allowed.",
+			"callback data is limited to 64 UTF-8 bytes; url buttons are refused in groups unless explicitly allowed. " +
+			"For a simple pick-one question prefer `choices` ([{id,label}], 1–10 options): the press comes back as a structured `[choice]` event. " +
+			"Use `keyboard` ({rows:[[label,...]]}) for a reply keyboard under the composer. Only one of buttons/choices/keyboard may be set.",
 		parameters: Type.Object({
 			text: Type.String({ description: "Message body. Write like a person: short, concrete, no process narration." }),
 			format: Type.Optional(
@@ -874,6 +877,24 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 					{ description: "Rows of 1–3 inline buttons (max one level of nesting)." },
 				),
 			),
+			choices: Type.Optional(
+				Type.Array(
+					Type.Object({
+						id: Type.String({ description: "Short stable slug: a-z, 0-9, _ or -, 1–20 chars." }),
+						label: Type.String({ description: "Visible button label, 1–64 chars." }),
+					}),
+					{ minItems: 1, maxItems: 10, description: "1–10 pick-one options rendered as an inline keyboard (max 3 per row)." },
+				),
+			),
+			keyboard: Type.Optional(
+				Type.Object({
+					rows: Type.Array(Type.Array(Type.String(), { minItems: 1, maxItems: 4 }), {
+						minItems: 1,
+						maxItems: 5,
+						description: "1–5 rows of 1–4 reply-keyboard labels (remove_keyboard follows the press).",
+					}),
+				}),
+			),
 		}),
 		execute: async (_toolCallId, params): Promise<ToolResult> => {
 			const run = requireRun(deps, "send_message");
@@ -907,6 +928,9 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 			// escaping or oversize file, or an invalid/oversized button, must fail as a
 			// tool error, not a half-sent message.
 			const buttons = params.buttons as OutgoingButtonRows | undefined;
+			const choices = params.choices as OutgoingChoiceList | undefined;
+			const keyboard = params.keyboard as OutgoingKeyboard | undefined;
+			validateChoiceInputs({ choices, buttons, keyboard });
 			validateOutgoingButtons(buttons, {
 				thread,
 				chatType: deps.history.thread(thread)?.meta?.chatType as string | undefined,
@@ -940,6 +964,8 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 					replyTo: params.reply_to,
 					attachments: attachment ? [attachment] : undefined,
 					buttons,
+					choices,
+					keyboard,
 					format,
 				},
 				deliver,
@@ -959,17 +985,21 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 				messageId: message.id,
 				attachment: attachment?.path,
 				buttons: buttonSummary?.buttons.length ?? 0,
+				choices: choices?.length ?? 0,
 				format,
 			});
 			const attached = attachment ? ` with ${attachment.kind ?? "file"} ${attachment.name ?? attachment.path}` : "";
 			const withButtons = buttonSummary ? ` and ${buttonSummary.buttons.length} inline button(s)` : "";
-			return ok(`Delivered to ${thread}${attached}${withButtons} (message ${message.id}).`, {
+			const withChoices = choices ? ` and ${choices.length} choice(s)` : keyboard ? ` and a ${keyboard.rows.length}-row reply keyboard` : "";
+			return ok(`Delivered to ${thread}${attached}${withButtons}${withChoices} (message ${message.id}).`, {
 				messageId: message.id,
 				thread,
 				delivered: message.delivered ?? false,
 				...(format ? { format } : {}),
 				...(attachment ? { attachment: { path: attachment.path, kind: attachment.kind } } : {}),
 				...(buttonSummary ? { buttons: buttonSummary } : {}),
+				...(choices ? { choices } : {}),
+				...(keyboard ? { keyboard } : {}),
 			});
 		},
 	});

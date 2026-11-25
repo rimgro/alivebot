@@ -59,10 +59,28 @@ import {
 	validateOutgoingButtons,
 	type ButtonHistorySummary,
 } from "./buttons.js";
+import {
+	CHOICE_ALREADY_ANSWER,
+	CHOICE_REPLY_KEYBOARD_REMOVED_TEXT,
+	CHOICE_STALE_ANSWER,
+	TELEGRAM_CHOICE_CALLBACK_PREFIX,
+	ChoiceStore,
+	choiceEventText,
+	choicePromptText,
+	choicesToReplyMarkup,
+	newChoiceSetId,
+	parseChoiceCallbackData,
+	replyKeyboardOptions,
+	replyKeyboardRemoval,
+	replyKeyboardToReplyMarkup,
+	validateChoiceInputs,
+	type ChoicePress,
+	type ChoiceSet,
+} from "./choices.js";
 import { formatThread, isTelegramTarget, parseThread, resolveThreadRef } from "./threads.js";
 import { TelegramMcpConfirmation, createTelegramMcpConfirmation } from "./mcp-confirmation.js";
 import type { TelegramCallbackQuery, TelegramChat, TelegramSentMessage, TelegramUpdate } from "./types.js";
-import { normalizeUpdate, type NormalizedInbound } from "./update.js";
+import { normalizeChoicePress, normalizeUpdate, type NormalizedInbound } from "./update.js";
 import { acceptBrowserPairing } from "../browser/operator.js";
 import { parseAbortToolCommand, writeToolAbortRequest } from "../../runtime/tool-abort.js";
 import { snapshotRuntime } from "../../runtime/daemon.js";
@@ -222,6 +240,7 @@ export class TelegramModule implements AliveModule {
 	private ctx?: ModuleContext;
 	private api?: TelegramApi;
 	private state?: TelegramStateStore;
+	private choiceStore?: ChoiceStore;
 	private allowlist?: TelegramAllowlistStore;
 	private deliveryLedger?: TelegramDeliveryLedger;
 	private readonly abort = new AbortController();
@@ -313,6 +332,9 @@ export class TelegramModule implements AliveModule {
 		this.state = new TelegramStateStore(moduleDir);
 		this.deliveryLedger = new TelegramDeliveryLedger(moduleDir);
 		this.allowlist = new TelegramAllowlistStore(moduleDir);
+		// #266: choice sets live at <stateDir>/telegram-choices and are swept on start.
+		this.choiceStore = new ChoiceStore(ctx.paths.stateDir);
+		this.choiceStore.prune();
 		// Before the first getUpdates: a token swap must look like a fresh bot, not
 		// like a poller resuming a foreign feed (#139).
 		this.resetOnTokenChange(ctx, token);
@@ -878,6 +900,181 @@ export class TelegramModule implements AliveModule {
 		return true;
 	}
 
+	/**
+	 * Resolve an `alive:ch:` inline press from the persisted set (#266).
+	 *
+	 * Returns true for every data starting with the namespace, valid or not, so
+	 * no choice callback can fall through to `normalizeUpdate`. The first press
+	 * answers, edits the message to drop its keyboard and emits one structured
+	 * event; a repeat answers "уже выбрано" without an edit or an event; an
+	 * unknown, expired, corrupt or foreign set answers "кнопка устарела".
+	 */
+	private async handleChoiceCallback(update: TelegramUpdate, query: TelegramCallbackQuery): Promise<boolean> {
+		const data = query.data;
+		if (!data || !data.startsWith(TELEGRAM_CHOICE_CALLBACK_PREFIX)) return false;
+		const ctx = this.ctx;
+		const api = this.api;
+		const store = this.choiceStore;
+		const answer = async (text: string): Promise<void> => {
+			if (!api) return;
+			try {
+				await api.answerCallbackQuery({ callback_query_id: query.id, text });
+			} catch {
+				// The client spinner is best effort; the decision is made locally.
+			}
+		};
+		const parsed = parseChoiceCallbackData(data);
+		const pressedMessage = query.message;
+		if (!ctx || !api || !store || !parsed || !pressedMessage) {
+			await answer(CHOICE_STALE_ANSWER);
+			return true;
+		}
+		const set = store.get(parsed.setId);
+		const option = set?.options.find((entry) => entry.id === parsed.optionId);
+		const foreignChat = set !== undefined && set.chatId !== String(pressedMessage.chat.id);
+		if (!set || !option || set.source !== "inline" || foreignChat) {
+			await answer(CHOICE_STALE_ANSWER);
+			return true;
+		}
+		const messageId = set.messageId ?? pressedMessage.message_id;
+		const press: ChoicePress = {
+			set: set.setId,
+			optionId: option.id,
+			label: option.label,
+			messageId,
+			thread: set.thread,
+			source: "inline",
+		};
+		const inbound = normalizeChoicePress({
+			updateId: update.update_id,
+			chat: pressedMessage.chat,
+			thread: set.thread,
+			messageId,
+			from: query.from,
+			set: set.setId,
+			optionId: option.id,
+			label: option.label,
+			source: "inline",
+			callbackQueryId: query.id,
+			topicId: pressedMessage.message_thread_id !== undefined ? String(pressedMessage.message_thread_id) : undefined,
+		});
+		// A press from a user outside the allowlist must not become an event and
+		// must not consume the one choice.
+		if (!this.allowed(inbound)) {
+			await answer(CHOICE_STALE_ANSWER);
+			return true;
+		}
+		if (set.chosen) {
+			await answer(CHOICE_ALREADY_ANSWER);
+			return true;
+		}
+		await answer(`выбрано: ${option.label}`);
+		// Persist first: an edit failure (deleted/too old message) must still mark
+		// the set chosen and still deliver the press.
+		try {
+			store.choose(set.setId, option, String(query.from.id));
+		} catch (err) {
+			ctx.log.warn("telegram choice state could not be saved", { setId: set.setId, error: message(err) });
+		}
+		const editedText = `${set.text}\n\n✅ ${option.label}`;
+		const editParams = {
+			chat_id: set.chatId,
+			message_id: messageId,
+			text: editedText,
+			...(set.parseMode ? { parse_mode: set.parseMode } : {}),
+			// Removing the keyboard is part of the contract, not a cosmetic detail.
+			reply_markup: { inline_keyboard: [] },
+		};
+		try {
+			await api.editMessageText(editParams);
+		} catch (err) {
+			if (set.parseMode && isParseModeError(err)) {
+				// The chunk was rendered for a parse mode; an edited line can make the
+				// markup invalid. Mirror the normal send path: one plain-text retry.
+				const plainText = set.parseMode === "HTML" ? htmlToPlainText(editedText) : editedText;
+				ctx.log.warn("telegram rejected the choice markup; editing as plain text", {
+					setId: set.setId,
+					messageId,
+					parseMode: set.parseMode,
+				});
+				try {
+					await api.editMessageText({ ...editParams, text: plainText, parse_mode: undefined });
+				} catch (retryErr) {
+					ctx.log.warn("telegram choice message edit failed", {
+						setId: set.setId,
+						messageId,
+						error: message(retryErr),
+					});
+				}
+			} else {
+				ctx.log.warn("telegram choice message edit failed", {
+					setId: set.setId,
+					messageId,
+					error: message(err),
+				});
+			}
+		}
+		await this.processInbound(inbound);
+		return true;
+	}
+
+	/**
+	 * Turn an exact reply-keyboard label into a choice event (#266).
+	 *
+	 * Only an unanswered set in this chat matches; a repeated press therefore
+	 * falls through to the ordinary message path. `remove_keyboard` goes out as a
+	 * direct Bot API call so it never becomes a second event or history row.
+	 */
+	private async applyReplyKeyboardChoice(inbound: NormalizedInbound, rawText: string | undefined): Promise<boolean> {
+		const store = this.choiceStore;
+		const api = this.api;
+		const ctx = this.ctx;
+		if (!store || !api || !ctx || rawText === undefined) return false;
+		const set = store.findReplySet(inbound.chatId, rawText);
+		const option = set?.options.find((entry) => entry.label === rawText);
+		if (!set || !option) return false;
+		const press: ChoicePress = {
+			set: set.setId,
+			optionId: option.id,
+			label: option.label,
+			messageId: Number(inbound.messageId),
+			thread: inbound.thread,
+			source: "reply_keyboard",
+		};
+		try {
+			store.choose(set.setId, option, inbound.author?.id ?? inbound.chatId);
+		} catch (err) {
+			ctx.log.warn("telegram choice state could not be saved", { setId: set.setId, error: message(err) });
+		}
+		try {
+			await api.sendMessage({
+				chat_id: inbound.chatId,
+				text: CHOICE_REPLY_KEYBOARD_REMOVED_TEXT,
+				message_thread_id: inbound.topicId !== undefined ? Number(inbound.topicId) : undefined,
+				reply_markup: replyKeyboardRemoval(),
+			});
+		} catch (err) {
+			ctx.log.warn("telegram reply keyboard removal failed", { setId: set.setId, error: message(err) });
+		}
+		inbound.text = choiceEventText(press);
+		inbound.promptText = choicePromptText(press);
+		inbound.payload = {
+			...inbound.payload,
+			choice: {
+				set: press.set,
+				optionId: press.optionId,
+				label: press.label,
+				messageId: press.messageId,
+				source: press.source,
+			},
+		};
+		inbound.eventTitle = `choice "${option.label}" from ${inbound.author?.name ?? "unknown"} in ${inbound.chatLabel}`;
+		inbound.expectsReply = true;
+		inbound.addressedToBot = true;
+		await this.processInbound(inbound);
+		return true;
+	}
+
 	/** Expire overdue managed-bot requests and remove their stale keyboards. */
 	private async sweepManagedRequests(): Promise<void> {
 		const ctx = this.ctx;
@@ -906,6 +1103,9 @@ export class TelegramModule implements AliveModule {
 		// #264 B2: the MCP confirmation card is internal too. Swallow every
 		// `alive_tgmcp:` press before normalizeUpdate so it never wakes the agent.
 		if (update.callback_query && (await this.mcpConfirmation?.handleCallback(update.callback_query))) return;
+		// #266: every `alive:ch:` press is resolved from the persisted set before
+		// normalizeUpdate, so a stale/foreign button never becomes a model event.
+		if (update.callback_query && (await this.handleChoiceCallback(update, update.callback_query))) return;
 		if (update.message?.text?.match(/^\/browser_pair(?:@[A-Za-z0-9_]+)?(?:\s|$)/)) {
 			const operator = acceptBrowserPairing(ctx.paths.modulesDir, update.message, this.config.allowedChatIds);
 			if (operator) this.allowlist?.add(operator.userId);
@@ -948,6 +1148,10 @@ export class TelegramModule implements AliveModule {
 			await this.handleAbortToolCommand(inbound);
 			return;
 		}
+		// #266: a reply-keyboard label arrives as ordinary text. Only an exact
+		// match against an unanswered set in this chat turns it into a choice
+		// event; a repeat press falls through as a normal message.
+		if (!inbound.isEdit && (await this.applyReplyKeyboardChoice(inbound, update.message?.text))) return;
 		// Edits are corrections, not new questions (#113): debounce them per message
 		// and deliver one merged event for the whole burst instead of one run per
 		// keystroke. `processInbound` receives the burst metadata for `meta.edits`.
@@ -1804,18 +2008,62 @@ export class TelegramModule implements AliveModule {
 		const topicId = ref.topicId !== undefined ? Number(ref.topicId) : undefined;
 		const threadId = Number.isFinite(topicId) ? topicId : undefined;
 		const replyTo = this.resolveReplyTo(message);
-		// Buttons are validated before the first API call too: an oversize callback
-		// payload or a disallowed group link must not leave half a message behind.
+		// Reply surfaces are validated before the first API call too: an oversize
+		// callback payload, a mixing of buttons/choices/keyboard or a disallowed
+		// group link must not leave half a message behind.
+		validateChoiceInputs({ choices: message.choices, buttons: message.buttons, keyboard: message.keyboard });
 		validateOutgoingButtons(message.buttons, {
 			thread: message.thread,
 			chatType: ctx.history.thread(message.thread)?.meta?.chatType as string | undefined,
 			allowUrlButtonsInGroups: this.config.allowUrlButtonsInGroups,
 		});
-		const replyMarkup = buttonsToReplyMarkup(message.buttons);
+		const choiceOptions = message.choices ?? (message.keyboard ? replyKeyboardOptions(message.keyboard) : undefined);
+		const choiceSource = message.choices ? "inline" : message.keyboard ? "reply_keyboard" : undefined;
+		const choiceSetId = choiceOptions ? newChoiceSetId() : undefined;
+		const replyMarkup = message.choices && choiceSetId
+			? choicesToReplyMarkup(choiceSetId, message.choices)
+			: message.keyboard
+				? replyKeyboardToReplyMarkup(message.keyboard)
+				: buttonsToReplyMarkup(message.buttons);
 		const buttonSummary = buttonHistorySummary(message.buttons);
 		// Attachments are read and limit-checked before the first API call: an
 		// unreadable or oversize file must not leave half a message in the chat.
 		const uploads = await this.prepareAttachments(ctx, message.attachments);
+		// Split before persisting the set: the keyboard rides on the last chunk, and
+		// the stored text must be that chunk, not the whole (possibly long) message.
+		const htmlFormat = format === "markdown" || format === "html";
+		const textChunks = htmlFormat
+			? splitHtml(rendered, this.config.maxMessageChars)
+			: splitMessage(text, this.config.maxMessageChars);
+		const captions = uploads.length > 0
+			? htmlFormat
+				? splitHtml(rendered, TELEGRAM_CAPTION_MAX_CHARS)
+				: splitMessage(text, TELEGRAM_CAPTION_MAX_CHARS)
+			: [];
+		const followUps = captions.slice(1);
+		// The keyboard is attached to the last follow-up chunk, else the last (only)
+		// upload caption, else the last text chunk.
+		const lastUploadCaption = uploads.length === 1 ? (captions[0] ?? "") : "";
+		const keyboardText = uploads.length > 0
+			? followUps.length > 0
+				? (followUps[followUps.length - 1] ?? "")
+				: lastUploadCaption
+			: (textChunks[textChunks.length - 1] ?? "");
+		// Persist the set before the send so a press that lands immediately after
+		// the API accepted the message can still be resolved. `messageId` is filled
+		// in once Telegram returns it.
+		let choiceSet: ChoiceSet | undefined;
+		if (choiceSetId && choiceOptions && choiceSource) {
+			choiceSet = this.choiceStore?.create({
+				setId: choiceSetId,
+				chatId: ref.chatId,
+				thread: message.thread,
+				text: keyboardText,
+				...(parseMode ? { parseMode } : {}),
+				options: choiceOptions,
+				source: choiceSource,
+			});
+		}
 		const sent: Array<{
 			result: TelegramSentMessage;
 			text: string;
@@ -1833,11 +2081,6 @@ export class TelegramModule implements AliveModule {
 			// Telegram captions are limited to 1024 characters; the remainder becomes
 			// ordinary text messages so no part of the reply is lost. Only the first
 			// attachment carries the caption (one file per `send_message` today).
-			const htmlFormat = format === "markdown" || format === "html";
-			const captions = htmlFormat
-				? splitHtml(rendered, TELEGRAM_CAPTION_MAX_CHARS)
-				: splitMessage(text, TELEGRAM_CAPTION_MAX_CHARS);
-			const followUps = captions.slice(1);
 			for (const [index, upload] of uploads.entries()) {
 				const caption = index === 0 ? captions[0] ?? "" : "";
 				const carriesButtons = index === uploads.length - 1 && followUps.length === 0 && replyMarkup !== undefined;
@@ -1884,11 +2127,8 @@ export class TelegramModule implements AliveModule {
 				if (result) sent.push({ result, text: chunk, ...(carriesButtons && buttonSummary ? { buttons: buttonSummary } : {}) });
 			}
 		} else {
-			const chunks = format === "markdown" || format === "html"
-				? splitHtml(rendered, this.config.maxMessageChars)
-				: splitMessage(text, this.config.maxMessageChars);
-			for (const [index, chunk] of chunks.entries()) {
-				const carriesButtons = index === chunks.length - 1 && replyMarkup !== undefined;
+			for (const [index, chunk] of textChunks.entries()) {
+				const carriesButtons = index === textChunks.length - 1 && replyMarkup !== undefined;
 				const result = await this.sendPart(partKey(index), ref.chatId, message.thread, () =>
 					this.sendTextChunk(ctx, api, ref.chatId, threadId, chunk, nextReplyTo(), carriesButtons ? replyMarkup : undefined, parseMode, text, format),
 					"telegram sendMessage",
@@ -1898,6 +2138,17 @@ export class TelegramModule implements AliveModule {
 		}
 
 		this.stopTyping(message.thread);
+		if (choiceSet && sent.length > 0) {
+			const keyboardMessageId = sent[sent.length - 1]!.result.message_id;
+			try {
+				this.choiceStore?.setMessageId(choiceSet.setId, keyboardMessageId);
+			} catch (err) {
+				ctx.log.warn("telegram choice set message id could not be saved", {
+					setId: choiceSet.setId,
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
+		}
 		const outboundAt = Date.now();
 		for (const [index, entry] of sent.entries()) {
 			ctx.history.append({
@@ -1936,6 +2187,8 @@ export class TelegramModule implements AliveModule {
 			attachments: uploads.map((upload) => `${upload.kind}:${upload.name}`),
 			// Button labels/kind are safe; callback payload values are never logged.
 			buttons: message.buttons?.reduce((total, row) => total + row.length, 0) ?? 0,
+			choices: message.choices?.length ?? 0,
+			keyboardRows: message.keyboard?.rows.length ?? 0,
 		});
 		return sent.map((entry) => entry.result);
 	}

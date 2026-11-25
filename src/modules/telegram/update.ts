@@ -1,5 +1,6 @@
 import type { HistoryAttachment } from "../../store/history.js";
-import type { TelegramChat, TelegramMessage, TelegramMessageEntity, TelegramUpdate } from "./types.js";
+import { choiceEventText, choicePromptText, type ChoicePress, type ChoiceSource } from "./choices.js";
+import type { TelegramChat, TelegramMessage, TelegramMessageEntity, TelegramUpdate, TelegramUser } from "./types.js";
 import { formatThread } from "./threads.js";
 import { chatLabel } from "./text.js";
 
@@ -205,6 +206,81 @@ function normalizeCallback(update: TelegramUpdate): NormalizedInbound | undefine
 			callbackQueryId: query.id,
 			data: query.data,
 			author: { id: String(query.from.id), name: displayName(query.from), username: query.from.username },
+		},
+	};
+}
+
+export interface ChoicePressInput {
+	updateId: number;
+	chat: TelegramChat;
+	thread: string;
+	messageId: number;
+	from: TelegramUser;
+	set: string;
+	optionId: string;
+	label: string;
+	source: ChoiceSource;
+	/** Present for an inline press; reply-keyboard presses are ordinary messages. */
+	callbackQueryId?: string;
+	/** Topic of the message, when the chat is a forum. */
+	topicId?: string;
+}
+
+/**
+ * Turn a stored choice set + press into the same normalized shape as any other
+ * inbound event, but with the structural `[choice] {json}` body (#266).
+ */
+export function normalizeChoicePress(input: ChoicePressInput): NormalizedInbound {
+	const chatId = String(input.chat.id);
+	const thread = input.thread || formatThread(chatId, input.topicId);
+	const press: ChoicePress = {
+		set: input.set,
+		optionId: input.optionId,
+		label: input.label,
+		messageId: input.messageId,
+		thread,
+		source: input.source,
+	};
+	const text = choiceEventText(press);
+	const author = { id: String(input.from.id), name: displayName(input.from), username: input.from.username };
+	const isCallback = input.callbackQueryId !== undefined;
+	return {
+		updateId: input.updateId,
+		updateType: isCallback ? "callback_query" : "message",
+		chat: input.chat,
+		chatId,
+		chatLabel: chatLabel(input.chat),
+		messageId: String(input.messageId),
+		topicId: input.topicId,
+		thread,
+		ts: Date.now(),
+		isEdit: false,
+		isChannel: input.chat.type === "channel",
+		expectsReply: true,
+		addressedToBot: true,
+		author,
+		text,
+		promptText: choicePromptText(press),
+		attachments: [],
+		historyId: isCallback ? `telegram:${chatId}:cb:${input.callbackQueryId}` : `telegram:${chatId}:${input.messageId}`,
+		dedupeKey: isCallback ? `telegram:cb:${input.callbackQueryId}` : `telegram:msg:${chatId}:${input.messageId}`,
+		eventTitle: `choice "${input.label}" from ${author.name} in ${chatLabel(input.chat)}`,
+		payload: {
+			module: "telegram",
+			updateId: input.updateId,
+			updateType: isCallback ? "callback_query" : "message",
+			chat: { id: input.chat.id, type: input.chat.type, title: input.chat.title, username: input.chat.username },
+			messageId: String(input.messageId),
+			topicId: input.topicId,
+			...(input.callbackQueryId !== undefined ? { callbackQueryId: input.callbackQueryId } : {}),
+			author,
+			choice: {
+				set: press.set,
+				optionId: press.optionId,
+				label: press.label,
+				messageId: press.messageId,
+				source: press.source,
+			},
 		},
 	};
 }
