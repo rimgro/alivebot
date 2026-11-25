@@ -1030,7 +1030,7 @@ export class TelegramModule implements AliveModule {
 		const api = this.api;
 		const ctx = this.ctx;
 		if (!store || !api || !ctx || rawText === undefined) return false;
-		const set = store.findReplySet(inbound.chatId, rawText);
+		const set = store.findReplySet(inbound.chatId, rawText, inbound.thread);
 		const option = set?.options.find((entry) => entry.label === rawText);
 		if (!set || !option) return false;
 		const press: ChoicePress = {
@@ -1122,6 +1122,21 @@ export class TelegramModule implements AliveModule {
 			requireMentionInGroups: this.config.requireMentionInGroups,
 			ingestEdits: this.config.ingestEdits,
 			editExpectsReply: this.config.editExpectsReply,
+			// #279: a reply-keyboard press arrives as plain text without a mention,
+			// so the group mention filter must let an exact label of a live keyboard
+			// through to `applyReplyKeyboardChoice` below. Edits are never presses.
+			isReplyKeyboardPress: ({ chatId, thread, text, isEdit }) => {
+				if (isEdit || text === undefined) return false;
+				const found = this.choiceStore?.findReplySet(chatId, text, thread);
+				if (!found) return false;
+				return (
+					found.source === "reply_keyboard" &&
+					found.chosen === null &&
+					found.chatId === chatId &&
+					found.thread === thread &&
+					found.options.some((option) => option.label === text)
+				);
+			},
 		});
 		if (!inbound) return;
 		if (update.callback_query) {
@@ -1129,7 +1144,11 @@ export class TelegramModule implements AliveModule {
 		}
 		if (!this.allowed(inbound)) {
 			ctx.log.debug("telegram update denied by allowlist", { chatId: inbound.chatId, author: inbound.author?.id });
-			if (inbound.author?.id) {
+			// #279: a reply-keyboard label can pass the group mention filter without
+			// addressing the bot, so an unaddressed group message must stay silent:
+			// otherwise any member could make the bot post the deny/whitelist text.
+			const isGroup = inbound.chat.type === "group" || inbound.chat.type === "supergroup";
+			if (inbound.author?.id && (inbound.addressedToBot || !isGroup)) {
 				const text =
 					`⛔ Доступ не разрешён. Ваш Telegram ID: ${inbound.author.id}.\n` +
 					`Чтобы добавить себя в вайтлист, попросите владельца выполнить в консоли: alive telegram whitelist add ${inbound.author.id}`;
