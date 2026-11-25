@@ -26,6 +26,7 @@ import { telegramMcpAuditFile } from "../modules/telegram/mcp/audit.js";
 import { UPSTREAM_ENV_ALLOWLIST, buildUpstreamEnv } from "../modules/telegram/mcp/child.js";
 import { TelegramMcpLimitsStore, telegramMcpLimitsFile } from "../modules/telegram/mcp/limits.js";
 import { decideTelegramMcpCall } from "../modules/telegram/mcp/policy.js";
+import { normalizeToolCall } from "../modules/telegram/mcp/normalize.js";
 import { parseJsonRpcMessage, parseStdioChunk } from "../modules/telegram/mcp/protocol.js";
 import { TelegramMcpServer } from "../modules/telegram/mcp/server.js";
 import {
@@ -88,6 +89,7 @@ const stateDir = path.join(root, ".alive");
 const fakePath = path.join(root, "fake-telegram-mcp.cjs");
 const startLog = path.join(root, "starts.jsonl");
 const writeLog = path.join(root, "writes.jsonl");
+const callLog = path.join(root, "calls.jsonl");
 const groupPidFile = path.join(root, "group-pids.jsonl");
 const groupTermFile = path.join(root, "group-terms.txt");
 const crashMarker = path.join(root, "crashed.once");
@@ -100,6 +102,7 @@ function profileEnv(name: string, extra: Record<string, string> = {}): Record<st
 	return {
 		FAKE_START_LOG: startLog,
 		FAKE_WRITE_LOG: writeLog,
+		FAKE_CALL_LOG: callLog,
 		FAKE_GROUP_PID_FILE: groupPidFile,
 		FAKE_GROUP_TERM_FILE: groupTermFile,
 		FAKE_CRASH_MARKER: crashMarker,
@@ -154,7 +157,8 @@ process.stdin.on("data", (chunk) => {
 			respond({ jsonrpc: "2.0", id: message.id, result: { tools: [
 				{ name: "telegram_help", description: "help", inputSchema: { type: "object", properties: {} } },
 				{ name: "telegram_read", description: "read", inputSchema: { type: "object", properties: {} } },
-				{ name: "telegram_write", description: "write", inputSchema: { type: "object", properties: {} } }
+				{ name: "telegram_write", description: "write", inputSchema: { type: "object", properties: {} } },
+				{ name: "telegram_setup", description: "setup", inputSchema: { type: "object", properties: {} } }
 			] } });
 			continue;
 		}
@@ -165,13 +169,28 @@ process.stdin.on("data", (chunk) => {
 		const params = message.params || {};
 		const name = params.name;
 		const args = params.arguments || {};
-		const text = typeof args.text === "string" ? args.text : "";
+		const argv = Array.isArray(args.args) ? args.args : undefined;
+		const stdin = typeof args.stdin === "string" ? args.stdin : undefined;
+		let chat = typeof args.chat === "string" ? args.chat : typeof args.chat === "number" ? String(args.chat) : "";
+		let text = typeof args.text === "string" ? args.text : "";
+		if (argv) {
+			const chatFlag = argv.indexOf("--chat");
+			if (argv[0] === "search" && chatFlag >= 0) chat = String(argv[chatFlag + 1] || "");
+			else chat = typeof argv[1] === "string" ? argv[1] : "";
+			if (stdin !== undefined) text = stdin;
+			else if (argv[0] === "search") text = typeof argv[1] === "string" ? argv[1] : "";
+			else if (argv[0] === "reply" || argv[0] === "edit") text = argv.slice(3).join(" ");
+			else text = argv.slice(2).join(" ");
+		}
+		if (process.env.FAKE_CALL_LOG) {
+			fs.appendFileSync(process.env.FAKE_CALL_LOG, JSON.stringify({ profile, name, argv, stdin, args }) + "\n");
+		}
 		if (text.includes("crash-once") && process.env.FAKE_CRASH_MARKER && !fs.existsSync(process.env.FAKE_CRASH_MARKER)) {
 			fs.writeFileSync(process.env.FAKE_CRASH_MARKER, "1");
 			process.exit(1);
 		}
 		if (process.env.FAKE_WRITE_LOG && name === "telegram_write") {
-			fs.appendFileSync(process.env.FAKE_WRITE_LOG, JSON.stringify({ profile, args }) + "\n");
+			fs.appendFileSync(process.env.FAKE_WRITE_LOG, JSON.stringify({ profile, args, argv, stdin, command: argv ? argv[0] : undefined, chat, text }) + "\n");
 		}
 		if (args.serverRequest === true) {
 			const id = "srv-" + String(message.id);
@@ -181,8 +200,8 @@ process.stdin.on("data", (chunk) => {
 		}
 		const wait = args.slow === true ? 80 : 5;
 		setTimeout(() => respond({ jsonrpc: "2.0", id: message.id, result: {
-			content: [{ type: "text", text: "fake:" + name + ":" + (args.chat || "") + ":" + text }],
-			structuredContent: { name, chat: args.chat || "", text }
+			content: [{ type: "text", text: "fake:" + name + ":" + chat + ":" + text }],
+			structuredContent: { name, chat, text }
 		} }), wait);
 	}
 });
@@ -201,6 +220,9 @@ let resolverToken = "";
 let burstToken = "";
 let guardedToken = "";
 let confirmerToken = "";
+let argvWriterToken = "";
+let argvLimitToken = "";
+let argvAskerToken = "";
 let limits: TelegramMcpLimitsStore | undefined;
 let clockNow = Date.UTC(2026, 0, 1, 12, 0, 0);
 
@@ -453,7 +475,7 @@ try {
 	}
 
 	const profiles: TelegramMcpProfileConfig[] = [
-		{ name: "reader", mode: "read", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath], env: profileEnv("reader", { PROFILE_ONLY: "from-profile", LANG: "profile-lang" }) },
+		{ name: "reader", mode: "read", allowChats: ["111", "@test"], writeTtlMs: 60_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath], env: profileEnv("reader", { PROFILE_ONLY: "from-profile", LANG: "profile-lang" }) },
 		{ name: "asker", mode: "write:ask", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath], env: profileEnv("asker") },
 		{ name: "autowriter", mode: "write:auto", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath], env: profileEnv("autowriter") },
 		{ name: "unopened", mode: "write:auto", allowChats: ["111"], writeTtlMs: 60_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath], env: profileEnv("unopened") },
@@ -472,6 +494,19 @@ try {
 			command: process.execPath,
 			args: [fakePath],
 			env: profileEnv("confirmer"),
+		},
+		{ name: "argvwriter", mode: "write:auto", allowChats: ["@test", "111"], writeTtlMs: 60_000, writeLimitPerHour: 20, command: process.execPath, args: [fakePath], env: profileEnv("argvwriter") },
+		{ name: "argvlimit", mode: "write:auto", allowChats: ["@test"], writeTtlMs: 60_000, writeLimitPerHour: 2, command: process.execPath, args: [fakePath], env: profileEnv("argvlimit") },
+		{
+			name: "argvasker",
+			mode: "write:ask",
+			allowChats: ["@test", "111"],
+			writeTtlMs: 60_000,
+			writeLimitPerHour: 5,
+			confirmation: { ticketDir: confirmationDir, ttlMs: 60_000 },
+			command: process.execPath,
+			args: [fakePath],
+			env: profileEnv("argvasker"),
 		},
 	];
 	const config: TelegramMcpConfig = { enabled: true, host: "127.0.0.1", port: 8787, profiles };
@@ -600,6 +635,219 @@ try {
 		}
 	}
 
+	section("normalize: argv grammar and flat compatibility");
+	{
+		const view = (tool: string, args: Record<string, unknown>) => {
+			const result = normalizeToolCall(tool, args);
+			return result.ok ? result.view : undefined;
+		};
+		const reason = (tool: string, args: Record<string, unknown>): string => {
+			const result = normalizeToolCall(tool, args);
+			return result.ok ? "" : result.reason;
+		};
+		const open = { windowActive: true, windowExpiresAt: clockNow + 60_000, writesThisHour: 0 };
+
+		const read = view("telegram_read", { args: ["read", "@test"] });
+		check(
+			"argv read keeps the original argv and finds the chat",
+			read?.command === "read" && read.chat === "@test" && read.argv.join(" ") === "read @test" && read.write === false,
+			read,
+		);
+		const send = view("telegram_write", { args: ["send", "@test", "hello", "world"] });
+		check("argv send joins the text positionals", send?.write === true && send.chat === "@test" && send.text === "hello world", send);
+		const flags = view("telegram_read", { args: ["read", "@test", "-n", "10", "--json"] });
+		check(
+			"known flags keep their values out of the positionals",
+			flags?.chat === "@test" && flags.argv.join(" ") === "read @test -n 10 --json",
+			flags,
+		);
+
+		const stdinSend = view("telegram_write", { args: ["send", "@test", "-"], stdin: "from stdin" });
+		check("send - takes its text from stdin", stdinSend?.text === "from stdin" && stdinSend.argv[2] === "-", stdinSend);
+		const reply = view("telegram_write", { args: ["reply", "@test", "5", "-"], stdin: "reply text" });
+		check("reply - takes its text from stdin after the message id", reply?.chat === "@test" && reply.text === "reply text", reply);
+		const edit = view("telegram_write", { args: ["edit", "@test", "5", "-"], stdin: "edit text" });
+		check("edit - takes its text from stdin after the message id", edit?.chat === "@test" && edit.text === "edit text", edit);
+		const noStdin = reason("telegram_write", { args: ["send", "@test", "-"] });
+		check("send - without stdin is denied", noStdin.includes("no stdin"), noStdin);
+
+		const search = view("telegram_read", { args: ["search", "query", "--chat", "@test"] });
+		check(
+			"search takes its chat only from --chat and does not treat the query as a chat",
+			search?.chat === "@test" && search.argv.join(" ") === "search query --chat @test",
+			search,
+		);
+		const searchNoChat = view("telegram_read", { args: ["search", "query"] });
+		check("search without --chat has no chat for the policy to reject", searchNoChat !== undefined && searchNoChat.chat === undefined, searchNoChat);
+		const searchDenied = decideTelegramMcpCall({
+			profile: profiles[0]!,
+			tool: "telegram_read",
+			args: { args: ["search", "query"] },
+			now: clockNow,
+			limits: open,
+		});
+		check("search without --chat is denied by the policy", searchDenied.decision === "deny", searchDenied);
+		for (const command of [["whoami"], ["check"], ["help"], ["help-all"], ["write-access"]]) {
+			const decision = decideTelegramMcpCall({
+				profile: profiles[0]!,
+				tool: "telegram_read",
+				args: { args: command },
+				now: clockNow,
+				limits: open,
+			});
+			check(`no-chat read ${command[0]} is allowed`, decision.decision === "allow", decision);
+		}
+		const readWithoutChat = decideTelegramMcpCall({
+			profile: profiles[0]!,
+			tool: "telegram_read",
+			args: { args: ["read"] },
+			now: clockNow,
+			limits: open,
+		});
+		check("a chat command without its chat stays denied", readWithoutChat.decision === "deny" && readWithoutChat.reason.includes("chat argument"), readWithoutChat);
+		check("--chat=@test is parsed on search", view("telegram_read", { args: ["search", "q", "--chat=@test"] })?.chat === "@test");
+
+		check("an unknown command is denied", reason("telegram_read", { args: ["frobnicate", "x"] }).includes("unknown telegram command"));
+		for (const command of ["delete", "forward", "send-file", "api"]) {
+			const denied = reason("telegram_write", { args: [command, "@test"] });
+			check(`${command} is denied as a command`, denied.includes("denied"), denied);
+		}
+
+		check(
+			"two positional chats are denied as a mass send",
+			reason("telegram_read", { args: ["read", "@test", "@other"] }).includes("mass send"),
+		);
+		check(
+			"a second negative-id chat is denied as a mass send",
+			reason("telegram_read", { args: ["read", "@test", "-1004003"] }).includes("mass send"),
+		);
+		check(
+			"two chats in a write are denied as a mass send",
+			reason("telegram_write", { args: ["send", "@test", "@other", "hi"] }).includes("mass send"),
+		);
+		check(
+			"a conflicting --chat is denied",
+			reason("telegram_write", { args: ["send", "--chat", "@other", "@test", "hi"] }).includes("mass send"),
+		);
+
+		const unknownFlag = reason("telegram_write", { args: ["send", "@test", "hi", "--frobnicate"] });
+		check("an unknown flag is denied", unknownFlag.includes("unknown flag"), unknownFlag);
+		const missingFlagValue = reason("telegram_read", { args: ["read", "@test", "--chat"] });
+		check("a value flag without a value is denied", missingFlagValue.includes("requires a value"), missingFlagValue);
+		check(
+			"--chat on a non-search command is denied",
+			reason("telegram_read", { args: ["whoami", "--chat", "@a"] }).includes("only supported by"),
+		);
+
+		const valuedFlags = [
+			"-n",
+			"--topic",
+			"--thread",
+			"--reply-to",
+			"--schedule",
+			"--max-text",
+			"--preview",
+			"--since",
+			"--until",
+			"--before",
+			"--after",
+			"--from",
+			"--type",
+			"--correct",
+			"--message",
+			"--grep",
+			"-q",
+			"-g",
+			"-c",
+		];
+		for (const flag of valuedFlags) {
+			check(`known value flag ${flag} is accepted`, view("telegram_read", { args: ["read", "@test", flag, "v"] }) !== undefined);
+		}
+		const booleanFlags = [
+			"--json",
+			"--html",
+			"--markdown",
+			"--silent",
+			"--unread",
+			"--asc",
+			"--just-me",
+			"--full",
+			"--stats",
+			"--multiple",
+			"--quiz",
+			"--drop-author",
+			"--revoke",
+			"--notify",
+			"--requests",
+			"--include-archived",
+			"--unmuted",
+			"--no-bots",
+			"--help",
+		];
+		for (const flag of booleanFlags) {
+			check(`known boolean flag ${flag} is accepted`, view("telegram_read", { args: ["read", "@test", flag] }) !== undefined);
+		}
+
+		check("empty argv is denied", reason("telegram_write", { args: [] }).includes("non-empty array"));
+		check("non-string argv is denied", reason("telegram_write", { args: ["send", 111, "hi"] }).includes("only non-empty strings"));
+		check(
+			"mixed shapes with a different chat are denied",
+			reason("telegram_write", { args: ["send", "@test", "hi"], chat: "@other" }).includes("mixed argument shapes"),
+		);
+		check(
+			"mixed shapes with matching values are allowed",
+			view("telegram_write", { args: ["send", "@test", "hi"], chat: "@test", text: "hi" })?.text === "hi",
+		);
+		check(
+			"stdin with a positional text is a mixed shape",
+			reason("telegram_write", { args: ["send", "@test", "hi"], stdin: "x" }).includes("mixed argument shapes"),
+		);
+		check(
+			"stdin on a read is a mixed shape",
+			reason("telegram_read", { args: ["read", "@test"], stdin: "x" }).includes("mixed argument shapes"),
+		);
+
+		const flatWrite = view("telegram_write", { chat: "111", text: "hi" });
+		check(
+			"the flat write still maps to send",
+			flatWrite?.command === "send" && flatWrite.chat === "111" && flatWrite.text === "hi" && flatWrite.write === true,
+			flatWrite,
+		);
+		const flatRead = view("telegram_read", { chat: "111" });
+		check("the flat read still maps to read", flatRead?.command === "read" && flatRead.chat === "111" && flatRead.write === false, flatRead);
+		check("a flat action is honoured", view("telegram_write", { action: "mark-read", chat: "111" })?.command === "mark-read");
+		check("flat delete_chat is denied", reason("telegram_write", { action: "delete_chat", chat: "111" }).includes("deleting"));
+		check("flat recipient lists are mass-send denied", reason("telegram_write", { recipients: ["1", "2"] }).includes("mass send"));
+		check(
+			"a nested chat object is not guessed",
+			reason("telegram_write", { chat: { id: "111" } }).includes("cannot resolve target chat"),
+		);
+
+		check(
+			"a write command on telegram_read is denied",
+			reason("telegram_read", { args: ["send", "@test", "hi"] }).includes("call it through telegram_write"),
+		);
+		check(
+			"a read command on telegram_write is denied",
+			reason("telegram_write", { args: ["read", "@test"] }).includes("call it through telegram_read"),
+		);
+		check("write-access without a mode is allowed", view("telegram_read", { args: ["write-access"] })?.command === "write-access");
+		check(
+			"write-access with a mode is denied",
+			reason("telegram_read", { args: ["write-access", "ask"] }).includes("write mode"),
+		);
+		check(
+			"write-access --for is denied",
+			reason("telegram_read", { args: ["write-access", "--for", "2h"] }).includes("write mode"),
+		);
+		check(
+			"join in argv is denied",
+			reason("telegram_write", { args: ["send", "@test", "join the call"] }).includes("inviting or joining"),
+		);
+		check("broadcast in argv is denied", reason("telegram_read", { args: ["read", "broadcast"] }).includes("broadcast"));
+		check("help-all with -g is allowed", view("telegram_read", { args: ["help-all", "-g", "thread"] })?.command === "help-all");
+	}
+
 	section("limits: TTL and hourly counter with an injected clock");
 	{
 		const fixture = path.join(root, "limits-fixture");
@@ -632,6 +880,8 @@ try {
 		limits.openWindow("resolver", 60_000, clockNow);
 		limits.openWindow("burst", 60_000, clockNow);
 		limits.openWindow("guarded", 60_000, clockNow);
+		limits.openWindow("argvwriter", 60_000, clockNow);
+		limits.openWindow("argvlimit", 60_000, clockNow);
 	}
 
 	section("server: transport, auth and policy");
@@ -647,6 +897,9 @@ try {
 		burstToken = tokens.issue("burst");
 		guardedToken = tokens.issue("guarded");
 		confirmerToken = tokens.issue("confirmer");
+		argvWriterToken = tokens.issue("argvwriter");
+		argvLimitToken = tokens.issue("argvlimit");
+		argvAskerToken = tokens.issue("argvasker");
 		server = new TelegramMcpServer({
 			config,
 			stateDir,
@@ -694,6 +947,17 @@ try {
 		const list = await rpc(readerToken, { jsonrpc: "2.0", id: "list-1", method: "tools/list" });
 		const tools = (list.body.result as { tools?: Array<{ name?: string }> } | undefined)?.tools ?? [];
 		check("tools/list passes through with exactly 3 tools", list.status === 200 && tools.length === 3, tools);
+		check(
+			"tools/list hides telegram_setup and keeps only the allowed tools",
+			tools.map((tool) => tool.name).join(",") === "telegram_help,telegram_read,telegram_write",
+			tools,
+		);
+		const hiddenCall = await call(readerToken, "hidden-1", "telegram_setup", {});
+		check(
+			"calling the hidden telegram_setup tool is denied",
+			decisionOf(hiddenCall.body) === "deny" && textOf(hiddenCall.body).includes("not allowed"),
+			hiddenCall.body,
+		);
 
 		const readAllowed = await call(readerToken, "read-1", "telegram_read", { chat: "111" });
 		check("telegram_read inside allowChats is forwarded", textOf(readAllowed.body).startsWith("fake:telegram_read:111:"), readAllowed.body);
@@ -921,6 +1185,7 @@ try {
 		const audit = readJsonl(auditFile) as unknown as Array<{
 			profile?: string;
 			tool?: string;
+			command?: string;
 			chat?: string;
 			decision?: string;
 			reason?: string;
@@ -930,6 +1195,7 @@ try {
 		check("the audit records allow and deny decisions", audit.some((entry) => entry.decision === "allow") && audit.some((entry) => entry.decision === "deny"), audit.length);
 		const deniedRead = audit.find((entry) => entry.tool === "telegram_read" && entry.chat === "222");
 		check("the denied read has profile, reason and decision", deniedRead?.profile === "reader" && deniedRead?.decision === "deny" && (deniedRead?.reason ?? "").includes("allowChats"), deniedRead);
+		check("the audit records the command name", deniedRead?.command === "read", deniedRead);
 		const unresolvedAudit = audit.find(
 			(entry) => entry.profile === "resolver" && entry.tool === "telegram_write" && entry.decision === "deny" && (entry.reason ?? "").includes("cannot resolve target chat"),
 		);
@@ -1253,6 +1519,149 @@ try {
 		for (const ticketId of backlogIds) {
 			fs.rmSync(ticketFilePath(confirmerDir, ticketId), { force: true });
 		}
+	}
+
+	section("server: argv tool calls, stdin, modes and limits");
+	{
+		// The confirmation section advanced the injected clock; reopen the windows.
+		limits!.openWindow("argvwriter", 60_000, clockNow);
+		limits!.openWindow("argvlimit", 60_000, clockNow);
+		const callLogEntries = (profile: string) => readJsonl(callLog).filter((entry) => entry.profile === profile);
+
+		const argvRead = await call(readerToken, "argv-read-allow", "telegram_read", { args: ["read", "@test"] });
+		check("argv read inside allowChats is forwarded", textOf(argvRead.body).startsWith("fake:telegram_read:@test:"), argvRead.body);
+		const argvReadDenied = await call(readerToken, "argv-read-deny", "telegram_read", { args: ["read", "@other"] });
+		check(
+			"argv read outside allowChats is denied",
+			decisionOf(argvReadDenied.body) === "deny" && textOf(argvReadDenied.body).includes("allowChats"),
+			argvReadDenied.body,
+		);
+
+		const sendArgv = await call(argvWriterToken, "argv-send", "telegram_write", { args: ["send", "@test", "hello", "argv"] });
+		check("argv send with positional text is forwarded", textOf(sendArgv.body).startsWith("fake:telegram_write:@test:hello argv"), sendArgv.body);
+		const sendCall = callLogEntries("argvwriter").find(
+			(entry) => Array.isArray(entry.argv) && (entry.argv as string[])[0] === "send" && (entry.argv as string[])[2] === "hello",
+		);
+		check(
+			"the upstream receives the exact argv",
+			Array.isArray(sendCall?.argv) && (sendCall!.argv as string[]).join(" ") === "send @test hello argv",
+			sendCall,
+		);
+
+		const sendStdin = await call(argvWriterToken, "argv-send-stdin", "telegram_write", { args: ["send", "@test", "-"], stdin: "line from stdin" });
+		check("argv send - forwards stdin", textOf(sendStdin.body).includes("line from stdin"), sendStdin.body);
+		const stdinCall = callLogEntries("argvwriter").find((entry) => entry.stdin === "line from stdin");
+		check(
+			"the upstream receives stdin separately from argv",
+			Array.isArray(stdinCall?.argv) && (stdinCall!.argv as string[]).join(" ") === "send @test -",
+			stdinCall,
+		);
+
+		const replyStdin = await call(argvWriterToken, "argv-reply-stdin", "telegram_write", { args: ["reply", "@test", "5", "-"], stdin: "reply text" });
+		check("argv reply - forwards stdin", textOf(replyStdin.body).includes("reply text"), replyStdin.body);
+		const editStdin = await call(argvWriterToken, "argv-edit-stdin", "telegram_write", { args: ["edit", "@test", "5", "-"], stdin: "edit text" });
+		check("argv edit - forwards stdin", textOf(editStdin.body).includes("edit text"), editStdin.body);
+
+		const search = await call(readerToken, "argv-search", "telegram_read", { args: ["search", "query", "--chat", "@test"] });
+		check("argv search with --chat is forwarded", textOf(search.body).startsWith("fake:telegram_read:@test:query"), search.body);
+		const searchNoChat = await call(readerToken, "argv-search-no-chat", "telegram_read", { args: ["search", "query"] });
+		check("argv search without --chat is denied", decisionOf(searchNoChat.body) === "deny", searchNoChat.body);
+		const writeAccessStatus = await call(readerToken, "argv-write-access", "telegram_read", { args: ["write-access"] });
+		check(
+			"argv write-access status read is allowed without a chat",
+			textOf(writeAccessStatus.body).startsWith("fake:telegram_read::"),
+			writeAccessStatus.body,
+		);
+
+		const unknown = await call(readerToken, "argv-unknown", "telegram_read", { args: ["frobnicate", "x"] });
+		check(
+			"argv unknown command is denied",
+			decisionOf(unknown.body) === "deny" && textOf(unknown.body).includes("unknown telegram command"),
+			unknown.body,
+		);
+		for (const command of ["delete", "forward", "send-file", "api"]) {
+			const denied = await call(argvWriterToken, `argv-deny-${command}`, "telegram_write", { args: [command, "@test"] });
+			check(`argv ${command} is denied`, decisionOf(denied.body) === "deny", denied.body);
+		}
+		const twoChats = await call(argvWriterToken, "argv-two-chats", "telegram_write", { args: ["send", "@test", "@other", "hi"] });
+		check(
+			"argv two chats are denied",
+			decisionOf(twoChats.body) === "deny" && textOf(twoChats.body).includes("mass send"),
+			twoChats.body,
+		);
+		const unknownFlag = await call(argvWriterToken, "argv-unknown-flag", "telegram_write", { args: ["send", "@test", "hi", "--frobnicate"] });
+		check(
+			"argv unknown flag is denied",
+			decisionOf(unknownFlag.body) === "deny" && textOf(unknownFlag.body).includes("unknown flag"),
+			unknownFlag.body,
+		);
+		const emptyArgv = await call(argvWriterToken, "argv-empty", "telegram_write", { args: [] });
+		check("empty argv is denied", decisionOf(emptyArgv.body) === "deny", emptyArgv.body);
+		const nonString = await call(argvWriterToken, "argv-non-string", "telegram_write", { args: ["send", 111, "hi"] });
+		check("non-string argv is denied", decisionOf(nonString.body) === "deny", nonString.body);
+		const mixed = await call(argvWriterToken, "argv-mixed", "telegram_write", { args: ["send", "@test", "hi"], chat: "@other" });
+		check(
+			"argv plus a different flat chat is denied",
+			decisionOf(mixed.body) === "deny" && textOf(mixed.body).includes("mixed argument shapes"),
+			mixed.body,
+		);
+		const dashNoStdin = await call(argvWriterToken, "argv-dash-no-stdin", "telegram_write", { args: ["send", "@test", "-"] });
+		check(
+			"argv - without stdin is denied",
+			decisionOf(dashNoStdin.body) === "deny" && textOf(dashNoStdin.body).includes("stdin"),
+			dashNoStdin.body,
+		);
+		const readMode = await call(readerToken, "argv-read-mode", "telegram_write", { args: ["send", "@test", "hi"] });
+		check(
+			"argv write in mode read is denied",
+			decisionOf(readMode.body) === "deny" && textOf(readMode.body).includes("read-only"),
+			readMode.body,
+		);
+
+		// write:ask with argv and stdin.
+		const askCall = call(argvAskerToken, "argv-ask", "telegram_write", { args: ["send", "@test", "-"], stdin: "confirm argv text" });
+		let askSettled = false;
+		void askCall.then(() => {
+			askSettled = true;
+		});
+		const argvAskDir = profileTicketDir(confirmationDir, "argvasker");
+		const askReady = await waitFor(() => listTickets(argvAskDir).some((ticket) => ticket.text === "confirm argv text"));
+		const askTicket = listTickets(argvAskDir).find((ticket) => ticket.text === "confirm argv text");
+		check("argv write:ask creates a pending ticket", askReady && askTicket?.status === "pending", askTicket);
+		check('the ticket carries argv.join(" ") as command', askTicket?.command === "send @test -", askTicket);
+		await delay(50);
+		check("the argv ask blocks before sending", !askSettled && callLogEntries("argvasker").length === 0, askSettled);
+		if (!askTicket) throw new Error("the argv ask ticket is missing");
+		writeDecision(argvAskDir, decisionFor(askTicket, "approve") as Parameters<typeof writeDecision>[1]);
+		const askApproved = await askCall;
+		check("argv write:ask approval forwards the exact argv and stdin", textOf(askApproved.body).includes("confirm argv text"), askApproved.body);
+		const askForward = callLogEntries("argvasker").find((entry) => Array.isArray(entry.argv));
+		check(
+			"the approved argv write reaches the upstream unchanged",
+			Array.isArray(askForward?.argv) && (askForward!.argv as string[]).join(" ") === "send @test -" && askForward?.stdin === "confirm argv text",
+			askForward,
+		);
+		check("the argv ask ticket is marked sent", readTicket(argvAskDir, askTicket.ticketId)?.status === "sent", readTicket(argvAskDir, askTicket.ticketId));
+
+		// write:auto limits on argv calls.
+		const limit1 = await call(argvLimitToken, "argv-limit-1", "telegram_write", { args: ["send", "@test", "one"] });
+		const limit2 = await call(argvLimitToken, "argv-limit-2", "telegram_write", { args: ["send", "@test", "two"] });
+		const limit3 = await call(argvLimitToken, "argv-limit-3", "telegram_write", { args: ["send", "@test", "three"] });
+		check(
+			"argv write:auto honours the hourly limit",
+			textOf(limit1.body).startsWith("fake:telegram_write:@test:one") &&
+				textOf(limit2.body).startsWith("fake:telegram_write:@test:two") &&
+				decisionOf(limit3.body) === "deny" &&
+				textOf(limit3.body).includes("write limit"),
+			[limit1.body, limit2.body, limit3.body],
+		);
+
+		const argvAudit = readJsonl(telegramMcpAuditFile(stateDir)) as unknown as Array<{ profile?: string; command?: string; tool?: string }>;
+		check(
+			"the audit records the argv command",
+			argvAudit.some((entry) => entry.profile === "argvwriter" && entry.tool === "telegram_write" && entry.command === "send"),
+			argvAudit.filter((entry) => entry.profile === "argvwriter"),
+		);
 	}
 
 	section("shutdown kills the upstream process group");

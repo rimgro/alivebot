@@ -283,6 +283,7 @@ export class TelegramMcpConfirmation {
 			`Профиль: ${ticket.profile}\n` +
 			`Чат: ${ticket.chat ?? "не указан"}\n` +
 			`Действие: ${ticket.tool}\n` +
+			`Команда: ${ticket.command ?? "не указана"}\n` +
 			`Действует до: ${expires}\n` +
 			`Хэш запроса: ${ticket.requestHash}\n\n` +
 			`Текст записи:\n${text}\n\n` +

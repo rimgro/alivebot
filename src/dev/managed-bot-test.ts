@@ -334,6 +334,7 @@ try {
 				ticketId,
 				profile: "ops",
 				tool: "telegram_write",
+				command: `send 42 ${text}`,
 				chat: "42",
 				text,
 				createdAt: now,
@@ -391,9 +392,10 @@ try {
 			check("a pending ticket becomes a card in the target thread", cardSent && Number(card?.params.chat_id) === 42, card?.params);
 			check("the ticket file is 0600", mode(ticketFilePath(profileDir, ticket.ticketId)) === 0o600, mode(ticketFilePath(profileDir, ticket.ticketId)).toString(8));
 			check(
-				"the card names the profile, chat, expiry, request hash and exact write text",
+				"the card names the profile, chat, command, expiry, request hash and exact write text",
 				String(card?.params.text).includes("Профиль: ops") &&
 					String(card?.params.text).includes("Чат: 42") &&
+					String(card?.params.text).includes("Команда: send 42 confirm-card-text") &&
 					String(card?.params.text).includes("Действует до:") &&
 					String(card?.params.text).includes(`Хэш запроса: ${ticket.requestHash}`) &&
 					String(card?.params.text).includes("confirm-card-text"),

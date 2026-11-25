@@ -155,6 +155,13 @@ default to `telegram mcp`, and `env` is the only way to add a variable to the
 child beyond the fixed exact-name allowlist (PATH, HOME, locale, XDG, temp,
 proxy; no Telegram credentials).
 
+If `telegram` is not on the unit's `PATH`, set `command` to the absolute path
+of the binary (for example
+`%h/opt/better-tg-cli/node_modules/.bin/telegram`); otherwise the child fails
+with `spawn telegram ENOENT`. The unit adds
+`%h/opt/better-tg-cli/node_modules/.bin` to `PATH` for the default install
+location.
+
 `enabled: true` is required: `serve` refuses to listen while it is false, so do
 not enable the unit before the block is configured. The proxy is meant for the
 host runtime only — nothing in the sandbox talks to it directly at this step.
