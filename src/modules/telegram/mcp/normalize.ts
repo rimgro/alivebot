@@ -205,6 +205,28 @@ export function commandRequiresChat(command: string): boolean {
 }
 
 /**
+ * Arguments to send to the upstream child.
+ *
+ * The real 0.41.2 tools take `{args: string[], stdin?}` only, so a legacy flat
+ * call is rewritten into that shape: the command, the chat, and `-` with the
+ * text on stdin for a write. Everything the normaliser accepted is kept exactly
+ * as approved, and the argv shape itself passes through untouched (the policy
+ * has already checked any extra flat fields against it).
+ */
+export function upstreamToolArguments(tool: string, args: Record<string, unknown>): Record<string, unknown> {
+	if (tool !== "telegram_read" && tool !== "telegram_write") return args;
+	if (args.args !== undefined) return args;
+	const normalized = normalizeToolCall(tool, args);
+	// A denied call is never forwarded; hand the original back untouched.
+	if (!normalized.ok) return args;
+	const { view } = normalized;
+	const argv = [view.command, ...(view.chat === undefined ? [] : [view.chat])];
+	if (view.text === undefined) return { args: argv };
+	argv.push("-");
+	return { args: argv, stdin: view.text };
+}
+
+/**
  * Normalise one `telegram_read` / `telegram_write` call.
  *
  * `telegram_help` and `tools/list` never reach this function: the policy allows

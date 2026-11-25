@@ -14,6 +14,7 @@ import { TelegramMcpAuditLog, auditPreview } from "./audit.js";
 import type { TelegramMcpConfig, TelegramMcpProfileConfig } from "./config.js";
 import { UpstreamChild, type UpstreamChildOptions } from "./child.js";
 import { TelegramMcpLimitsStore } from "./limits.js";
+import { upstreamToolArguments } from "./normalize.js";
 import {
 	JSON_RPC_ERROR,
 	isJsonRpcNotification,
@@ -715,7 +716,8 @@ export class TelegramMcpServer {
 				timer,
 			});
 		});
-		const sent = child.send({ jsonrpc: "2.0", id: upstreamId, method: message.method, ...(message.params === undefined ? {} : { params: message.params }) });
+		const params = upstreamParams(message.params);
+		const sent = child.send({ jsonrpc: "2.0", id: upstreamId, method: message.method, ...(params === undefined ? {} : { params }) });
 		if (!sent) {
 			this.settle(key, new Error("telegram mcp upstream is not running"));
 		}
@@ -794,6 +796,20 @@ function toolResult(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A legacy flat call is rewritten into the real `{args, stdin}` shape before it
+ * reaches the upstream; every other request passes through unchanged (#274).
+ */
+function upstreamParams(params: unknown): unknown {
+	if (!isRecord(params) || typeof params.name !== "string") return params;
+	const tool = params.name;
+	if (tool !== "telegram_read" && tool !== "telegram_write") return params;
+	const args = isRecord(params.arguments) ? params.arguments : undefined;
+	if (args === undefined) return params;
+	const rewritten = upstreamToolArguments(tool, args);
+	return rewritten === args ? params : { ...params, arguments: rewritten };
 }
 
 /** The raw command name from an argv-shaped call, for audit entries of a deny. */

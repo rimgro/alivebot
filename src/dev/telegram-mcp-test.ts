@@ -26,7 +26,7 @@ import { telegramMcpAuditFile } from "../modules/telegram/mcp/audit.js";
 import { UPSTREAM_ENV_ALLOWLIST, buildUpstreamEnv } from "../modules/telegram/mcp/child.js";
 import { TelegramMcpLimitsStore, telegramMcpLimitsFile } from "../modules/telegram/mcp/limits.js";
 import { decideTelegramMcpCall } from "../modules/telegram/mcp/policy.js";
-import { normalizeToolCall } from "../modules/telegram/mcp/normalize.js";
+import { normalizeToolCall, upstreamToolArguments } from "../modules/telegram/mcp/normalize.js";
 import { parseJsonRpcMessage, parseStdioChunk } from "../modules/telegram/mcp/protocol.js";
 import { TelegramMcpServer } from "../modules/telegram/mcp/server.js";
 import {
@@ -893,6 +893,25 @@ try {
 		);
 		check("broadcast in argv is denied", reason("telegram_read", { args: ["read", "broadcast"] }).includes("broadcast"));
 		check("help-all with -g is allowed", view("telegram_read", { args: ["help-all", "-g", "thread"] })?.command === "help-all");
+
+		// The real upstream takes `{args, stdin}` only, so a legacy flat call is
+		// rewritten before it leaves the proxy (#274).
+		const flatUpstream = upstreamToolArguments("telegram_write", { chat: "111", text: "flat hi" });
+		check(
+			"a flat write becomes argv plus stdin",
+			JSON.stringify(flatUpstream) === JSON.stringify({ args: ["send", "111", "-"], stdin: "flat hi" }),
+			flatUpstream,
+		);
+		const flatReadUpstream = upstreamToolArguments("telegram_read", { chat: "111" });
+		check(
+			"a flat read becomes argv",
+			JSON.stringify(flatReadUpstream) === JSON.stringify({ args: ["read", "111"] }),
+			flatReadUpstream,
+		);
+		const argvArgs = { args: ["send", "@test", "-"], stdin: "same" };
+		check("the argv shape is forwarded untouched", upstreamToolArguments("telegram_write", argvArgs) === argvArgs, argvArgs);
+		const helpArgs = { args: ["read", "@test"] };
+		check("non telegram tools are untouched", upstreamToolArguments("telegram_help", helpArgs) === helpArgs, helpArgs);
 	}
 
 	section("limits: TTL and hourly counter with an injected clock");
@@ -1608,6 +1627,23 @@ try {
 		check("argv reply - forwards stdin", textOf(replyStdin.body).includes("reply text"), replyStdin.body);
 		const editStdin = await call(argvWriterToken, "argv-edit-stdin", "telegram_write", { args: ["edit", "@test", "5", "-"], stdin: "edit text" });
 		check("argv edit - forwards stdin", textOf(editStdin.body).includes("edit text"), editStdin.body);
+
+		// A legacy flat call must leave the proxy in the real argv shape: the
+		// upstream console has spoken `{args, stdin}` only since #274.
+		const flatWrite = await call(argvWriterToken, "flat-send", "telegram_write", { chat: "@test", text: "flat path text" });
+		check("a flat write is forwarded", textOf(flatWrite.body).includes("flat path text"), flatWrite.body);
+		const flatWriteCall = callLogEntries("argvwriter").find((entry) => entry.stdin === "flat path text");
+		check(
+			"a flat write reaches the upstream as argv plus stdin",
+			Array.isArray(flatWriteCall?.argv) && (flatWriteCall!.argv as string[]).join(" ") === "send @test -",
+			flatWriteCall,
+		);
+		const flatRead = await call(readerToken, "flat-read", "telegram_read", { chat: "@test" });
+		check("a flat read is forwarded", textOf(flatRead.body).startsWith("fake:telegram_read:@test:"), flatRead.body);
+		const flatReadCall = callLogEntries("reader").find(
+			(entry) => Array.isArray(entry.argv) && (entry.argv as string[]).join(" ") === "read @test",
+		);
+		check("a flat read reaches the upstream as argv", flatReadCall !== undefined, flatReadCall);
 
 		const search = await call(readerToken, "argv-search", "telegram_read", { args: ["search", "query", "--chat", "@test"] });
 		check("argv search with --chat is forwarded", textOf(search.body).startsWith("fake:telegram_read:@test:query"), search.body);
