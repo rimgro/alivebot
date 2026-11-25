@@ -3379,6 +3379,27 @@ section("telegram send_message buttons and managed-bot inline requests (#84, #85
 			plainCalls.length === 1 && plainCalls[0]?.method === "sendMessage" && plainCalls[0]?.params.reply_markup === undefined,
 			plainCalls.map((call) => call.method),
 		);
+
+		section("send_message body format (#266)");
+		const beforeLegacyFormat = calls.length;
+		await send({ thread: "telegram:42", text: "**legacy**" });
+		const legacyFormatCall = lastSend();
+		check(
+			"without format the body and parse mode stay exactly as before",
+			calls.length - beforeLegacyFormat === 1 &&
+				legacyFormatCall?.params.text === "**legacy**" &&
+				legacyFormatCall?.params.parse_mode === undefined,
+			legacyFormatCall?.params,
+		);
+		await send({ thread: "telegram:42", text: "**bold** <raw>", format: "markdown" });
+		const markdownFormatCall = lastSend();
+		check(
+			"format=markdown renders to HTML and escapes raw tags",
+			markdownFormatCall?.params.parse_mode === "HTML" &&
+				markdownFormatCall?.params.text === "<b>bold</b> &lt;raw&gt;",
+			markdownFormatCall?.params,
+		);
+
 		const beforeAttachment = calls.length;
 		await send({ thread: "telegram:42", text: "file attached", attachment: "note.txt" });
 		const attachmentCalls = calls.slice(beforeAttachment);

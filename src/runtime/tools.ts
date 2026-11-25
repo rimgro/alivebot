@@ -23,7 +23,7 @@ import type { Journal } from "../store/journal.js";
 import type { HistoryQuery, HistoryRecord, HistoryStore } from "../store/history.js";
 import type { NoteStore } from "../store/notes.js";
 import type { MemoryService } from "../store/memory.js";
-import type { Outbox, OutgoingButtonRows, OutgoingMessage } from "../store/outbox.js";
+import type { MessageFormat, Outbox, OutgoingButtonRows, OutgoingMessage } from "../store/outbox.js";
 import type { NotifyMode, PolicyStore } from "../store/policy.js";
 import type { ReminderStore } from "../store/reminders.js";
 import type { ThreadStore } from "../store/threads.js";
@@ -829,6 +829,14 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 			"callback data is limited to 64 UTF-8 bytes; url buttons are refused in groups unless explicitly allowed.",
 		parameters: Type.Object({
 			text: Type.String({ description: "Message body. Write like a person: short, concrete, no process narration." }),
+			format: Type.Optional(
+				Type.String({
+					description:
+						"Optional body format: 'markdown' renders Markdown (bold, italic, code, links, tables) as Telegram HTML; " +
+						"'html' sends the text as HTML; 'plain' sends it without markup. " +
+						"Omitted keeps the module's configured parse mode; an unknown value is treated as 'plain'.",
+				}),
+			),
 			thread: Type.Optional(
 				Type.String({
 					description:
@@ -870,6 +878,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 		execute: async (_toolCallId, params): Promise<ToolResult> => {
 			const run = requireRun(deps, "send_message");
 			if (!params.text.trim()) throw new Error("send_message requires non-empty text");
+			const format = normalizeMessageFormat(params.format);
 			const thread = params.thread ?? resolveSendThread(run);
 			// The operator TUI has no chat module and reads this profile's local
 			// history directly. Recording the outbound row is the delivery point for
@@ -931,6 +940,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 					replyTo: params.reply_to,
 					attachments: attachment ? [attachment] : undefined,
 					buttons,
+					format,
 				},
 				deliver,
 			);
@@ -949,6 +959,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 				messageId: message.id,
 				attachment: attachment?.path,
 				buttons: buttonSummary?.buttons.length ?? 0,
+				format,
 			});
 			const attached = attachment ? ` with ${attachment.kind ?? "file"} ${attachment.name ?? attachment.path}` : "";
 			const withButtons = buttonSummary ? ` and ${buttonSummary.buttons.length} inline button(s)` : "";
@@ -956,6 +967,7 @@ export function createAliveTools(deps: ToolDeps): ToolDefinition[] {
 				messageId: message.id,
 				thread,
 				delivered: message.delivered ?? false,
+				...(format ? { format } : {}),
 				...(attachment ? { attachment: { path: attachment.path, kind: attachment.kind } } : {}),
 				...(buttonSummary ? { buttons: buttonSummary } : {}),
 			});
@@ -1654,6 +1666,19 @@ function resolveSendThread(run: RunHandle): string {
 		`send_message needs an explicit thread: this run has ${threads.length} threads (${threads.join(", ")}) ` +
 			"and none of the events is addressed to you",
 	);
+}
+
+/**
+ * Normalize an optional `send_message.format` value.
+ *
+ * Omitted (undefined) means "use the module's configured parse mode", which is
+ * the historical behaviour. Unknown values degrade to plain text instead of
+ * failing the tool: a typo should not swallow the message (#266).
+ */
+function normalizeMessageFormat(value: string | undefined): MessageFormat | undefined {
+	if (value === undefined) return undefined;
+	if (value === "markdown" || value === "html" || value === "plain") return value;
+	return "plain";
 }
 
 /**

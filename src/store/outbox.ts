@@ -35,6 +35,15 @@ export interface OutgoingButton {
 /** Rows of inline buttons, 1–3 buttons per row. */
 export type OutgoingButtonRows = OutgoingButton[][];
 
+/**
+ * How the body of an outgoing message should be interpreted.
+ *
+ * Omitted means "whatever the sink is configured for" (the historical
+ * behaviour); `markdown` asks the Telegram module to render Markdown to its
+ * HTML subset, `html` sends the text as HTML, `plain` sends it without markup.
+ */
+export type MessageFormat = "markdown" | "html" | "plain";
+
 export interface OutgoingMessage {
 	id: string;
 	/**
@@ -53,6 +62,8 @@ export interface OutgoingMessage {
 	attachments?: OutgoingAttachment[];
 	/** Inline quick-reply buttons attached to the message. */
 	buttons?: OutgoingButtonRows;
+	/** Optional explicit body format; omitted keeps the sink's configured parse mode. */
+	format?: MessageFormat;
 	/** Explicit recipient for local managed-agent routing; thread remains a conversation id. */
 	recipientAgentId?: string;
 	senderId?: string;
@@ -147,6 +158,7 @@ export class Outbox {
 			senderName?: string;
 			attachments?: OutgoingAttachment[];
 			buttons?: OutgoingButtonRows;
+			format?: MessageFormat;
 		},
 		deliver: (message: OutgoingMessage) => Promise<void>,
 	): Promise<OutgoingMessage> {
@@ -159,6 +171,7 @@ export class Outbox {
 			text: input.text,
 			...(input.attachments && input.attachments.length > 0 ? { attachments: input.attachments } : {}),
 			...(input.buttons && input.buttons.length > 0 ? { buttons: input.buttons } : {}),
+			...(input.format ? { format: input.format } : {}),
 			recipientAgentId: input.recipientAgentId,
 			senderId: input.senderId,
 			senderName: input.senderName,

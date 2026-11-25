@@ -18,7 +18,7 @@ import {
 } from "./managed-request.js";
 import type { AliveModule, ModuleContext } from "../../events/api.js";
 import type { HistoryAttachment } from "../../store/history.js";
-import type { OutgoingMessage } from "../../store/outbox.js";
+import type { MessageFormat, OutgoingMessage } from "../../store/outbox.js";
 import { ensureDir, iso, newId, sleep } from "../../util.js";
 import { MaskContext, maskSecrets } from "../../secrets.js";
 import { TelegramApi, TelegramApiError, TelegramFileTooLargeError, type SendMessageParams } from "./client.js";
@@ -42,6 +42,7 @@ import {
 	type TelegramTranscriptionQuota,
 } from "./state.js";
 import { chatLabel, isParseModeError, splitMessage } from "./text.js";
+import { htmlToPlainText, renderMarkdownToHtml, splitHtml } from "./markdown.js";
 import {
 	TELEGRAM_CAPTION_MAX_CHARS,
 	AttachmentNotFoundError,
@@ -1792,6 +1793,12 @@ export class TelegramModule implements AliveModule {
 		// caption and the follow-up remainder.
 		const context = new MaskContext();
 		const text = maskSecrets(message.text, ctx.config.secrets, process.env, context);
+		// `format` is an explicit opt-in. Without it the message goes out exactly
+		// as before: the configured parse mode sees the text untouched.
+		const format = message.format;
+		const rendered = format === "markdown" ? renderMarkdownToHtml(text) : text;
+		const parseMode = format === "markdown" || format === "html" ? "HTML" : format === "plain" ? undefined : this.config.parseMode || undefined;
+		const plainFallback = (value: string): string => (format === "markdown" || format === "html" ? htmlToPlainText(value) : value);
 		const ref = resolveThreadRef(message.thread);
 		const api = this.requireApi();
 		const topicId = ref.topicId !== undefined ? Number(ref.topicId) : undefined;
@@ -1826,7 +1833,10 @@ export class TelegramModule implements AliveModule {
 			// Telegram captions are limited to 1024 characters; the remainder becomes
 			// ordinary text messages so no part of the reply is lost. Only the first
 			// attachment carries the caption (one file per `send_message` today).
-			const captions = splitMessage(text, TELEGRAM_CAPTION_MAX_CHARS);
+			const htmlFormat = format === "markdown" || format === "html";
+			const captions = htmlFormat
+				? splitHtml(rendered, TELEGRAM_CAPTION_MAX_CHARS)
+				: splitMessage(text, TELEGRAM_CAPTION_MAX_CHARS);
 			const followUps = captions.slice(1);
 			for (const [index, upload] of uploads.entries()) {
 				const caption = index === 0 ? captions[0] ?? "" : "";
@@ -1842,11 +1852,16 @@ export class TelegramModule implements AliveModule {
 				};
 				const result = await this.sendPart(partKey(index), ref.chatId, message.thread, async () => {
 					try {
-						return await api.sendFile({ ...params, parse_mode: this.config.parseMode || undefined });
+						return await api.sendFile({ ...params, parse_mode: parseMode });
 					} catch (err) {
-						if (this.config.parseMode && isParseModeError(err)) {
-							ctx.log.warn("telegram rejected the caption markup; resending as plain text", { thread: message.thread });
-							return api.sendFile({ ...params, parse_mode: undefined });
+						if (parseMode && isParseModeError(err)) {
+							ctx.log.warn("telegram rejected the caption markup; resending as plain text", {
+								thread: message.thread,
+								format: format ?? "config",
+								parseMode,
+								snippet: messageSnippet(text),
+							});
+							return api.sendFile({ ...params, caption: params.caption ? plainFallback(params.caption) : params.caption, parse_mode: undefined });
 						}
 						throw err;
 					}
@@ -1860,20 +1875,22 @@ export class TelegramModule implements AliveModule {
 					});
 				}
 			}
-			for (const [index, text] of followUps.entries()) {
+			for (const [index, chunk] of followUps.entries()) {
 				const carriesButtons = index === followUps.length - 1 && replyMarkup !== undefined;
 				const result = await this.sendPart(partKey(uploads.length + index), ref.chatId, message.thread, () =>
-					this.sendTextChunk(ctx, api, ref.chatId, threadId, text, nextReplyTo(), carriesButtons ? replyMarkup : undefined),
+					this.sendTextChunk(ctx, api, ref.chatId, threadId, chunk, nextReplyTo(), carriesButtons ? replyMarkup : undefined, parseMode, text, format),
 					"telegram sendMessage",
 				);
-				if (result) sent.push({ result, text, ...(carriesButtons && buttonSummary ? { buttons: buttonSummary } : {}) });
+				if (result) sent.push({ result, text: chunk, ...(carriesButtons && buttonSummary ? { buttons: buttonSummary } : {}) });
 			}
 		} else {
-			const chunks = splitMessage(text, this.config.maxMessageChars);
-			for (const [index, text] of chunks.entries()) {
+			const chunks = format === "markdown" || format === "html"
+				? splitHtml(rendered, this.config.maxMessageChars)
+				: splitMessage(text, this.config.maxMessageChars);
+			for (const [index, chunk] of chunks.entries()) {
 				const carriesButtons = index === chunks.length - 1 && replyMarkup !== undefined;
 				const result = await this.sendPart(partKey(index), ref.chatId, message.thread, () =>
-					this.sendTextChunk(ctx, api, ref.chatId, threadId, text, nextReplyTo(), carriesButtons ? replyMarkup : undefined),
+					this.sendTextChunk(ctx, api, ref.chatId, threadId, chunk, nextReplyTo(), carriesButtons ? replyMarkup : undefined, parseMode, text, format),
 					"telegram sendMessage",
 				);
 				if (result) sent.push({ result, text, ...(carriesButtons && buttonSummary ? { buttons: buttonSummary } : {}) });
@@ -1915,6 +1932,7 @@ export class TelegramModule implements AliveModule {
 			thread: message.thread,
 			parts: sent.length,
 			chars: text.length,
+			format: format ?? "config",
 			attachments: uploads.map((upload) => `${upload.kind}:${upload.name}`),
 			// Button labels/kind are safe; callback payload values are never logged.
 			buttons: message.buttons?.reduce((total, row) => total + row.length, 0) ?? 0,
@@ -2001,6 +2019,9 @@ export class TelegramModule implements AliveModule {
 		text: string,
 		replyTo: number | undefined,
 		replyMarkup?: unknown,
+		parseMode?: string,
+		sourceText = "",
+		format?: MessageFormat,
 	): Promise<TelegramSentMessage> {
 		const base: SendMessageParams = {
 			chat_id: chatId,
@@ -2012,11 +2033,20 @@ export class TelegramModule implements AliveModule {
 			...(replyMarkup !== undefined ? { reply_markup: replyMarkup } : {}),
 		};
 		try {
-			return await api.sendMessage({ ...base, parse_mode: this.config.parseMode || undefined });
+			return await api.sendMessage({ ...base, parse_mode: parseMode });
 		} catch (err) {
-			if (this.config.parseMode && isParseModeError(err)) {
-				ctx.log.warn("telegram rejected the message markup; resending as plain text", { thread: `telegram:${chatId}` });
-				return api.sendMessage({ ...base, parse_mode: undefined });
+			if (parseMode && isParseModeError(err)) {
+				// The failure is almost always one broken entity, not the whole message.
+				// Log a short piece of the source so the culprit can be found without
+				// dumping the whole reply into the log.
+				ctx.log.warn("telegram rejected the message markup; resending as plain text", {
+					thread: `telegram:${chatId}`,
+					format: format ?? "config",
+					parseMode,
+					snippet: messageSnippet(sourceText || text),
+				});
+				const plain = format === "markdown" || format === "html" ? htmlToPlainText(text) : text;
+				return api.sendMessage({ ...base, text: plain, parse_mode: undefined });
 			}
 			throw err;
 		}
@@ -2275,6 +2305,12 @@ export class TelegramModule implements AliveModule {
 			},
 		});
 	}
+}
+
+/** A short, whitespace-collapsed excerpt for a markup-failure log line. */
+function messageSnippet(text: string, max = 80): string {
+	const compact = text.replace(/\s+/g, " ").trim();
+	return compact.length > max ? `${compact.slice(0, max)}…` : compact;
 }
 
 /** Environment wins over the config file so tokens do not have to be committed. */
