@@ -816,9 +816,10 @@ export class AgentRunner {
 						// Thrown out of `session.prompt`: the provider, the network or the
 						// session failed, not the model's answer (#168).
 						errorSource = "provider";
-						providerNetwork = this.providerNetworkFailure(caught, run, promptAttempts);
+						const network = classifyNetworkError(caught);
+						providerNetwork = this.providerNetworkFailure(caught, run, promptAttempts, network);
 						// The record must name the cause, not a bare `fetch failed` (#282).
-						if (providerNetwork) error = providerNetworkErrorText(error, providerNetwork);
+						if (network.transient) error = providerNetworkErrorText(error, network);
 						break;
 					}
 					formatRetried = true;
@@ -841,8 +842,9 @@ export class AgentRunner {
 						stopReason = "error";
 						errorSource = "provider";
 						// The retry was one direct prompt: one attempt, never retried again.
-						providerNetwork = this.providerNetworkFailure(retryCaught, run, 1);
-						if (providerNetwork) error = providerNetworkErrorText(error, providerNetwork);
+						const retryNetwork = classifyNetworkError(retryCaught);
+						providerNetwork = this.providerNetworkFailure(retryCaught, run, 1, retryNetwork);
+						if (retryNetwork.transient) error = providerNetworkErrorText(error, retryNetwork);
 						break;
 					}
 					// Retry succeeded: fall through to the ordinary post-prompt checks.
@@ -1152,12 +1154,22 @@ export class AgentRunner {
 	): { error: string; record: RunProviderError } {
 		const description = this.providerDiagnostics.describeError(caught);
 		const record = providerErrorRecord(Date.now(), description, snapshot);
+		// #282: `fetch` hides the real reason (`EAI_AGAIN`, the host) in `cause`.
+		// Keep the errno-shaped cause on the durable block so an incident review can
+		// tell a dead route from a provider rejection. Permanent failures never
+		// reach this branch, so a 401 stays as it was.
+		const classification = classifyNetworkError(caught);
+		if (classification.transient) {
+			if (record.code === undefined && classification.code !== undefined) record.code = classification.code;
+			if (record.hostname === undefined && classification.hostname !== undefined) record.hostname = classification.hostname;
+		}
 		const error = maskSecrets(caught instanceof Error ? caught.message : String(caught), this.deps.config.config.secrets);
 		this.deps.log.error(`run #${run.index} session error`, {
 			error,
 			...(record.status !== undefined ? { status: record.status } : {}),
 			...(record.requestId !== undefined ? { requestId: record.requestId } : {}),
 			...(record.code !== undefined ? { code: record.code } : {}),
+			...(record.hostname !== undefined ? { hostname: record.hostname } : {}),
 			...(record.body !== undefined ? { body: record.body } : {}),
 			...(record.model !== undefined ? { model: record.model } : {}),
 			...(record.request !== undefined ? { request: record.request } : {}),
@@ -1179,13 +1191,14 @@ export class AgentRunner {
 		caught: unknown,
 		run: RunHandle,
 		attempts: number,
+		classification = classifyNetworkError(caught),
 	): RunProviderNetworkError | undefined {
-		const classification = classifyNetworkError(caught);
 		if (!classification.transient) return undefined;
 		if (run.turns > 0 || this.toolCallsThisRun > 0) return undefined;
 		return {
 			reason: classification.reason,
 			...(classification.code ? { code: classification.code } : {}),
+			...(classification.hostname ? { hostname: classification.hostname } : {}),
 			attempts: Number.isFinite(attempts) && attempts > 0 ? Math.floor(attempts) : 1,
 		};
 	}

@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { sanitizeHostname } from "../retry.js";
 import { appendJsonl, ensureDir, localDay, readJson, readJsonl, writeJsonAtomic, writeJsonlAtomic } from "../util.js";
 
 export interface RunEventSummary {
@@ -184,7 +185,10 @@ export interface RunProviderError {
 	at: string;
 	status?: number;
 	requestId?: string;
+	/** Network errno from the error cause chain (`EAI_AGAIN`), not a provider JSON code. */
 	code?: string;
+	/** Host named by the error cause (`opencode.ai`); never a URL, path or query. */
+	hostname?: string;
 	body?: string;
 	model?: string;
 	request?: ProviderRequestSummary;
@@ -246,6 +250,8 @@ export interface RunProviderNetworkError {
 	reason: string;
 	/** Lowest-level errno, e.g. `EAI_AGAIN`, `ETIMEDOUT`, `ECONNRESET`. */
 	code?: string;
+	/** Host named by the error cause (`opencode.ai`); never hardcoded, never a URL. */
+	hostname?: string;
 	/** Attempts the provider prompt made (1 = no retry happened). */
 	attempts: number;
 }
@@ -265,6 +271,10 @@ export function runProviderError(record: { providerError?: unknown }): RunProvid
 		const field = candidate[key];
 		if (typeof field === "string" && field.length > 0) out[key] = field;
 	}
+	// A hostname is only kept when it is a bare host: a hand-edited or legacy
+	// record must not smuggle a URL/token into the dashboard (#282).
+	const hostname = sanitizeHostname(candidate.hostname);
+	if (hostname !== undefined) out.hostname = hostname;
 	const request = providerRequestSummary(candidate.request);
 	if (request !== undefined) out.request = request;
 	if (candidate.attachmentsDropped === true) out.attachmentsDropped = true;

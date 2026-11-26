@@ -76,6 +76,8 @@ export interface NetworkErrorClassification {
 	transient: boolean;
 	/** Lowest-level errno, e.g. `ECONNRESET`, `ETIMEDOUT`, `EAI_AGAIN`. */
 	code?: string;
+	/** Host named by the error chain (`opencode.ai`), never a URL or a guessed value. */
+	hostname?: string;
 	/** HTTP status when the failure is an API response (401, 429, 503, ...). */
 	status?: number;
 	/** Provider-requested wait before the next attempt, in milliseconds. */
@@ -91,6 +93,22 @@ const MAX_ERROR_CHAIN_DEPTH = 6;
  * code (`http_error`) is not an errno and must not be shown as one.
  */
 const ERRNO_CODE = /^(?:E[A-Z0-9_]+|UND_ERR_[A-Z_]+)$/;
+/** DNS name or IPv4 literal, and bracketed IPv6: no scheme, port, path or query. */
+const HOSTNAME = /^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/;
+const IPV6_HOSTNAME = /^\[[0-9a-f:.]+\]$/;
+
+/**
+ * A hostname taken from an error (`error.hostname`), or undefined.
+ *
+ * The value is only accepted when it is a bare host: this is what keeps a URL,
+ * a query string or a token from ever reaching `runs.jsonl` (#282).
+ */
+export function sanitizeHostname(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const hostname = value.trim().toLowerCase();
+	if (hostname.length === 0 || hostname.length > 253) return undefined;
+	return HOSTNAME.test(hostname) || IPV6_HOSTNAME.test(hostname) ? hostname : undefined;
+}
 
 /**
  * Conditions that mean "the request was wrong", not "the network was unlucky".
@@ -224,6 +242,7 @@ export function classifyNetworkError(error: unknown): NetworkErrorClassification
 		reason: reasonFrom(error, details, status),
 	};
 	if (details.code) classification.code = details.code;
+	if (details.hostname) classification.hostname = details.hostname;
 	if (status !== undefined) classification.status = status;
 	if (details.retryAfterMs !== undefined) classification.retryAfterMs = details.retryAfterMs;
 	return classification;
@@ -326,14 +345,36 @@ export async function withRetries<T>(
 interface ErrorDetails {
 	messages: string[];
 	code?: string;
+	hostname?: string;
 	status?: number;
 	retryAfterMs?: number;
+}
+
+/**
+ * The errno-shaped cause of an error chain: `{ code: "EAI_AGAIN", hostname: "opencode.ai" }`.
+ *
+ * `fetch` hides the real failure in `cause`, so the durable run record uses this
+ * instead of the top-level `fetch failed` message (#282). A provider's own JSON
+ * `code` is not an errno and is never returned here.
+ */
+export interface NetworkErrorCause {
+	code?: string;
+	hostname?: string;
+}
+
+export function networkErrorCause(error: unknown): NetworkErrorCause {
+	const details = errorDetails(error);
+	const cause: NetworkErrorCause = {};
+	if (details.code) cause.code = details.code;
+	if (details.hostname) cause.hostname = details.hostname;
+	return cause;
 }
 
 /** Flatten an error and its `cause` chain; fetch hides the real reason there. */
 function errorDetails(error: unknown): ErrorDetails {
 	const messages: string[] = [];
 	let code: string | undefined;
+	let hostname: string | undefined;
 	let status: number | undefined;
 	let retryAfterMs: number | undefined;
 	let current: unknown = error;
@@ -346,6 +387,9 @@ function errorDetails(error: unknown): ErrorDetails {
 			if (code === undefined && typeof errno === "string" && ERRNO_CODE.test(errno.toUpperCase())) {
 				code = errno.toUpperCase();
 			}
+			// Node/undici put the host that failed in `hostname` on the cause, not on
+			// the `fetch failed` wrapper. Only the first valid one is kept.
+			hostname ??= sanitizeHostname(fields.hostname) ?? sanitizeHostname(fields.host);
 			status ??= numericStatus(fields.status) ?? numericStatus(fields.statusCode) ?? numericStatus(fields.errorCode);
 			const response = fields.response;
 			if (response && typeof response === "object") status ??= numericStatus((response as { status?: unknown }).status);
@@ -356,7 +400,7 @@ function errorDetails(error: unknown): ErrorDetails {
 			break;
 		}
 	}
-	return { messages, code, status, retryAfterMs };
+	return { messages, code, hostname, status, retryAfterMs };
 }
 
 /** Accept only plausible HTTP statuses; `errorCode` is also used for non-HTTP codes. */

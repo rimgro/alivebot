@@ -27,7 +27,7 @@
  * generic one (and the other way round), so one incident is one pause.
  */
 import type { Logger } from "../log.js";
-import { sanitizeNetworkReason } from "../retry.js";
+import { sanitizeHostname, sanitizeNetworkReason } from "../retry.js";
 import type { RunProviderNetworkError, RunStopReason } from "../store/runs.js";
 import { formatDuration, oneLine, sleep } from "../util.js";
 
@@ -91,18 +91,24 @@ export function formatProviderNetworkLogLine(info: {
  * `record.error` text for a provider network failure: the cause, not a bare
  * `fetch failed`.
  *
- * `provider network error: fetch failed (EAI_AGAIN)` — the classified detail is
- * appended only when the message does not already name it, so a message that is
- * just the errno is not turned into `EAI_AGAIN (EAI_AGAIN)`.
+ * `provider network error: fetch failed (EAI_AGAIN)` — the classified errno and
+ * the host from the error cause are appended only when the message does not
+ * already name them, so a message that is just the errno is not turned into
+ * `EAI_AGAIN (EAI_AGAIN)`. `hostname` comes from the error chain, never from a
+ * hardcoded provider URL (#282).
  */
 export function providerNetworkErrorText(
 	message: string | undefined,
-	classification: { reason?: string; code?: string },
+	classification: { reason?: string; code?: string; hostname?: string },
 ): string {
 	const base = sanitizeNetworkReason(oneLine(typeof message === "string" ? message : "", 300)) || "provider request failed";
-	const detail = classification.code ?? classification.reason;
-	if (!detail || detail === base || base.includes(detail)) return `provider network error: ${base}`;
-	return `provider network error: ${base} (${sanitizeNetworkReason(detail)})`;
+	const primary = classification.code?.trim() || classification.reason?.trim();
+	const hostname = sanitizeHostname(classification.hostname);
+	const details: string[] = [];
+	if (primary && primary !== base && !base.includes(primary)) details.push(sanitizeNetworkReason(primary));
+	if (hostname && !base.toLowerCase().includes(hostname)) details.push(hostname);
+	if (details.length === 0) return `provider network error: ${base}`;
+	return `provider network error: ${base} (${details.join(", ")})`;
 }
 
 /** What the pause planner needs from a finished run. */
