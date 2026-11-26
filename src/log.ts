@@ -1,6 +1,12 @@
 import * as path from "node:path";
+import {
+	resolveLogRotationOptions,
+	rotateIfNeeded,
+	type LogRotationOptions,
+	type ResolvedLogRotationOptions,
+} from "./log-rotation.js";
 import { DEFAULT_SECRETS_CONFIG, MaskContext, maskSecrets, maskValue, type SecretsConfig } from "./secrets.js";
-import { appendJsonl, ensureDir } from "./util.js";
+import { appendJsonlLine, ensureDir, jsonlLine } from "./util.js";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -16,6 +22,8 @@ export interface LoggerOptions {
 	scope?: string;
 	/** Secret rules for messages and structured data. Defaults to masking env values. */
 	secrets?: SecretsConfig;
+	/** Size-based rotation for the JSONL sink. Env overrides apply when omitted. */
+	rotation?: LogRotationOptions;
 }
 
 /**
@@ -29,6 +37,7 @@ export class Logger {
 	readonly level: LogLevel;
 	readonly scope?: string;
 	readonly secrets: SecretsConfig;
+	readonly rotation: ResolvedLogRotationOptions;
 	private readonly printToConsole: boolean;
 
 	constructor(options: LoggerOptions = {}) {
@@ -36,6 +45,7 @@ export class Logger {
 		this.level = options.level ?? "info";
 		this.scope = options.scope;
 		this.secrets = options.secrets ?? DEFAULT_SECRETS_CONFIG;
+		this.rotation = resolveLogRotationOptions(options.rotation);
 		this.printToConsole = options.console ?? true;
 		if (this.file) ensureDir(path.dirname(this.file));
 	}
@@ -47,6 +57,7 @@ export class Logger {
 			level: this.level,
 			scope: this.scope ? `${this.scope}:${scope}` : scope,
 			secrets: this.secrets,
+			rotation: this.rotation,
 		});
 	}
 
@@ -82,7 +93,14 @@ export class Logger {
 			msg: safeMessage,
 			...(safeValue === undefined ? {} : { data: safeValue }),
 		};
-		if (this.file) appendJsonl(this.file, record);
+		if (this.file) {
+			const line = jsonlLine(record);
+			// Check before appending: the file that crosses the limit is archived,
+			// and the new active file starts with this line. `incomingBytes` lets
+			// the common path skip `statSync` entirely.
+			rotateIfNeeded(this.file, { ...this.rotation, incomingBytes: Buffer.byteLength(line) });
+			appendJsonlLine(this.file, line);
+		}
 		if (!this.printToConsole || LEVEL_ORDER[level] < LEVEL_ORDER[this.level]) return;
 		const time = new Date(record.ts).toISOString().slice(11, 19);
 		const scope = this.scope ? ` ${this.scope}` : "";

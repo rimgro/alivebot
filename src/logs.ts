@@ -10,9 +10,10 @@
  * looks the same live and after the fact.
  */
 import * as fs from "node:fs";
+import { readLogTailWithParts } from "./log-rotation.js";
 import { stdoutLogPath } from "./runtime/daemon.js";
 import { term } from "./term.js";
-import { sleep, tailLines } from "./util.js";
+import { sleep } from "./util.js";
 import type { Paths } from "./config.js";
 
 export type LogSource = "stdout" | "alive" | "thoughts";
@@ -40,7 +41,9 @@ export function resolveLogSource(paths: Paths, source: string): { source: LogSou
 }
 
 export function readLogTail(file: string, lines: number): string[] {
-	return tailLines(file, lines);
+	// The active structured log may have been rotated into `alive.jsonl.N[.gz]`
+	// parts; other sources simply have no parts and read as before.
+	return readLogTailWithParts(file, lines);
 }
 
 export function fileSize(file: string): number {

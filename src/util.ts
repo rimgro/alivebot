@@ -40,9 +40,19 @@ export function writeJsonAtomic(file: string, value: unknown): void {
 	fs.renameSync(tmp, file);
 }
 
-export function appendJsonl(file: string, value: unknown): void {
+/** One JSONL record, encoded exactly as `appendJsonl` writes it. */
+export function jsonlLine(value: unknown): string {
+	return `${JSON.stringify(value)}\n`;
+}
+
+/** Append an already-encoded JSONL line; keeps the no-held-descriptor policy. */
+export function appendJsonlLine(file: string, line: string): void {
 	ensureDir(path.dirname(file));
-	fs.appendFileSync(file, `${JSON.stringify(value)}\n`, "utf8");
+	fs.appendFileSync(file, line, "utf8");
+}
+
+export function appendJsonl(file: string, value: unknown): void {
+	appendJsonlLine(file, jsonlLine(value));
 }
 
 /** Replace a JSONL file atomically. Used when a record is updated in place. */
