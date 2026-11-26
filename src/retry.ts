@@ -76,6 +76,8 @@ export interface NetworkErrorClassification {
 	transient: boolean;
 	/** Lowest-level errno, e.g. `ECONNRESET`, `ETIMEDOUT`, `EAI_AGAIN`. */
 	code?: string;
+	/** Host named by the error chain (`opencode.ai`), never a URL or a guessed value. */
+	hostname?: string;
 	/** HTTP status when the failure is an API response (401, 429, 503, ...). */
 	status?: number;
 	/** Provider-requested wait before the next attempt, in milliseconds. */
@@ -85,8 +87,28 @@ export interface NetworkErrorClassification {
 }
 
 const MAX_ERROR_CHAIN_DEPTH = 6;
-/** Errno-shaped codes only; a provider's own string code (`http_error`) is not an errno. */
-const ERRNO_CODE = /^E[A-Z0-9_]+$/;
+/**
+ * Errno-shaped codes only: `EAI_AGAIN`, `ECONNRESET`, ... and undici's
+ * `UND_ERR_CONNECT_TIMEOUT` / `UND_ERR_SOCKET` (#282). A provider's own string
+ * code (`http_error`) is not an errno and must not be shown as one.
+ */
+const ERRNO_CODE = /^(?:E[A-Z0-9_]+|UND_ERR_[A-Z_]+)$/;
+/** DNS name or IPv4 literal, and bracketed IPv6: no scheme, port, path or query. */
+const HOSTNAME = /^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/;
+const IPV6_HOSTNAME = /^\[[0-9a-f:.]+\]$/;
+
+/**
+ * A hostname taken from an error (`error.hostname`), or undefined.
+ *
+ * The value is only accepted when it is a bare host: this is what keeps a URL,
+ * a query string or a token from ever reaching `runs.jsonl` (#282).
+ */
+export function sanitizeHostname(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const hostname = value.trim().toLowerCase();
+	if (hostname.length === 0 || hostname.length > 253) return undefined;
+	return HOSTNAME.test(hostname) || IPV6_HOSTNAME.test(hostname) ? hostname : undefined;
+}
 
 /**
  * Conditions that mean "the request was wrong", not "the network was unlucky".
@@ -144,6 +166,12 @@ const TRANSIENT_PATTERNS: readonly RegExp[] = [
 	/\bEHOSTUNREACH\b/,
 	/\bENOTFOUND\b/,
 	/connection (?:error|reset|refused|closed|aborted|terminated|dropped)/i,
+	// TLS handshake failures: the route is up but a proxy/MITM/alert broke the
+	// handshake; it recovers on its own (the #282 incident had these next to the
+	// `git fetch` TLS failures), so it is not a permanent config error.
+	/tls handshake/i,
+	/ssl routines/i,
+	/tlsv1 alert/i,
 	/network error/i,
 	/fetch failed/i,
 	/socket hang ?up/i,
@@ -186,7 +214,8 @@ export function isTransientNetworkErrorText(message: string | undefined | null):
  * Classify a failure as retryable or not.
  *
  * Transient: timeouts, connection resets/refusals, DNS hiccups, `fetch failed`,
- * `socket hang up`, 408/425/429/5xx, provider overload/rate-limit markers.
+ * `socket hang up`, TLS handshake failures, 408/425/429/5xx, provider
+ * overload/rate-limit markers.
  * Permanent: 401/403, 400/422 and other 4xx, quota/billing, model-not-found,
  * invalid request, content policy, and every abort.
  */
@@ -213,6 +242,7 @@ export function classifyNetworkError(error: unknown): NetworkErrorClassification
 		reason: reasonFrom(error, details, status),
 	};
 	if (details.code) classification.code = details.code;
+	if (details.hostname) classification.hostname = details.hostname;
 	if (status !== undefined) classification.status = status;
 	if (details.retryAfterMs !== undefined) classification.retryAfterMs = details.retryAfterMs;
 	return classification;
@@ -315,14 +345,36 @@ export async function withRetries<T>(
 interface ErrorDetails {
 	messages: string[];
 	code?: string;
+	hostname?: string;
 	status?: number;
 	retryAfterMs?: number;
+}
+
+/**
+ * The errno-shaped cause of an error chain: `{ code: "EAI_AGAIN", hostname: "opencode.ai" }`.
+ *
+ * `fetch` hides the real failure in `cause`, so the durable run record uses this
+ * instead of the top-level `fetch failed` message (#282). A provider's own JSON
+ * `code` is not an errno and is never returned here.
+ */
+export interface NetworkErrorCause {
+	code?: string;
+	hostname?: string;
+}
+
+export function networkErrorCause(error: unknown): NetworkErrorCause {
+	const details = errorDetails(error);
+	const cause: NetworkErrorCause = {};
+	if (details.code) cause.code = details.code;
+	if (details.hostname) cause.hostname = details.hostname;
+	return cause;
 }
 
 /** Flatten an error and its `cause` chain; fetch hides the real reason there. */
 function errorDetails(error: unknown): ErrorDetails {
 	const messages: string[] = [];
 	let code: string | undefined;
+	let hostname: string | undefined;
 	let status: number | undefined;
 	let retryAfterMs: number | undefined;
 	let current: unknown = error;
@@ -335,6 +387,9 @@ function errorDetails(error: unknown): ErrorDetails {
 			if (code === undefined && typeof errno === "string" && ERRNO_CODE.test(errno.toUpperCase())) {
 				code = errno.toUpperCase();
 			}
+			// Node/undici put the host that failed in `hostname` on the cause, not on
+			// the `fetch failed` wrapper. Only the first valid one is kept.
+			hostname ??= sanitizeHostname(fields.hostname) ?? sanitizeHostname(fields.host);
 			status ??= numericStatus(fields.status) ?? numericStatus(fields.statusCode) ?? numericStatus(fields.errorCode);
 			const response = fields.response;
 			if (response && typeof response === "object") status ??= numericStatus((response as { status?: unknown }).status);
@@ -345,7 +400,7 @@ function errorDetails(error: unknown): ErrorDetails {
 			break;
 		}
 	}
-	return { messages, code, status, retryAfterMs };
+	return { messages, code, hostname, status, retryAfterMs };
 }
 
 /** Accept only plausible HTTP statuses; `errorCode` is also used for non-HTTP codes. */
@@ -378,11 +433,29 @@ function reasonFrom(error: unknown, details?: ErrorDetails, status?: number): st
 	const info = details ?? errorDetails(error);
 	if (info.code) return info.code;
 	if (status !== undefined) return `HTTP ${status}`;
-	const message = sanitizeReason(info.messages[0] ?? (error instanceof Error ? error.message : String(error)));
+	const message = sanitizeNetworkReason(bestReasonMessage(info.messages) ?? (error instanceof Error ? error.message : String(error)));
 	return message || "unknown error";
 }
 
-function sanitizeReason(text: string): string {
+/**
+ * The most informative message of an error chain.
+ *
+ * `fetch` always puts its own `fetch failed` first and hides the real reason
+ * (`TLS handshake ... failed`, `other side closed`) in `cause`, so the generic
+ * wrapper is skipped when a more specific message exists (#282). The wrapper is
+ * still used when it is all there is.
+ */
+function bestReasonMessage(messages: readonly string[]): string | undefined {
+	const GENERIC_FETCH_FAILURE = /^(?:fetch failed|failed to fetch|network error|network request failed)$/i;
+	return messages.find((message) => message.trim().length > 0 && !GENERIC_FETCH_FAILURE.test(message.trim())) ?? messages[0];
+}
+
+/**
+ * Short, secret-free text for a log line: no Bot API token, no bearer token, no
+ * URL, no over-long blob. Exported so other failure loggers (#282) apply the
+ * same rule instead of inventing their own.
+ */
+export function sanitizeNetworkReason(text: string): string {
 	return oneLine(
 		text
 			// Bot API URLs carry the token in the path: `.../bot123:ABC/getUpdates`.

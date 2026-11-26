@@ -62,6 +62,7 @@ import { loadModules } from "../events/loader.js";
 import type { AliveModule } from "../events/api.js";
 import { term } from "../term.js";
 import { formatDuration, nextMidnight, sleep } from "../util.js";
+import { RunBackoff } from "./provider-network.js";
 
 export interface AliveRuntimeOptions {
 	config: LoadedConfig;
@@ -125,7 +126,13 @@ export class AliveRuntime {
 	private currentRun: RunHandle | undefined;
 	private redeliveryRange: { fromSeq: number; toSeq: number } | undefined;
 	private statusKind: RuntimeStatusKind = "starting";
-	private consecutiveFailures = 0;
+	/**
+	 * The one pause planner between runs (#282): provider-network streak (30 s
+	 * doubling, 10 min cap), generic error streak (30 s doubling, 15 min cap) and
+	 * the stalled courtesy pause. A single planner means the pauses can never be
+	 * added together.
+	 */
+	private readonly backoff: RunBackoff;
 	private sleepCount = 0;
 	private abortController = new AbortController();
 	private loopPromise: Promise<void> | undefined;
@@ -154,6 +161,7 @@ export class AliveRuntime {
 		this.config = options.config;
 		this.log = options.log;
 		this.force = options.force ?? false;
+		this.backoff = new RunBackoff({ log: this.log.child("backoff") });
 	}
 
 	static async create(options: AliveRuntimeOptions): Promise<AliveRuntime> {
@@ -788,15 +796,13 @@ export class AliveRuntime {
 				const range = this.redeliveryRange;
 				this.redeliveryRange = undefined;
 				const record = await this.runner.execute({ redeliveryRange: range });
-				if (record) this.finishRun(record);
-				if (record?.stopReason === "error") {
-					const backoffMs = Math.min(30_000 * 2 ** (this.consecutiveFailures - 1), 15 * 60_000);
-					await sleep(backoffMs, this.abortController.signal);
-				} else if (record?.stopReason === "stalled") {
-					// The model kept ending its turn without idle/sleep. Pause briefly so
-					// a broken model cannot spin runs back-to-back; this is a courtesy
-					// delay, not a step limit.
-					await sleep(2_000, this.abortController.signal);
+				if (record) {
+					this.finishRun(record);
+					// One pause per run: a provider network failure waits on the shorter
+					// network schedule (30 s doubling, 10 min cap) and is *not* stacked
+					// with the generic `stopReason: "error"` backoff (#282). A stalled
+					// run keeps its 2 s courtesy pause so a broken model cannot spin.
+					await this.backoff.waitFor(record, this.abortController.signal);
 				}
 			} catch (err) {
 				this.log.error("run failed", { error: err instanceof Error ? err.message : String(err) });
@@ -819,16 +825,13 @@ export class AliveRuntime {
 		}
 	}
 
+	/**
+	 * Close out a finished run: counters, summary, runtime state.
+	 *
+	 * The pause before the next start belongs to {@link RunBackoff} and is applied
+	 * by `loop()` (not here) because `runOnce()` must not sleep (#282).
+	 */
 	private finishRun(record: RunRecord): void {
-		if (record.stopReason === "error") {
-			this.consecutiveFailures += 1;
-			this.log.warn("run failed; backing off", {
-				failures: this.consecutiveFailures,
-				error: record.error,
-			});
-		} else {
-			this.consecutiveFailures = 0;
-		}
 		if (record.stopReason === "slept") this.sleepCount += 1;
 		this.printRunSummary(record);
 		this.writeState(true);

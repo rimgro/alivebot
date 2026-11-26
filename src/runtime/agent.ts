@@ -8,7 +8,7 @@ import { term, stamp } from "../term.js";
 import type { AliveEvent } from "../store/events.js";
 import type { EventStore } from "../store/events.js";
 import type { PolicyStore } from "../store/policy.js";
-import { runTurnCount, type ContextResetReason, type RunLog, type RunProviderError, type RunRecord, type RunStoppedBy, type RunStopReason } from "../store/runs.js";
+import { runTurnCount, type ContextResetReason, type RunLog, type RunProviderError, type RunProviderNetworkError, type RunRecord, type RunStoppedBy, type RunStopReason } from "../store/runs.js";
 import type { ThreadStore } from "../store/threads.js";
 import { renderAwakePrompt, renderInterruptPrompt, renderLongRunWarning, renderNudgePrompt } from "./prompt.js";
 import { TurnTraceRecorder, hasUsage, residualUsage } from "./run-trace.js";
@@ -19,6 +19,7 @@ import { maskSecrets } from "../secrets.js";
 import { cacheHitRate, isColdCacheRun } from "../usage/cache.js";
 import { privateMemoryScope } from "./memory-access.js";
 import { compactionMonitorFor, isContextOverflowFailure } from "./compaction.js";
+import { providerNetworkErrorText } from "./provider-network.js";
 import {
 	ProviderDiagnostics,
 	hasImageAttachments,
@@ -726,6 +727,12 @@ export class AgentRunner {
 			let error: string | undefined;
 			/** Provider evidence persisted when the run closes with a provider error (#176). */
 			let providerError: RunProviderError | undefined;
+			/**
+			 * Transient provider network failure that did no work (#282), persisted on
+			 * the record so the loop can apply the network backoff instead of treating
+			 * a dead route as a model failure. Cleared if the run survives.
+			 */
+			let providerNetwork: RunProviderNetworkError | undefined;
 			/** One attachment-free retry per run: a format rejection must not loop. */
 			let formatRetried = false;
 			let first = true;
@@ -737,6 +744,9 @@ export class AgentRunner {
 				}
 				if (!first) this.trackEvents(run, this.claimDeliverable());
 				let activePrompt: string | undefined;
+				// #282: how many attempts this prompt made, for the run record and the
+				// loop's log line ("retried and still failed" vs "not retried").
+				let promptAttempts = 0;
 				try {
 					const awake = first
 						? await this.renderAwake(run, options.redeliveryRange)
@@ -760,6 +770,9 @@ export class AgentRunner {
 							label: `agent ${run.id} provider`,
 							log,
 							signal: retryAbort.signal,
+							onAttempt: ({ attempt }) => {
+								promptAttempts = attempt;
+							},
 							// Never replay a prompt after a tool call or token spend: the provider
 							// already did (and billed) work that a retry would duplicate. Permanent
 							// classes (auth, quota, invalid request) are rejected by the classifier.
@@ -803,6 +816,10 @@ export class AgentRunner {
 						// Thrown out of `session.prompt`: the provider, the network or the
 						// session failed, not the model's answer (#168).
 						errorSource = "provider";
+						const network = classifyNetworkError(caught);
+						providerNetwork = this.providerNetworkFailure(caught, run, promptAttempts, network);
+						// The record must name the cause, not a bare `fetch failed` (#282).
+						if (network.transient) error = providerNetworkErrorText(error, network);
 						break;
 					}
 					formatRetried = true;
@@ -824,6 +841,10 @@ export class AgentRunner {
 						providerError = retryReport.record;
 						stopReason = "error";
 						errorSource = "provider";
+						// The retry was one direct prompt: one attempt, never retried again.
+						const retryNetwork = classifyNetworkError(retryCaught);
+						providerNetwork = this.providerNetworkFailure(retryCaught, run, 1, retryNetwork);
+						if (retryNetwork.transient) error = providerNetworkErrorText(error, retryNetwork);
 						break;
 					}
 					// Retry succeeded: fall through to the ordinary post-prompt checks.
@@ -889,6 +910,10 @@ export class AgentRunner {
 				initiator: this.stopInitiator,
 			});
 
+			// A provider network failure did no work: `reachedModel` stays false, so the
+			// claim is rolled back and the events that woke this run are redelivered to
+			// the next one after the backoff (#282). A human writing during the pause is
+			// a new event; both are claimed together by the next run.
 			const reachedModel = run.lastStopReason !== undefined || run.turns > 0 || run.idleReturns > 0;
 			const redeliver = stopReason === "error" || stopReason === "timeout" || stopReason === "aborted";
 			// #219: a sleep caused by the context-sleep directive before any outbound
@@ -952,6 +977,7 @@ export class AgentRunner {
 				stoppedBy,
 				error,
 				providerError: finalStopReason === "error" && errorSource === "provider" ? providerError : undefined,
+				providerNetwork: finalStopReason === "error" && errorSource === "provider" ? providerNetwork : undefined,
 				sessionFile: this.session.sessionFile,
 				summary,
 				events,
@@ -1128,12 +1154,24 @@ export class AgentRunner {
 	): { error: string; record: RunProviderError } {
 		const description = this.providerDiagnostics.describeError(caught);
 		const record = providerErrorRecord(Date.now(), description, snapshot);
+		// #282: `fetch` hides the real reason (`EAI_AGAIN`, the host) in `cause`.
+		// Keep the errno-shaped cause on the durable block so an incident review can
+		// tell a dead route from a provider rejection. Permanent failures never
+		// reach this branch, so a 401 stays as it was.
+		const classification = classifyNetworkError(caught);
+		if (classification.transient) {
+			// The cause errno is the actionable one (`EAI_AGAIN`), so it wins over a
+			// provider-shaped top-level code if both are present.
+			if (classification.code !== undefined) record.code = classification.code;
+			if (classification.hostname !== undefined) record.hostname = classification.hostname;
+		}
 		const error = maskSecrets(caught instanceof Error ? caught.message : String(caught), this.deps.config.config.secrets);
 		this.deps.log.error(`run #${run.index} session error`, {
 			error,
 			...(record.status !== undefined ? { status: record.status } : {}),
 			...(record.requestId !== undefined ? { requestId: record.requestId } : {}),
 			...(record.code !== undefined ? { code: record.code } : {}),
+			...(record.hostname !== undefined ? { hostname: record.hostname } : {}),
 			...(record.body !== undefined ? { body: record.body } : {}),
 			...(record.model !== undefined ? { model: record.model } : {}),
 			...(record.request !== undefined ? { request: record.request } : {}),
@@ -1141,6 +1179,30 @@ export class AgentRunner {
 			...(record.imagesOmitted !== undefined ? { imagesOmitted: record.imagesOmitted } : {}),
 		});
 		return { error, record };
+	}
+
+	/**
+	 * Classify a prompt failure as a provider network outage (#282).
+	 *
+	 * Only a transient network error with zero turns and zero tool calls qualifies:
+	 * that is exactly the request that never reached the model (the same condition
+	 * `withRetries` uses before replaying a prompt). A failure after work started
+	 * may have been billed, so it keeps the ordinary error path.
+	 */
+	private providerNetworkFailure(
+		caught: unknown,
+		run: RunHandle,
+		attempts: number,
+		classification = classifyNetworkError(caught),
+	): RunProviderNetworkError | undefined {
+		if (!classification.transient) return undefined;
+		if (run.turns > 0 || this.toolCallsThisRun > 0) return undefined;
+		return {
+			reason: classification.reason,
+			...(classification.code ? { code: classification.code } : {}),
+			...(classification.hostname ? { hostname: classification.hostname } : {}),
+			attempts: Number.isFinite(attempts) && attempts > 0 ? Math.floor(attempts) : 1,
+		};
 	}
 
 	private get isFreshContext(): boolean {
