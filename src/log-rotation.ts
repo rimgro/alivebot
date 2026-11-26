@@ -14,6 +14,12 @@
  *     Older parts are deleted in a ring (`1 -> 2 -> ... -> maxParts -> gone`).
  *   - Parts are gzip-compressed as `<file>.N.gz`. A gzip failure is not fatal:
  *     the part stays uncompressed as `<file>.N` and rotation continues.
+ *   - A part larger than `maxBytes` is never compressed: it came from a file
+ *     that grew past the limit before this policy applied (an older build, a
+ *     raised limit, a manual append). `gzipSync` of such a buffer would block
+ *     the event loop for seconds inside `Logger.write`, so the part is kept
+ *     plain under `<file>.N` and shifted out by later rotations. Reading
+ *     handles plain parts, so nothing is lost.
  *
  * Invalid/empty env values silently fall back to the defaults; a bad env var
  * must never take the runtime (and therefore its logging) down.
@@ -38,6 +44,9 @@ export const DEFAULT_LOG_STAT_INTERVAL_MS = 1_000;
 
 export const LOG_MAX_BYTES_ENV = "ALIVE_LOG_MAX_BYTES";
 export const LOG_MAX_PARTS_ENV = "ALIVE_LOG_MAX_PARTS";
+
+/** A rotation lock older than this is treated as left over by a dead process. */
+export const ROTATION_LOCK_STALE_MS = 30_000;
 
 export interface LogRotationOptions {
 	/** Rotate when the active file would exceed this many bytes. */
@@ -181,12 +190,12 @@ function rotateFile(file: string, policy: ResolvedLogRotationOptions): string | 
 	}
 
 	const plain = partFile(file, 1, false);
-	if (!policy.gzip) {
-		removePart(file, policy.maxParts + 1);
-		return plain;
-	}
 	const gz = partFile(file, 1, true);
 	try {
+		// Never gzip a part that already exceeds the threshold: this is the hot
+		// path (`Logger.write`), and a synchronous gzip of a 200 MB part would
+		// freeze the run. The part stays readable as a plain `.1`.
+		if (!policy.gzip || activeSize(plain) > policy.maxBytes) return plain;
 		const data = fs.readFileSync(plain);
 		const compressed = policy.compress ? policy.compress(data) : zlib.gzipSync(data);
 		fs.writeFileSync(gz, compressed);
@@ -204,6 +213,52 @@ function rotateFile(file: string, policy: ResolvedLogRotationOptions): string | 
 	} finally {
 		// The part that fell off the end is always removed, compressed or not.
 		removePart(file, policy.maxParts + 1);
+	}
+}
+
+/**
+ * One `alive.jsonl` can have several writers: the profile runtime plus short-lived
+ * CLI processes (`alive sessions gc`, `alive browser ...`) and a second harness
+ * started by hand. Two rotations that interleave their renames silently drop
+ * lines (both `active -> .1` renames target the same slot), so rotation is
+ * serialised with an `O_EXCL` lock file next to the log. A writer that cannot
+ * take the lock skips rotation this time; the next record tries again.
+ */
+function lockFile(file: string): string {
+	return `${file}.rotate.lock`;
+}
+
+/** Take the rotation lock; false when another process holds a fresh one. */
+function acquireRotationLock(file: string): boolean {
+	const lockPath = lockFile(file);
+	for (let attempt = 0; attempt < 2; attempt++) {
+		try {
+			const fd = fs.openSync(lockPath, "wx");
+			try {
+				fs.writeSync(fd, String(process.pid));
+			} finally {
+				fs.closeSync(fd);
+			}
+			return true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") return false;
+			try {
+				if (Date.now() - fs.statSync(lockPath).mtimeMs <= ROTATION_LOCK_STALE_MS) return false;
+				// Left over by a process that died mid-rotation: safe to steal.
+				fs.unlinkSync(lockPath);
+			} catch {
+				return false;
+			}
+		}
+	}
+	return false;
+}
+
+function releaseRotationLock(file: string): void {
+	try {
+		fs.unlinkSync(lockFile(file));
+	} catch {
+		// Already gone or never created.
 	}
 }
 
@@ -240,11 +295,31 @@ export function rotateIfNeeded(file: string, options: LogRotationOptions = {}): 
 	// An empty/missing file has nothing worth rotating; a single record larger
 	// than maxBytes cannot be split anyway.
 	if (state.size > 0 && state.size + incoming > policy.maxBytes) {
-		const part = rotateFile(file, policy);
-		if (part) {
-			state.size = incoming;
-			state.checkedAt = now;
-			return { rotated: true, size: state.size, maxBytes: policy.maxBytes, part };
+		// Another writer may have rotated (or grown) the file since the cached
+		// size was recorded, and the cache is per process. Check the real size
+		// and serialise the rotation on disk; a lock held by someone else means
+		// that writer is rotating right now, so this append simply goes on top
+		// of a slightly oversized file.
+		if (acquireRotationLock(file)) {
+			try {
+				const actual = activeSize(file);
+				if (actual > 0 && actual + incoming > policy.maxBytes) {
+					const part = rotateFile(file, policy);
+					if (part) {
+						state.size = incoming;
+						state.checkedAt = now;
+						return { rotated: true, size: state.size, maxBytes: policy.maxBytes, part };
+					}
+					// Rotation itself failed (read-only mount, raced part): keep
+					// logging into the current file.
+					state.size = actual;
+				} else {
+					state.size = actual;
+					state.checkedAt = now;
+				}
+			} finally {
+				releaseRotationLock(file);
+			}
 		}
 	}
 

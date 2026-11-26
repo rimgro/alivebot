@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as zlib from "node:zlib";
+import { spawn } from "node:child_process";
 import {
 	DEFAULT_LOG_MAX_BYTES,
 	DEFAULT_LOG_MAX_PARTS,
@@ -326,6 +327,191 @@ section("gzip failure does not stop rotation");
 	check("data in the uncompressed part is valid JSONL", valid, firstPart?.file);
 	const all = ids(allLogLines(file));
 	check("the newest record is still readable", all.includes(79), all.slice(-3));
+	fs.rmSync(root, { recursive: true, force: true });
+}
+
+section("a pre-existing file far over the threshold is archived without gzip");
+{
+	// A live log can be far larger than the threshold before this policy applies
+	// (an older build without rotation, a raised limit, a manual append).
+	// Compressing such a part synchronously inside `Logger.write` would block the
+	// event loop for seconds, so it must be kept plain.
+	const root = tempRoot("oversized-part");
+	const file = logFile(root);
+	const maxBytes = 512;
+	const oldLines: string[] = [];
+	for (let i = 0; i < 400; i++) {
+		oldLines.push(JSON.stringify({ ts: 1_700_000_000_000 + i, level: "info", msg: `old-${i}`, pad: "x".repeat(48) }));
+	}
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(file, `${oldLines.join("\n")}\n`);
+	const before = fs.statSync(file).size;
+	check("fixture is at least 3x the threshold", before >= maxBytes * 3 && before > 0, { before, maxBytes });
+
+	let compressCalls = 0;
+	const logger = new Logger({
+		file,
+		console: false,
+		rotation: {
+			maxBytes,
+			maxParts: 5,
+			compress: (data) => {
+				compressCalls += 1;
+				return zlib.gzipSync(data);
+			},
+		},
+	});
+	logger.info("first-after-rotation");
+
+	check("the oversized active file was rotated", listLogParts(file).some((part) => part.index === 1));
+	check("compress was never called for an oversized part", compressCalls === 0, compressCalls);
+	const firstPart = listLogParts(file).find((part) => part.index === 1);
+	check(
+		"part 1 stays plain under .1",
+		firstPart !== undefined && !firstPart.gzip && fs.existsSync(`${file}.1`) && !fs.existsSync(`${file}.1.gz`),
+		firstPart,
+	);
+	check("the oversized part is archived whole", firstPart !== undefined && fs.statSync(firstPart.file).size === before, {
+		before,
+		after: firstPart === undefined ? undefined : fs.statSync(firstPart.file).size,
+	});
+	check("every oversized line is still readable", firstPart !== undefined && partLines(firstPart).length === 400, firstPart && partLines(firstPart).length);
+	check("the new active file holds only the new record", activeLines(file).length === 1, activeLines(file).length);
+
+	// The next rotation shifts the plain part to .2 and compresses only the new,
+	// small part 1 — the threshold still bounds a normal rotation, not a legacy
+	// part that was already over it. Write one record at a time so the loop stops
+	// right after that rotation.
+	let written = 0;
+	while (written < 100 && !fs.existsSync(`${file}.2`)) {
+		logger.info(`new-${written}`, { i: written });
+		written += 1;
+	}
+	const afterSecond = listLogParts(file);
+	check("the second rotation compressed exactly one small part", compressCalls === 1, compressCalls);
+	check(
+		"the oversized part moved to .2 and stayed plain",
+		fs.existsSync(`${file}.2`) && !fs.existsSync(`${file}.2.gz`),
+		afterSecond.map((part) => path.basename(part.file)),
+	);
+	const movedPart = afterSecond.find((part) => part.index === 2);
+	check("the moved part is whole and readable", movedPart !== undefined && partLines(movedPart).length === 400, movedPart && partLines(movedPart).length);
+	const archived = allLogLines(file);
+	const newIds = ids(
+		archived.filter((line) => (JSON.parse(line) as { msg?: string }).msg?.startsWith("new-")),
+		"new",
+	);
+	check(
+		"every new record survives across the two rotations",
+		newIds.length === written && newIds.every((id, index) => id === index),
+		{ written, newIds },
+	);
+	check(
+		"the record that triggered the first rotation is still readable",
+		archived.some((line) => line.includes("first-after-rotation")),
+	);
+	fs.rmSync(root, { recursive: true, force: true });
+}
+
+section("parallel writers on one file");
+{
+	// `alive.jsonl` has more than one possible writer: the profile runtime plus
+	// short-lived CLI processes (`alive sessions gc`, `alive browser ...`) and a
+	// second harness started by hand. Two overlapping rotations would rename two
+	// different files onto the same `.1` slot and lose lines, so rotation is
+	// serialised on disk.
+	const root = tempRoot("lock");
+	const file = logFile(root);
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	writeRows(makeLogger(file, { maxBytes: 4096, maxParts: 5 }), 0, 40);
+	const sizeBefore = fs.statSync(file).size;
+	const lockPath = `${file}.rotate.lock`;
+	fs.writeFileSync(lockPath, String(process.pid));
+	const held = rotateIfNeeded(file, { maxBytes: 128, maxParts: 5, incomingBytes: 256 });
+	check("a fresh lock blocks rotation", held.rotated === false, held);
+	check("the active file is untouched while the lock is held", fs.statSync(file).size === sizeBefore && listLogParts(file).length === 0);
+	fs.rmSync(lockPath, { force: true });
+
+	// A lock left behind by a process killed mid-rotation must not stop rotation
+	// for good.
+	fs.writeFileSync(lockPath, "1");
+	const old = new Date(Date.now() - 5 * 60_000);
+	fs.utimesSync(lockPath, old, old);
+	const stolen = rotateIfNeeded(file, { maxBytes: 128, maxParts: 5, incomingBytes: 256, force: true });
+	check("a stale lock is stolen and rotation proceeds", stolen.rotated === true, stolen);
+	check("the stolen lock is removed", !fs.existsSync(lockPath));
+	fs.rmSync(root, { recursive: true, force: true });
+}
+
+section("two processes rotating the same file lose nothing");
+{
+	// The same lock protects real processes: both writers run the real Logger
+	// with a tiny threshold, so rotations interleave.
+	const root = tempRoot("multi-process");
+	const file = logFile(root);
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	const logUrl = new URL("../log.js", import.meta.url).href;
+	const count = 60;
+	const startFile = path.join(root, "start");
+	const tagFor = (tag: string) => `mp-${tag}`;
+	const script = [
+		`import * as fs from "node:fs";`,
+		`const { Logger } = await import(${JSON.stringify(logUrl)});`,
+		`const file = process.env.ALIVE_TEST_LOG_FILE;`,
+		`const tag = process.env.ALIVE_TEST_LOG_TAG;`,
+		`const count = Number(process.env.ALIVE_TEST_LOG_COUNT);`,
+		`const start = process.env.ALIVE_TEST_LOG_START;`,
+		`fs.writeFileSync(process.env.ALIVE_TEST_LOG_READY, "ready");`,
+		`while (!fs.existsSync(start)) {}`,
+		`const logger = new Logger({ file, console: false, rotation: { maxBytes: 256, maxParts: 40 } });`,
+		`for (let i = 0; i < count; i++) logger.info(\`\${tag}-\${i}\`, { i });`,
+		`fs.writeFileSync(process.env.ALIVE_TEST_LOG_DONE, "done");`,
+	].join("\n");
+	const children = ["a", "b"].map((tag) => {
+		const ready = path.join(root, `${tag}.ready`);
+		const done = path.join(root, `${tag}.done`);
+		const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", script], {
+			cwd: process.cwd(),
+			env: {
+				...process.env,
+				ALIVE_TEST_LOG_FILE: file,
+				ALIVE_TEST_LOG_TAG: tagFor(tag),
+				ALIVE_TEST_LOG_COUNT: String(count),
+				ALIVE_TEST_LOG_START: startFile,
+				ALIVE_TEST_LOG_READY: ready,
+				ALIVE_TEST_LOG_DONE: done,
+			},
+			stdio: ["ignore", "ignore", "pipe"],
+		});
+		let stderr = "";
+		child.stderr?.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
+		return { child, ready, done, tag, stderr: () => stderr };
+	});
+	const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+	const deadline = Date.now() + 20_000;
+	while ((!fs.existsSync(children[0].ready) || !fs.existsSync(children[1].ready)) && Date.now() < deadline) await sleep(10);
+	const ready = children.every((entry) => fs.existsSync(entry.ready));
+	check("both writer processes started", ready);
+	fs.writeFileSync(startFile, "go");
+	const exitCodes = await Promise.all(
+		children.map(
+			(entry) =>
+				new Promise<number | null>((resolve) => {
+					entry.child.once("error", () => resolve(-1));
+					entry.child.once("exit", (code) => resolve(code));
+				}),
+		),
+	);
+	check("both writer processes finished cleanly", exitCodes.every((code) => code === 0), { exitCodes, stderr: children.map((entry) => entry.stderr().slice(0, 200)) });
+	const messages = allLogLines(file).map((line) => (JSON.parse(line) as { msg?: string }).msg ?? "");
+	const expected = children.flatMap((entry) => Array.from({ length: count }, (_, i) => `mp-${entry.tag}-${i}`));
+	const present = new Set(messages);
+	const missing = expected.filter((msg) => !present.has(msg));
+	const duplicates = messages.length - present.size;
+	check("every record from both processes survived", missing.length === 0, { missing: missing.slice(0, 5), missingCount: missing.length });
+	check("no record was written twice", duplicates === 0, duplicates);
+	check("no line is corrupt", messages.length === expected.length, { got: messages.length, expected: expected.length });
+	check("the log was rotated more than once", listLogParts(file).length > 2, listLogParts(file).length);
 	fs.rmSync(root, { recursive: true, force: true });
 }
 
