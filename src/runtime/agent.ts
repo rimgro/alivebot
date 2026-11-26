@@ -1160,8 +1160,10 @@ export class AgentRunner {
 		// reach this branch, so a 401 stays as it was.
 		const classification = classifyNetworkError(caught);
 		if (classification.transient) {
-			if (record.code === undefined && classification.code !== undefined) record.code = classification.code;
-			if (record.hostname === undefined && classification.hostname !== undefined) record.hostname = classification.hostname;
+			// The cause errno is the actionable one (`EAI_AGAIN`), so it wins over a
+			// provider-shaped top-level code if both are present.
+			if (classification.code !== undefined) record.code = classification.code;
+			if (classification.hostname !== undefined) record.hostname = classification.hostname;
 		}
 		const error = maskSecrets(caught instanceof Error ? caught.message : String(caught), this.deps.config.config.secrets);
 		this.deps.log.error(`run #${run.index} session error`, {
