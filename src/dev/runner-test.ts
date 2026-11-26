@@ -2719,6 +2719,30 @@ section("a provider network failure is classified on the record and redelivered 
 	check("a 401 providerError has no hostname", unauthorized?.providerError?.hostname === undefined, unauthorized?.providerError);
 	check("a 401 keeps its own error text", unauthorized?.error === "401 Unauthorized", unauthorized?.error);
 	check("a 401 is not retried", promptsAfterUnauthorized - promptsBeforeUnauthorized === 1, promptsAfterUnauthorized - promptsBeforeUnauthorized);
+
+	// A transient network failure after the run already did work (a tool call)
+	// may have been billed: the run keeps the ordinary error path and must not
+	// feed the network counter the loop backs off on (#282).
+	store.append({
+		kind: "user_message",
+		source: "test",
+		priority: "normal",
+		title: "failure after work",
+		text: "ping",
+		thread: "alice",
+		expectsReply: true,
+	});
+	const promptsBeforeWorked = created.reduce((sum, session) => sum + session.prompts.length, 0);
+	handler = async (session) => {
+		session.emit({ type: "tool_execution_start", toolName: "note", args: { action: "list" } });
+		session.emit({ type: "tool_execution_end", toolName: "note", result: { content: [] }, isError: false });
+		throw fetchFailure;
+	};
+	const worked = await flaky.execute();
+	const promptsAfterWorked = created.reduce((sum, session) => sum + session.prompts.length, 0);
+	check("a failure after work still closes the run with an error", worked?.stopReason === "error", worked?.stopReason);
+	check("a failure after work is not a provider network failure", worked?.providerNetwork === undefined, worked?.providerNetwork);
+	check("a failure after work is not retried", promptsAfterWorked - promptsBeforeWorked === 1, promptsAfterWorked - promptsBeforeWorked);
 	drainInbox();
 }
 

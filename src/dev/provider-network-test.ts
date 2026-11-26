@@ -335,6 +335,22 @@ section("the network pause never stacks with the stopReason=error backoff");
 }
 
 // ---------------------------------------------------------------------------
+section("a network failure clears an older generic error streak");
+{
+	// The other direction of the same rule: an error run, then a network outage,
+	// then another error. The network failure is one incident and must not leave
+	// the generic streak behind, so the second error starts at 1 (30 s) instead
+	// of inheriting the earlier failure.
+	const clock = virtualClock();
+	const backoff = new RunBackoff({ sleep: clock.sleep });
+	await backoff.waitFor({ stopReason: "error", error: "model error" });
+	await backoff.waitFor(networkRun());
+	const afterNetwork = await backoff.waitFor({ stopReason: "error", error: "model error" });
+	check("a network failure resets a previous generic streak", afterNetwork?.streak === 1, afterNetwork);
+	check("the generic pause after the outage is 30 s again", clock.sleeps.join(",") === [30, 30, 30].map((s) => s * second).join(","), clock.sleeps);
+}
+
+// ---------------------------------------------------------------------------
 section("one log line per failure: streak, classified code, attempts");
 {
 	const lines: LogLine[] = [];
