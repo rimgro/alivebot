@@ -189,7 +189,7 @@ alive telegram whitelist remove 123456789
 | `alive abort-tool <agent>` | обрывает **только текущий tool call**: run, контекст и `stoppedBy` не трогаются; агент получает ошибку `aborted by operator: tool <name>` и продолжает следующим шагом |
 | `alive restart [--yes] [--deferred [--after SECONDS] [--user]] [--force] [--verbose]` | `stop` + `run` в фоне; `--deferred` — запланировать перезапуск через `systemd-run` (разрешено изнутри харнесса), `--force` — не ждать drain, закрыть старый run сразу |
 | `alive update [--check] [--auto] [--rollback] [--status] [--tag vX.Y.Z] [--force]` | обновление харнесса до стабильного тега; `--check` — отчёт, `--auto` — автообновление с проверками и кодом 10 «перезапусти меня», `--rollback` — откат по маркеру, `--status` — состояние |
-| `alive logs [-n 50] [-f] [--file stdout\|alive\|thoughts] [--json]` | хвост логов; `-f` — следить за новыми строками |
+| `alive logs [-n 50] [-f] [--file\|--source alive\|stdout\|thoughts] [<source>] [--json]` | хвост логов; дефолт — `alive` (структурный JSONL), источник можно указать позиционно, строки не из сегодняшнего дня печатаются с датой; `-f` — следить за новыми строками |
 | `alive say <text> [--thread t] [--no-reply]` | кладёт сообщение человека в durable-инбокс |
 | `alive emit <text> [--kind k] [--priority p] [--json '<obj>']` | observability-событие |
 | `alive remind <text> --in 5m \| --at <ISO>` | напоминание агенту |
@@ -543,8 +543,8 @@ CSRF-токеном: он генерируется на каждый ренде�
 ```bash
 alive run                 # старт в фоне, pid и путь к логам в ответе
 alive status              # pid, режим (background/foreground), uptime, idle, инбокс
-alive logs -f             # следить за stdout/stderr процесса
-alive logs --file alive   # структурный JSONL лога рантайма
+alive logs -f             # следить за структурным JSONL лога рантайма (дефолт)
+alive logs -f stdout      # stdout/stderr процесса (на systemd живёт в journald)
 alive logs --file thoughts # приватный монолог агента
 alive restart             # перезапуск (например, после правки конфига)
 alive restart --deferred  # запланировать перезапуск через systemd-run (можно изнутри харнесса)

@@ -70,7 +70,7 @@ function renderJsonl(raw: string): string {
 		return raw;
 	}
 	const level = record.level ?? "info";
-	const time = new Date(record.ts ?? Date.now()).toISOString().slice(11, 19);
+	const time = renderLogTime(record.ts ?? Date.now());
 	const scope = record.scope ? ` ${record.scope}` : "";
 	const data = record.data === undefined ? "" : ` ${compact(record.data)}`;
 	return `${time} ${colorLevel(level)}${scope} ${record.msg ?? ""}${data}`;
@@ -85,9 +85,25 @@ function renderThought(raw: string): string | undefined {
 	}
 	const body = record.text?.trim() ? record.text : record.thinking ? term.dim(`(thinking) ${record.thinking}`) : "";
 	if (!body) return undefined;
-	const time = new Date(record.ts ?? Date.now()).toISOString().slice(11, 19);
+	const time = renderLogTime(record.ts ?? Date.now());
 	const index = record.runIndex ?? record.wakeIndex ?? 0;
 	return `${term.gray(`[run #${index} ${time}]`)} ${body}`;
+}
+
+/**
+ * `HH:MM:SS` for today's lines, `DD.MM HH:MM:SS` for anything else.
+ *
+ * The bare clock is what made a stale file look plausible: `alive logs` reading
+ * the wrong sink printed October lines as if they were from this session
+ * (#285). Today's lines stay short; an older date is impossible to miss.
+ * Timestamps are UTC here, exactly like the clock was before — the day boundary
+ * follows the same clock.
+ */
+export function renderLogTime(ts: number, now: number = Date.now()): string {
+	const iso = new Date(ts).toISOString();
+	const clock = iso.slice(11, 19);
+	const sameDay = new Date(now).toISOString().slice(0, 10) === iso.slice(0, 10);
+	return sameDay ? clock : `${iso.slice(8, 10)}.${iso.slice(5, 7)} ${clock}`;
 }
 
 function colorLevel(level: string): string {

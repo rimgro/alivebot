@@ -56,7 +56,7 @@ import {
 	type DeferredRestartDeps,
 	type DeferredScope,
 } from "./runtime/deferred-restart.js";
-import { snapshotRuntime, spawnBackground, stdoutLogPath, stopRuntime, waitForRuntime, type StopInitiator, type StopResult } from "./runtime/daemon.js";
+import { snapshotRuntime, spawnBackground, stopRuntime, waitForRuntime, type StopInitiator, type StopResult } from "./runtime/daemon.js";
 import {
 	HARNESS_ENV_MARKER,
 	detectHarnessEnvironment,
@@ -379,7 +379,7 @@ export async function main(argv: string[], options: CliOptions = {}): Promise<nu
 			}
 			case "logs":
 			case "log": {
-				return await logsCommand(cwd, flags);
+				return await logsCommand(cwd, flags, positionals);
 			}
 			case "say": {
 				return sayCommand(cwd, flags, positionals.join(" "));
@@ -672,7 +672,8 @@ async function startBackground(config: LoadedConfig, flags: Record<string, strin
 	const logPath = path.relative(config.paths.rootDir, handle.logFile) || handle.logFile;
 	process.stdout.write(
 		`${term.green("started")} ${config.config.name} in background (pid ${handle.pid}, mode ${snapshot.state.mode ?? "background"})\n` +
-			`  alive logs -f     follow ${logPath}\n` +
+			`  alive logs -f     follow ${path.relative(config.paths.rootDir, config.paths.logFile) || config.paths.logFile}\n` +
+			`  ${term.dim(`process stdout: ${logPath}`)}\n` +
 			`  alive status      state, inbox, threads\n` +
 			`  alive stop        graceful stop (SIGTERM, then SIGKILL)\n`,
 	);
@@ -884,9 +885,16 @@ async function deferredRestartCommand(
 	return 0;
 }
 
-async function logsCommand(cwd: string, flags: Record<string, string | boolean>): Promise<number> {
+async function logsCommand(
+	cwd: string,
+	flags: Record<string, string | boolean>,
+	positionals: string[] = [],
+): Promise<number> {
 	const config = loadForCli(flags);
-	const requested = flagString(flags, "file") ?? flagString(flags, "source") ?? "stdout";
+	if (positionals.length > 1) throw new Error("usage: alive logs [<source>]");
+	// Default is the structured log: on a systemd deployment the process stdout
+	// goes to journald, so the stdout file can be a dead October leftover (#285).
+	const requested = flagString(flags, "file") ?? flagString(flags, "source") ?? positionals[0] ?? "alive";
 	const { source, file } = resolveLogSource(config.paths, requested);
 	const json = flagBool(flags, "json");
 	const render = (line: string): string | undefined => (json ? line : renderLogLine(source, line));
@@ -1307,7 +1315,7 @@ function statusCommand(cwd: string, flags: Record<string, string | boolean>): nu
 		line("session", runtime.sessionFile ?? "(none)");
 		line("idle", runtime.idling ? `yes since ${iso(runtime.idleSince ?? runtime.lastTickAt)}` : "no");
 		line("sleeps", String(runtime.sleeps ?? 0));
-		line("logs", `${term.dim("alive logs -f")}  ${path.relative(config.paths.rootDir, stdoutLogPath(config.paths))}`);
+		line("logs", `${term.dim("alive logs -f")}  ${path.relative(config.paths.rootDir, config.paths.logFile)}`);
 	} else if (snapshot && !snapshot.cleanStop) {
 		line("stale", `runtime state for pid ${snapshot.pid} (${snapshot.state.status}) — start with ${term.dim("alive run")}`);
 	}
@@ -2447,8 +2455,8 @@ usage:
   alive update --rollback [--force]           restore previousRef and dist.prev/ from .alive-update.json
   alive update --status                       current ref, update marker, dist/ and dist.prev/
                                               (update never restarts the harness — restart it yourself)
-  alive logs [-n 50] [-f] [--file <source>] [--json]
-                                              tail logs; sources: stdout (default), alive, thoughts
+  alive logs [-n 50] [-f] [--file|--source <source>] [<source>] [--json]
+                                              tail logs; sources: alive (default), stdout, thoughts
   alive say <text> [--thread t] [--no-reply]  send a message into the agent's inbox
   alive emit <text> [--kind k] [--priority p] [--json '<obj>'] [--dedupe key]
                                               inject an observability event
