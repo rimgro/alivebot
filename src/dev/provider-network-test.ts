@@ -27,7 +27,7 @@ import { DEFAULT_CONFIG, loadConfig } from "../config.js";
 import { ModuleHost } from "../events/host.js";
 import { Logger } from "../log.js";
 import { TelegramModule } from "../modules/telegram/module.js";
-import { classifyNetworkError } from "../retry.js";
+import { classifyNetworkError, networkErrorCause, sanitizeHostname } from "../retry.js";
 import {
 	PROVIDER_NETWORK_BACKOFF_BASE_MS,
 	PROVIDER_NETWORK_BACKOFF_MAX_MS,
@@ -61,9 +61,16 @@ function section(name: string): void {
 // ---------------------------------------------------------------------------
 
 /** `fetch` hides the real reason in `cause`; `undici` adds its own code there. */
-function fetchFailure(message: string, code?: string): TypeError {
-	const cause = Object.assign(new Error(message), code ? { code } : {});
+function fetchFailure(message: string, code?: string, hostname?: string): TypeError {
+	const cause = Object.assign(new Error(message), code ? { code } : {}, hostname ? { hostname } : {});
 	return Object.assign(new TypeError("fetch failed"), { cause });
+}
+
+/** The same failure one level deeper: `fetch failed` → `other side closed` → `EAI_AGAIN`. */
+function nestedFetchFailure(message: string, code: string, hostname: string): TypeError {
+	const inner = Object.assign(new Error(message), { code, hostname });
+	const middle = Object.assign(new Error("other side closed"), { cause: inner });
+	return Object.assign(new TypeError("fetch failed"), { cause: middle });
 }
 
 function httpError(status: number, message = `HTTP ${status}`): Error {
@@ -114,7 +121,7 @@ const second = 1_000;
 // ---------------------------------------------------------------------------
 section("classification: transport failures are transient, request errors are not");
 {
-	const cases: Array<{ name: string; error: unknown; code?: string }> = [
+	const cases: Array<{ name: string; error: unknown; code?: string; hostname?: string }> = [
 		{ name: "EAI_AGAIN", error: fetchFailure("getaddrinfo EAI_AGAIN api.provider.example", "EAI_AGAIN"), code: "EAI_AGAIN" },
 		{ name: "ETIMEDOUT", error: fetchFailure("connect ETIMEDOUT 10.0.0.1:443", "ETIMEDOUT"), code: "ETIMEDOUT" },
 		{ name: "ECONNRESET", error: fetchFailure("read ECONNRESET", "ECONNRESET"), code: "ECONNRESET" },
@@ -128,12 +135,42 @@ section("classification: transport failures are transient, request errors are no
 			error: fetchFailure("Connect Timeout Error", "UND_ERR_CONNECT_TIMEOUT"),
 			code: "UND_ERR_CONNECT_TIMEOUT",
 		},
+		{
+			name: "EAI_AGAIN with a host",
+			error: fetchFailure("getaddrinfo EAI_AGAIN opencode.ai", "EAI_AGAIN", "opencode.ai"),
+			code: "EAI_AGAIN",
+			hostname: "opencode.ai",
+		},
+		{
+			name: "nested cause with a host",
+			error: nestedFetchFailure("getaddrinfo EAI_AGAIN opencode.ai", "EAI_AGAIN", "opencode.ai"),
+			code: "EAI_AGAIN",
+			hostname: "opencode.ai",
+		},
 	];
 	for (const testCase of cases) {
 		const classification = classifyNetworkError(testCase.error);
 		check(`${testCase.name} is transient`, classification.transient === true, classification);
 		if (testCase.code) check(`${testCase.name} keeps its code as the reason`, classification.reason === testCase.code, classification);
+		if (testCase.hostname) check(`${testCase.name} keeps the host from the cause chain`, classification.hostname === testCase.hostname, classification);
 	}
+	check(
+		"a failure without a host in its chain has no hostname",
+		classifyNetworkError(fetchFailure("fetch failed")).hostname === undefined,
+		classifyNetworkError(fetchFailure("fetch failed")),
+	);
+	check(
+		"a URL is never accepted as a hostname",
+		sanitizeHostname("https://opencode.ai/zen/go/v1?token=SECRET") === undefined &&
+			classifyNetworkError(fetchFailure("fetch failed", "EAI_AGAIN", "opencode.ai/zen?token=SECRET")).hostname === undefined,
+		classifyNetworkError(fetchFailure("fetch failed", "EAI_AGAIN", "opencode.ai/zen?token=SECRET")),
+	);
+	check(
+		"networkErrorCause returns only the errno-shaped cause",
+		JSON.stringify(networkErrorCause(fetchFailure("fetch failed", "http_error", "opencode.ai"))) ===
+			JSON.stringify({ hostname: "opencode.ai" }),
+		networkErrorCause(fetchFailure("fetch failed", "http_error", "opencode.ai")),
+	);
 	check(
 		"a TLS handshake failure names the handshake, not the bare wrapper",
 		classifyNetworkError(fetchFailure("TLS handshake with api.provider.example failed")).reason.startsWith("TLS handshake"),
@@ -142,8 +179,13 @@ section("classification: transport failures are transient, request errors are no
 
 	const permanent: Array<{ name: string; error: unknown }> = [
 		{ name: "401", error: httpError(401, "Unauthorized") },
+		{ name: "403", error: httpError(403, "Forbidden") },
 		{ name: "400", error: httpError(400, "Bad Request") },
+		{ name: "422", error: httpError(422, "Unprocessable Entity") },
 		{ name: "quota", error: new Error("insufficient_quota: you exceeded your current quota") },
+		{ name: "billing", error: new Error("billing hard limit reached") },
+		{ name: "unknown model", error: new Error("Unknown model: deepseek-v4.1-flash") },
+		{ name: "unknown provider", error: new Error("unknown provider: opencode") },
 	];
 	for (const testCase of permanent) {
 		check(`${testCase.name} is not transient`, classifyNetworkError(testCase.error).transient === false, classifyNetworkError(testCase.error));
@@ -200,6 +242,45 @@ section("five consecutive provider network failures throttle the run starts");
 	await backoff.waitFor({ stopReason: "error", error: "HTTP 500 from the model" });
 	await backoff.waitFor(networkRun());
 	check("a generic error resets the network streak too", clock.sleeps[8] === 30 * second, clock.sleeps[8]);
+}
+
+// ---------------------------------------------------------------------------
+section("permanent request and config errors never enter the network streak");
+{
+	const cases: Array<{ name: string; error: unknown }> = [
+		{ name: "401", error: httpError(401, "Unauthorized") },
+		{ name: "403", error: httpError(403, "Forbidden") },
+		{ name: "400", error: httpError(400, "Bad Request") },
+		{ name: "422", error: httpError(422, "Unprocessable Entity") },
+		{ name: "quota/billing", error: new Error("insufficient_quota: billing hard limit reached") },
+		{ name: "unknown model", error: new Error("Unknown model: deepseek-v4.1-flash") },
+		{ name: "unknown provider", error: new Error("unknown provider: opencode") },
+	];
+	for (const testCase of cases) {
+		const clock = virtualClock();
+		const lines: LogLine[] = [];
+		const backoff = new RunBackoff({ log: collectingLogger(lines), sleep: clock.sleep });
+		const pause = await backoff.waitFor({ stopReason: "error", error: testCase.error instanceof Error ? testCase.error.message : String(testCase.error) });
+		check(`${testCase.name} is a generic error pause, not the network pause`, pause?.kind === "error", pause);
+		check(`${testCase.name} does not grow the network streak`, backoff.providerNetworkStreak === 0, backoff.providerNetworkStreak);
+		check(`${testCase.name} writes no network line`, !lines.some((line) => line.msg.includes("provider network unavailable")), lines.map((line) => line.msg));
+	}
+}
+
+// ---------------------------------------------------------------------------
+section("a successful run after a series resets the network pause to 30 s");
+{
+	const clock = virtualClock();
+	const backoff = new RunBackoff({ sleep: clock.sleep });
+	await backoff.waitFor(networkRun());
+	await backoff.waitFor(networkRun());
+	await backoff.waitFor(networkRun());
+	check("three failures pause 30s/60s/120s", clock.sleeps.join(",") === [30, 60, 120].map((s) => s * second).join(","), clock.sleeps);
+	const afterSuccess = await backoff.waitFor({ stopReason: "slept" });
+	check("the successful run takes no pause", afterSuccess === undefined, afterSuccess);
+	check("the successful run clears the network streak", backoff.providerNetworkStreak === 0, backoff.providerNetworkStreak);
+	await backoff.waitFor(networkRun());
+	check("the first failure after the success waits 30 s again", clock.sleeps[3] === 30 * second, clock.sleeps);
 }
 
 // ---------------------------------------------------------------------------
@@ -327,6 +408,24 @@ section("the run record text names the cause instead of a bare `fetch failed`");
 		"an empty message still produces a full sentence",
 		providerNetworkErrorText(undefined, {}) === "provider network error: provider request failed",
 		providerNetworkErrorText(undefined, {}),
+	);
+	check(
+		"the errno and the host from the cause chain are both appended",
+		providerNetworkErrorText("fetch failed", { reason: "EAI_AGAIN", code: "EAI_AGAIN", hostname: "opencode.ai" }) ===
+			"provider network error: fetch failed (EAI_AGAIN, opencode.ai)",
+		providerNetworkErrorText("fetch failed", { reason: "EAI_AGAIN", code: "EAI_AGAIN", hostname: "opencode.ai" }),
+	);
+	check(
+		"a hostname already named by the message is not doubled",
+		providerNetworkErrorText("getaddrinfo EAI_AGAIN opencode.ai", { code: "EAI_AGAIN", hostname: "opencode.ai" }) ===
+			"provider network error: getaddrinfo EAI_AGAIN opencode.ai",
+		providerNetworkErrorText("getaddrinfo EAI_AGAIN opencode.ai", { code: "EAI_AGAIN", hostname: "opencode.ai" }),
+	);
+	check(
+		"a URL is never appended as a hostname",
+		providerNetworkErrorText("fetch failed", { code: "EAI_AGAIN", hostname: "https://opencode.ai/zen?token=SECRET" }) ===
+			"provider network error: fetch failed (EAI_AGAIN)",
+		providerNetworkErrorText("fetch failed", { code: "EAI_AGAIN", hostname: "https://opencode.ai/zen?token=SECRET" }),
 	);
 }
 

@@ -2641,7 +2641,7 @@ section("a provider network failure is classified on the record and redelivered 
 	// `fetch` puts the real reason in `cause`; the record must keep it, not a bare
 	// `fetch failed`, and the attempt count must show the prompt was retried.
 	const fetchFailure = Object.assign(new TypeError("fetch failed"), {
-		cause: Object.assign(new Error("getaddrinfo EAI_AGAIN api.provider.example"), { code: "EAI_AGAIN" }),
+		cause: Object.assign(new Error("getaddrinfo EAI_AGAIN opencode.ai"), { code: "EAI_AGAIN", hostname: "opencode.ai" }),
 	});
 	const promptsBefore = created.reduce((sum, session) => sum + session.prompts.length, 0);
 	handler = async () => {
@@ -2655,8 +2655,26 @@ section("a provider network failure is classified on the record and redelivered 
 	check("the run is stopped by the provider", record?.stoppedBy === "provider", record?.stoppedBy);
 	check("the record marks it as a provider network failure", record?.providerNetwork?.code === "EAI_AGAIN", record?.providerNetwork);
 	check("the record carries the classified reason", record?.providerNetwork?.reason === "EAI_AGAIN", record?.providerNetwork);
+	check("the record carries the host from the error cause", record?.providerNetwork?.hostname === "opencode.ai", record?.providerNetwork);
 	check("the record counts the three prompt attempts", record?.providerNetwork?.attempts === 3, record?.providerNetwork);
-	check("the error text names the cause", record?.error === "provider network error: fetch failed (EAI_AGAIN)", record?.error);
+	check("the providerError block keeps the errno", record?.providerError?.code === "EAI_AGAIN", record?.providerError);
+	check("the providerError block keeps the host", record?.providerError?.hostname === "opencode.ai", record?.providerError);
+	check(
+		"the persisted run record carries code and hostname in providerError",
+		runs.last()?.id === record?.id && runs.last()?.providerError?.code === "EAI_AGAIN" && runs.last()?.providerError?.hostname === "opencode.ai",
+		runs.last()?.providerError,
+	);
+	const sessionError = logRecords().filter((entry) => entry.msg.endsWith("session error")).at(-1);
+	check(
+		"the session error line names the errno and the host",
+		sessionError?.data?.code === "EAI_AGAIN" && sessionError?.data?.hostname === "opencode.ai",
+		sessionError?.data,
+	);
+	check(
+		"the error text names the errno and the host",
+		record?.error === "provider network error: fetch failed (EAI_AGAIN, opencode.ai)",
+		record?.error,
+	);
 	check("the prompt really was attempted three times", promptsAfter - promptsBefore === 3, promptsAfter - promptsBefore);
 	check("no turn reached the model", runTurnCount(record ?? {}) === 0, record?.turnCount);
 	check(
@@ -2686,6 +2704,21 @@ section("a provider network failure is classified on the record and redelivered 
 		permanent?.error,
 	);
 	check("a 400 is not retried", promptsAfterPermanent - promptsBeforePermanent === 1, promptsAfterPermanent - promptsBeforePermanent);
+
+	// A 401 is also a request problem: no retry, no network block, and the
+	// providerError block must not carry an errno that would feed the counter.
+	const promptsBeforeUnauthorized = created.reduce((sum, session) => sum + session.prompts.length, 0);
+	handler = async () => {
+		throw Object.assign(new Error("401 Unauthorized"), { status: 401 });
+	};
+	const unauthorized = await flaky.execute();
+	const promptsAfterUnauthorized = created.reduce((sum, session) => sum + session.prompts.length, 0);
+	check("a 401 still closes the run with an error", unauthorized?.stopReason === "error", unauthorized?.stopReason);
+	check("a 401 is not recorded as a network failure", unauthorized?.providerNetwork === undefined, unauthorized?.providerNetwork);
+	check("a 401 providerError has no errno code", unauthorized?.providerError?.code === undefined, unauthorized?.providerError);
+	check("a 401 providerError has no hostname", unauthorized?.providerError?.hostname === undefined, unauthorized?.providerError);
+	check("a 401 keeps its own error text", unauthorized?.error === "401 Unauthorized", unauthorized?.error);
+	check("a 401 is not retried", promptsAfterUnauthorized - promptsBeforeUnauthorized === 1, promptsAfterUnauthorized - promptsBeforeUnauthorized);
 	drainInbox();
 }
 
