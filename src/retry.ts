@@ -85,8 +85,12 @@ export interface NetworkErrorClassification {
 }
 
 const MAX_ERROR_CHAIN_DEPTH = 6;
-/** Errno-shaped codes only; a provider's own string code (`http_error`) is not an errno. */
-const ERRNO_CODE = /^E[A-Z0-9_]+$/;
+/**
+ * Errno-shaped codes only: `EAI_AGAIN`, `ECONNRESET`, ... and undici's
+ * `UND_ERR_CONNECT_TIMEOUT` / `UND_ERR_SOCKET` (#282). A provider's own string
+ * code (`http_error`) is not an errno and must not be shown as one.
+ */
+const ERRNO_CODE = /^(?:E[A-Z0-9_]+|UND_ERR_[A-Z_]+)$/;
 
 /**
  * Conditions that mean "the request was wrong", not "the network was unlucky".
@@ -144,6 +148,12 @@ const TRANSIENT_PATTERNS: readonly RegExp[] = [
 	/\bEHOSTUNREACH\b/,
 	/\bENOTFOUND\b/,
 	/connection (?:error|reset|refused|closed|aborted|terminated|dropped)/i,
+	// TLS handshake failures: the route is up but a proxy/MITM/alert broke the
+	// handshake; it recovers on its own (the #282 incident had these next to the
+	// `git fetch` TLS failures), so it is not a permanent config error.
+	/tls handshake/i,
+	/ssl routines/i,
+	/tlsv1 alert/i,
 	/network error/i,
 	/fetch failed/i,
 	/socket hang ?up/i,
@@ -186,7 +196,8 @@ export function isTransientNetworkErrorText(message: string | undefined | null):
  * Classify a failure as retryable or not.
  *
  * Transient: timeouts, connection resets/refusals, DNS hiccups, `fetch failed`,
- * `socket hang up`, 408/425/429/5xx, provider overload/rate-limit markers.
+ * `socket hang up`, TLS handshake failures, 408/425/429/5xx, provider
+ * overload/rate-limit markers.
  * Permanent: 401/403, 400/422 and other 4xx, quota/billing, model-not-found,
  * invalid request, content policy, and every abort.
  */
@@ -378,11 +389,29 @@ function reasonFrom(error: unknown, details?: ErrorDetails, status?: number): st
 	const info = details ?? errorDetails(error);
 	if (info.code) return info.code;
 	if (status !== undefined) return `HTTP ${status}`;
-	const message = sanitizeReason(info.messages[0] ?? (error instanceof Error ? error.message : String(error)));
+	const message = sanitizeNetworkReason(bestReasonMessage(info.messages) ?? (error instanceof Error ? error.message : String(error)));
 	return message || "unknown error";
 }
 
-function sanitizeReason(text: string): string {
+/**
+ * The most informative message of an error chain.
+ *
+ * `fetch` always puts its own `fetch failed` first and hides the real reason
+ * (`TLS handshake ... failed`, `other side closed`) in `cause`, so the generic
+ * wrapper is skipped when a more specific message exists (#282). The wrapper is
+ * still used when it is all there is.
+ */
+function bestReasonMessage(messages: readonly string[]): string | undefined {
+	const GENERIC_FETCH_FAILURE = /^(?:fetch failed|failed to fetch|network error|network request failed)$/i;
+	return messages.find((message) => message.trim().length > 0 && !GENERIC_FETCH_FAILURE.test(message.trim())) ?? messages[0];
+}
+
+/**
+ * Short, secret-free text for a log line: no Bot API token, no bearer token, no
+ * URL, no over-long blob. Exported so other failure loggers (#282) apply the
+ * same rule instead of inventing their own.
+ */
+export function sanitizeNetworkReason(text: string): string {
 	return oneLine(
 		text
 			// Bot API URLs carry the token in the path: `.../bot123:ABC/getUpdates`.

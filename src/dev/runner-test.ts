@@ -2622,6 +2622,73 @@ section("a clean run between overflow failures prevents the restart seed (#239)"
 	resetContextWarn();
 }
 
+// ---------------------------------------------------------------------------
+section("a provider network failure is classified on the record and redelivered (#282)");
+{
+	policy.reset();
+	resetRunHealth();
+	resetContextWarn();
+	drainInbox();
+	const trigger = store.append({
+		kind: "user_message",
+		source: "test",
+		priority: "normal",
+		title: "network outage",
+		text: "are you there?",
+		thread: "alice",
+		expectsReply: true,
+	});
+	// `fetch` puts the real reason in `cause`; the record must keep it, not a bare
+	// `fetch failed`, and the attempt count must show the prompt was retried.
+	const fetchFailure = Object.assign(new TypeError("fetch failed"), {
+		cause: Object.assign(new Error("getaddrinfo EAI_AGAIN api.provider.example"), { code: "EAI_AGAIN" }),
+	});
+	const promptsBefore = created.reduce((sum, session) => sum + session.prompts.length, 0);
+	handler = async () => {
+		throw fetchFailure;
+	};
+	const flaky = makeAgentRunner();
+	await flaky.init();
+	const record = await flaky.execute();
+	const promptsAfter = created.reduce((sum, session) => sum + session.prompts.length, 0);
+	check("the run ends with stopReason=error", record?.stopReason === "error", record?.stopReason);
+	check("the run is stopped by the provider", record?.stoppedBy === "provider", record?.stoppedBy);
+	check("the record marks it as a provider network failure", record?.providerNetwork?.code === "EAI_AGAIN", record?.providerNetwork);
+	check("the record carries the classified reason", record?.providerNetwork?.reason === "EAI_AGAIN", record?.providerNetwork);
+	check("the record counts the three prompt attempts", record?.providerNetwork?.attempts === 3, record?.providerNetwork);
+	check("the error text names the cause", record?.error === "provider network error: fetch failed (EAI_AGAIN)", record?.error);
+	check("the prompt really was attempted three times", promptsAfter - promptsBefore === 3, promptsAfter - promptsBefore);
+	check("no turn reached the model", runTurnCount(record ?? {}) === 0, record?.turnCount);
+	check(
+		"the trigger event was rolled back, not acknowledged",
+		store.peekPending(50).some((event) => event.seq === trigger.seq),
+		store.peekPending(50).map((event) => event.seq),
+	);
+	check(
+		"the run record lists the trigger",
+		record?.events.some((event) => event.seq === trigger.seq) === true,
+		record?.events,
+	);
+
+	// A 400 is a request problem: no retry, no provider network block, and the
+	// loop keeps the generic error backoff instead of the network one.
+	const promptsBeforePermanent = created.reduce((sum, session) => sum + session.prompts.length, 0);
+	handler = async () => {
+		throw Object.assign(new Error("400 Bad Request: invalid request"), { status: 400 });
+	};
+	const permanent = await flaky.execute();
+	const promptsAfterPermanent = created.reduce((sum, session) => sum + session.prompts.length, 0);
+	check("a 400 still closes the run with an error", permanent?.stopReason === "error", permanent?.stopReason);
+	check("a 400 is not recorded as a network failure", permanent?.providerNetwork === undefined, permanent?.providerNetwork);
+	check(
+		"a 400 keeps its own error text",
+		permanent?.error === "400 Bad Request: invalid request",
+		permanent?.error,
+	);
+	check("a 400 is not retried", promptsAfterPermanent - promptsBeforePermanent === 1, promptsAfterPermanent - promptsBeforePermanent);
+	drainInbox();
+}
+
 process.stdout.write(
 	failures === 0 ? `\nALL RUNNER TESTS PASSED (${root})\n` : `\n${failures} RUNNER TEST(S) FAILED\n`,
 );

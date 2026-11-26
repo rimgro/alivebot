@@ -228,6 +228,29 @@ export function providerRequestSummary(value: unknown): ProviderRequestSummary |
 }
 
 /**
+ * A provider network failure that closed a run before the model was reached (#282).
+ *
+ * The whole incident of 2026-11-26 looked like ordinary `stopReason: "error"`
+ * runs, so the loop could not tell "the route to the provider is down" from
+ * "the provider rejected the work" and never backed off. This block is written
+ * only when the failure is a transient network error AND the run did no work
+ * (no turns, no tool calls): the request never reached the model.
+ *
+ * `reason`/`code` come from `classifyNetworkError`, so they are secret-free
+ * (`EAI_AGAIN`, `ETIMEDOUT`, `TLS handshake`, ...). `attempts` is how many
+ * attempts `withRetries` made in the provider prompt, which is what tells
+ * "we retried and still failed" from "retrying was not allowed".
+ */
+export interface RunProviderNetworkError {
+	/** Classified reason of the failure: an errno or a short sanitized text. */
+	reason: string;
+	/** Lowest-level errno, e.g. `EAI_AGAIN`, `ETIMEDOUT`, `ECONNRESET`. */
+	code?: string;
+	/** Attempts the provider prompt made (1 = no retry happened). */
+	attempts: number;
+}
+
+/**
  * The provider-error block of a run record, sanitized. Older records have no
  * field at all; malformed blocks are ignored rather than thrown on.
  */
@@ -376,6 +399,13 @@ export interface RunRecord {
 	 * on runs that did not end with a provider error.
 	 */
 	providerError?: RunProviderError;
+	/**
+	 * Transient provider network failure that closed this run before the model was
+	 * reached (#282). Present only for a retryable network error with no turns and
+	 * no tool calls; this is what the loop uses to pick the network backoff and to
+	 * stop treating a dead route as a model failure.
+	 */
+	providerNetwork?: RunProviderNetworkError;
 	/** Pi session file backing this run, so a resume can reopen the exact session. */
 	sessionFile?: string;
 	/** Human-readable interruption summary, written when a harness restart drains the run. */

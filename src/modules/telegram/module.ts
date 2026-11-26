@@ -102,6 +102,17 @@ export const TELEGRAM_DUPLICATE_POLLER_MESSAGE =
 const TELEGRAM_CONFLICT_WINDOW_MS = 5 * 60_000;
 
 /**
+ * Aggregation window for `getUpdates` failure logging (#282).
+ *
+ * A flaky route drops the long poll roughly every minute; each break used to
+ * write its own warn line (plus one from the inner retry), so a day of ~850
+ * short breaks buried everything else in the log. One loud line per window per
+ * channel (retry line, outage line), the rest at debug with the same classified
+ * reason — the poll keeps retrying either way, nothing is skipped or delayed.
+ */
+const TELEGRAM_POLL_NOTICE_WINDOW_MS = 60_000;
+
+/**
  * Background `getMe` retry backoff: 2s, 5s, 15s, 60s, then every 5 min. Tests
  * inject a shorter list through {@link TelegramModuleOptions} instead of waiting.
  */
@@ -275,6 +286,10 @@ export class TelegramModule implements AliveModule {
 	private pollerConflict?: TelegramPollerConflict;
 	private lastConflictProbeAt = 0;
 	private lastConflictNoticeAt = 0;
+	/** Last loud `telegram getUpdates failed` line (#282): one per window. */
+	private lastPollNoticeAt = 0;
+	/** Last loud inner-retry line of the poll loop (#282): aggregated separately. */
+	private lastPollRetryNoticeAt = 0;
 	/** Recent voice results, keyed by message and by file id (10 min window, #136). */
 	private readonly recentVoiceAttempts = new Map<string, { at: number; result: VoiceTranscriptionResult }>();
 	/** Last loud line about a transcription cooldown; bounds the log to one per window. */
@@ -558,6 +573,28 @@ export class TelegramModule implements AliveModule {
 	// polling
 	// ------------------------------------------------------------------
 
+	/**
+	 * Retry-line logger for the poll loop (#282).
+	 *
+	 * The line itself is unchanged (`retry 2/2 after 0.9s: ECONNRESET`), only its
+	 * level is aggregated: the first one per window stays a warn, repeats at the
+	 * same rate become debug. It never touches `lastPollNoticeAt`, so the outage
+	 * line still reports the first failure of an outage with its VPN/proxy hint.
+	 */
+	private pollRetryLogger(ctx: ModuleContext): { warn(message: string, data?: unknown): void } {
+		return {
+			warn: (message, data) => {
+				const now = Date.now();
+				if (now - this.lastPollRetryNoticeAt >= TELEGRAM_POLL_NOTICE_WINDOW_MS) {
+					this.lastPollRetryNoticeAt = now;
+					ctx.log.warn(message, data);
+					return;
+				}
+				ctx.log.debug(message, data);
+			},
+		};
+	}
+
 	private async poll(): Promise<void> {
 		const ctx = this.ctx;
 		const api = this.api;
@@ -581,7 +618,9 @@ export class TelegramModule implements AliveModule {
 						baseDelayMs: 500,
 						maxDelayMs: 3_000,
 						label: "telegram getUpdates",
-						log: ctx.log,
+						// Aggregated: a route that breaks every minute must not write a warn
+						// line per retry. Details are still in the debug record (#282).
+						log: this.pollRetryLogger(ctx),
 						signal: this.abort.signal,
 						// 409 is a duplicate-poller conflict, not a transient hiccup: leave it
 						// to the existing #108 handler below without an inner retry.
@@ -724,11 +763,17 @@ export class TelegramModule implements AliveModule {
 					}
 					const retryAfter = err instanceof TelegramApiError ? err.retryAfterSec : undefined;
 					const waitMs = retryAfter !== undefined ? retryAfter * 1000 : jitter(backoff);
-					// One warning when the outage starts (and occasionally after), otherwise
-					// debug: a blocked route must not flood the console every second.
-					const loud = this.consecutiveFailures === 1 || this.consecutiveFailures % 30 === 0;
+					// #282: aggregate by time, not by failure count. A short break resets
+					// `consecutiveFailures` on its own recovery, so "first failure of this
+					// outage" was still one line per break; one line per window is not.
+					const classification = classifyNetworkError(err);
+					const loud = this.lastErrorAt - this.lastPollNoticeAt >= TELEGRAM_POLL_NOTICE_WINDOW_MS;
+					if (loud) this.lastPollNoticeAt = this.lastErrorAt;
 					const detail = {
 						error: this.lastError,
+						// Classified, secret-free: EAI_AGAIN / ECONNRESET / ETIMEDOUT / HTTP 500.
+						reason: classification.reason,
+						...(classification.code ? { code: classification.code } : {}),
 						networkCode: err instanceof TelegramApiError ? err.networkCode : undefined,
 						failures: this.consecutiveFailures,
 						outageMs: Date.now() - (this.outageStartedAt ?? Date.now()),
